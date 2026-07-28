@@ -643,6 +643,16 @@ ai-memory finalize-session
 # add --all to close every matching open Codex session in this workspace/project
 ```
 
+Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
+end of one execution loop, so ai-memory intentionally records it without
+closing the conversation. After the final turn, finalize the latest matching
+Antigravity session explicitly:
+
+```bash
+ai-memory finalize-session --agent antigravity-cli
+# add --all only to close every matching open Antigravity session in this scope
+```
+
 ### Devin CLI
 
 Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`

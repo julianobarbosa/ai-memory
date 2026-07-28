@@ -1608,8 +1608,15 @@ fn apply_to_antigravity_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    println!();
+    print!("{ANTIGRAVITY_FINALIZATION_GUIDANCE}");
     Ok(())
 }
+
+const ANTIGRAVITY_FINALIZATION_GUIDANCE: &str = "\
+Antigravity `Stop` ends one execution loop, not the conversation. After the\n\
+final turn, run `ai-memory finalize-session --agent antigravity-cli` to create\n\
+the final summary and handoff and to queue opt-in SessionEnd consolidation.\n";
 
 fn merge_antigravity_hooks(
     staged: &Path,
@@ -2920,6 +2927,10 @@ fn render_agent_output(
         out.push_str(&instruction);
         out.push('\n');
     }
+    if label == "antigravity-cli" {
+        out.push('\n');
+        out.push_str(ANTIGRAVITY_FINALIZATION_GUIDANCE);
+    }
     out
 }
 
@@ -3995,6 +4006,26 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             &[CODEX_PROFILE.events],
         );
         assert!(!output.contains("AI_MEMORY_PROJECT_STRATEGY"));
+    }
+
+    #[test]
+    fn antigravity_manual_render_explains_explicit_finalization() {
+        let temp = TempDir::new().unwrap();
+        stub_scripts(temp.path(), &["session-start.sh", "stop.sh"]);
+        let output = render_agent_output(
+            "antigravity-cli",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[&ANTIGRAVITY_LIFECYCLE_EVENTS],
+        );
+
+        assert!(output.contains("`Stop` ends one execution loop, not the conversation"));
+        assert!(
+            output.contains("ai-memory finalize-session --agent antigravity-cli"),
+            "Antigravity install output must expose the supported finalizer: {output}"
+        );
     }
 
     #[test]

@@ -82,8 +82,10 @@ from hook paths.
    converge. Existing ended sessions are baselined at migration instead of
    becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
-   Codex provides `ai-memory finalize-session`, while Antigravity CLI should
-   call `memory_handoff_begin` before quitting when a handoff is needed.
+   use `ai-memory finalize-session` for Codex, or
+   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
+   The command selects the latest matching open session and enters the same
+   canonical SessionEnd path as a native hook.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation

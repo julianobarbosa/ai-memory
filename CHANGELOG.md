@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-07-28
+
+### Fixed
+- Source installation no longer fails when `cargo install --path` resolves
+  rmcp 1.8, whose `peer_info()` return type differs from rmcp 1.7. CI now checks
+  the unlocked source-install resolution separately from the workspace's
+  lock-aware gates, while the documented persistent Windows install uses
+  `--locked` for reproducibility. (#285)
+- Antigravity CLI hook installation and documentation now expose the existing
+  agent-aware manual finalizer:
+  `ai-memory finalize-session --agent antigravity-cli`. Antigravity's `Stop`
+  event ends one execution loop rather than the conversation, so it remains a
+  normal observation; the explicit command closes the latest scoped session
+  through the canonical SessionEnd path, producing its summary and automatic
+  handoff and queueing opt-in consolidation. The docs also clarify that
+  `memory_handoff_begin` deliberately creates a session-neutral, project-wide
+  manual handoff for every MCP client; attributed handoffs come from canonical
+  SessionEnd processing. (#284)
+
 ## [1.19.1] - 2026-07-27
 
 ### Changed
@@ -2492,7 +2511,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.2...HEAD
+[1.19.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.2
 [1.19.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.1
 [1.19.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.0
 [1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0

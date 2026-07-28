@@ -103,7 +103,7 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
-    /// Manually finalize the latest open Codex session for this project.
+    /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
@@ -1001,8 +1001,8 @@ impl AgentChoice {
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
-    /// Agent kind to finalize. Defaults to Codex because Codex has no reliable
-    /// true SessionEnd hook.
+    /// Agent kind to finalize. Defaults to Codex for backward compatibility;
+    /// Codex and Antigravity CLI have no reliable true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
