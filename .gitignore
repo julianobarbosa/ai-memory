@@ -36,3 +36,8 @@ evals/runs/
 
 # ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
 *.bak-*
+# BMAD tooling (installed per-session; not project content).
+/_bmad/
+/.bmad-loop/
+/.agent/
+/.agents/
