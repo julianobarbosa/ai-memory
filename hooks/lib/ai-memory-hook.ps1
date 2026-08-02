@@ -261,6 +261,36 @@ function Read-AiMemoryStdin {
     return ""
 }
 
+# Fire-and-forget POST honouring the 200 ms hook latency budget
+# (`docs/ARCHITECTURE.md` cross-cutting invariant 5). `Invoke-WebRequest`
+# cannot express it: `-TimeoutSec` takes whole seconds and 0 means
+# *infinite*, so the capture path uses `HttpClient` with a millisecond
+# timeout instead. Failures are swallowed by design — the agent's hot
+# path must never observe this call.
+function Invoke-AiMemoryHookPost {
+    param(
+        [string] $Uri,
+        [hashtable] $Headers,
+        [string] $Payload
+    )
+
+    $Client = $null
+    try {
+        $Client = [System.Net.Http.HttpClient]::new()
+        $Client.Timeout = [TimeSpan]::FromMilliseconds(200)
+        foreach ($Key in $Headers.Keys) {
+            $null = $Client.DefaultRequestHeaders.TryAddWithoutValidation(
+                $Key, [string] $Headers[$Key])
+        }
+        $Content = [System.Net.Http.StringContent]::new(
+            $Payload, [System.Text.Encoding]::UTF8, "application/json")
+        $null = $Client.PostAsync($Uri, $Content).GetAwaiter().GetResult()
+    } catch {
+    } finally {
+        if ($null -ne $Client) { $Client.Dispose() }
+    }
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -300,17 +330,10 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
-    try {
-        Invoke-WebRequest `
-            -UseBasicParsing `
-            -TimeoutSec 3 `
-            -Method Post `
-            -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
-            -Headers $Headers `
-            -ContentType "application/json" `
-            -Body $Payload | Out-Null
-    } catch {
-    }
+    Invoke-AiMemoryHookPost `
+        -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
+        -Headers $Headers `
+        -Payload $Payload
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
         Clear-AiMemorySessionId -Agent $Agent
     }

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Hook capture now honors the documented 200 ms latency budget on every
+  transport. The shell hooks posted with a 500 ms `curl --max-time`, the
+  generated TypeScript hooks used a 2000 ms request timeout (500 ms in the
+  OpenClaw plugin), and the PowerShell hook used `-TimeoutSec 3` — none
+  matched `docs/ARCHITECTURE.md` cross-cutting invariant 5, and the shell
+  comment claimed compliance it did not have. All fire-and-forget capture
+  paths are now 200 ms. `Invoke-WebRequest` cannot express a sub-second
+  timeout (`-TimeoutSec` is whole seconds and `0` means infinite), so the
+  PowerShell capture path moved to `HttpClient` with a millisecond timeout.
+  The synchronous handoff fetch is deliberately unchanged: it feeds the
+  resuming agent's context and is not a fire-and-forget path, so invariant 5
+  does not govern it. (#NNN)
+
 ## [1.19.2] - 2026-07-28
 
 ### Fixed

@@ -445,7 +445,7 @@ function postHook(eventName: string, body: Record<string, unknown>): void {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
-      signal: timeoutSignal(500),
+      signal: timeoutSignal(200),
     }}).catch(() => undefined);
   }} catch (_e) {{
     // Fire-and-forget. Hooks must never block OpenClaw.

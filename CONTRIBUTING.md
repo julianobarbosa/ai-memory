@@ -104,7 +104,11 @@ Highlights for contributors:
 
 ## Versioning and deprecation policy
 
-This project follows [Semantic Versioning](https://semver.org/):
+This project follows [Semantic Versioning](https://semver.org/).
+
+The **public surface** this policy governs is: the `memory_*` MCP tool
+set, `POST /hook`, `/api/v1`, and the `ai-memory` CLI subcommands. Every
+other HTTP route is internal and may change in any release.
 
 - **Patch** (`x.y.Z`): bug fixes that do not change public API or
   on-disk format.
@@ -112,8 +116,14 @@ This project follows [Semantic Versioning](https://semver.org/):
   tools, new config keys. Existing behaviour is preserved.
 - **Major** (`X.0.0`): breaking changes. This includes on-disk format
   changes that are not handled by a migration, removal of CLI subcommands,
-  or changes to the MCP tool schema that would break existing agents.
+  changes to the MCP tool schema, and changes to `/api/v1` response shapes
+  or the `POST /hook` request contract that would break existing clients.
 
 Breaking changes only ship in major releases. Deprecated items are
 documented in the CHANGELOG under `### Deprecated` and removed no sooner
 than the following major release.
+
+A shipped config key's **meaning** may change only through that same
+deprecation cycle: a `### Deprecated` entry, a runtime warning when the
+old form is read, and removal no sooner than the following major. Adding
+a key is a minor; silently redefining one is never acceptable.

@@ -1969,7 +1969,7 @@ const HOOK_QUEUE_MAX = 100;
 const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
-const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_REQUEST_TIMEOUT_MS = 200;
 const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
@@ -2568,7 +2568,7 @@ const HOOK_QUEUE_MAX = 100;
 const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
-const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_REQUEST_TIMEOUT_MS = 200;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
@@ -4845,7 +4845,7 @@ model = "gpt-5"
         assert!(generated.contains("const HOOK_FLUSH_INTERVAL_MS = 2000;"));
         assert!(generated.contains("const HOOK_FLUSH_THRESHOLD = 20;"));
         assert!(generated.contains("const HOOK_INTER_REQUEST_DELAY_MS = 50;"));
-        assert!(generated.contains("const HOOK_REQUEST_TIMEOUT_MS = 2000;"));
+        assert!(generated.contains("const HOOK_REQUEST_TIMEOUT_MS = 200;"));
         assert!(generated.contains("const HOOK_IMMEDIATE_EVENTS = new Set([\"session-start\", \"stop\", \"session-end\", \"pre-compact\"]);"));
         assert!(generated.contains("const hookQueue: HookQueueItem[] = [];"));
         assert!(generated.contains(

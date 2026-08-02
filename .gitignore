@@ -43,3 +43,6 @@ evals/runs/
 /.agents/
 # BMAD document-project scan state (regenerated per run).
 /docs/project-scan-report.json
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
