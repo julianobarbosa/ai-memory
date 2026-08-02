@@ -74,6 +74,21 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     let moved_via = report["moved_via"].as_str().unwrap_or("");
     let skipped_count = report["pages_skipped"].as_array().map_or(0, |s| s.len());
 
+    if (moved_via == "true-move" || purged)
+        && let Err(error) = super::project_registry::rekey_scope(
+            config,
+            &endpoint,
+            &from_workspace,
+            &project,
+            &args.to_workspace,
+            &project,
+        )
+    {
+        eprintln!(
+            "ai-memory: project moved, but the client-local checkout link could not be updated ({error:#})"
+        );
+    }
+
     if moved_via == "true-move" {
         // Lossless: re-stamped in place, nothing copied or purged.
         println!(

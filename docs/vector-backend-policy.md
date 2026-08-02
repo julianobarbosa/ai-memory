@@ -9,9 +9,9 @@ deferred intentionally, not rejected.
 The expected corpus is usually hundreds to low-thousands of latest wiki
 pages per project. At that size, brute-force cosine is simple,
 inspectable, and fast enough, especially because vector retrieval is only
-one signal in the query path. `memory_query` already combines FTS5,
-graph-neighbor expansion, optional vector RRF, and raw observation
-fallback. Each stream contributes through the same bounded candidate window,
+one signal in the query path. `memory_query` already combines FTS5, lexical
+entity matching, graph-neighbor expansion, optional vector RRF, and raw
+observation fallback. Each stream contributes through the same bounded candidate window,
 then a page-authority adjustment runs after fusion, so semantic similarity
 cannot by itself declare a session page more canonical than a maintained
 decision.
@@ -44,7 +44,7 @@ Concrete trigger criteria:
   vector scoring, after FTS/graph paths are already optimized.
 - Profiling shows query-time dot products consume meaningful CPU,
   especially under concurrent MCP calls.
-- Real retrieval evals show vector results improve recall over FTS5 +
+- Real retrieval evals show vector results improve recall over FTS5 + entity +
   graph by a meaningful margin, for example `+5-10% recall@5`.
 - A migration can create and backfill the vec table from existing
   `page_embeddings` without resetting user data.
@@ -70,5 +70,5 @@ the MCP tool surface. The migration path should be additive:
 3. Teach diagnostics to report vec-table row counts and stale rows.
 4. Add a safe rebuild command/path for the derived vec table.
 5. Switch vector candidate generation from brute-force scan to
-   `sqlite-vec`, while preserving FTS5 + graph + vector RRF semantics.
+   `sqlite-vec`, while preserving FTS5 + entity + graph + vector RRF semantics.
    The existing post-fusion authority adjustment remains unchanged.

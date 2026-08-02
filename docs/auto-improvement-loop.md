@@ -384,7 +384,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | Background scheduler | Reviews newly completed sessions after the first-run watermark and applies or stages validated proposals according to approval policy. |
 | `ai-memory auto-improve --session-id <id>` | Manually review one session and apply or stage validated proposals through the auto-improvement approval path. |
 | `ai-memory auto-improve-report --workspace <w> --project <p> [--days N] [--limit N] [--stage]` | Read-only telemetry report for recent auto-improvement runs, proposal outcomes, terminal rates, and findings by default. `--stage` creates exactly one pending telemetry report page for audit/approval. |
-| `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
+| `memory_auto_improve` | Manually review the newest completed session with no persisted auto-improvement run, or explicitly rerun a named session, and apply or stage validated proposals through the same path. An empty run records a preflight skip so the next implicit call advances. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |
@@ -397,6 +397,13 @@ so humans can review them in the wiki/Obsidian workflow. SQLite can still hold
 proposal state, approval status, evidence metadata, and audit rows, but the
 review artifact itself should be inspectable and versioned like the rest of the
 wiki.
+
+On deployments that distinguish operators, manually staged proposals record
+the qualified operator identity and enforce one pending proposal per target
+*per operator*. Unattributed scheduler, curator, and telemetry proposals stay
+in the shared bucket. A collision skips only that proposal, preserves its
+siblings, and appears in the command or API response with the target and
+reason; it must not become a silent partial run.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the

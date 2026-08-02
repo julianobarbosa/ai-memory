@@ -2,19 +2,19 @@
 # Curl-based installer for ai-memory's lifecycle-hook scripts.
 #
 # Use when you don't want to clone the repo and don't want to use the
-# docker image to extract the bundle. Pulls each hook script for the
-# requested agent straight from the published GitHub raw URL.
+# docker image to extract the bundle. Downloads a checksum-verified hook
+# archive from a GitHub Release, then installs only the requested agent files.
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/scripts/install-hooks.sh \
-#       | bash -s -- --agent claude-code
+#   ai-memory-install-hooks --agent claude-code
 #
 # Options:
 #   --agent <claude-code|codex|cursor|gemini-cli|kimi-code|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
-#   --ref <git-ref>                          repo ref to pull from (default: main)
+#   --ref <release-tag>                      release tag to pull (default: latest)
+#   --repo <owner/repo>                      release repository (default: akitaonrails/ai-memory)
 #
 # After installation, render the matching agent config snippet:
 #   ai-memory install-hooks --agent claude-code --hooks-dir ~/.ai-memory/hooks
@@ -27,7 +27,7 @@ set -euo pipefail
 
 AGENT="claude-code"
 TO="$HOME/.ai-memory/hooks"
-REF="main"
+REF="latest"
 REPO="akitaonrails/ai-memory"
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +51,15 @@ case "$AGENT" in
         echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | kimi-code | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
+
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "invalid --repo: expected owner/repository" >&2
+    exit 64
+fi
+if [[ ! "$REF" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "invalid --ref: expected a release tag without path separators" >&2
+    exit 64
+fi
 
 if [[ "$AGENT" == "opencode" ]]; then
     echo "OpenCode uses a generated TypeScript plugin, not shell hook scripts."
@@ -100,15 +109,41 @@ fi
 DEST="$TO/$AGENT"
 mkdir -p "$DEST"
 
+if [[ "$REF" == "latest" ]]; then
+    BASE_URL="https://github.com/$REPO/releases/latest/download"
+else
+    BASE_URL="https://github.com/$REPO/releases/download/$REF"
+fi
+ARCHIVE="ai-memory-hooks.tar.gz"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "Downloading checksum-verified ai-memory hook bundle from $BASE_URL"
+curl -fsSL "$BASE_URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
+curl -fsSL "$BASE_URL/$ARCHIVE.sha256" -o "$TMP/$ARCHIVE.sha256"
+expected_sum="$(awk 'NR == 1 && $1 ~ /^[0-9A-Fa-f]{64}$/ { print tolower($1) }' "$TMP/$ARCHIVE.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_sum="$(sha256sum "$TMP/$ARCHIVE" | awk '{ print $1 }')"
+elif command -v shasum >/dev/null 2>&1; then
+    actual_sum="$(shasum -a 256 "$TMP/$ARCHIVE" | awk '{ print $1 }')"
+else
+    echo "sha256sum or shasum is required to verify the hook bundle" >&2
+    exit 69
+fi
+if [[ -z "$expected_sum" || "$actual_sum" != "$expected_sum" ]]; then
+    echo "hook bundle checksum mismatch; refusing installation" >&2
+    exit 1
+fi
 echo "Installing ai-memory hooks for $AGENT into $DEST"
 for name in "${SCRIPTS[@]}"; do
-    url="https://raw.githubusercontent.com/$REPO/$REF/hooks/$AGENT/${name}.sh"
+    member="hooks/$AGENT/${name}.sh"
+    source="$TMP/${name}.sh"
     out="$DEST/${name}.sh"
-    if curl -fsSL "$url" -o "$out"; then
-        chmod +x "$out"
+    if tar -xOf "$TMP/$ARCHIVE" "$member" > "$source" && [[ -s "$source" ]]; then
+        install -m 0755 "$source" "$out"
         echo "  ✓ $name"
     else
-        echo "  ✗ $name (failed to fetch $url)" >&2
+        echo "  ✗ $name (missing from verified release bundle)" >&2
         exit 1
     fi
 done

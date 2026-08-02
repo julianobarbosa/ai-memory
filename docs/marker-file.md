@@ -206,7 +206,12 @@ an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
 arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
-2,000 UTF-8-safe bytes. Unsupported tool envelopes do not gain a PreToolUse
+2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
+the bounded replacement or written-content field in `toolCall.args` because its
+hook payload does not include an output field; failed edits retain the error
+instead. The fallback is Antigravity-only and is discarded with any event
+rejected by capture exclusions.
+Unsupported tool envelopes do not gain a PreToolUse
 body, and association is only by matching agent-provided call IDs. User-prompt stores its prompt
 text, notification stores its message/text, and post-compaction stores its
 summary; other event bodies are currently empty unless explicitly supported.

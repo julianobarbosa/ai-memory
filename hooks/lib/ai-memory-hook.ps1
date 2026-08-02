@@ -291,6 +291,19 @@ function Invoke-AiMemoryHookPost {
     }
 }
 
+function Test-AiMemoryAntigravityInitialInvocation {
+    param([string] $Payload)
+    try {
+        $Parsed = $Payload | ConvertFrom-Json
+        $Property = $Parsed.PSObject.Properties["invocationNum"]
+        if ($null -eq $Property) { return $false }
+        $Value = $Property.Value
+        return (($Value -is [int] -or $Value -is [long]) -and [long]$Value -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -308,6 +321,10 @@ function Invoke-AiMemoryHook {
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
     $Payload = Read-AiMemoryStdin
+    if ($AntigravityPreInvocationOutput -and -not (Test-AiMemoryAntigravityInitialInvocation -Payload $Payload)) {
+        [Console]::Out.Write("{}")
+        return
+    }
     # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
     # so a PostToolUse whose tool output legitimately contains the literal string
     # is unaffected. If a Stop payload still carries the raw field, drop the whole

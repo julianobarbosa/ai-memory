@@ -136,12 +136,21 @@ impl Wiki {
         self
     }
 
+    /// Borrow the configured sanitizer, so components holding a `Wiki`
+    /// (e.g. the consolidator scrubbing project-provided prompt
+    /// preferences) reuse the operator's patterns instead of
+    /// constructing a second, built-in-only instance.
+    #[must_use]
+    pub fn sanitizer(&self) -> &Sanitizer {
+        &self.sanitizer
+    }
+
     /// Attach an embedder. When set, `write_page` computes + stores an
     /// embedding for the new version synchronously. `apply_batch` keeps
     /// the SQL/file fan-out atomic and leaves vector completeness to
     /// admin or scheduled embedding backfill. Without an embedder,
     /// vector search is skipped and `ReaderPool::hybrid_search` uses
-    /// FTS5 + graph expansion.
+    /// FTS5 + entity + graph expansion.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -376,7 +385,7 @@ impl Wiki {
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -394,11 +403,13 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
                 author_id: None,
+                expires_at: meta.expires_at,
+                entities: meta.entities,
             })
             .await?;
         Ok(id)
@@ -464,7 +475,69 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
+        self.delete_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            author_id,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
 
+    /// Delete a page only when `expected_latest_id` is still its latest
+    /// indexed version. Used by retention so a stale expiry candidate cannot
+    /// delete a page that was refreshed after the sweep selected it.
+    ///
+    /// The exclusive mutation guard keeps normal wiki writes out between the
+    /// pre-admission comparison and file quarantine; the writer repeats the
+    /// comparison in the delete transaction as the final authority check.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn delete_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("conditional page delete requires a store reader")
+        })?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        self.delete_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            None,
+            Some(expected_latest_id),
+        )
+        .await
+    }
+
+    async fn delete_page_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        admission_ctx: Option<AdmissionContext>,
+        author_id: Option<ai_memory_core::UserId>,
+        expected_latest_id: Option<PageId>,
+    ) -> WikiResult<bool> {
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
@@ -481,22 +554,28 @@ impl Wiki {
             Err(e) => return Err(crate::WikiError::Io(e)),
         };
 
-        let delete_result = self
-            .writer
-            .delete_page(workspace_id, project_id, path.clone(), author_id)
-            .await;
-        if let Err(e) = delete_result {
-            if let Some(quarantine) = &quarantined
-                && let Err(restore_err) = std::fs::rename(quarantine, &abs)
-            {
-                tracing::error!(
-                    path = %path.as_str(),
-                    quarantine = %quarantine.display(),
-                    error = %restore_err,
-                    "delete_page: DB delete failed and restoring quarantined file also failed"
-                );
+        let delete_result = match expected_latest_id {
+            Some(expected) => {
+                self.writer
+                    .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
+                    .await
             }
-            return Err(e.into());
+            None => self
+                .writer
+                .delete_page(workspace_id, project_id, path.clone(), author_id)
+                .await
+                .map(|()| true),
+        };
+        let deleted = match delete_result {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                restore_quarantined_file(&quarantined, &abs, path);
+                return Err(e.into());
+            }
+        };
+        if !deleted {
+            restore_quarantined_file(&quarantined, &abs, path);
+            return Ok(false);
         }
 
         if let Some(quarantine) = quarantined {
@@ -506,7 +585,7 @@ impl Wiki {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", ctx);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Purge a whole project's wiki directory. When an admission chain is
@@ -576,6 +655,74 @@ impl Wiki {
         } else {
             Ok(None)
         }
+    }
+
+    /// Ask the admission chain about an operation that has no page and no body
+    /// — a handoff lifecycle event.
+    ///
+    /// Handoffs live outside the wiki tree (they have their own table), so they
+    /// never passed through `write_page` and were invisible to admission
+    /// webhooks. That left the operations that move prompt-derived text between
+    /// operators unauthorizable: a webhook that decides who may touch which
+    /// scope could not see them at all.
+    ///
+    /// Only the webhooks that can refuse the operation are awaited — that is
+    /// what the caller has to know before doing destructive work, and a
+    /// `reject` policy is the operator asking to be waited for. The observers
+    /// are handed back with the resolved context: pass it to
+    /// [`Self::notify_operation_observers`] once the operation is durable, or
+    /// drop it if the operation was abandoned, so no webhook is told about work
+    /// that never happened. Every path that raises one of these ops owes its
+    /// webhooks the same three steps in the same order — decide, act, notify —
+    /// or the same event reaches a mirror from one caller and not from another.
+    ///
+    /// Returns `None` when no chain is attached (nothing left to notify).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses.
+    pub async fn authorize_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        let Some(chain) = &self.admission_chain else {
+            return Ok(None);
+        };
+        let ctx = self
+            .operation_admission_ctx(workspace_id, project_id, op, actor, skip_webhooks)
+            .await;
+        chain.authorize(None, &ctx).await?;
+        Ok(Some(ctx))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation previously gated
+    /// by [`Self::authorize_operation`] and since committed.
+    pub fn notify_operation_observers(&self, ctx: &AdmissionContext) {
+        if let Some(chain) = &self.admission_chain {
+            chain.dispatch_notify_observers(None, ctx);
+        }
+    }
+
+    async fn operation_admission_ctx(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> AdmissionContext {
+        let mut ctx = AdmissionContext {
+            op,
+            actor,
+            skip_webhooks,
+            ..Default::default()
+        };
+        self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+            .await;
+        ctx
     }
 
     /// Run just the blocking admission chain for a would-be write, without
@@ -765,6 +912,8 @@ impl Wiki {
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
         let title = self.sanitizer.scrub(&detail.summary.title);
         let links = extract_links(&markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
         let emitted = emit(&markdown)?;
         let page = NewPage {
             workspace_id,
@@ -777,6 +926,8 @@ impl Wiki {
             pinned: is_slot_path(&path),
             links,
             author_id,
+            expires_at,
+            entities,
         };
 
         let result = {
@@ -856,7 +1007,7 @@ impl Wiki {
         let links = extract_links(&md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -865,12 +1016,13 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
-
                 author_id: None,
+                expires_at: meta.expires_at,
+                entities: meta.entities,
             })
             .await?;
         Ok(id)
@@ -1135,19 +1287,23 @@ impl Wiki {
             // Build NewPage batch with the precomputed titles.
             let pages: Vec<ai_memory_core::NewPage> = staged_files
                 .iter()
-                .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                    workspace_id: req.workspace_id,
-                    project_id: req.project_id,
-                    path: req.path.clone(),
-                    title: req.title.clone().unwrap_or_default(),
-                    body: req.body.clone(),
-                    tier: req.tier,
-                    frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned,
-                    links: extract_links(&req.body, &req.path),
-                    author_id: req.author_id,
+                .map(|(req, _, _, _)| {
+                    Ok(ai_memory_core::NewPage {
+                        workspace_id: req.workspace_id,
+                        project_id: req.project_id,
+                        path: req.path.clone(),
+                        title: req.title.clone().unwrap_or_default(),
+                        body: req.body.clone(),
+                        tier: req.tier,
+                        frontmatter_json: req.frontmatter.clone(),
+                        pinned: req.pinned,
+                        links: extract_links(&req.body, &req.path),
+                        author_id: req.author_id,
+                        expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
+                        entities: parse_entities(&req.path, &req.frontmatter)?,
+                    })
                 })
-                .collect();
+                .collect::<WikiResult<Vec<_>>>()?;
 
             // Install files first so the DB is never ahead of markdown. If the
             // SQL batch fails below, rollback restores the prior disk state;
@@ -1269,6 +1425,8 @@ impl Wiki {
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links = extract_links(&markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1304,6 +1462,8 @@ impl Wiki {
                     pinned,
                     links,
                     author_id,
+                    expires_at,
+                    entities,
                 })
                 .await
             {
@@ -1410,7 +1570,7 @@ fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
 fn derive_index_metadata(
     path: &PagePath,
     frontmatter: &serde_json::Value,
-) -> WikiResult<(Tier, bool)> {
+) -> WikiResult<IndexMetadata> {
     let tier = match frontmatter.get("tier") {
         None => Tier::Semantic,
         Some(serde_json::Value::String(s)) => s.parse::<Tier>().map_err(|e| {
@@ -1431,7 +1591,92 @@ fn derive_index_metadata(
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-    Ok((tier, pinned))
+    let expires_at = parse_expires_at(path, frontmatter)?;
+    let entities = parse_entities(path, frontmatter)?;
+    Ok(IndexMetadata {
+        tier,
+        pinned,
+        expires_at,
+        entities,
+    })
+}
+
+/// Index-relevant metadata derived from a page's frontmatter. Markdown
+/// is the source of truth; every field here is rebuildable by a reindex.
+struct IndexMetadata {
+    tier: Tier,
+    pinned: bool,
+    expires_at: Option<jiff::Timestamp>,
+    entities: Vec<String>,
+}
+
+/// Parse the optional frontmatter `entities:` list — salient nouns the
+/// consolidator extracted, indexed by the store as a retrieval stream.
+///
+/// Unlike `expires_at`, malformed entries are *dropped* rather than
+/// rejected: entities are a soft ranking signal, and refusing a whole
+/// page write because one hand-edited entity is 80 characters long
+/// would trade a real page for a marginal signal. A non-array value is
+/// still an error — that's a structural mistake, not a bad item.
+pub(crate) fn parse_entities(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Vec<String>> {
+    let raw = match frontmatter.get("entities") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-array entities in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    let strings = raw.iter().filter_map(|v| v.as_str());
+    Ok(ai_memory_core::normalize_entities(strings))
+}
+
+/// Parse the optional frontmatter `expires_at:` key. Accepts RFC3339
+/// (`2026-09-01T12:00:00Z`) or a bare date (`2026-09-01` = end of that
+/// day, UTC). Anything else is rejected in the same style as an
+/// invalid `tier`, so a typo can't silently mean "never expires".
+pub(crate) fn parse_expires_at(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Option<jiff::Timestamp>> {
+    let raw = match frontmatter.get("expires_at") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.trim(),
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-string expires_at in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(Some(ts));
+    }
+    if let Ok(date) = raw.parse::<jiff::civil::Date>() {
+        let ts = date
+            .at(23, 59, 59, 999_999_000)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map_err(|e| {
+                ai_memory_wiki_error(&format!(
+                    "invalid expires_at date in frontmatter for {}: {e}",
+                    path.as_str()
+                ))
+            })?
+            .timestamp();
+        return Ok(Some(ts));
+    }
+    Err(ai_memory_wiki_error(&format!(
+        "invalid expires_at in frontmatter for {} (want RFC3339 or YYYY-MM-DD): {raw}",
+        path.as_str()
+    )))
 }
 
 fn canonicalize_index_frontmatter(
@@ -1596,6 +1841,19 @@ fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
+fn restore_quarantined_file(quarantined: &Option<PathBuf>, path: &Path, page_path: &PagePath) {
+    if let Some(quarantine) = quarantined
+        && let Err(error) = std::fs::rename(quarantine, path)
+    {
+        tracing::error!(
+            path = %page_path.as_str(),
+            quarantine = %quarantine.display(),
+            %error,
+            "delete_page: conditional/DB delete failed and restoring quarantined file also failed"
+        );
+    }
+}
+
 fn scrub_frontmatter_strings(value: &mut serde_json::Value, sanitizer: &Sanitizer) {
     match value {
         serde_json::Value::String(s) => {
@@ -1674,6 +1932,41 @@ mod tests {
         StageAutoImproveRun, Store,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn expires_at_accepts_rfc3339_and_date_only_utc() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        let rfc3339 = serde_json::json!({"expires_at": "2026-08-01T12:00:00-03:00"});
+        assert_eq!(
+            parse_expires_at(&path, &rfc3339).unwrap().unwrap(),
+            "2026-08-01T15:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
+
+        let date_only = serde_json::json!({"expires_at": "2026-08-01"});
+        assert_eq!(
+            parse_expires_at(&path, &date_only).unwrap().unwrap(),
+            "2026-08-01T23:59:59.999999Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expires_at_fails_closed_for_invalid_values() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({"expires_at": "  "}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": "soon"})).is_err());
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": 7})).is_err());
+    }
 
     #[cfg(windows)]
     fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
@@ -1888,7 +2181,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages_for_project(ws, proj, "proposed body".into(), 10)
+                .search_pages_for_project(ws, proj, "proposed body".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1907,7 +2200,7 @@ mod tests {
                 "notes/leaky-proposal.md",
                 "body has ANTHROPIC_API_KEY=sk-ant-leak-1234567890abcdef",
                 "rationale has postgres://admin:hunter2@db.internal/prod",
-                serde_json::json!([{ "secret": "GH_TOKEN=ghp_1234567890abcdef1234567890abcdef1234" }]),
+                serde_json::json!([{ "secret": "GH_TOKEN=ghp_FAKEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }]),
             ),
         )
         .await;
@@ -3283,7 +3576,7 @@ mod tests {
                 proj,
                 "notes/a.md",
                 "alpha uniquetoken",
-                serde_json::json!({}),
+                serde_json::json!({"entities": ["NATS JetStream"]}),
             ),
             req(
                 ws,
@@ -3328,6 +3621,27 @@ mod tests {
             1,
             "reindexed page is searchable in the fresh store"
         );
+        let entity_hits = s2
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                "jetstream".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_hits.len(),
+            1,
+            "reindex must rebuild the entity stream from canonical frontmatter"
+        );
+        assert_eq!(entity_hits[0].path.as_str(), "notes/a.md");
         drop(s2);
     }
 
@@ -3382,5 +3696,42 @@ mod tests {
             err.to_string().contains("symlinked scope manifest"),
             "reindex must reject symlinked manifests, got {err:#}"
         );
+    }
+
+    /// Frontmatter `entities:` round-trips through the write path and is
+    /// normalised on the way into the index. A non-array value is a
+    /// structural error; bad *items* are dropped, because entities are a
+    /// ranking signal and one long hand-typed entry must not cost the page.
+    #[test]
+    fn parse_entities_normalises_and_rejects_non_arrays() {
+        let path = PagePath::new("concepts/x.md").unwrap();
+
+        assert!(
+            parse_entities(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_empty(),
+            "absent key means no entities",
+        );
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["SQLite", "  sqlite ", "Writer\nActor", 42]}),
+            )
+            .unwrap(),
+            vec!["sqlite".to_string(), "writer actor".to_string()],
+            "lowercased, whitespace-collapsed, de-duplicated, non-strings dropped",
+        );
+        assert!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["ok", "x".repeat(200)]}),
+            )
+            .unwrap()
+                == vec!["ok".to_string()],
+            "over-long items are dropped, not fatal",
+        );
+        let err = parse_entities(&path, &serde_json::json!({"entities": "sqlite"}))
+            .expect_err("a string instead of a list is a structural error");
+        assert!(err.to_string().contains("non-array entities"), "{err}");
     }
 }

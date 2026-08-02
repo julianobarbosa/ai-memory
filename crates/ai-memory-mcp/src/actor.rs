@@ -24,7 +24,7 @@
 //! bypass a reject-policy admission webhook by setting a client-controlled
 //! header.
 
-use ai_memory_core::{ActorContext, AuthLevel, Capability, UserId};
+use ai_memory_core::{ActorContext, AuthLevel, UserId};
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
 
@@ -44,6 +44,7 @@ pub fn actor_from_headers(headers: &HeaderMap) -> ActorContext {
     ActorContext {
         agent: header_str(headers, "x-memory-actor-agent"),
         user: header_str(headers, "x-memory-actor-user"),
+        issuer: header_str(headers, "x-memory-actor-issuer"),
         sub: header_str(headers, "x-memory-actor-sub"),
         client: header_str(headers, "x-memory-actor-client"),
         session_id: header_str(headers, "x-memory-actor-session-id"),
@@ -72,6 +73,12 @@ pub fn author_id_from_parts(parts: &Parts) -> Option<UserId> {
     parts.extensions.get::<UserId>().copied()
 }
 
+fn header_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(ai_memory_core::SKIP_ADMISSION_CHAIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+}
+
 /// Parse the admission-chain loop-prevention skip list from the
 /// `X-Memory-Skip-Admission-Chain` request header (comma-separated
 /// webhook names). A webhook that writes back into the engine (e.g. via
@@ -82,17 +89,7 @@ pub fn author_id_from_parts(parts: &Parts) -> Option<UserId> {
 /// and empty tokens dropped, so `"a, ,b,"` → `["a", "b"]`.
 #[must_use]
 pub fn skip_webhooks_from_headers(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get("x-memory-skip-admission-chain")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    ai_memory_core::parse_skip_admission_chain(header_value(headers))
 }
 
 /// Parse the skip-list header only for trusted re-entry contexts.
@@ -103,14 +100,7 @@ pub fn skip_webhooks_from_parts(parts: &Parts) -> Vec<String> {
         .get::<AuthLevel>()
         .copied()
         .unwrap_or(AuthLevel::Anonymous);
-    if level
-        .authorize(Capability::SkipAdmissionChain, true)
-        .is_ok()
-    {
-        skip_webhooks_from_headers(&parts.headers)
-    } else {
-        Vec::new()
-    }
+    ai_memory_core::skip_admission_chain_for(level, header_value(&parts.headers))
 }
 
 #[cfg(test)]
@@ -126,6 +116,10 @@ mod tests {
             HeaderValue::from_static("claude-code"),
         );
         h.insert("x-memory-actor-user", HeaderValue::from_static("djalmajr"));
+        h.insert(
+            "x-memory-actor-issuer",
+            HeaderValue::from_static("https://idp.example"),
+        );
         h.insert("x-memory-actor-sub", HeaderValue::from_static("8f3a-uuid"));
         h.insert(
             "x-memory-actor-client",
@@ -138,6 +132,7 @@ mod tests {
         let ctx = actor_from_headers(&h);
         assert_eq!(ctx.agent.as_deref(), Some("claude-code"));
         assert_eq!(ctx.user.as_deref(), Some("djalmajr"));
+        assert_eq!(ctx.issuer.as_deref(), Some("https://idp.example"));
         assert_eq!(ctx.sub.as_deref(), Some("8f3a-uuid"));
         assert_eq!(ctx.client.as_deref(), Some("72836f52-uuid"));
         assert_eq!(ctx.session_id.as_deref(), Some("019e6d-session"));
@@ -150,6 +145,7 @@ mod tests {
         let ctx = actor_from_headers(&h);
         assert!(ctx.agent.is_none());
         assert!(ctx.user.is_none());
+        assert!(ctx.issuer.is_none());
         assert!(ctx.sub.is_none());
         assert!(ctx.client.is_none());
         assert!(ctx.session_id.is_none());

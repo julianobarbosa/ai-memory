@@ -40,6 +40,14 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
 pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, true)
+}
+
+pub(super) fn run_quiet(args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, false)
+}
+
+fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
     let block = full_block();
     let targets = resolve_targets(args.target.as_ref())?;
     let skill_args = if args.no_skills {
@@ -66,21 +74,27 @@ pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
             let outcome = apply_atomic(target, |existing| {
                 Ok(merge_instructions_block(existing, &block))
             })?;
-            println!(
-                "✓ {} {} ({})",
-                outcome.verb(),
-                target.display(),
-                match outcome {
-                    ApplyOutcome::Created => "new file",
-                    ApplyOutcome::Updated => "backup written next to it",
-                    ApplyOutcome::NoOp => "already up to date",
-                }
-            );
+            if report {
+                println!(
+                    "✓ {} {} ({})",
+                    outcome.verb(),
+                    target.display(),
+                    match outcome {
+                        ApplyOutcome::Created => "new file",
+                        ApplyOutcome::Updated => "backup written next to it",
+                        ApplyOutcome::NoOp => "already up to date",
+                    }
+                );
+            }
         }
     }
 
     if let Some(prepared_skills) = prepared_skills {
-        install_skills::run_prepared(prepared_skills)?;
+        if report {
+            install_skills::run_prepared(prepared_skills)?;
+        } else {
+            install_skills::run_prepared_quiet(prepared_skills)?;
+        }
     }
 
     Ok(())

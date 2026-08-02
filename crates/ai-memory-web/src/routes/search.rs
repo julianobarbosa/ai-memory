@@ -32,7 +32,7 @@ pub(crate) async fn handler(
     } else {
         let raw = state
             .reader
-            .search_pages_with_meta(query.clone(), 50)
+            .search_pages_with_meta(query.clone(), 50, None)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

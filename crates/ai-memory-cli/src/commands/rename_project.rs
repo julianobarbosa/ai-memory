@@ -29,6 +29,13 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     });
     let summary: serde_json::Value = post_json(&endpoint, "/admin/rename-project", &body).await?;
     let pages = summary["pages"].as_u64().unwrap_or(0);
+    if let Err(error) = super::project_registry::rekey_scope(
+        config, &endpoint, &workspace, &from, &workspace, &args.to,
+    ) {
+        eprintln!(
+            "ai-memory: project renamed, but the client-local checkout link could not be updated ({error:#})"
+        );
+    }
     println!(
         "Renamed {}/{} → {}/{} ({} pages now under the new name).",
         workspace, from, workspace, args.to, pages

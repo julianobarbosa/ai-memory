@@ -47,6 +47,8 @@ pub fn synthesize_session_page(
         pinned: false,
         links: Vec::new(),
         author_id: None,
+        expires_at: None,
+        entities: Vec::new(),
     }
 }
 

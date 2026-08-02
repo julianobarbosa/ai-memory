@@ -39,6 +39,60 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
 
+/// Config-file representation of retention settings.
+///
+/// The breadth coefficient lives here rather than expanding the public
+/// `ai_memory_store::DecayParams` struct, preserving source compatibility for
+/// downstream Rust callers that construct that struct directly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecaySettings {
+    /// Per-day decay rate.
+    pub lambda: f64,
+    /// Access-reinforcement magnitude.
+    pub sigma: f64,
+    /// Per-day decay of access reinforcement.
+    pub mu: f64,
+    /// Default page salience.
+    pub salience_default: f64,
+    /// Soft-delete threshold.
+    pub cold_threshold: f64,
+    /// Delay before hard-deleting an untouched soft-deleted page.
+    pub hard_delete_after_days: i64,
+    /// Optional weight for the number of distinct authenticated readers.
+    pub breadth_weight: f64,
+}
+
+impl Default for DecaySettings {
+    fn default() -> Self {
+        let base = ai_memory_store::DecayParams::default();
+        Self {
+            lambda: base.lambda,
+            sigma: base.sigma,
+            mu: base.mu,
+            salience_default: base.salience_default,
+            cold_threshold: base.cold_threshold,
+            hard_delete_after_days: base.hard_delete_after_days,
+            breadth_weight: 0.0,
+        }
+    }
+}
+
+impl DecaySettings {
+    /// Retention coefficients consumed by existing store/consolidation APIs.
+    #[must_use]
+    pub fn decay_params(self) -> ai_memory_store::DecayParams {
+        ai_memory_store::DecayParams {
+            lambda: self.lambda,
+            sigma: self.sigma,
+            mu: self.mu,
+            salience_default: self.salience_default,
+            cold_threshold: self.cold_threshold,
+            hard_delete_after_days: self.hard_delete_after_days,
+        }
+    }
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -80,14 +134,11 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
-    /// Opt-in: send `response_format=json_schema` (strict) to the
-    /// `openai-compat` provider instead of asking for prose JSON and
-    /// extracting the first balanced object. Off by default — the tolerant
-    /// parser stays the default for older local engines that ignore
-    /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
-    /// llama.cpp) honour structured output; this lets the operator opt in.
-    /// If the strict raw call fails, the provider falls back to the tolerant
-    /// parser. Set with `AI_MEMORY_LLM_COMPAT_STRICT=true`.
+    /// Send `response_format=json_schema` (strict) to the `openai-compat`
+    /// provider instead of relying on prose instructions and extracting the
+    /// first balanced object. On by default because every structured call
+    /// already supplies its own schema. Set
+    /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
@@ -105,7 +156,16 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
-    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
+    /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
+    /// supported: LLM-as-judge over the configured LLM provider, so it
+    /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
+    /// an LLM call on the search hot path, trading latency for recall
+    /// at the top of the ranking. On any error or timeout the query
+    /// preserves the fused, authority-adjusted order. Set with
+    /// `AI_MEMORY_RERANKER=llm`.
+    pub reranker: Option<String>,
+    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
+    /// or `openai-compat`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
     pub embedding_model: Option<String>,
@@ -118,9 +178,11 @@ pub struct Config {
     /// threshold), followed by ~180 days of soft-delete buffer before
     /// hard-deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
-    pub decay: ai_memory_store::DecayParams,
+    pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Memory-slot behaviour.
+    pub slots: SlotSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -351,6 +413,13 @@ pub struct AuthSettings {
     /// pre-multi-user behaviour — bearer authenticates but
     /// attributes anonymously.
     pub root_username: Option<String>,
+    /// OIDC issuer for the root operator when a trusted proxy asserts stable
+    /// identities. Configure together with [`Self::root_subject`].
+    pub root_issuer: Option<String>,
+    /// OIDC subject for the root operator. Configure together with
+    /// [`Self::root_issuer`]; only this pair can grant a proxy-authenticated
+    /// request root capability. A display username is not a stable root key.
+    pub root_subject: Option<String>,
     /// Optional email for the root user, surfaced alongside
     /// `root_username` in the web UI + `/api/v1` responses.
     pub root_email: Option<String>,
@@ -366,6 +435,16 @@ pub struct AuthSettings {
     /// token resolution even during first-user bootstrap; operational admin
     /// access becomes root-only once a user row exists.
     pub token_pepper: Option<String>,
+    /// Dedicated bearer token for a trusted authenticating proxy, allowing it
+    /// to name the real end user in `X-Memory-Actor-*` headers.
+    ///
+    /// A proxy that terminates SSO usually cannot forward the user's own
+    /// credential upstream. This token must differ from [`Self::bearer_token`]
+    /// so an omitted or malformed identity cannot fall through as root.
+    /// Actor headers on ordinary root and DB-user requests are ignored.
+    ///
+    /// Only set this when the server is reachable *only* through that proxy.
+    pub actor_proxy_bearer_token: Option<String>,
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -413,15 +492,17 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
-            llm_compat_strict: false,
+            llm_compat_strict: true,
             consolidate_on_session_end: false,
             capture_assistant: false,
+            reranker: None,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
             embedding_base_url: None,
-            decay: ai_memory_store::DecayParams::default(),
+            decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            slots: SlotSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -584,6 +665,43 @@ impl Default for AutoImproveSettings {
     }
 }
 
+/// `[slots]` memory-slot behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlotSettings {
+    /// Namespace engine-written slots under the operator that produced them
+    /// (`_slots/u-alice/current-focus.md` instead of
+    /// `_slots/current-focus.md`). The segment is the operator's
+    /// `IdentityKey::path_segment()` — `u-<name>` for safe usernames and a
+    /// bounded deterministic identifier for path-hostile usernames or complete
+    /// OIDC issuer/subject pairs — never a raw OIDC value.
+    ///
+    /// Off by default, so nothing changes for an existing install: with the
+    /// flag off a nested slot path carries no ownership meaning at all, and
+    /// every slot goes into every brief exactly as it did before.
+    ///
+    /// Turning it ON changes reads and writes, in both directions:
+    ///
+    /// * a session brief and the consolidation prompt see the shared slots
+    ///   plus the requesting operator's own — so a slot already stored under
+    ///   `_slots/<segment>/…` becomes visible to that operator alone;
+    /// * writing into another operator's namespace is refused (admins aside);
+    /// * a write naming the SHARED slot is namespaced into the writer's own
+    ///   prefix, whether it comes from the engine or from `memory_write_page`.
+    ///
+    /// What the flag scopes is INJECTION, not access: an exact-path read
+    /// still returns anyone's slot, like any other page.
+    ///
+    /// Turning it back OFF restores the pre-feature rule everywhere: personal
+    /// slots become visible to everyone again and nested writes stop being
+    /// gated. Un-namespaced slots are shared under either setting, so nothing
+    /// already stored is ever hidden or reinterpreted.
+    ///
+    /// Only meaningful once requests carry distinct identities; with a single
+    /// shared credential every slot lands under the same namespace.
+    pub per_user: bool,
+}
+
 /// `[maintenance]` scheduled server jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -686,6 +804,12 @@ impl Config {
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
 
+        if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
+            anyhow::bail!(
+                "decay.breadth_weight must be a finite number greater than or equal to zero"
+            );
+        }
+
         Ok(config)
     }
 
@@ -772,6 +896,26 @@ impl Config {
         Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
     }
 
+    /// Whether the operator opted into post-RRF reranking.
+    ///
+    /// Unknown values are rejected loudly at *startup* rather than
+    /// silently disabling the feature — a typo'd `AI_MEMORY_RERANKER`
+    /// should not look like "reranking is on" in the operator's head
+    /// while eligible queries keep their normal ranking.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for any value other than
+    /// `llm` (case-insensitive) or empty.
+    pub fn reranker_choice(&self) -> LlmResult<bool> {
+        match non_empty(self.reranker.as_deref()).map(str::to_ascii_lowercase) {
+            None => Ok(false),
+            Some(v) if v == "llm" => Ok(true),
+            Some(other) => Err(LlmError::NotConfigured(format!(
+                "AI_MEMORY_RERANKER={other} is not supported (only `llm`)"
+            ))),
+        }
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -785,9 +929,11 @@ impl Config {
             "openai" => EmbedderChoice::OpenAi,
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
+            "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             other => {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of openai|voyage|google|gemini"
+                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
+                     openai|voyage|google|gemini|openai-compat"
                 )));
             }
         };
@@ -797,11 +943,32 @@ impl Config {
                 EmbedderChoice::OpenAi => "text-embedding-3-small".to_string(),
                 EmbedderChoice::Voyage => "voyage-3".to_string(),
                 EmbedderChoice::Google => ai_memory_llm::GOOGLE_DEFAULT_EMBED_MODEL.to_string(),
+                EmbedderChoice::OpenAiCompat => {
+                    return Err(LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_MODEL must be set explicitly for openai-compat \
+                         (no safe default for self-hosted engines)"
+                            .into(),
+                    ));
+                }
             },
         };
-        let dim = self
-            .embedding_dim
-            .unwrap_or_else(|| ai_memory_llm::default_embedding_dim(provider, &model));
+        let dim = match self.embedding_dim {
+            Some(0) => {
+                return Err(LlmError::NotConfigured(
+                    "AI_MEMORY_EMBEDDING_DIM must be greater than zero".into(),
+                ));
+            }
+            Some(d) => d,
+            None => {
+                ai_memory_llm::try_default_embedding_dim(provider, &model).ok_or_else(|| {
+                    LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_DIM must be set explicitly for openai-compat \
+                         (self-hosted model dims vary)"
+                            .into(),
+                    )
+                })?
+            }
+        };
         let api_key = match provider {
             EmbedderChoice::OpenAi => self.openai_embedding_api_key()?,
             EmbedderChoice::Voyage => self
@@ -812,13 +979,26 @@ impl Config {
             EmbedderChoice::Google => self.runtime_env.gemini_api_key.clone().ok_or_else(|| {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
+            // Keyless engines (Ollama, LM Studio) are the norm; a
+            // gateway key rides on LLM_API_KEY when present.
+            EmbedderChoice::OpenAiCompat => self
+                .runtime_env
+                .llm_api_key
+                .clone()
+                .unwrap_or_else(|| SecretString::from(String::new())),
         };
+        let base_url = self.embedding_base_url.clone();
+        if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
+            return Err(LlmError::NotConfigured(
+                "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
+            ));
+        }
         Ok(Some(EmbedderConfig {
             provider,
             model,
             dim,
             api_key,
-            base_url: self.embedding_base_url.clone(),
+            base_url,
         }))
     }
 
@@ -990,6 +1170,8 @@ mod tests {
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert_eq!(cfg.decay.breadth_weight, 0.0);
+        assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);
@@ -1043,6 +1225,21 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_destructive_invalid_breadth_weights() {
+        for value in ["-0.1", "nan", "inf"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, format!("[decay]\nbreadth_weight = {value}\n")).unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("invalid breadth weight must fail closed");
+            assert!(
+                error.to_string().contains("breadth_weight"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn load_populates_home_dir_from_env() {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
@@ -1077,6 +1274,30 @@ mod tests {
         // root-collapsing prefix key.
         assert_eq!(normalize_home_dir("/"), None);
         assert_eq!(normalize_home_dir(""), None);
+    }
+
+    #[test]
+    fn reranker_choice_is_explicit_case_insensitive_and_fail_closed() {
+        for value in [None, Some(""), Some("  ")] {
+            let cfg = Config {
+                reranker: value.map(str::to_string),
+                ..Config::default()
+            };
+            assert!(!cfg.reranker_choice().unwrap());
+        }
+        for value in ["llm", "LLM", " LlM "] {
+            let cfg = Config {
+                reranker: Some(value.into()),
+                ..Config::default()
+            };
+            assert!(cfg.reranker_choice().unwrap());
+        }
+        let cfg = Config {
+            reranker: Some("cross-encoder".into()),
+            ..Config::default()
+        };
+        let err = cfg.reranker_choice().unwrap_err();
+        assert!(err.to_string().contains("AI_MEMORY_RERANKER=cross-encoder"));
     }
 
     #[test]
@@ -1226,6 +1447,72 @@ mod tests {
     }
 
     #[test]
+    fn openai_compat_embedding_is_keyless_and_requires_explicit_settings() {
+        // Fully specified, no key: valid (Ollama / LM Studio).
+        let cfg = Config {
+            embedding_provider: Some("openai-compat".into()),
+            embedding_model: Some("nomic-embed-text".into()),
+            embedding_dim: Some(768),
+            embedding_base_url: Some("http://localhost:11434/v1".into()),
+            ..Config::default()
+        };
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::OpenAiCompat);
+        assert_eq!(embedder.model, "nomic-embed-text");
+        assert_eq!(embedder.dim, 768);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        assert_eq!(
+            embedder.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        // A gateway key rides on LLM_API_KEY when present.
+        let cfg_with_key = Config {
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("sk-or-key")),
+                ..RuntimeEnv::default()
+            },
+            ..cfg.clone()
+        };
+        let embedder = cfg_with_key.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-or-key");
+
+        // Missing model / dim / base URL each fail closed.
+        let missing_model = Config {
+            embedding_model: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_model.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_MODEL")
+        ));
+        let missing_dim = Config {
+            embedding_dim: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_DIM")
+        ));
+        let zero_dim = Config {
+            embedding_dim: Some(0),
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            zero_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("greater than zero")
+        ));
+        let missing_base = Config {
+            embedding_base_url: None,
+            ..cfg
+        };
+        assert!(matches!(
+            missing_base.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
+        ));
+    }
+
+    #[test]
     fn openai_embedding_does_not_use_llm_api_key_without_custom_base_url() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
@@ -1270,7 +1557,7 @@ mod tests {
             provider.auth.require_api_key().unwrap().expose_secret(),
             "sk-test-key"
         );
-        assert!(!provider.compat_strict);
+        assert!(provider.compat_strict);
     }
 
     #[test]
@@ -1327,12 +1614,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_compat_provider_threads_strict_flag() {
-        let cfg = Config {
+    fn openai_compat_provider_defaults_strict_and_allows_opt_out() {
+        let mut cfg = Config {
             llm_provider: Some("openai-compat".into()),
             llm_model: Some("qwen3:32b".into()),
             llm_base_url: Some("http://localhost:11434/v1".into()),
-            llm_compat_strict: true,
             ..Config::default()
         };
 
@@ -1345,6 +1631,10 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert!(provider.compat_strict);
+
+        cfg.llm_compat_strict = false;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_strict);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Recall@5 eval harness.
 //!
 //! Loads a small hand-crafted corpus + a probe set, measures recall@5
-//! against both the pure-FTS5 path and the hybrid (FTS5 + graph RRF +
-//! vector) path, and asserts a baseline. It also pins graph-neighbor
-//! expansion and raw observation fallback. The point is *the framework*: once the
+//! against both the pure-FTS5 path and the hybrid (FTS5 + entity + graph RRF +
+//! vector) path, and asserts a baseline. It also pins entity-only recall,
+//! graph-neighbor expansion, and raw observation fallback. The point is *the
+//! framework*: once the
 //! harness is in CI, anyone can drop in real embeddings (set the
 //! `AI_MEMORY_EMBEDDING_PROVIDER` env vars + plug in a real model) and
 //! watch the numbers move. The synthetic embedder shipped for tests is
@@ -217,7 +218,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
 
     let fts_hits = store
         .reader
-        .search_pages_for_project(ws, proj, "graphseed".into(), 5)
+        .search_pages_for_project(ws, proj, "graphseed".into(), 5, None)
         .await
         .expect("fts search");
     assert!(
@@ -238,6 +239,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
             String::new(),
             0,
             5,
+            None,
         )
         .await
         .expect("hybrid search");
@@ -246,6 +248,84 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
             .iter()
             .any(|hit| hit.path.as_str() == "notes/hidden_target.md"),
         "graph expansion should include the linked target"
+    );
+}
+
+/// The entity stream recovers a probe that BOTH pure FTS and the graph
+/// stream miss: the page's body never carries the query's wording, and it
+/// has no links. The only bridge is the frontmatter `entities:` list the
+/// consolidator writes.
+#[tokio::test]
+async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("decisions/queue-choice.md").expect("path"),
+        // Body deliberately avoids the probe term and carries no links.
+        frontmatter: serde_json::json!({
+            "title": "Queue choice",
+            "entities": ["nats jetstream", "delivery guarantees"],
+        }),
+        body: "We picked the streaming broker for at-least-once delivery.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    })
+    .await
+    .expect("write page");
+
+    let probe = "jetstream";
+    let fts_hits = store
+        .reader
+        .search_pages_for_project(ws, proj, probe.into(), 5, None)
+        .await
+        .expect("fts search");
+    assert!(
+        fts_hits.is_empty(),
+        "pure FTS must miss: the body never says {probe}"
+    );
+
+    let hybrid_hits = store
+        .reader
+        .hybrid_search(
+            ws,
+            proj,
+            probe.into(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            5,
+            None,
+        )
+        .await
+        .expect("hybrid search");
+    assert!(
+        hybrid_hits
+            .iter()
+            .any(|hit| hit.path.as_str() == "decisions/queue-choice.md"),
+        "the entity stream should recover the page: {:?}",
+        hybrid_hits
+            .iter()
+            .map(|h| h.path.as_str())
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -273,6 +353,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
             project_id: proj,
             agent_kind: AgentKind::OpenCode,
             cwd: None,
+            actor_user: None,
         })
         .await
         .expect("begin session");
@@ -297,7 +378,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
 
     let page_hits = store
         .reader
-        .search_pages_for_project(ws, proj, "capybara".into(), 5)
+        .search_pages_for_project(ws, proj, "capybara".into(), 5, None)
         .await
         .expect("page search");
     assert!(page_hits.is_empty(), "compiled wiki should miss");
@@ -333,6 +414,7 @@ async fn measure_recall(
                     emb.model().to_string(),
                     emb.dim(),
                     5,
+                    None,
                 )
                 .await
                 .expect("hybrid search")

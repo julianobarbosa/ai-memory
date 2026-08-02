@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn scrubs_generic_env_var_assignments() {
-        let out = s().scrub("MY_INTERNAL_API_KEY=abcdef123456");
+        let out = s().scrub("MY_INTERNAL_API_KEY=aaaaaaaaaaaa");
         assert!(out.contains("[REDACTED]"));
         let out2 = s().scrub("SOMETHING_SECRET=foo");
         assert!(out2.contains("[REDACTED]"));

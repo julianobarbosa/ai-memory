@@ -116,6 +116,20 @@ ai_memory_extract_session_id() {
     done
 }
 
+# Antigravity's PreInvocation hook fires before every model call. Only the
+# documented invocationNum=0 boundary represents the startup event that
+# ai-memory maps to SessionStart. Missing or malformed counters fail closed so
+# a repeated invocation cannot consume a next-session handoff.
+ai_memory_antigravity_is_initial_invocation() {
+    payload="${1:-$(cat)}"
+    rest=${payload#*\"invocationNum\"}
+    [ "$rest" != "$payload" ] || return 1
+    value=$(printf '%s' "$rest" \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*([,}]).*/\1/p' \
+        | head -n 1)
+    [ "$value" = "0" ]
+}
+
 ai_memory_managed_qs() {
     [ -n "${AI_MEMORY_RUN_ID:-}" ] || return 0
     printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"

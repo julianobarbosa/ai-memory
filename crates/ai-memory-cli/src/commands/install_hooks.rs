@@ -689,6 +689,12 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here.
+        McpClient::Zed => Ok(infer_json_mcp_config(
+            &content,
+            &["context_servers", "ai-memory"],
+            "url",
+        )),
     }
 }
 

@@ -140,6 +140,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             "bag-of-words-v1".into(),
             64,
             5,
+            None,
         )
         .await
         .expect("hybrid search");
@@ -153,9 +154,9 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         "the karpathy page should be the top hybrid hit; got {top_path}",
     );
 
-    // 4. FTS5-only path (None query vector) still works through the
-    //    same method — the hybrid method gracefully falls back.
-    let fts_only = store
+    // 4. Without a query vector, FTS5 + entity + graph still work through the
+    //    same method; only the vector stream is absent.
+    let lexical_graph = store
         .reader
         .hybrid_search(
             ws,
@@ -166,12 +167,13 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             "bag-of-words-v1".into(),
             64,
             5,
+            None,
         )
         .await
         .expect("hybrid (no query vec)");
     assert!(
-        !fts_only.is_empty(),
-        "FTS5-only fallback should still return Karpathy page",
+        !lexical_graph.is_empty(),
+        "FTS5 + entity + graph fallback should still return Karpathy page",
     );
 
     // 5. Re-writing a page produces a fresh embedding row (the

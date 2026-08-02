@@ -82,12 +82,14 @@ id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
+id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
+id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
 
 /// Relative path of a page within the wiki tree.
 ///
@@ -208,6 +210,8 @@ pub enum AgentKind {
     Devin,
     /// Kimi Code CLI (Moonshot AI).
     KimiCode,
+    /// Hermes Agent (Nous Research).
+    Hermes,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -218,7 +222,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -234,6 +238,7 @@ impl AgentKind {
         Self::Zero,
         Self::Devin,
         Self::KimiCode,
+        Self::Hermes,
         Self::Other,
     ];
 
@@ -256,6 +261,7 @@ impl AgentKind {
             Self::Zero => "zero",
             Self::Devin => "devin",
             Self::KimiCode => "kimi-code",
+            Self::Hermes => "hermes",
             Self::Other => "other",
         }
     }
@@ -281,6 +287,7 @@ impl AgentKind {
             "zero" => Self::Zero,
             "devin" => Self::Devin,
             "kimi-code" | "kimi" => Self::KimiCode,
+            "hermes" | "hermes-agent" => Self::Hermes,
             _ => Self::Other,
         }
     }
@@ -310,7 +317,7 @@ impl AgentKind {
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
             self,
-            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Other
+            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Hermes | Self::Other
         )
     }
 
@@ -414,6 +421,23 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_hermes_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Hermes.as_str(), "hermes");
+        assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
+        assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"hermes\"").unwrap(),
+            AgentKind::Hermes
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Hermes).unwrap(),
+            "\"hermes\""
+        );
+        assert!(!AgentKind::Hermes.session_start_injects_handoff());
+        assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
     }
 
     #[test]

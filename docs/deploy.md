@@ -174,11 +174,11 @@ alternatives:
 ai-memory's hosted OpenAI-family providers use `json_schema` strict mode for
 structured output. The OpenAI provider normalizes schemars output into
 OpenAI's supported subset (`additionalProperties: false`, complete `required`,
-generated enum `anyOf`, and plain `$ref` nodes). For `openai-compat` local or
-gateway endpoints, the tolerant parser stays the default; set
-`AI_MEMORY_LLM_COMPAT_STRICT=true` only after confirming the endpoint honours
-OpenAI-style `response_format=json_schema`. If you switch to a niche local
-model, run a quick `ai-memory llm-test` before trusting it.
+generated enum `anyOf`, and plain `$ref` nodes). `openai-compat` local and
+gateway endpoints use the same schema-constrained request by default, with a
+tolerant fallback for explicit capability rejection or malformed output. Set
+`AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint. If you switch
+to a niche local model, run a quick `ai-memory llm-test` before trusting it.
 
 ## Backups
 
@@ -189,7 +189,7 @@ The data dir is whatever you mounted in `docker-compose.prod.yml`
 data/
 ├── wiki/    # markdown — back up with rsync or git push to a remote
 ├── raw/    # immutable session log archive
-├── db/     # memory.sqlite (FTS5 + page_embeddings)
+├── db/     # memory.sqlite (FTS5 + entities + page_embeddings)
 ├── logs/   # daily rolling tracing
 └── models/ # reserved for future local embedders
 ```

@@ -119,7 +119,7 @@ impl LlmProvider for OpenAiCompatProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        // Strict mode (opt-in; see `strict` field): modern local engines
+        // Strict mode: modern local engines
         // honour `response_format=json_schema`. Normalise the schema
         // to the strict subset (additionalProperties:false, full required, no
         // oneOf / no $ref siblings) — the same rewrite the Official dialect
@@ -134,12 +134,10 @@ impl LlmProvider for OpenAiCompatProvider {
         // silently drop it.
         //
         // Fallback path:
-        // Fallback only on *parse-shape* failures — the engine returned a
-        // response but it wasn't a valid JSON object (the case the tolerant
-        // path was designed for). On `LlmError::Provider` (HTTP 4xx/5xx,
-        // auth, rate-limit) and transport-level failures, propagate the
-        // error: a `complete()` retry inside the fallback would hit the
-        // same wall and double the latency / token spend for no gain.
+        // Fallback on *parse-shape* failures, or when a compatibility endpoint
+        // explicitly rejects `response_format` / `json_schema` before model
+        // execution. Other provider and transport failures propagate: a
+        // retry would hit the same wall and may double latency or token spend.
         //
         // The fallback itself is a SECOND HTTP call to the model — the
         // strict raw call returns parsed JSON or an error, not raw text,
@@ -160,6 +158,9 @@ impl LlmProvider for OpenAiCompatProvider {
                 }
                 Err(err) if is_parse_shape_error(&err) => {
                     debug!(error = %err, "compat strict parse-shape mismatch, falling back to tolerant parser");
+                }
+                Err(err) if is_response_format_rejection(&err) => {
+                    debug!(error = %err, "compat endpoint rejected response_format, falling back to tolerant parser");
                 }
                 Err(err) => {
                     // Transport / 5xx / auth / rate-limit: a tolerant retry
@@ -213,6 +214,23 @@ fn is_parse_shape_error(err: &LlmError) -> bool {
     matches!(err, LlmError::UnexpectedShape(_) | LlmError::Serde(_))
 }
 
+/// True only when a compatibility endpoint rejected structured-output syntax
+/// before generation. Generic 4xx errors are deliberately excluded so auth,
+/// quota, model, and malformed-request failures retain their original cause.
+fn is_response_format_rejection(err: &LlmError) -> bool {
+    let LlmError::Provider { status, body } = err else {
+        return false;
+    };
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("response_format")
+        || body.contains("json_schema")
+        || body.contains("structured output")
+        || body.contains("structured-output")
+}
+
 /// Find the first balanced `{...}` object in a string, skipping
 /// braces that appear inside JSON string literals.
 ///
@@ -259,8 +277,8 @@ fn first_json_object(s: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    /// `new` defaults strict off; `with_strict` is the only way to turn it
-    /// on, mirroring how the factory threads `ProviderConfig::compat_strict`.
+    /// The low-level constructor stays tolerant so wrappers can choose their
+    /// own compatibility policy; runtime configuration supplies the default.
     #[test]
     fn strict_defaults_off_and_can_be_overridden() {
         let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
@@ -270,12 +288,28 @@ mod tests {
         assert!(p.strict);
     }
 
-    /// The strict path's fallback policy lives in `is_parse_shape_error`:
-    /// fall back ONLY when the upstream returned a response in the wrong
-    /// shape (the tolerant prose-JSON parser has a real chance). Propagate
-    /// transport / HTTP-status / auth errors — a tolerant retry would just
-    /// hit the same wall and double cost. Regression guard for the audit
-    /// finding that the original strict-fallback caught every `Err(_)`.
+    #[test]
+    fn only_explicit_response_format_rejections_are_retryable() {
+        assert!(is_response_format_rejection(&LlmError::Provider {
+            status: 400,
+            body: "unsupported parameter: response_format".into(),
+        }));
+        assert!(is_response_format_rejection(&LlmError::Provider {
+            status: 422,
+            body: "json_schema is not supported".into(),
+        }));
+        assert!(!is_response_format_rejection(&LlmError::Provider {
+            status: 400,
+            body: "unknown model".into(),
+        }));
+        assert!(!is_response_format_rejection(&LlmError::Provider {
+            status: 401,
+            body: "response_format requires authentication".into(),
+        }));
+    }
+
+    /// Parse-shape failures are retryable. Provider capability rejection is
+    /// classified separately; generic provider and transport failures are not.
     #[test]
     fn is_parse_shape_error_classifies_correctly() {
         // Shape failures → fall back.

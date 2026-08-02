@@ -25,8 +25,10 @@ middleware as `/mcp`, `/hook`, and `/admin/*` — they're all nested
 - **Anonymous request → `401 Unauthorized`** (when the server is running
   with a bearer token configured).
 - **Disallowed `Host` header → `403 Forbidden`** (DNS-rebinding guard).
-- The same token protects everything; there is no per-user scoping.
-  Single-tenant by design (see [`docs/design-decisions.md`](design-decisions.md) §13).
+- The static bearer is the root credential. DB-user tokens and a configured
+  trusted-proxy bearer resolve per-user identities; actor-scoped responses then
+  expose only that operator's plus shared handoffs. See
+  [`docs/users.md`](users.md) for the full auth ladder.
 
 Pass the bearer in the standard header:
 
@@ -37,7 +39,7 @@ Authorization: Bearer <token>
 Get a token:
 
 ```bash
-ai-memory generate-auth-token   # writes to stdout
+ai-memory generate-auth-token   # writes a root token to stdout
 # then export AI_MEMORY_AUTH_TOKEN=<token> in the server's environment,
 # or put it under [auth].bearer_token in config.toml
 ```
@@ -67,7 +69,7 @@ with one of these statuses:
 |---|---|
 | `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`. |
 | `401 Unauthorized` | bearer missing or wrong. |
-| `403 Forbidden` | Host header not in allowlist. |
+| `403 Forbidden` | Host header not in allowlist; or a non-root caller requests `all_owners=true`. |
 | `404 Not Found` | workspace, project, or page doesn't exist; or page file missing on disk. |
 | `500 Internal Server Error` | reader pool / SQLite failure. Body is `{"error":"<context>"}` with the source error chain. |
 
@@ -296,6 +298,62 @@ pages. No LLM, deterministic.
 ```http
 GET /api/v1/workspaces/{workspace}/overview?limit=10
 GET /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=10
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=open&limit=50
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?all_owners=true
+```
+
+### Handoff listing
+
+`state` accepts `open` | `accepted` | `expired`; omit it to list every state,
+which is how you find a baton that was already consumed. Results are scoped by
+owner: an authenticated caller sees their own plus the shared handoffs, an
+anonymous browser sees only shared ones — an owned handoff (and the prompt-
+derived text inside it) is never rendered to someone it does not belong to.
+The same scoping applies to the `handoff` field of both overview endpoints and
+to `pending_handoff_count`, so the count and the fetch always agree.
+For recovery, a root-authorized request may pass `all_owners=true` to list all
+operators' rows. User and anonymous requests receive `403`; the default remains
+own plus shared, including for root.
+
+On a server that authenticates, the listing's prompt-derived fields —
+`summary`, `open_questions`, `next_steps` — are served to a caller the server
+can name and to the root operator; an automatic handoff synthesises them
+verbatim from the operator's prompts, and the listing returns the project's
+whole history rather than the single newest open row. A caller that is neither
+named nor root gets the fields absent and `redacted` set to `true`; the metadata
+(state, timestamps, agent, cwd, touched files, ownership) is always served. A
+server with no auth configured serves the bodies, since it already serves every
+page body unauthenticated.
+
+"Can name" means the identity the auth tier itself resolved
+(`ActorContext::identity_key()`): the asserted issuer/subject pair when there is
+one, otherwise the username. An ingress that terminates OIDC and forwards both
+`X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub` therefore reads its own
+handoffs and the shared ones with `redacted: false`, and no rung of the auth
+chain produces an
+authenticated-but-unnameable caller today — the redacting arm is a fail-safe
+floor, not a live tier. `owner` / `accepted_by` carry the qualified storage key
+(`user:alice`, `oidc:<issuer-byte-length>:<issuer><subject>`).
+
+```json
+{
+  "handoffs": [
+    {
+      "id": "01930…",
+      "agent": "claude-code",
+      "at": "2026-07-28T12:00:00Z",
+      "state": "accepted",
+      "summary": "…",
+      "open_questions": [],
+      "next_steps": [],
+      "redacted": false,
+      "files_touched": [],
+      "owner": "user:alice",
+      "accepted_by": "user:alice",
+      "accepted_at": "2026-07-28T13:00:00Z"
+    }
+  ]
+}
 ```
 
 Bundles what a frontend usually needs on its home view in one round-trip.
@@ -387,16 +445,19 @@ the info-leak surface is nil.
 
 ## 5. Limits and pagination
 
-- All `limit` query params clamp to `1..=100`.
+- Most `limit` query params clamp to `1..=100`; handoff history clamps to
+  `1..=200`.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
-- **Cache-Control + ETag.** Idempotent read endpoints (workspaces,
-  projects, pages list, page read, recent, briefing, overview) send
-  `Cache-Control: private, max-age=N` with an N tuned per endpoint
-  and a SHA-256 `ETag` derived from the response body. Browsers that
-  echo back `If-None-Match` receive a `304 Not Modified` with no body.
-  Search responses are not cacheable (request body affects the result).
+- **Cache-Control + ETag.** Identity-independent read endpoints use
+  `Cache-Control: private, max-age=N` with an endpoint-specific TTL; page reads
+  also carry a SHA-256 `ETag`, and a matching `If-None-Match` receives `304 Not
+  Modified`. Briefing, overview and handoff-list responses depend on the
+  authenticated actor and therefore use `Cache-Control: private, no-store`, so
+  a browser cannot reuse Alice's prompt-derived response after credentials at
+  the same URL switch to Bob. Search responses are not cacheable because the
+  request body affects the result.
 
 ## 6. Custom UI hosting and base paths
 

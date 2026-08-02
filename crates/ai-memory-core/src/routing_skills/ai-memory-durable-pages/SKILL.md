@@ -1,6 +1,6 @@
 ---
 name: ai-memory-durable-pages
-description: "Use this skill for any explicit durable wiki mutation in ai-memory: saving project knowledge, recording a rule or annotation, updating a permanent note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request."
+description: "Use this skill for any explicit wiki mutation in ai-memory: saving durable or time-bounded project knowledge, recording a rule or annotation, updating a note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request."
 ---
 <!-- ai-memory-managed: routing-skill -->
 
@@ -18,6 +18,12 @@ Use this skill only for deliberate durable wiki mutations. Routine session captu
 Write a page only when the user explicitly asks to remember something permanently, save a note, add an annotation, or record project knowledge. Do not use durable pages for transient progress, normal status updates, or next-session context.
 
 Put the page title as a `# H1` on the first line of the body and omit the separate title argument. ai-memory derives the title from that H1. Keep the content concise and fact-like, with enough context that a future agent can apply it without rereading the whole session.
+
+When the user explicitly wants a note to be temporary, pass `expires_at` as an
+RFC3339 instant or a bare `YYYY-MM-DD` (the end of that day in UTC). After the
+TTL, normal search, recent, and briefing reads hide the page; the next forget
+sweep deletes it. A TTL outranks `pinned`, so do not combine them unless the user
+has deliberately requested that behavior.
 
 ## Project rules belong in instructions first
 

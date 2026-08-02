@@ -409,13 +409,17 @@ fn validate_workstream_name(name: &str) -> StoreResult<()> {
     Ok(())
 }
 
-/// Extend the lease for a live managed run.
+/// Extend the lease for an active managed run.
+///
+/// The timestamp may have lapsed during a server outage. It remains renewable
+/// until another prepare transaction atomically expires this row and grants a
+/// replacement run. Finished, cancelled, and superseded runs stay terminal.
 pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let changed = conn.execute(
         "UPDATE managed_runs SET lease_expires_at = ?1 \
-         WHERE id = ?2 AND state = 'active' AND lease_expires_at > ?3",
-        params![now + LEASE_MICROS, run_id.as_bytes(), now],
+         WHERE id = ?2 AND state = 'active'",
+        params![now + LEASE_MICROS, run_id.as_bytes()],
     )?;
     Ok(changed > 0)
 }

@@ -160,6 +160,21 @@ impl ServerEndpoint {
         format!("{}{}{path}", self.url, self.base_path)
     }
 
+    /// Stable, credential-free identity for client-local state tied to this
+    /// server. The normalized mount path is part of the identity; bearer
+    /// material deliberately is not.
+    pub(crate) fn identity(&self) -> String {
+        let raw = format!("{}{}", self.url.trim_end_matches('/'), self.base_path);
+        let Ok(mut parsed) = reqwest::Url::parse(&raw) else {
+            return "<invalid-server-url>".to_owned();
+        };
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        parsed.as_str().trim_end_matches('/').to_owned()
+    }
+
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_token {
@@ -446,6 +461,22 @@ mod tests {
     fn from_pair_non_empty_token_preserved() {
         let ep = ServerEndpoint::from_pair(None, Some("secret".to_string()));
         assert_eq!(ep.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn client_state_identity_normalizes_mounts_and_never_contains_credentials() {
+        let first = ServerEndpoint::from_pair(
+            Some("http://alice:secret@MEMORY.example:49374/wiki/".to_owned()),
+            None,
+        );
+        let second = ServerEndpoint::from_pair(
+            Some("http://memory.example:49374/wiki".to_owned()),
+            Some("bearer-secret".to_owned()),
+        );
+
+        assert_eq!(first.identity(), second.identity());
+        assert!(!first.identity().contains("alice"));
+        assert!(!first.identity().contains("secret"));
     }
 
     // ----------------------------------------------------------------

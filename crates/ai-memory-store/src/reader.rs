@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use ai_memory_core::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
-    ManagedRunId, Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId,
-    SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    IdentityKey, ManagedRunId, Observation, ObservationId, ObservationKind, OwnerFilter, PageId,
+    PagePath, ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -28,13 +28,33 @@ use uuid::Uuid;
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row, to_sql_err,
+    AutoImproveTelemetryCount, OwnedAutoImproveProposalDetail, bytes32, opt_bytes32,
+    summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
 use crate::workstream::{ManagedRunContext, StoredManagedRunStatus};
+
+/// TTL guard for retrieval surfaces (search / recent / embedding hits /
+/// graph neighbours / briefing lists): appended to a WHERE clause that
+/// already constrains `is_latest = 1`. `table` is the pages alias in
+/// that query; `now_param` is the positional placeholder bound to the
+/// current wall-clock in microseconds. One definition so the
+/// NULL-handling never drifts between queries. Exact-path/id reads and
+/// the decay-candidate walk deliberately do NOT use this — reads
+/// annotate expiry instead of hiding it, and the sweep must see
+/// expired rows to delete them.
+fn not_expired(table: &str, now_param: &str) -> String {
+    format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
+}
+
+/// Current wall-clock in microseconds, for binding against
+/// [`not_expired`] fragments.
+fn now_us() -> i64 {
+    Timestamp::now().as_microsecond()
+}
 
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     format!(
@@ -199,6 +219,182 @@ fn rerank_page_hits_with_meta(
     });
     hits.truncate(limit);
     hits
+}
+
+/// One page flagged by `stale`/`wrong` feedback on its current version,
+/// aggregated per (page, kind) for the lint pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedbackFinding {
+    /// Wiki path of the flagged page.
+    pub path: String,
+    /// `stale` or `wrong`.
+    pub kind: String,
+    /// How many signals of this kind the current version has.
+    pub signal_count: u32,
+    /// ISO-8601 timestamp of the most recent signal.
+    pub latest_at: String,
+    /// Most recent caller-supplied reason for this kind, if any.
+    pub reason: Option<String>,
+}
+
+/// A page matched by the entity stream, with the inverse-frequency
+/// weight that ranked it and the entity names that matched.
+#[derive(Debug, Clone)]
+pub(crate) struct EntityHit {
+    /// The matched page.
+    pub(crate) hit: PageHit,
+    /// Sum of `1 / pages_carrying_entity` over the matched entities.
+    pub(crate) weight: f64,
+    /// Entity names that matched the query.
+    pub(crate) matched: Vec<String>,
+}
+
+/// Escape a literal for use inside a SQL `LIKE` pattern with
+/// `ESCAPE '\'`. Entity tokens legitimately contain `_`, which `LIKE`
+/// would otherwise treat as "any single character" — so `foo_bar` would
+/// match `fooxbar`.
+fn like_escape(literal: &str) -> String {
+    literal
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Split a query into entity-match tokens: lowercase, alphanumeric-ish
+/// runs, 3+ characters, de-duplicated, bounded. Short tokens are
+/// dropped because a 1-2 character prefix match is noise, not a signal.
+///
+/// A hyphenated/underscored run yields BOTH the whole token and its
+/// parts — the same both-forms trick [`crate::ops::path_search_text`]
+/// uses on paths, and for the same reason: an entity may be written
+/// `ai-memory`, `ai_memory`, or `ai memory`, and the query may pick
+/// any of them.
+fn entity_query_tokens(query: &str) -> Vec<String> {
+    /// Beyond this the query is prose, not a set of nouns; the FTS
+    /// stream already handles prose better than prefix matching does.
+    const MAX_TOKENS: usize = 12;
+    const MIN_TOKEN_CHARS: usize = 3;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut push = |raw: &str| -> bool {
+        let char_count = raw.chars().count();
+        if !(MIN_TOKEN_CHARS..=ai_memory_core::MAX_ENTITY_LEN).contains(&char_count) {
+            return true;
+        }
+        let token = raw.to_lowercase();
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+        out.len() < MAX_TOKENS
+    };
+    'outer: for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+        let token = raw.trim_matches(['-', '_']);
+        if token.is_empty() {
+            continue;
+        }
+        let compound = token.contains(['-', '_']);
+        if !push(token) {
+            break;
+        }
+        if compound {
+            for part in token.split(['-', '_']) {
+                if !push(part) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A graph-expansion neighbour with provenance (which seed and which
+/// link direction produced it). Internal to hybrid search + explain.
+struct GraphNeighbor {
+    hit: PageHit,
+    /// Index into the seed list handed to the expansion.
+    seed_ord: usize,
+    /// `true` when the neighbour links TO the seed (backlink).
+    incoming: bool,
+}
+
+/// Which seed page pulled a hit in via graph expansion, and the link
+/// direction. Part of [`SearchExplain`].
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphVia {
+    /// Path of the FTS/entity/vector seed page the link was followed from.
+    pub seed_path: String,
+    /// `outgoing` = seed links to the hit; `incoming` = hit links to
+    /// the seed (backlink).
+    pub direction: &'static str,
+}
+
+/// Per-stream RRF contributions (`1/(k+rank)`, k=60) for one hit.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RrfContributions {
+    /// FTS5 stream contribution (0.0 when the hit missed that stream).
+    pub fts: f64,
+    /// Vector stream contribution.
+    pub vector: f64,
+    /// Graph-neighbour stream contribution.
+    pub graph: f64,
+    /// Entity-match stream contribution.
+    pub entity: f64,
+}
+
+/// Score transparency for one `memory_query` hit: where the hit ranked
+/// in each retrieval stream, the raw per-stream scores, and how the
+/// RRF fusion combined them. All ranks are 1-based; a `None` rank
+/// means the hit did not surface in that stream.
+///
+/// [`Default`] is "surfaced in no stream": every rank `None`, zero
+/// contributions. Streams fill in their own fields as they contribute.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchExplain {
+    /// 1-based rank in the FTS5 stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_rank: Option<usize>,
+    /// Raw FTS5 (bm25-based) score — lower is better.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_score: Option<f64>,
+    /// 1-based rank in the vector stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<usize>,
+    /// Cosine similarity against the query embedding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cosine: Option<f32>,
+    /// 1-based rank in the graph-neighbour stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_rank: Option<usize>,
+    /// Which seed page and link direction pulled the hit in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_via: Option<GraphVia>,
+    /// 1-based rank in the entity-match stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_rank: Option<usize>,
+    /// Raw inverse-frequency weight used to order the entity stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_weight: Option<f64>,
+    /// Entity names on this page that matched the query.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_entities: Vec<String>,
+    /// Per-stream RRF contributions.
+    pub rrf: RrfContributions,
+    /// Total fused score (sum of the RRF contributions) — higher is
+    /// better. The returned `rank` is its negation *after* the
+    /// authority multiplier below, so `fused` alone does not reproduce
+    /// the ordering.
+    pub fused: f64,
+    /// Bounded page-authority multiplier applied to the fused rank
+    /// after RRF (canonical kind/tier/`pinned`/frontmatter tags).
+    /// `None` when the page had no authority row to adjust with; `1.0`
+    /// means it was considered and left alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<f64>,
+    /// Relevance in `[0, 1]` assigned by the optional post-RRF
+    /// reranker. `None` when no reranker is configured, when it
+    /// degraded, or when the hit fell outside the bounded judged prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
 }
 
 /// One hit returned by [`ReaderPool::search_pages`].
@@ -688,6 +884,15 @@ pub struct PageMeta {
     /// NULL`); `Some` when JOIN resolves a `users` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<PageAuthor>,
+    /// ISO-8601 TTL instant from the frontmatter `expires_at:` key.
+    /// Exact-path/id reads return expired pages (an explicit read is
+    /// not search); callers annotate expiry via [`PageMeta::expired`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// `true` when [`PageMeta::expires_at`] is in the past — the page
+    /// is hidden from retrieval and awaiting the next forget sweep.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 /// One resolved cross-project edge (a link whose endpoints live in
@@ -889,14 +1094,15 @@ impl ReaderPool {
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1 \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64],
+                params![fts_query, authority_candidate_limit(limit) as i64, now_us()],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
@@ -954,11 +1160,13 @@ impl ReaderPool {
         &self,
         query: String,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -970,14 +1178,15 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1 \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64],
+                params![fts_query, authority_candidate_limit(limit) as i64, cutoff],
                 |row| {
                     let workspace_name: String = row.get(0)?;
                     let project_name: String = row.get(1)?;
@@ -1039,6 +1248,11 @@ impl ReaderPool {
 
     /// Run an authority-adjusted full-text search scoped to one project.
     ///
+    /// `expiry_cutoff_us`: `None` hides pages whose TTL has passed as of
+    /// now (the default retrieval behaviour); `Some(cutoff)` compares
+    /// against that instant instead — pass `i64::MIN` to include
+    /// expired pages.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn search_pages_for_project(
@@ -1047,6 +1261,7 @@ impl ReaderPool {
         project_id: ProjectId,
         query: String,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1057,6 +1272,7 @@ impl ReaderPool {
                 project_id,
                 query,
                 authority_candidate_limit(limit),
+                expiry_cutoff_us,
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
@@ -1068,11 +1284,13 @@ impl ReaderPool {
         project_id: ProjectId,
         query: String,
         candidate_limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -1085,9 +1303,10 @@ impl ReaderPool {
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
                    AND pages.project_id = ?3 \
-                   AND pages.is_latest = 1 \
+                   AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?4"
+                 LIMIT ?4",
+                not_expired = not_expired("pages", "?5"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
@@ -1096,7 +1315,8 @@ impl ReaderPool {
                     fts_query,
                     workspace_id.as_bytes(),
                     project_id.as_bytes(),
-                    candidate_limit as i64
+                    candidate_limit as i64,
+                    cutoff
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
@@ -1228,17 +1448,19 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn recent_pages(&self, limit: usize) -> StoreResult<Vec<PageHit>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT id, path, title, \
                         substr(body, 1, 240) AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
-                 WHERE is_latest = 1 \
+                 WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
-            )?;
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![limit as i64], |row| {
+            let rows = stmt.query_map(params![limit as i64, now_us()], |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
@@ -1273,18 +1495,25 @@ impl ReaderPool {
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT id, path, title, \
                         substr(body, 1, 240) AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
-            )?;
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), limit as i64],
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit as i64,
+                    now_us()
+                ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
@@ -1324,19 +1553,21 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         substr(pages.body, 1, 240) AS snip, \
                         CAST(pages.updated_at AS REAL) AS rank \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages.is_latest = 1 \
+                 WHERE pages.is_latest = 1{not_expired} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
-            )?;
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![limit as i64], |row| {
+            let rows = stmt.query_map(params![limit as i64, now_us()], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
                 let path: String = row.get(2)?;
@@ -1418,6 +1649,45 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the latest completed session that has no persisted
+    /// auto-improvement run in the same project.
+    ///
+    /// This is the implicit queue used by manual auto-improvement. Explicitly
+    /// named sessions remain rerunnable, while an omitted session id advances
+    /// past both full reviews and preflight-skipped runs.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_unreviewed_completed_session_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<SessionId>> {
+        self.with_conn(move |conn| {
+            let row_opt: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT s.id FROM sessions s \
+                     WHERE s.workspace_id = ?1 \
+                       AND s.project_id = ?2 \
+                       AND s.ended_at IS NOT NULL \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM auto_improve_runs r \
+                           WHERE r.workspace_id = s.workspace_id \
+                             AND r.project_id = s.project_id \
+                             AND r.session_id = s.id \
+                       ) \
+                     ORDER BY s.ended_at DESC, s.started_at DESC LIMIT 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            row_opt
+                .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+    }
+
     /// Return open sessions matching one scoped project and agent.
     ///
     /// Results are newest-first so callers can default to finalizing only the
@@ -1430,26 +1700,42 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
         limit: Option<usize>,
     ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
             let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
+            // Without the owner predicate this returns whichever session in the
+            // scope started last — frequently a teammate's live one — and the
+            // callers act on it destructively.
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
+                OwnerFilter::Unattributed => " AND actor_user IS NULL",
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL \
+                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let cwd: Option<String> = row.get(1)?;
-                    Ok((id_bytes, cwd))
-                },
-            )?;
+            let row_map = |row: &rusqlite::Row<'_>| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let cwd: Option<String> = row.get(1)?;
+                Ok((id_bytes, cwd))
+            };
+            let rows = match &owner_filter {
+                OwnerFilter::User(user) => stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), agent, user],
+                    row_map,
+                )?,
+                _ => stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
+                    row_map,
+                )?,
+            };
             let mut out = Vec::new();
             for row in rows {
                 let (id_bytes, cwd) = row?;
@@ -1675,6 +1961,32 @@ impl ReaderPool {
         .await
     }
 
+    /// The operator a session belongs to (an
+    /// [`ai_memory_core::IdentityKey::storage_key`] string), as recorded at
+    /// session start.
+    ///
+    /// The identity carrying a SessionEnd is not necessarily the identity that
+    /// owned the session: a spool drain, an operator finalizing a stuck
+    /// session, or a shared static hook token can all deliver it. Attribution
+    /// for the session's page and the baton it leaves must follow the session,
+    /// not the request.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_actor_user(&self, session_id: SessionId) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| {
+            let owner: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT actor_user FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(owner.flatten())
+        })
+        .await
+    }
+
     /// Resolve the `(workspace, project)` where a session's observations
     /// actually landed, independent of the (possibly stale) `sessions` row.
     ///
@@ -1836,22 +2148,25 @@ impl ReaderPool {
         model: String,
         dim: u32,
         limit: usize,
+        expiry_cutoff_us: i64,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT page_embeddings.page_id, page_embeddings.vector, pages.path \
                  FROM page_embeddings \
                  JOIN pages ON pages.id = page_embeddings.page_id \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
-                   AND pages.is_latest = 1 \
+                   AND pages.is_latest = 1{not_expired} \
                    AND page_embeddings.provider = ?3 \
                    AND page_embeddings.model = ?4 \
                    AND page_embeddings.dim = ?5",
-            )?;
+                not_expired = not_expired("pages", "?6"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(
                 params![
                     workspace_id.as_bytes(),
@@ -1859,6 +2174,7 @@ impl ReaderPool {
                     provider,
                     model,
                     dim,
+                    expiry_cutoff_us,
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
@@ -1947,7 +2263,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json \
+                        frontmatter_json, expires_at, salience \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -1964,8 +2280,238 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the number of DISTINCT operators that reinforced each
+    /// `is_latest = 1` page of a project, for the sweep's breadth term.
+    ///
+    /// Scoped and grouped exactly like [`decay_candidates`](Self::decay_candidates)
+    /// so the sweep pays for one query per run, never one per candidate. Pages
+    /// with no per-operator rows (everything read anonymously, and everything
+    /// that predates `page_access`) are simply absent from the map, which the
+    /// caller reads as breadth 0 — scored identically to breadth 1 by
+    /// [`retention_score_with_breadth`](crate::retention_score_with_breadth).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn access_breadth_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pa.page_id, COUNT(*) \
+                 FROM page_access pa \
+                 JOIN pages p ON p.id = pa.page_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2 AND p.is_latest = 1 \
+                 GROUP BY pa.page_id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let actors: i64 = row.get(1)?;
+                    Ok((id, u32::try_from(actors).unwrap_or(u32::MAX)))
+                },
+            )?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (id, actors) = r?;
+                out.insert(PageId::from_slice(&id)?, actors);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Rank pages by how many of the query's tokens match their indexed
+    /// entities, weighting each match by inverse entity frequency — a
+    /// query token matching an entity that appears on 2 pages is a much
+    /// stronger signal than one matching an entity on 200.
+    ///
+    /// Matching is lexical (exact name, name prefix, or a compound-word
+    /// prefix) so this stays a plain SQL stream with no LLM call. It returns
+    /// no candidates when the project has no entities indexed, as in the
+    /// common zero-LLM case without hand-edited entity frontmatter.
+    ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub(crate) async fn entity_hits_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<EntityHit>> {
+        let tokens = entity_query_tokens(query);
+        if tokens.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        self.with_conn(move |conn| {
+            let mut placeholders = String::with_capacity(tokens.len() * 96);
+            let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
+            for (idx, token) in tokens.iter().enumerate() {
+                if idx > 0 {
+                    placeholders.push_str(" OR ");
+                }
+                // Match exact names, name prefixes, and word prefixes after
+                // any accepted entity separator. The latter lets `actor`
+                // find `writer actor`, `writer-actor`, and `writer_actor`.
+                //
+                // `?` is positional-by-order, same as the graph query.
+                placeholders.push_str(
+                    "(e.name = ? \
+                      OR e.name LIKE ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '% ' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%-' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%\\_' || ? || '%' ESCAPE '\\')",
+                );
+                sql_params.push(Value::Text(token.clone()));
+                let escaped = like_escape(token);
+                for _ in 0..4 {
+                    sql_params.push(Value::Text(escaped.clone()));
+                }
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+
+            let mut sql = String::with_capacity(placeholders.len() + 1_200);
+            write!(
+                &mut sql,
+                // `freq` is how many current pages in this project carry
+                // the entity; 1/freq is the inverse-frequency weight.
+                "WITH matched AS ( \
+                   SELECT e.id AS entity_id, e.name AS name \
+                   FROM entities e \
+                   WHERE ({placeholders}) \
+                     AND e.workspace_id = ? AND e.project_id = ? \
+                 ), \
+                 freq AS ( \
+                   SELECT m.entity_id, m.name, COUNT(*) AS pages \
+                   FROM matched m \
+                   JOIN entity_page_links l ON l.entity_id = m.entity_id \
+                   JOIN pages p ON p.id = l.page_id AND p.is_latest = 1 \
+                   WHERE 1 = 1{freq_not_expired} \
+                   GROUP BY m.entity_id, m.name \
+                 ) \
+                 SELECT pg.id, pg.path, pg.title, substr(pg.body, 1, 240) AS snippet, \
+                        SUM(1.0 / f.pages) AS weight, \
+                        COUNT(*) AS matches, \
+                        json_group_array(f.name) AS names \
+                 FROM freq f \
+                 JOIN entity_page_links l ON l.entity_id = f.entity_id \
+                 JOIN pages pg ON pg.id = l.page_id \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ? AND pg.is_latest = 1{not_expired} \
+                 GROUP BY pg.id, pg.path, pg.title \
+                 ORDER BY weight DESC, matches DESC, pg.path ASC \
+                 LIMIT ?",
+                not_expired = not_expired("pg", "?"),
+                freq_not_expired = not_expired("p", "?"),
+            )
+            .expect("writing SQL into String cannot fail");
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let weight: f64 = row.get(4)?;
+                let names_json: String = row.get(6)?;
+                Ok((id_bytes, path, title, snippet, weight, names_json))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, path, title, snippet, weight, names_json) = row?;
+                let mut matched: Vec<String> = serde_json::from_str(&names_json)?;
+                matched.sort_unstable();
+                matched.dedup();
+                out.push(EntityHit {
+                    hit: PageHit {
+                        id: PageId::from_slice(&id_bytes)?,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    },
+                    weight,
+                    matched,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Return `stale` / `wrong` feedback still attached to a *current*
+    /// page version in one project, grouped by (page, kind) — the input
+    /// for the lint pass's `feedback_flagged` findings. Rewriting a
+    /// flagged page supersedes the version the feedback points at, so
+    /// the finding drops out here without any explicit dismissal.
+    /// Most-recent signal first.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_feedback_findings(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<FeedbackFinding>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
+                        (SELECT reason FROM page_feedback r \
+                          WHERE r.page_id = f.page_id AND r.kind = f.kind \
+                            AND r.reason IS NOT NULL \
+                          ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
+                 FROM page_feedback f \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
+                   AND f.kind IN ('stale', 'wrong') \
+                 GROUP BY f.page_id, pg.path, f.kind \
+                 ORDER BY latest DESC, pg.path ASC, f.kind ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let signal_count: i64 = row.get(2)?;
+                    let latest_us: i64 = row.get(3)?;
+                    let reason: Option<String> = row.get(4)?;
+                    Ok((path, kind, signal_count, latest_us, reason))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path, kind, signal_count, latest_us, reason) = row?;
+                out.push(FeedbackFinding {
+                    path,
+                    kind,
+                    signal_count: u32::try_from(signal_count.max(0)).unwrap_or(u32::MAX),
+                    latest_at: jiff::Timestamp::from_microsecond(latest_us)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_default(),
+                    reason,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return pages linked to or from the seed pages, scoped to latest pages
     /// in the same project.
+    ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -1975,16 +2521,44 @@ impl ReaderPool {
         project_id: ProjectId,
         seed_ids: Vec<PageId>,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
+        Ok(self
+            .graph_neighbors_for_project_explained(
+                workspace_id,
+                project_id,
+                seed_ids,
+                limit,
+                expiry_cutoff_us,
+            )
+            .await?
+            .into_iter()
+            .map(|n| n.hit)
+            .collect())
+    }
+
+    /// [`Self::graph_neighbors_for_project`] plus provenance: which seed
+    /// produced each neighbour (`seed_ord` indexes into the caller's
+    /// `seed_ids`) and in which direction the link points. Feeds the
+    /// `memory_query` explain surface.
+    async fn graph_neighbors_for_project_explained(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        seed_ids: Vec<PageId>,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
 
             let mut values_clause = String::with_capacity(seed_ids.len() * 8);
-            let mut sql_params = Vec::with_capacity(seed_ids.len() * 2 + 4);
+            let mut sql_params = Vec::with_capacity(seed_ids.len() * 2 + 6);
             for (idx, seed_id) in seed_ids.iter().enumerate() {
                 if idx > 0 {
                     values_clause.push_str(", ");
@@ -1993,12 +2567,17 @@ impl ReaderPool {
                 sql_params.push(Value::Blob(seed_id.as_bytes().to_vec()));
                 sql_params.push(Value::Integer(idx as i64));
             }
+            let now = cutoff;
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(now));
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(now));
 
-            let mut sql = String::with_capacity(values_clause.len() + 1_400);
+            let out_not_expired = not_expired("tp", "?");
+            let in_not_expired = not_expired("fp", "?");
+            let mut sql = String::with_capacity(values_clause.len() + 1_500);
             write!(
                 &mut sql,
                 "WITH seeds(seed_id, seed_ord) AS (VALUES {values_clause}), \
@@ -2009,7 +2588,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1 \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1{out_not_expired} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           substr(fp.body, 1, 240) AS snippet, \
@@ -2017,12 +2596,12 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1 \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
                  ) \
-                 SELECT id, path, title, snippet \
+                 SELECT id, path, title, snippet, stream_ord \
                  FROM neighbors \
                  WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = neighbors.id) \
-                 ORDER BY stream_ord ASC, updated_at DESC"
+                 ORDER BY stream_ord ASC, updated_at DESC, path ASC"
             )
             .expect("writing SQL into String cannot fail");
 
@@ -2032,21 +2611,28 @@ impl ReaderPool {
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
                 let snippet: String = row.get(3)?;
-                Ok((id_bytes, path, title, snippet))
+                let stream_ord: i64 = row.get(4)?;
+                Ok((id_bytes, path, title, snippet, stream_ord))
             })?;
 
             for row in rows {
-                let (id_bytes, path, title, snippet) = row?;
+                let (id_bytes, path, title, snippet, stream_ord) = row?;
                 let id = PageId::from_slice(&id_bytes)?;
                 if !seen.insert(id) {
                     continue;
                 }
-                out.push(PageHit {
-                    id,
-                    path: PagePath::new(path)?,
-                    title,
-                    snippet,
-                    rank: 0.0,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let seed_ord = (stream_ord / 2).max(0) as usize;
+                out.push(GraphNeighbor {
+                    hit: PageHit {
+                        id,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    },
+                    seed_ord,
+                    incoming: stream_ord % 2 == 1,
                 });
                 if out.len() >= limit {
                     break;
@@ -2116,12 +2702,17 @@ impl ReaderPool {
 
     /// Hybrid search: RRF-fuse FTS5 results with cosine-similarity
     /// over the stored embeddings of the matching `(provider, model,
-    /// dim)`, then add link-neighbour expansion as a third RRF stream.
-    /// Applies the bounded page-authority adjustment after fusion and returns
-    /// the top-`limit` pages by adjusted fused score.
+    /// dim)`, entity matches, and link-neighbour expansion — four RRF
+    /// streams. Applies the bounded page-authority adjustment after
+    /// fusion and returns the top-`limit` pages by adjusted fused score.
     ///
-    /// When `query_vec` is `None`, the vector stream is skipped but graph
-    /// expansion still runs from the FTS seeds.
+    /// Each stream degrades independently to contributing nothing: no
+    /// `query_vec` skips the vector stream, an empty `entities` table
+    /// skips the entity stream, and graph expansion still runs from
+    /// whatever seeds the other streams produced.
+    ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. The
+    /// cutoff resolves once here so all streams agree on it.
     ///
     /// k=60 is the canonical RRF constant.
     ///
@@ -2138,16 +2729,105 @@ impl ReaderPool {
         model: String,
         dim: u32,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
+        Ok(self
+            .hybrid_search_inner(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                false,
+            )
+            .await?
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .collect())
+    }
+
+    /// [`Self::hybrid_search`] plus a [`SearchExplain`] per hit — the
+    /// per-stream ranks, raw scores, and RRF contributions the fusion
+    /// otherwise discards. Callers that don't need the bounded provenance
+    /// bookkeeping use `hybrid_search`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_explained(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
+        Ok(self
+            .hybrid_search_inner(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                true,
+            )
+            .await?
+            .into_iter()
+            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hybrid_search_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        explain: bool,
+    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
         // the fused pool and receive its bounded promotion.
         let candidate_limit = authority_candidate_limit(limit);
-
-        // Fetch FTS5 hits first.
+        // Tokenize the borrowed query before the FTS candidate call consumes
+        // it. This avoids cloning a caller-controlled query on the hot path.
+        let entity_hits = self
+            .entity_hits_for_project(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                Some(cutoff),
+            )
+            .await?;
         let fts_candidates = self
-            .search_page_candidates_for_project(workspace_id, project_id, query, candidate_limit)
+            .search_page_candidates_for_project(
+                workspace_id,
+                project_id,
+                query,
+                candidate_limit,
+                Some(cutoff),
+            )
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
@@ -2168,91 +2848,178 @@ impl ReaderPool {
                     model,
                     dim,
                     candidate_limit,
+                    cutoff,
                 )
                 .await?;
         }
 
         let mut seed_seen = std::collections::HashSet::new();
         let mut seed_ids = Vec::new();
-        for id in fts_hits
-            .iter()
-            .map(|h| h.id)
-            .chain(vec_hits.iter().map(|(id, _, _)| *id))
-        {
-            if seed_seen.insert(id) {
-                seed_ids.push(id);
+        let mut seed_paths = explain.then(Vec::new);
+        for hit in &fts_hits {
+            if seed_seen.insert(hit.id) {
+                seed_ids.push(hit.id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(hit.path.as_str().to_string());
+                }
+            }
+        }
+        for (id, path, _) in &vec_hits {
+            if seed_seen.insert(*id) {
+                seed_ids.push(*id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(path.as_str().to_string());
+                }
+            }
+        }
+        for e in &entity_hits {
+            if seed_seen.insert(e.hit.id) {
+                seed_ids.push(e.hit.id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(e.hit.path.as_str().to_string());
+                }
             }
         }
         let graph_hits = self
-            .graph_neighbors_for_project(workspace_id, project_id, seed_ids, candidate_limit)
+            .graph_neighbors_for_project_explained(
+                workspace_id,
+                project_id,
+                seed_ids,
+                candidate_limit,
+                Some(cutoff),
+            )
             .await?;
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
-        let mut fused: std::collections::HashMap<PageId, (PagePath, String, String, f64, f64)> =
-            std::collections::HashMap::new();
+        struct Fused {
+            path: PagePath,
+            title: String,
+            snippet: String,
+            score: f64,
+            explain: Option<SearchExplain>,
+        }
+        let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
         for (rank, h) in fts_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+            let entry = fused.entry(h.id).or_insert_with(|| Fused {
+                path: h.path.clone(),
+                title: h.title.clone(),
+                snippet: h.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.fts_rank = Some(rank + 1);
+                details.fts_score = Some(h.rank);
+                details.rrf.fts = contrib;
+                details.fused += contrib;
+            }
         }
-        for (rank, (id, path, _score)) in vec_hits.iter().enumerate() {
+        for (rank, (id, path, cosine)) in vec_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(*id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((path.clone(), String::new(), String::new(), contrib, 0.0));
+            let entry = fused.entry(*id).or_insert_with(|| Fused {
+                path: path.clone(),
+                title: String::new(),
+                snippet: String::new(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.vector_rank = Some(rank + 1);
+                details.cosine = Some(*cosine);
+                details.rrf.vector = contrib;
+                details.fused += contrib;
+            }
         }
-        for (rank, h) in graph_hits.iter().enumerate() {
+        for (rank, e) in entity_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+            let entry = fused.entry(e.hit.id).or_insert_with(|| Fused {
+                path: e.hit.path.clone(),
+                title: e.hit.title.clone(),
+                snippet: e.hit.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.entity_rank = Some(rank + 1);
+                details.entity_weight = Some(e.weight);
+                details.matched_entities = e.matched.clone();
+                details.rrf.entity = contrib;
+                details.fused += contrib;
+            }
+        }
+        for (rank, n) in graph_hits.iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(n.hit.id).or_insert_with(|| Fused {
+                path: n.hit.path.clone(),
+                title: n.hit.title.clone(),
+                snippet: n.hit.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.graph_rank = Some(rank + 1);
+                details.graph_via = Some(GraphVia {
+                    seed_path: seed_paths
+                        .as_ref()
+                        .and_then(|paths| paths.get(n.seed_ord))
+                        .cloned()
+                        .unwrap_or_default(),
+                    direction: if n.incoming { "incoming" } else { "outgoing" },
+                });
+                details.rrf.graph = contrib;
+                details.fused += contrib;
+            }
         }
 
-        let mut out: Vec<PageHit> = fused
+        let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
             .into_iter()
-            .map(|(id, (path, title, snippet, fused_rank, _orig))| PageHit {
-                id,
-                path,
-                title,
-                snippet,
-                rank: -fused_rank, // lower = better (matches FTS5 convention)
+            .map(|(id, entry)| {
+                (
+                    PageHit {
+                        id,
+                        path: entry.path,
+                        title: entry.title,
+                        snippet: entry.snippet,
+                        rank: -entry.score, // lower = better (matches FTS5 convention)
+                    },
+                    entry.explain,
+                )
             })
             .collect();
         let missing_authorities: Vec<PageId> = out
             .iter()
-            .filter_map(|hit| (!authorities.contains_key(&hit.id)).then_some(hit.id))
+            .filter_map(|(hit, _)| (!authorities.contains_key(&hit.id)).then_some(hit.id))
             .collect();
         authorities.extend(
             self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
                 .await?,
         );
-        for hit in &mut out {
+        for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
                 hit.rank = authority.adjust_rank(hit.rank);
+                // `fused` stays the raw RRF sum; without the multiplier
+                // beside it the explain could not account for the rank it
+                // returns, which is the whole point of the surface.
+                if let Some(details) = explain {
+                    details.authority = Some(authority.factor);
+                }
             }
         }
         out.sort_by(|a, b| {
-            a.rank
-                .partial_cmp(&b.rank)
+            a.0.rank
+                .partial_cmp(&b.0.rank)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic tiebreak: equal fused scores (common when
+                // two streams each contribute a rank-1 hit) previously fell
+                // back to HashMap iteration order.
+                .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
         out.truncate(limit);
         Ok(out)
@@ -2267,8 +3034,8 @@ impl ReaderPool {
     /// ancestor-or-equal of `cwd_filter` (path-boundary, the prior art's
     /// check rather than exact equality: a handoff left in `/repo` reaches a
     /// session in `/repo/api`, but never `/repo-other`). Among candidates a
-    /// manual handoff wins over an auto one, then the most specific cwd, then
-    /// the most recent — so an explicit "where we left off" baton
+    /// manual handoff wins over an auto one, then the most recent, with cwd
+    /// specificity only breaking timestamp ties — so an explicit "where we left off" baton
     /// deterministically beats the heuristic SessionEnd handoff, regardless of
     /// whether the model passed a cwd. With `cwd_filter == None` every open
     /// handoff is a candidate (project-wide read, e.g. the web overview). The
@@ -2282,24 +3049,33 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         cwd_filter: Option<String>,
+        owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            // Ownership belongs in the query, not just in
+            // `is_handoff_candidate`: prompt-derived fields from another
+            // operator must never be loaded or deserialized for this caller.
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 3);
+            let sql = format!(
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
-                        created_at, accepted_by, accepted_at, accepted_by_session \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
                  FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
-                 ORDER BY created_at DESC",
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
-                row_to_handoff,
-            )?;
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause} \
+                 ORDER BY created_at DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let rows = stmt.query_map(binds.as_slice(), row_to_handoff)?;
             let mut selected: Option<Handoff> = None;
             for r in rows {
                 let handoff = r??;
-                if is_handoff_candidate(&handoff, cwd_filter.as_deref())
+                if is_handoff_candidate(&handoff, cwd_filter.as_deref(), &owner_filter)
                     && selected
                         .as_ref()
                         .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
@@ -2308,6 +3084,51 @@ impl ReaderPool {
                 }
             }
             Ok(selected)
+        })
+        .await
+    }
+
+    /// List a project's handoffs, newest first.
+    ///
+    /// The system had no handoff listing at all: every reader fetched "the
+    /// single open one" and consumed it. That made a mis-delivered or
+    /// prematurely consumed baton unrecoverable and invisible — there was no
+    /// way to ask what happened to it. `state = None` returns every state so an
+    /// operator can find an already-accepted handoff and read it back.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        state: Option<HandoffState>,
+        owner_filter: OwnerFilter,
+        limit: usize,
+    ) -> StoreResult<Vec<Handoff>> {
+        let state = state.map(|s| s.as_str().to_string());
+        self.with_conn(move |conn| {
+            // Push the owner predicate and the limit into SQL rather than
+            // filtering a fully materialised result set in Rust: without them
+            // this reads (and sorts) every handoff the project has ever
+            // accumulated, and the caller's limit provides no protection
+            // because it is applied after the rows are already loaded.
+            let (sql, owner_param) = handoff_listing_sql(state.is_some(), &owner_filter, limit);
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(state) = state.as_ref() {
+                binds.push(state);
+            }
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let rows = stmt.query_map(binds.as_slice(), row_to_handoff)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
         })
         .await
     }
@@ -2322,11 +3143,55 @@ impl ReaderPool {
                 .query_row(
                     "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                             cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                            created_at, accepted_by, accepted_at, accepted_by_session, \
+                            owner_user, accepted_by_user \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
                 )
+                .optional()?;
+            row.transpose()
+        })
+        .await
+    }
+
+    /// Look up a handoff by id within an exact scope and ownership boundary.
+    ///
+    /// This is the object-authorization form used by exact-id operations. The
+    /// scope and owner predicates run before prompt-derived columns are loaded,
+    /// so callers cannot distinguish a foreign id from an absent one or inspect
+    /// another operator's malformed/private row as a side effect of checking it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn handoff_by_id_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        handoff_id: HandoffId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<Handoff>> {
+        self.with_conn(move |conn| {
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 4);
+            let sql = format!(
+                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                        cwd, summary, open_questions, next_steps, files_touched, state, \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND id = ?3{owner_clause}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                handoff_id.as_bytes(),
+            ];
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let row = stmt
+                .query_row(binds.as_slice(), row_to_handoff)
                 .optional()?;
             row.transpose()
         })
@@ -2357,8 +3222,33 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_lines)]
-    pub async fn briefing(&self, recent_pages_limit: usize) -> StoreResult<BriefingSnapshot> {
+    pub async fn briefing(
+        &self,
+        recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<BriefingSnapshot> {
+        self.briefing_with_slot_visibility(
+            recent_pages_limit,
+            owner_filter,
+            &ai_memory_core::SlotVisibility::All,
+        )
+        .await
+    }
+
+    /// Assemble a global briefing while filtering operator-owned slot pages.
+    ///
+    /// This additive variant preserves [`Self::briefing`] for existing callers.
+    /// The filter only controls agent-context injection; exact page reads remain
+    /// project-wide.
+    pub async fn briefing_with_slot_visibility(
+        &self,
+        recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
+    ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        let slot_visibility = slot_visibility.clone();
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slot_visibility, 3);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -2386,8 +3276,16 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count: u64 =
-                count(conn, "SELECT COUNT(*) FROM handoffs WHERE state = 'open'")?;
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 1);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count: u64 = count_bound(
+                conn,
+                &format!("SELECT COUNT(*) FROM handoffs WHERE state = 'open'{owner_clause}"),
+                &owner_binds,
+            )?;
 
             // Rules: any `is_latest = 1` page under `_rules/`.
             // Routed there automatically by the consolidator when
@@ -2396,11 +3294,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?1"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map([], briefing_page_from_row)?
+                .query_map(params![now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2409,11 +3308,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?1"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map([], briefing_page_from_row)?
+                .query_map(params![now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2422,17 +3322,24 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE is_latest = 1 \
+                 WHERE is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?1"
+                 LIMIT ?1",
+                not_expired = not_expired("pages", "?2"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![recent_limit], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt
+                    .query_map(params![recent_limit, now_us, glob], briefing_page_from_row)?,
+                None => {
+                    recent_stmt.query_map(params![recent_limit, now_us], briefing_page_from_row)?
+                }
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            Ok(BriefingSnapshot {
+            let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
                 activity_30d,
@@ -2443,7 +3350,9 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
-            })
+            };
+            filter_briefing_slots(&mut snapshot, &slot_visibility);
+            Ok(snapshot)
         })
         .await
     }
@@ -2458,8 +3367,30 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<BriefingSnapshot> {
+        self.briefing_for_project_with_slot_visibility(
+            workspace_id,
+            project_id,
+            recent_pages_limit,
+            owner_filter,
+            &ai_memory_core::SlotVisibility::All,
+        )
+        .await
+    }
+
+    /// Assemble a project briefing while filtering operator-owned slot pages.
+    pub async fn briefing_for_project_with_slot_visibility(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        let slot_visibility = slot_visibility.clone();
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slot_visibility, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -2509,22 +3440,31 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_project(
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 3);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count = count_bound(
                 conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'",
-                workspace_id,
-                project_id,
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause}"
+                ),
+                &owner_binds,
             )?;
 
             let mut rules_stmt = conn.prepare_cached(&format!(
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?3"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2533,11 +3473,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?3"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2547,18 +3488,40 @@ impl ReaderPool {
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3"
+                 LIMIT ?3",
+                not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us,
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us
+                    ],
+                    briefing_page_from_row,
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
             let (cross_project_dependents, cross_project_dependencies) =
                 cross_project_degree(conn, workspace_id, project_id)?;
-            Ok(BriefingSnapshot {
+            let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
                 activity_30d,
@@ -2569,7 +3532,9 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents,
                 cross_project_dependencies,
-            })
+            };
+            filter_briefing_slots(&mut snapshot, &slot_visibility);
+            Ok(snapshot)
         })
         .await
     }
@@ -2594,32 +3559,75 @@ impl ReaderPool {
         core_pages_limit: usize,
         recent_pages_limit: usize,
     ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
+        self.session_brief_pages_with_slot_visibility(
+            workspace_id,
+            project_id,
+            core_pages_limit,
+            recent_pages_limit,
+            ai_memory_core::SlotVisibility::All,
+        )
+        .await
+    }
+
+    /// Fetch session-start pages while excluding other operators' slot pages.
+    pub async fn session_brief_pages_with_slot_visibility(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        core_pages_limit: usize,
+        recent_pages_limit: usize,
+        slot_visibility: ai_memory_core::SlotVisibility,
+    ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
         let core_limit = core_pages_limit.clamp(1, 100) as i64;
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        let (slot_sql, slot_glob) = slot_visibility_sql(&slot_visibility, 5);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slot_visibility, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
-            let mut core_stmt = conn.prepare_cached(
+            let core_sql = format!(
                 "SELECT path, title, body, pinned, updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
-                   AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                   AND (path GLOB '_rules/*' \
+                        OR (pinned = 1 AND path NOT GLOB '_slots/*') \
+                        OR ({slot_sql})) \
                  ORDER BY pinned DESC, path ASC \
                  LIMIT ?3",
-            )?;
-            let core: Vec<BriefPageBody> = core_stmt
-                .query_map(
-                    params![workspace_id.as_bytes(), project_id.as_bytes(), core_limit],
-                    |row| {
-                        let updated_us: i64 = row.get(4)?;
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)? != 0,
-                            updated_us,
-                        ))
-                    },
-                )?
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut core_stmt = conn.prepare_cached(&core_sql)?;
+            let core_row = |row: &rusqlite::Row<'_>| {
+                let updated_us: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    updated_us,
+                ))
+            };
+            let core_rows = match slot_glob.as_deref() {
+                Some(glob) => core_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        core_limit,
+                        now_us(),
+                        glob
+                    ],
+                    core_row,
+                )?,
+                None => core_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        core_limit,
+                        now_us()
+                    ],
+                    core_row,
+                )?,
+            };
+            let core: Vec<BriefPageBody> = core_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(path, title, body, pinned, updated_us)| {
@@ -2644,14 +3652,33 @@ impl ReaderPool {
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3"
+                 LIMIT ?3",
+                not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent: Vec<BriefingPage> = recent_stmt
-                .query_map(
-                    params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit],
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us(),
+                        glob
+                    ],
                     briefing_page_from_row,
-                )?
+                )?,
+                None => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us()
+                    ],
+                    briefing_page_from_row,
+                )?,
+            };
+            let recent: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2669,20 +3696,36 @@ impl ReaderPool {
     pub async fn latest_open_handoff_for_workspace(
         &self,
         workspace_id: WorkspaceId,
+        owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
-            let row_opt = conn
-                .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
-                     FROM handoffs \
-                     WHERE workspace_id = ?1 AND state = 'open' \
-                     ORDER BY created_at DESC LIMIT 1",
-                    params![workspace_id.as_bytes()],
-                    row_to_handoff,
-                )
-                .optional()?;
+            // The owner predicate is pushed into SQL (rather than filtered after
+            // the fact like the project-scoped lookup) because this query keeps
+            // its `LIMIT 1`: filtering afterwards would return nothing whenever
+            // the newest open handoff in the workspace happened to belong to
+            // somebody else.
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?2)",
+                OwnerFilter::Unattributed => " AND owner_user IS NULL",
+            };
+            let sql = format!(
+                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                        cwd, summary, open_questions, next_steps, files_touched, state, \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND state = 'open'{owner_clause} \
+                 ORDER BY created_at DESC LIMIT 1"
+            );
+            let row_opt = match &owner_filter {
+                OwnerFilter::User(user) => conn
+                    .query_row(&sql, params![workspace_id.as_bytes(), user], row_to_handoff)
+                    .optional()?,
+                _ => conn
+                    .query_row(&sql, params![workspace_id.as_bytes()], row_to_handoff)
+                    .optional()?,
+            };
             row_opt.transpose()
         })
         .await
@@ -2750,8 +3793,28 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<BriefingSnapshot> {
+        self.briefing_for_workspace_with_slot_visibility(
+            workspace_id,
+            recent_pages_limit,
+            owner_filter,
+            &ai_memory_core::SlotVisibility::All,
+        )
+        .await
+    }
+
+    /// Assemble a workspace briefing while filtering operator-owned slots.
+    pub async fn briefing_for_workspace_with_slot_visibility(
+        &self,
+        workspace_id: WorkspaceId,
+        recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        let slot_visibility = slot_visibility.clone();
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slot_visibility, 4);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -2797,21 +3860,33 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_workspace(
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 2);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> = vec![workspace_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count = count_bound(
                 conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND state = 'open'",
-                workspace_id,
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs \
+                     WHERE workspace_id = ?1 AND state = 'open'{owner_clause}"
+                ),
+                &owner_binds,
             )?;
 
             let mut rules_stmt = conn.prepare_cached(&format!(
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?2"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .query_map(
+                    params![workspace_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2820,11 +3895,15 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?2"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .query_map(
+                    params![workspace_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2833,20 +3912,27 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(
-                    params![workspace_id.as_bytes(), recent_limit],
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![workspace_id.as_bytes(), recent_limit, now_us, glob],
                     briefing_page_from_row,
-                )?
+                )?,
+                None => recent_stmt.query_map(
+                    params![workspace_id.as_bytes(), recent_limit, now_us],
+                    briefing_page_from_row,
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            Ok(BriefingSnapshot {
+            let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
                 activity_30d,
@@ -2857,7 +3943,9 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
-            })
+            };
+            filter_briefing_slots(&mut snapshot, &slot_visibility);
+            Ok(snapshot)
         })
         .await
     }
@@ -3114,7 +4202,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -3147,7 +4235,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -3642,7 +4730,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -3696,6 +4784,58 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// Return the latest page version id for one fully scoped path.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_id_by_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+    ) -> StoreResult<Option<PageId>> {
+        self.with_conn(move |conn| {
+            let id: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(id.map(|bytes| PageId::from_slice(&bytes)).transpose()?)
+        })
+        .await
+    }
+
+    /// Return whether the latest version of one fully scoped page is expired.
+    /// Returns `None` when the path has no latest indexed row.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_expired_by_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &str,
+    ) -> StoreResult<Option<bool>> {
+        let path = path.to_owned();
+        self.with_conn(move |conn| {
+            let expires_at: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT expires_at FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(expires_at.map(|expires_at| expires_at.is_some_and(|value| value <= now_us())))
         })
         .await
     }
@@ -3759,6 +4899,19 @@ impl ReaderPool {
         project_id: ProjectId,
         proposal_id: AutoImproveProposalId,
     ) -> StoreResult<Option<AutoImproveProposalDetail>> {
+        self.auto_improve_proposal_detail_with_owner(workspace_id, project_id, proposal_id)
+            .await
+            .map(|detail| detail.map(|owned| owned.detail))
+    }
+
+    /// Read one proposal plus the operator that staged it, failing closed when
+    /// the scope does not match.
+    pub async fn auto_improve_proposal_detail_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+    ) -> StoreResult<Option<OwnedAutoImproveProposalDetail>> {
         self.with_conn(move |conn| {
             let row = conn
                 .query_row(
@@ -3769,7 +4922,8 @@ impl ReaderPool {
                             target_body_sha256_at_stage, target_updated_at_at_stage, \
                             decision_reason, decided_by_author_id, decided_by_actor_json, \
                             applied_page_id, checkpoint, edit_mode, patch_json, \
-                            expected_base_body_sha256, materialized_base_body_sha256 \
+                            expected_base_body_sha256, materialized_base_body_sha256, \
+                            staged_by_actor_user \
                      FROM auto_improve_proposals \
                      WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
                     params![
@@ -3800,36 +4954,39 @@ impl ReaderPool {
                             .transpose()
                             .map_err(to_sql_err)?;
                         let patch_raw: Option<String> = row.get(27)?;
-                        Ok(AutoImproveProposalDetail {
-                            summary,
-                            rationale: row.get(12)?,
-                            evidence_json: serde_json::from_str(&evidence_raw)
-                                .map_err(to_sql_err)?,
-                            body_markdown: row.get(14)?,
-                            body_sha256: body_hash,
-                            artifact_path: row.get(16)?,
-                            artifact_sha256: artifact_hash,
-                            target_latest_page_id_at_stage: staged_page_id,
-                            target_body_sha256_at_stage: staged_body_hash,
-                            target_updated_at_at_stage: row.get(20)?,
-                            decision_reason: row.get(21)?,
-                            decided_by_author_id: decided_author,
-                            decided_by_actor_json: decided_actor_raw
-                                .map(|raw| serde_json::from_str(&raw))
-                                .transpose()
-                                .map_err(to_sql_err)?,
-                            applied_page_id,
-                            checkpoint: row.get(25)?,
-                            edit_mode: row.get(26)?,
-                            patch_json: patch_raw
-                                .map(|raw| serde_json::from_str(&raw))
-                                .transpose()
-                                .map_err(to_sql_err)?,
-                            expected_base_body_sha256: opt_bytes32(row.get(28)?)
-                                .map_err(to_sql_err)?,
-                            materialized_base_body_sha256: opt_bytes32(row.get(29)?)
-                                .map_err(to_sql_err)?,
-                            events: Vec::new(),
+                        Ok(OwnedAutoImproveProposalDetail {
+                            detail: AutoImproveProposalDetail {
+                                summary,
+                                rationale: row.get(12)?,
+                                evidence_json: serde_json::from_str(&evidence_raw)
+                                    .map_err(to_sql_err)?,
+                                body_markdown: row.get(14)?,
+                                body_sha256: body_hash,
+                                artifact_path: row.get(16)?,
+                                artifact_sha256: artifact_hash,
+                                target_latest_page_id_at_stage: staged_page_id,
+                                target_body_sha256_at_stage: staged_body_hash,
+                                target_updated_at_at_stage: row.get(20)?,
+                                decision_reason: row.get(21)?,
+                                decided_by_author_id: decided_author,
+                                decided_by_actor_json: decided_actor_raw
+                                    .map(|raw| serde_json::from_str(&raw))
+                                    .transpose()
+                                    .map_err(to_sql_err)?,
+                                applied_page_id,
+                                checkpoint: row.get(25)?,
+                                edit_mode: row.get(26)?,
+                                patch_json: patch_raw
+                                    .map(|raw| serde_json::from_str(&raw))
+                                    .transpose()
+                                    .map_err(to_sql_err)?,
+                                expected_base_body_sha256: opt_bytes32(row.get(28)?)
+                                    .map_err(to_sql_err)?,
+                                materialized_base_body_sha256: opt_bytes32(row.get(29)?)
+                                    .map_err(to_sql_err)?,
+                                events: Vec::new(),
+                            },
+                            staged_by_actor_user: row.get(30)?,
                         })
                     },
                 )
@@ -3863,7 +5020,7 @@ impl ReaderPool {
                 })
             })?;
             for row in rows {
-                detail.events.push(row?);
+                detail.detail.events.push(row?);
             }
             Ok(Some(detail))
         })
@@ -4626,6 +5783,31 @@ impl ReaderPool {
         self.with_conn(crate::users::users_exist).await
     }
 
+    /// Does this deployment tell its operators apart?
+    ///
+    /// Two independent routes produce distinct operators: rows in `users`, and
+    /// usernames asserted by a trusted authenticating proxy. Only the first is
+    /// visible from the store, so the caller passes the second in — a
+    /// proxy-only deployment reports `users_exist() == false` forever.
+    ///
+    /// One notion, several gates: the admin authorization boundaries and the
+    /// per-author bucketing of pending auto-improve proposals all key on this,
+    /// so a single-operator server keeps the exact behaviour it had before
+    /// either route existed.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error so callers can fail closed.
+    pub async fn distinguishes_operators(&self, trusted_proxy_identity: bool) -> StoreResult<bool> {
+        // Short-circuits the DB round-trip when the static config bit already
+        // settles it. The users table is otherwise consulted per call rather
+        // than cached, so committing a first user tightens access without a
+        // restart.
+        if trusted_proxy_identity {
+            return Ok(true);
+        }
+        self.users_exist().await
+    }
+
     /// Return the last successful global maintenance completion for `job`.
     pub async fn maintenance_job_last_success(
         &self,
@@ -4633,6 +5815,56 @@ impl ReaderPool {
     ) -> StoreResult<Option<i64>> {
         self.with_conn(move |conn| crate::maintenance::last_success(conn, job))
             .await
+    }
+}
+
+/// Build the bounded history query and its optional owner binding.
+///
+/// A named operator reads two disjoint ranges: shared (`NULL`) and their own
+/// owner key. Expressing those ranges as `OR` makes SQLite prefer the
+/// project-wide timestamp index to satisfy `ORDER BY`, scanning other users'
+/// history until it finds enough visible rows. `UNION ALL` lets SQLite merge
+/// two already ordered owner-index ranges and stop at the requested limit.
+fn handoff_listing_sql(
+    has_state: bool,
+    owner_filter: &OwnerFilter,
+    limit: usize,
+) -> (String, Option<String>) {
+    const SELECT: &str = "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                cwd, summary, open_questions, next_steps, files_touched, state, \
+                created_at, accepted_by, accepted_at, accepted_by_session, \
+                owner_user, accepted_by_user \
+         FROM handoffs";
+    let state_clause = if has_state { " AND state = ?3" } else { "" };
+    let owner_index = if has_state { 4 } else { 3 };
+    let sql_limit = limit.clamp(1, 500);
+    match owner_filter {
+        OwnerFilter::User(owner) => (
+            format!(
+                "{SELECT} \
+                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause} \
+                   AND owner_user IS NULL \
+                 UNION ALL \
+                 {SELECT} \
+                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause} \
+                   AND owner_user = ?{owner_index} \
+                 ORDER BY created_at DESC \
+                 LIMIT {sql_limit}"
+            ),
+            Some(owner.clone()),
+        ),
+        _ => {
+            let (owner_clause, owner_param) = handoff_owner_sql(owner_filter, owner_index);
+            (
+                format!(
+                    "{SELECT} \
+                     WHERE workspace_id = ?1 AND project_id = ?2{state_clause}{owner_clause} \
+                     ORDER BY created_at DESC \
+                     LIMIT {sql_limit}"
+                ),
+                owner_param,
+            )
+        }
     }
 }
 
@@ -4666,6 +5898,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let author_username: Option<String> = row.get(12)?;
     let author_name: Option<String> = row.get(13)?;
     let author_email: Option<String> = row.get(14)?;
+    let expires_us: Option<i64> = row.get(15)?;
     let author = author_username.map(|username| PageAuthor {
         username,
         name: author_name,
@@ -4683,6 +5916,10 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let updated_at = jiff::Timestamp::from_microsecond(updated_us)
         .map(|ts| ts.to_string())
         .unwrap_or_default();
+    let expired = expires_us.is_some_and(|us| us <= now_us());
+    let expires_at = expires_us
+        .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+        .map(|ts| ts.to_string());
 
     Ok(Ok(PageMeta {
         workspace_name,
@@ -4698,6 +5935,8 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         updated_at,
         supersedes,
         author,
+        expires_at,
+        expired,
     }))
 }
 
@@ -4855,6 +6094,12 @@ pub struct DecayCandidate {
     /// Frontmatter JSON; the sweep peeks at it for an explicit
     /// `pinned: true` (which overrides the schema flag).
     pub frontmatter_json: String,
+    /// TTL instant in microseconds since epoch. The sweep hard-deletes
+    /// pages past this regardless of tier or pin.
+    pub expires_at_us: Option<i64>,
+    /// Per-page salience once explicit feedback has moved it (V37);
+    /// `None` means "use `DecayParams::salience_default`".
+    pub salience: Option<f64>,
 }
 
 fn row_to_decay_candidate(
@@ -4868,6 +6113,8 @@ fn row_to_decay_candidate(
     let access_count: i64 = row.get(5)?;
     let last_accessed_at_us: Option<i64> = row.get(6)?;
     let frontmatter_json: String = row.get(7)?;
+    let expires_at_us: Option<i64> = row.get(8)?;
+    let salience: Option<f64> = row.get(9)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -4877,6 +6124,8 @@ fn row_to_decay_candidate(
         access_count,
         last_accessed_at_us,
         frontmatter_json,
+        expires_at_us,
+        salience,
     ))
 }
 
@@ -4890,6 +6139,8 @@ fn materialise_decay_candidate(
     access_count: i64,
     last_accessed_at_us: Option<i64>,
     frontmatter_json: String,
+    expires_at_us: Option<i64>,
+    salience: Option<f64>,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
@@ -4902,6 +6153,8 @@ fn materialise_decay_candidate(
         access_count: u32::try_from(access_count.max(0)).unwrap_or(u32::MAX),
         last_accessed_at_us,
         frontmatter_json,
+        expires_at_us,
+        salience,
     })
 }
 
@@ -5015,7 +6268,7 @@ fn telemetry_count_from_row(
 /// Normalize a cwd for comparison: treat Windows backslashes as path
 /// separators and trim trailing separators while keeping a bare root as `/`.
 /// Pure and string-only; it does not touch the filesystem.
-fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
     let replaced = if p.contains('\\') {
         std::borrow::Cow::Owned(p.replace('\\', "/"))
     } else {
@@ -5036,7 +6289,7 @@ fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
 /// `/repo/api` but neither `/repo-other` nor `/repository`. Inputs are
 /// normalized first. Pure; no SQL `LIKE`, so `%`/`_` in a path cannot act
 /// as wildcards.
-fn cwd_within(ancestor: &str, descendant: &str) -> bool {
+pub(crate) fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     let a = normalize_cwd(ancestor);
     let d = normalize_cwd(descendant);
     if a == d {
@@ -5051,7 +6304,88 @@ fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     d.starts_with(a.as_ref()) && d.as_bytes().get(a.len()) == Some(&b'/')
 }
 
-fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
+fn filter_briefing_slots(
+    snapshot: &mut BriefingSnapshot,
+    visibility: &ai_memory_core::SlotVisibility,
+) {
+    snapshot.slots.retain(|page| visibility.allows(&page.path));
+    snapshot
+        .recent_pages
+        .retain(|page| visibility.allows(&page.path));
+}
+
+fn slot_visibility_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("path GLOB '_slots/*'".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(namespace) => (
+            format!(
+                "path GLOB '_slots/*' AND (path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"
+            ),
+            Some(format!("{}{namespace}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        None => (
+            "path GLOB '_slots/*' AND path NOT GLOB '_slots/*/*'".to_string(),
+            None,
+        ),
+    }
+}
+
+fn slot_exclusion_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("1".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(namespace) => (
+            format!("(path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"),
+            Some(format!("{}{namespace}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        None => ("path NOT GLOB '_slots/*/*'".to_string(), None),
+    }
+}
+
+/// SQL fragment restricting a handoff query to what `filter` can actually see,
+/// plus the owner key it expects bound at `?{param_index}` — the first free
+/// positional parameter of the statement it is spliced into.
+///
+/// The count and the fetch must agree: a briefing that advertises a pending
+/// baton the same caller cannot retrieve is worse than no count at all, because
+/// the agent keeps asking for something that will always come back empty.
+///
+/// The owner key is BOUND, never interpolated. It is not a validated
+/// identifier: it is [`ai_memory_core::IdentityKey::storage_key`] TEXT, and on
+/// a server behind a trusted proxy what follows the prefix is whatever
+/// `X-Memory-Actor-Sub` carried — an OIDC subject the engine never parses — so
+/// nothing upstream constrains its characters.
+fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Option<String>) {
+    match filter {
+        OwnerFilter::Any => (String::new(), None),
+        OwnerFilter::Unattributed => (" AND owner_user IS NULL".to_string(), None),
+        OwnerFilter::User(user) => (
+            format!(" AND (owner_user IS NULL OR owner_user = ?{param_index})"),
+            Some(user.clone()),
+        ),
+    }
+}
+
+fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &OwnerFilter) -> bool {
+    // Ownership is checked FIRST, before the manual short-circuit below.
+    // Order matters: a manual handoff is project-wide by cwd, so checking the
+    // owner afterwards would let one operator's `memory_handoff_begin` be
+    // claimed by the next session to start, whoever it belongs to — the exact
+    // cross-operator mixing this filter exists to stop. Handoffs with no owner
+    // (every pre-V39 row, and anything written without an actor) stay visible
+    // to everyone, which preserves single-operator behaviour untouched.
+    if !owner_filter.admits(h.owner_user.as_deref()) {
+        return false;
+    }
     // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
     // are project-wide and always candidates, whatever cwd they carry. Only auto
     // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
@@ -5060,7 +6394,17 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
     if h.from_session_id.is_none() {
         return true;
     }
-    match (cwd_filter, h.cwd.as_deref()) {
+    auto_handoff_matches_cwd(h.cwd.as_deref(), cwd_filter)
+}
+
+/// Whether an automatic handoff is eligible for a session starting in
+/// `cwd_filter`. Shared with the acceptance path so selection and supersession
+/// apply exactly the same path-boundary rule.
+pub(crate) fn auto_handoff_matches_cwd(
+    handoff_cwd: Option<&str>,
+    cwd_filter: Option<&str>,
+) -> bool {
+    match (cwd_filter, handoff_cwd) {
         // Project-wide read: every open handoff is a candidate.
         (None, _) => true,
         // No stored cwd: treat as project-wide.
@@ -5070,41 +6414,64 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
     }
 }
 
-fn handoff_selection_key(h: &Handoff) -> (bool, usize, Timestamp) {
-    let manual = h.from_session_id.is_none();
-    // cwd specificity discriminates only AUTO handoffs (most specific subdir
-    // wins). For manual handoffs it must be neutral so the NEWEST manual wins,
-    // not whichever happens to carry the longest cwd. Normalize before counting
-    // so legacy `/repo/` rows do not outrank equivalent `/repo` rows.
+pub(crate) fn handoff_selection_key(
+    manual: bool,
+    created_at_micros: i64,
+    cwd: Option<&str>,
+    id: HandoffId,
+) -> (bool, i64, usize, [u8; 16]) {
+    // Cwd specificity discriminates only equal-time AUTO handoffs. For manual
+    // handoffs it must be neutral so the newest manual wins, not whichever
+    // happens to carry the longest cwd. Normalize before counting so legacy
+    // `/repo/` rows do not outrank equivalent `/repo` rows.
     let auto_specificity = if manual {
         0
     } else {
-        h.cwd.as_deref().map_or(0, |cwd| normalize_cwd(cwd).len())
+        cwd.map_or(0, |cwd| normalize_cwd(cwd).len())
     };
     (
-        manual,           // manual beats auto
-        auto_specificity, // most specific auto cwd
-        h.created_at,     // newest
+        manual,            // manual beats auto
+        created_at_micros, // newest
+        auto_specificity,  // most specific equal-time auto cwd
+        *id.as_bytes(),    // deterministic final tie-break
     )
 }
 
 fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
-    handoff_selection_key(a).cmp(&handoff_selection_key(b))
+    handoff_selection_key(
+        a.from_session_id.is_none(),
+        a.created_at.as_microsecond(),
+        a.cwd.as_deref(),
+        a.id,
+    )
+    .cmp(&handoff_selection_key(
+        b.from_session_id.is_none(),
+        b.created_at.as_microsecond(),
+        b.cwd.as_deref(),
+        b.id,
+    ))
 }
 
 /// Pick the handoff to deliver from a project's open handoffs.
 ///
 /// See [`ReaderPool::latest_open_handoff`] for the full contract: manual handoffs
 /// are project-wide, auto handoffs are filtered by cwd path-boundary, and a
-/// manual handoff always beats an auto one, then most specific cwd, then newest.
+/// manual handoff always beats an auto one, then newest, with cwd specificity
+/// only breaking timestamp ties.
 #[cfg(test)]
 fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Option<Handoff> {
     candidates
         .into_iter()
-        .filter(|h| is_handoff_candidate(h, cwd_filter))
+        .filter(|h| is_handoff_candidate(h, cwd_filter, &OwnerFilter::Any))
         .max_by(prefer_handoff)
 }
 
+/// Build a [`Handoff`] from a row selected with the 18-column handoff SELECT
+/// every handoff query in this file shares.
+///
+/// Reading the row here (instead of destructuring it into a long positional
+/// argument list) keeps the column order defined in exactly one place next to
+/// the `SELECT`s that produce it.
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let ws_bytes: Vec<u8> = row.get(1)?;
@@ -5122,85 +6489,63 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let accepted_by: Option<String> = row.get(13)?;
     let accepted_at_us: Option<i64> = row.get(14)?;
     let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
-    Ok(materialise_handoff(
-        id_bytes,
-        ws_bytes,
-        pj_bytes,
-        from_session_bytes,
-        from_agent,
-        to_agent,
-        cwd,
-        summary,
-        open_q_json,
-        next_s_json,
-        files_json,
-        state,
-        created_us,
-        accepted_by,
-        accepted_at_us,
-        accepted_by_session_bytes,
-    ))
-}
+    let owner_user: Option<String> = row.get(16)?;
+    let accepted_by_user: Option<String> = row.get(17)?;
 
-#[allow(clippy::too_many_arguments)]
-fn materialise_handoff(
-    id_bytes: Vec<u8>,
-    ws_bytes: Vec<u8>,
-    pj_bytes: Vec<u8>,
-    from_session_bytes: Option<Vec<u8>>,
-    from_agent: String,
-    to_agent: Option<String>,
-    cwd: Option<String>,
-    summary: String,
-    open_q_json: String,
-    next_s_json: String,
-    files_json: String,
-    state: String,
-    created_us: i64,
-    accepted_by: Option<String>,
-    accepted_at_us: Option<i64>,
-    accepted_by_session_bytes: Option<Vec<u8>>,
-) -> StoreResult<Handoff> {
-    let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
-    let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
-    let files_touched: Vec<String> = serde_json::from_str(&files_json)?;
-    let from_session = from_session_bytes
-        .as_deref()
-        .map(SessionId::from_slice)
-        .transpose()?;
-    let accepted_session = accepted_by_session_bytes
-        .as_deref()
-        .map(SessionId::from_slice)
-        .transpose()?;
-    Ok(Handoff {
-        id: HandoffId::from_slice(&id_bytes)?,
-        workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
-        project_id: ProjectId::from_slice(&pj_bytes)?,
-        from_session_id: from_session,
-        from_agent: parse_agent(&from_agent),
-        to_agent: to_agent.as_deref().map(parse_agent),
-        cwd,
-        summary,
-        open_questions,
-        next_steps,
-        files_touched,
-        state: state.parse::<HandoffState>().map_err(StoreError::from)?,
-        created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
-            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                "bad created_at: {e}"
-            )))
-        })?,
-        accepted_by: accepted_by.as_deref().map(parse_agent),
-        accepted_at: accepted_at_us
-            .map(jiff::Timestamp::from_microsecond)
-            .transpose()
-            .map_err(|e| {
+    Ok((|| {
+        for (label, value) in [
+            ("handoff owner", owner_user.as_deref()),
+            ("accepting handoff operator", accepted_by_user.as_deref()),
+        ] {
+            if value.is_some_and(|value| IdentityKey::from_storage_key(value).is_none()) {
+                return Err(StoreError::MalformedRecord(format!(
+                    "{label} is not a qualified identity storage key"
+                )));
+            }
+        }
+        let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
+        let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
+        let files_touched: Vec<String> = serde_json::from_str(&files_json)?;
+        let from_session = from_session_bytes
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?;
+        let accepted_session = accepted_by_session_bytes
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?;
+        Ok(Handoff {
+            id: HandoffId::from_slice(&id_bytes)?,
+            workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
+            project_id: ProjectId::from_slice(&pj_bytes)?,
+            from_session_id: from_session,
+            from_agent: parse_agent(&from_agent),
+            to_agent: to_agent.as_deref().map(parse_agent),
+            cwd,
+            summary,
+            open_questions,
+            next_steps,
+            files_touched,
+            state: state.parse::<HandoffState>().map_err(StoreError::from)?,
+            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
                 StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                    "bad accepted_at: {e}"
+                    "bad created_at: {e}"
                 )))
             })?,
-        accepted_by_session: accepted_session,
-    })
+            accepted_by: accepted_by.as_deref().map(parse_agent),
+            accepted_at: accepted_at_us
+                .map(jiff::Timestamp::from_microsecond)
+                .transpose()
+                .map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad accepted_at: {e}"
+                    )))
+                })?,
+            accepted_by_session: accepted_session,
+            owner_user,
+            accepted_by_user,
+        })
+    })())
 }
 
 fn parse_agent(s: &str) -> AgentKind {
@@ -5208,7 +6553,17 @@ fn parse_agent(s: &str) -> AgentKind {
 }
 
 fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {
-    let n: Option<i64> = conn.query_row(sql, [], |row| row.get(0)).optional()?;
+    count_bound(conn, sql, &[])
+}
+
+/// `COUNT(*)` with an explicit parameter list.
+///
+/// The scope-less [`count`] and the scoped `count_project` / `count_workspace`
+/// helpers each bind a fixed shape; a predicate spliced in by the caller (the
+/// handoff owner filter) adds one more parameter to whichever shape it lands in,
+/// so it needs a helper that takes the whole list.
+fn count_bound(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> StoreResult<u64> {
+    let n: Option<i64> = conn.query_row(sql, params, |row| row.get(0)).optional()?;
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
@@ -5431,11 +6786,40 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
+    use super::{entity_query_tokens, handoff_listing_sql, like_escape};
     use crate::Store;
 
     use ai_memory_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, ProjectId, SessionId, WorkspaceId,
+        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, NewSession, OwnerFilter,
+        ProjectId, SessionId, WorkspaceId,
     };
+
+    #[test]
+    fn named_handoff_listing_uses_owner_index_for_both_ranges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let (sql, owner) = handoff_listing_sql(false, &OwnerFilter::User("user:alice".into()), 50);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = stmt
+            .query_map(
+                rusqlite::params![ws.as_bytes(), proj.as_bytes(), owner.unwrap()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("idx_handoffs_project_owner_recent"))
+                .count(),
+            2,
+            "shared and owned ranges must both use the owner index: {details:?}"
+        );
+    }
 
     #[test]
     fn authority_candidate_window_is_bounded_and_saturating() {
@@ -5470,6 +6854,8 @@ mod tests {
             accepted_by: None,
             accepted_at: None,
             accepted_by_session: None,
+            owner_user: None,
+            accepted_by_user: None,
         }
     }
 
@@ -5592,12 +6978,12 @@ mod tests {
     }
 
     #[test]
-    fn handoff_most_specific_ancestor_wins() {
+    fn handoff_newer_parent_beats_stale_specific_ancestor() {
         let c = vec![
             handoff("a", Some("/a"), false, 2),
             handoff("ab", Some("/a/b"), false, 1),
         ];
-        assert_eq!(pick(c, Some("/a/b/c")), "ab");
+        assert_eq!(pick(c, Some("/a/b/c")), "a");
     }
 
     #[test]
@@ -5668,6 +7054,7 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             })
             .await
             .unwrap();
@@ -5684,17 +7071,177 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             })
             .await
             .unwrap();
 
         let handoff = store
             .reader
-            .latest_open_handoff(ws_a, proj_a, Some("/repo".into()))
+            .latest_open_handoff(
+                ws_a,
+                proj_a,
+                Some("/repo".into()),
+                ai_memory_core::OwnerFilter::Any,
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(handoff.summary, "right project");
+    }
+
+    #[tokio::test]
+    async fn accepting_newest_auto_expires_only_older_matching_autos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "repo", Some("/repo".into()))
+            .await
+            .unwrap();
+
+        async fn insert_auto(
+            store: &Store,
+            workspace_id: WorkspaceId,
+            project_id: ProjectId,
+            cwd: &str,
+            summary: &str,
+        ) -> HandoffId {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id,
+                    project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: summary.into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    owner_user: None,
+                })
+                .await
+                .unwrap()
+        }
+
+        let superseded_same_cwd =
+            insert_auto(&store, ws, proj, "/repo/api", "older same cwd").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let stale_specific = insert_auto(&store, ws, proj, "/repo/api", "stale specific").await;
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(superseded_same_cwd)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Expired,
+            "a newer auto from the exact cwd must bound pre-accept accumulation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newest_parent = insert_auto(&store, ws, proj, "/repo", "newest parent").await;
+        let sibling = insert_auto(&store, ws, proj, "/repo/web", "sibling").await;
+
+        let selected = store
+            .reader
+            .latest_open_handoff(
+                ws,
+                proj,
+                Some("/repo/api/src".into()),
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, newest_parent, "newest eligible auto must win");
+
+        // A manual handoff appearing between selection and acceptance must not
+        // be swept by automatic-handoff cleanup.
+        let manual = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "manual".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .accept_handoff(ai_memory_core::HandoffAcceptance {
+                handoff_id: selected.id,
+                workspace_id: ws,
+                project_id: proj,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Any,
+                receiving_cwd: Some("/repo/api/src".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(stale_specific)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Expired
+        );
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(newest_parent)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Accepted
+        );
+        for untouched in [sibling, manual] {
+            assert_eq!(
+                store
+                    .reader
+                    .handoff_by_id(untouched)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                HandoffState::Open
+            );
+        }
     }
 
     /// A stored `repo_path` equal to the operator's `$HOME` must never be
@@ -5868,5 +7415,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(matched, None, "legacy trailing separator must not match");
+    }
+
+    #[test]
+    fn entity_query_tokens_lowercases_filters_short_and_bounds() {
+        // A compound token yields the whole form AND its parts, so a
+        // query can spell an entity `writer-actor` or `writer actor`.
+        assert_eq!(
+            entity_query_tokens("How does the Writer-Actor use SQLite?"),
+            vec![
+                "how".to_string(),
+                "does".to_string(),
+                "the".to_string(),
+                "writer-actor".to_string(),
+                "writer".to_string(),
+                "actor".to_string(),
+                "use".to_string(),
+                "sqlite".to_string(),
+            ],
+        );
+        assert!(
+            entity_query_tokens("a of an X").is_empty(),
+            "sub-3-char tokens are noise for prefix matching",
+        );
+        assert_eq!(
+            entity_query_tokens("dup dup dup"),
+            vec!["dup".to_string()],
+            "tokens de-duplicate",
+        );
+        assert!(entity_query_tokens(&"word ".repeat(50)).len() <= 12);
+        assert!(
+            entity_query_tokens(&"x".repeat(1_000_000)).is_empty(),
+            "an oversized untrusted token must be rejected before lowercase allocation"
+        );
+        assert_eq!(
+            entity_query_tokens(&format!("{} usable", "x".repeat(1_000_000))),
+            vec!["usable".to_string()],
+            "a rejected compound must not hide later bounded tokens"
+        );
+    }
+
+    #[test]
+    fn like_escape_neutralises_wildcards() {
+        // `_` is LIKE's single-char wildcard and appears in real entity
+        // names (`writer_actor`), so it must not match `writerxactor`.
+        assert_eq!(like_escape("writer_actor"), "writer\\_actor");
+        assert_eq!(like_escape("100%"), "100\\%");
+        assert_eq!(like_escape("back\\slash"), "back\\\\slash");
+        assert_eq!(like_escape("plain-name"), "plain-name");
     }
 }

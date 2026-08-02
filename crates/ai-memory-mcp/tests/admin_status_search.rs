@@ -35,6 +35,7 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -61,6 +62,8 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         pinned: false,
         links: Vec::new(),
         author_id: None,
+        expires_at: None,
+        entities: Vec::new(),
     };
     store.writer.upsert_page(page).await.unwrap();
 }
@@ -150,6 +153,8 @@ async fn list_projects_returns_workspace_project_pairs() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();

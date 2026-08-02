@@ -3,14 +3,17 @@
 > **Status:** Introduced in v0.8; this page documents the current shipped
 > contract.
 
-ai-memory is **single-tenant data** with **optional multi-user
+ai-memory is **single-tenant wiki data** with **optional multi-user
 attribution**. Every authenticated request sees the same wiki pages —
-there is no per-page RBAC, no per-user data scoping, no group
-permissions. What multi-user mode adds is *who-did-this*: every write
+there is no per-page RBAC or group permission model. Operational handoffs and
+open-session recovery are owner-scoped so one operator cannot accidentally
+consume or finalize another's live context. What multi-user mode also adds is
+*who-did-this*: every write
 attributes to a named user, audit-log rows carry that identity, and the
 web UI can show "Last edited by Alice Smith" instead of the anonymous
-default. Every `/admin/*` endpoint stays root-only once at least one user
-row exists, including read-only status/search/read-page helpers.
+default. Every `/admin/*` endpoint stays root-only once the deployment has a
+DB user or trusted-proxy identities, including read-only
+status/search/read-page helpers.
 
 If you run ai-memory alone, you can skip this page — your install
 keeps working unchanged.
@@ -45,12 +48,205 @@ Every HTTP request is resolved to one of four authentication tiers:
 |---|---|---|
 | **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
 | **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches a `users.token_hash` row (via SHA-256 of token + `[auth].token_pepper`). | Allowed as **that user** for normal read/write APIs. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. Closes the bypass — unknown bearers can't slip through as anonymous. |
 
-The rungs are sticky: a request is matched at the lowest tier that
-applies, never escalates. Root token always wins over any users-row
-collision; the two namespaces are intentionally distinct.
+The rungs are sticky: a request is matched at the first credential that
+applies, never escalates. Startup rejects equal root and proxy credentials;
+root and proxy credentials take precedence over any accidental DB-token
+collision.
+
+## Trusted proxy identity
+
+A deployment that terminates SSO validates the end user's credential, then
+authenticates upstream with a proxy-only bearer and describes the human in
+`X-Memory-Actor-*` headers. Those headers are **ignored by default** on root
+and DB-user requests because anything that can reach the port could otherwise
+claim any identity.
+
+Configure a distinct proxy credential:
+
+```toml
+[auth]
+bearer_token = "<root-token>"                    # direct administration
+actor_proxy_bearer_token = "<different-token>"  # SSO proxy only
+
+# Optional stable identity for the root human behind an OIDC proxy.
+root_issuer = "https://idp.example"
+root_subject = "<root-subject>"
+```
+
+- The proxy token **is** the switch. A blank value counts as unset. It must
+  differ from `bearer_token`, and `serve` refuses startup otherwise or when the
+  root bearer is absent.
+- Only set it when the server is reachable *only* through that proxy.
+- **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
+  setting its own.** Use a directive that *replaces* the header rather than
+  appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —
+  with an appending ingress the client's value arrives first and would be the
+  one read. Repeated headers and comma-folded values are rejected with `400`
+  rather than resolved to one identity.
+- Every proxy request must assert `X-Memory-Actor-User`, or both
+  `X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub`. The OIDC fields are a pair:
+  the standard guarantees subject uniqueness only within an issuer. A partial
+  pair or a request that names nobody is rejected with `400`.
+- Proxy callers are users by default. A username-only assertion can never
+  become root, including one equal to `root_username`, because an OIDC display
+  username is not a stable unique identifier. Proxied root access requires an
+  exact match with `root_issuer` plus `root_subject`.
+- Origin health checks or maintenance calls that need root should use the root
+  bearer, not the proxy bearer. Raw actor headers on the root rung are ignored.
+
+## Identity keys
+
+Identity-sensitive routing uses a *qualified* identity, never a bare string.
+`ActorContext::identity_key()` resolves a request to the OIDC
+`(issuer, subject)` pair when both are present, or to `user:<name>` for a
+username-only identity. The namespaces are disjoint, and identical subjects
+from different issuers stay different.
+
+The OIDC pair outranks `user` because OIDC defines `(iss, sub)` as the stable
+identifier and explicitly forbids relying on `preferred_username` for
+uniqueness. Configure the proxy to forward both values from day one. Adding a
+display username later then preserves the same identity; moving from a
+username-only assertion to the OIDC pair deliberately changes it once.
+
+## Ownership of handoffs and sessions
+
+Handoffs and sessions record the operator they belong to (`owner_user` /
+`actor_user`, holding the qualified `IdentityKey::storage_key()` TEXT). On a
+shared server this stops one operator's pending handoff from being delivered
+to — and consumed by — the next session to start, whoever it belongs to.
+
+- A `NULL` owner means **shared with the project**: every row written before
+  ownership existed, and anything written without an authenticated actor, stays
+  visible to everyone.
+- **An owner is only stamped where the deployment distinguishes operators.**
+  Single-operator servers are unaffected even when they name their operator via
+  `[auth].root_username`: with no `users` rows and no proxy bearer there is
+  nobody to separate, and stamping the one name would separate that operator's
+  *transports* instead — HTTP requests carry the name, while the stdio /
+  in-process MCP transport and the local CLI carry no actor at all and would
+  stop seeing what the HTTP side wrote. Reads are deliberately **not** gated the
+  same way, so a row stamped while the deployment did distinguish operators
+  stays readable by that operator afterwards.
+- The owner is the qualified identity the request names —
+  `ActorContext::identity_key()`, so the issuer-qualified OIDC key when a
+  complete issuer/subject pair is asserted and `user:<name>` otherwise. It is
+  the same rule that decides the auth tier, so the proxy path gets real
+  per-operator isolation rather than one shared bucket.
+- `memory_handoff_begin` takes `shared: true` to publish a baton deliberately.
+- `memory_handoff_accept` / `memory_handoff_cancel` take `any_owner: true` to
+  act on somebody else's baton; that opt-out requires admin authority in
+  multi-user mode.
+- `ai-memory finalize-session --all-owners` does the same for sessions, and
+  `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+- The read-only handoff listing (`GET
+  /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
+  fields — `summary`, `open_questions`, `next_steps` — to a caller the server
+  can name (their own rows plus the shared ones) and to the root operator, who
+  reads every page body through the wiki API anyway. A caller an authenticating
+  server can place as neither gets the metadata with `redacted: true`. A server
+  with no auth configured is unaffected: it already serves every page body
+  unauthenticated. The default listing remains own plus shared; root may request
+  the explicit recovery view with `?all_owners=true`, while user and anonymous
+  tiers receive `403`.
+- Handoff lifecycle events raise admission ops (`handoff_begin`,
+  `handoff_accept`, `handoff_cancel`), so an admission webhook can observe or —
+  with `failure_policy = "reject"` — refuse them. Only reject-policy hooks are
+  awaited on these ops; observers are notified after the operation is durable.
+
+"Multi-user mode" here means *the deployment distinguishes operators*: either
+`users` rows exist, or `[auth].actor_proxy_bearer_token` is configured. A trusted
+proxy never writes a `users` row, so counting only rows would leave every
+proxied caller on the single-operator escape hatch that waves admin through.
+One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
+the ownership stamped on handoffs and sessions all ask it.
+
+## Per-operator memory slots
+
+The "absent means shared" rule extends to memory slots, so a single-operator
+server behaves exactly as it always has. `_slots/current-focus.md` is injected
+into every operator's context; `_slots/<segment>/current-focus.md` is injected
+only into the operator whose `path_segment()` is `<segment>` (`u-alice`,
+`uh-<uuid>` for a path-hostile username, or `o-<uuid>` for a complete OIDC
+issuer/subject pair). What the feature scopes is injection, not access: a slot
+is an ordinary wiki page, so exact reads and searches remain project-wide like
+every other page. Every slot written before this is unnamespaced, therefore
+shared.
+
+`[slots] per_user` (default off) is the switch for the whole regime. With it
+ON:
+
+- session briefs and consolidation prompts show you the shared slots plus your
+  own — including the pointer list of recently touched pages, so another
+  operator's slot path and title stay out of your brief too;
+- the engine namespaces the slots it writes: a consolidation run that targets
+  the shared slot lands in the session operator's own namespace instead, and a
+  path the model aims at somebody else's namespace is skipped rather than
+  written or re-homed — that path comes from the model, and
+  anything reaching your observations can dictate it;
+- a `memory_write_page` call naming the SHARED slot is namespaced into your
+  own prefix, exactly as the engine would (the response reports the path the
+  page actually got), and writing into another operator's namespace is refused
+  (admins may still curate any namespace, the shared slot included).
+
+With it OFF a nested slot path means nothing in particular — every slot goes
+into every brief, exactly as before the feature existed — so turning it back
+off makes personal slots visible to everyone again rather than stranding them.
+
+The `<segment>` is derived from the qualified identity on this server: a safe
+username stays readable, while a path-hostile username or complete OIDC
+issuer/subject pair becomes a bounded deterministic identifier. The OIDC pair
+outranks the username; see "Identity keys" above. Every named operator owns a
+working namespace, and long or path-hostile values never fall back onto the
+shared slot. One consequence of qualified segments is worth stating: a nested
+path written before the feature
+(`_slots/backend/…`) spells a segment no qualified identity can produce, so
+with the flag ON it belongs to nobody and reaches no brief until the flag is
+turned back off or an admin re-homes it.
+
+One gap is deliberate and documented rather than closed: `ai-memory bootstrap`
+writes pages at paths the model picks from the repository's own README, docs
+and code, with no operator to attribute them to, so a repo carrying injected
+instructions can make it write a `_slots/…` page. It is an admin-only
+operation on a repository the admin chose to ingest, and the behaviour is the
+same with the flag off; review `bootstrap.md` — it lists every path written.
+
+## Other per-operator state
+
+Beyond attribution, some engine state is recorded per operator. "Absent means
+shared" is the rule throughout — a row with no recorded operator behaves
+exactly as it did before the column existed — so a single-operator server
+keeps its historical behaviour:
+
+- **Auto-improvement proposals.** Each records the operator who staged it (the
+  qualified identity key — username or complete OIDC issuer/subject pair — so
+  proxy-asserted humans count too, and it shows up on the proposal detail),
+  and the "one
+  pending proposal per page" rule applies per operator, so operators stop
+  blocking each other. Only where the deployment distinguishes operators,
+  though: elsewhere proposals stay unattributed and the original one-per-page
+  rule holds unchanged. A scheduled run has no caller and stages unattributed;
+  the telemetry report and the curator describe the project rather than a
+  person and stay unattributed too, so they neither block nor are blocked by
+  any named operator's pending proposal for the same page.
+
+  A proposal that does collide with one already pending is skipped on its own
+  — the run's other proposals still stage — and every staging surface reports
+  the skip with the target path and the reason (the `skipped` list in the MCP
+  and `/admin` responses, the CLI output, and the scheduler's log), so a run
+  of N-1 proposals is never silently indistinguishable from a clean run of
+  N-1.
+- **Page reinforcement.** The first reinforced read by each identified
+  operator is recorded per page alongside the existing shared access counter.
+  `[decay] breadth_weight` (default `0.0`) optionally lets a
+  page reinforced by many different people outrank one read repeatedly by a
+  single person — the forget sweep reads the per-page count of distinct
+  operators and feeds it into the retention score. At the default, and for
+  pages with fewer than two distinct readers at any weight, retention scores
+  are unchanged.
 
 ## Implementation contract
 

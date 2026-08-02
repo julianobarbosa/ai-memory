@@ -23,7 +23,7 @@ separated.
 |---------------|------------------------|----------------------------------------------------------------------------------------------------------|
 | `single`      | (none — global slot)   | **Default.** Single operator, one project at a time. Backward-compatible with every existing install.    |
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
-| `per_actor`   | `(user, session_id)`, with a user-only no-session slot | Shared engine fielding multiple authenticated users (multi-user mode, rung 2). Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
+| `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | Shared engine fielding multiple authenticated users or trusted-proxy identities. Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
 
 Both opt-in modes still publish to the single slot in parallel, so a
 caller with no actor identity (anonymous probe, legacy code path) sees
@@ -82,6 +82,7 @@ AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES=8192
 |----------------------------------------------------|----------------------------|
 | Hook payload (`/hook?event=…&agent=…`)             | `session_id`, `agent`      |
 | Auth middleware (rung 1 root with `root_username`) | `user` ← root_username     |
+| Auth middleware (rung 1b trusted proxy)           | username or OIDC `(issuer, subject)` pair |
 | Auth middleware (rung 2 DB user)                   | `user` ← `users.username`  |
 | MCP request header `X-Memory-Actor-Session-Id`     | `session_id` for tool calls |
 | MCP request header `Mcp-Session-Id`                | fallback `session_id` for tool calls |
@@ -92,8 +93,8 @@ lifecycle-hook payload. It is not an OIDC/Keycloak login session: the
 provider's JWT `sid` claim identifies an IdP browser/device session and
 must not be used as ai-memory's actor session key.
 
-`per_session` reads from `session_id`; `per_actor` reads from both
-`user` and `session_id`. In `per_actor`, a request that has `user` but
+`per_session` reads from `session_id`; `per_actor` reads from both the
+qualified identity and `session_id`. In `per_actor`, a request that has identity but
 no session id can use that user's latest no-session slot instead of the
 process-wide single slot. A request that does carry a session id must
 match a hook-published keyed entry; if it does not, ai-memory falls back
@@ -138,7 +139,8 @@ the legacy single slot.
 OIDC/Keycloak authentication can identify the human user, client, and
 agent, but it does not automatically identify the current coding-agent
 session. If a gateway validates a Keycloak JWT, it should propagate
-`X-Memory-Actor-User` / `Sub` / `Client` / `Agent`; it should only emit
+`X-Memory-Actor-User` or the `Issuer` + `Sub` pair, plus optional `Client` /
+`Agent`; it should only emit
 `X-Memory-Actor-Session-Id` when a real agent session id has been
 forwarded by a session-aware bridge.
 

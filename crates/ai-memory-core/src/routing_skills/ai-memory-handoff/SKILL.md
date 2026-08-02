@@ -26,9 +26,13 @@ Create a handoff only at session end or when the user explicitly asks to save co
 
 Lifecycle hooks already capture routine prompts and tool calls, so do not manually write a handoff just to record normal progress.
 
+On a shared server, a handoff belongs to the operator who created it. Set `shared: true` only when the user explicitly wants any operator in the project to receive the baton; do not infer sharing from ordinary collaboration prose.
+
 ## Canceling a handoff
 
 Cancel only when the user asks to discard a handoff or you created one by mistake. Use the exact handoff id returned by the begin tool. Cancellation is idempotent from the user's point of view, but it should still target only the known handoff.
+
+Accept and cancel normally act only on the caller's own plus shared handoffs. `any_owner: true` is a root-only recovery action over another operator's context; use it only on an explicit user request.
 
 ## Scope default
 

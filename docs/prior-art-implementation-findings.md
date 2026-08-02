@@ -35,7 +35,7 @@ The follow-up implementation landed the pragmatic subset of this roadmap:
 | Links / graph | Markdown and wikilinks are parsed into `links`; unresolved forward links resolve when targets appear; query uses graph-neighbor RRF. |
 | Raw fallback | `observations_fts` provides bounded raw fallback when compiled wiki search misses. |
 | Diagnostics | `status` includes FTS row counts, missing embeddings, embedding triples, and unresolved/stale link counts. |
-| Retrieval evals | Recall harness now covers FTS/vector, graph expansion, and raw fallback. |
+| Retrieval evals | Recall harness now covers FTS/entity/vector, graph expansion, and raw fallback. |
 | Procedural learning | Consolidation can classify procedural memory; auto-improvement creates or patches bounded `procedures/` pages. |
 | SessionEnd consolidation | The deterministic summary/handoff completes before optional provider work enters a durable, retryable queue outside hook latency. |
 
@@ -96,8 +96,8 @@ them every turn.
 
 ### Retrieval And Decay
 
-The current retrieval path is FTS5 by default, with graph-neighbor RRF
-and optional RRF fusion against stored page embeddings. Raw observation
+The current retrieval path is FTS5 + lexical entity + graph-neighbor RRF by
+default, with optional RRF fusion against stored page embeddings. Raw observation
 FTS is used as a bounded fallback when compiled wiki pages miss. The
 retention sweep implements the agentmemory-style decay/reinforcement
 formula for episodic pages and exempts semantic, procedural, pinned, and
@@ -177,28 +177,28 @@ Options evaluated:
 The implemented choice is status plus scheduled backfill. It preserves the
 durable FTS path, exposes vector gaps, and keeps backfill opt-in.
 
-### P1: Make Graph/Link Retrieval First-Class
+### Implemented: Graph/Link Retrieval
 
 The schema has a `links` table with nullable `to_page_id`. Markdown
 parsing now extracts wikilinks and markdown links into that table, and
 `memory_query` uses graph-neighbor expansion alongside FTS5 and optional
 page embeddings.
-This leaves two prior-art strengths untapped:
+This adopted two prior-art strengths without adding a graph database:
 
 | Source | Idea to adopt |
 |---|---|
 | basic-memory | unresolved forward links and graph context building. |
 | agentmemory | graph as a third retrieval stream in RRF. |
-| cognee | triplet-like searchable relationship text, later. |
+| cognee | Triplet-like relationship text remains deferred; V38 adds only bounded lexical entities. |
 
-Recommended sequence:
+Implemented sequence:
 
 1. Parse `[[wiki links]]` and ordinary markdown links from page bodies.
 2. Store unresolved links with `to_page_id = NULL` and resolve them when
    the target appears.
-3. Add a graph-neighbor expansion mode for pages already retrieved by
+3. Add graph-neighbor expansion for pages already retrieved by
    FTS/vector.
-4. Fold graph hits into RRF as the third signal.
+4. Fold graph hits into RRF, followed later by the V38 entity stream.
 
 Avoid a separate graph database. SQLite tables and recursive CTEs are
 enough for the expected corpus size.
@@ -253,11 +253,11 @@ Recommended benchmark matrix:
 
 | Variant | Purpose |
 |---|---|
-| FTS5 only | Baseline, zero-LLM/zero-embedding mode. |
+| FTS5 only | Lexical baseline. |
 | vector only | Measures semantic signal independent of keywords. |
-| FTS5 + vector RRF | Current hybrid path. |
-| FTS5 + vector + graph RRF | Future graph path. |
-| compiled wiki + raw fallback | Future MemPalace-inspired path. |
+| FTS5 + entity + graph RRF | Current zero-embedding project path. |
+| FTS5 + entity + vector + graph RRF | Current embedding-enabled hybrid path. |
+| compiled wiki + raw fallback | Current MemPalace-inspired miss path. |
 
 Borrow MemPalace's transparency, not its headline-chasing. Public claims
 should have tests or should not be claims.
@@ -309,7 +309,7 @@ These items previously drifted from the code. Their current status is:
 
 | Area | Current status |
 |---|---|
-| MCP tool count/list | Fixed: architecture and design docs list the current 16-tool surface. |
+| MCP tool count/list | Fixed: architecture and design docs list the current 17-tool surface. |
 | Lint scope | Fixed: lint covers stale episodic pages, duplicate titles, rule suggestions, broken cross-project links, and optional LLM contradictions. |
 | sqlite-vec status | Fixed: the vector policy documents packed vectors in SQLite with brute-force cosine as the current backend. |
 | raw archive status | Fixed: docs distinguish reserved `raw/` files from implemented observation-FTS fallback. |
@@ -333,7 +333,9 @@ These items previously drifted from the code. Their current status is:
    graph and raw fallback paths.
 7. **Add procedural learning.** Consolidation and auto-improvement can produce
    bounded durable procedure pages without weakening retention safeguards.
-8. **Queue optional SessionEnd consolidation.** Provider work is durable,
+8. **Add bounded lexical entities.** Canonical frontmatter rebuilds a
+   project-scoped noun index that participates as a fourth RRF stream.
+9. **Queue optional SessionEnd consolidation.** Provider work is durable,
    retryable, and independent of the deterministic summary/handoff path.
 
 ## Bottom Line
@@ -341,5 +343,5 @@ These items previously drifted from the code. Their current status is:
 ai-memory followed agentmemory most closely at the idea level and made
 the right substrate choices to avoid agentmemory's worst operational
 costs. The implemented follow-up kept that discipline: slots, scheduled
-decay/lint, graph-aware retrieval, raw fallback, and diagnostics landed
-without adding a sidecar, broad MCP surface, or multi-store sync layer.
+decay/lint, entity- and graph-aware retrieval, raw fallback, and diagnostics
+landed without adding a sidecar, broad MCP surface, or multi-store sync layer.

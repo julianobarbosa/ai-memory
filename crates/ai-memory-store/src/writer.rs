@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
-    ObservationId, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId, WorkspaceId,
+    AgentKind, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId, NewHandoff, NewObservation,
+    NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
+    Sanitized, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -20,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    StagedAutoImproveRunReport,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
@@ -86,6 +88,13 @@ pub(crate) enum WriteCmd {
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    DeletePageIfLatest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     BeginSession {
         session: NewSession,
@@ -155,13 +164,14 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
     AcceptHandoff {
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        acceptance: HandoffAcceptance,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     CancelHandoff {
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
@@ -175,13 +185,26 @@ pub(crate) enum WriteCmd {
     },
     BumpAccess {
         page_ids: Vec<PageId>,
+        actor: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    RecordPageFeedback {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        kind: ai_memory_core::FeedbackKind,
+        reason: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        params: crate::decay::DecayParams,
+        reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
     },
     SoftDeleteForDecay {
         page_ids: Vec<PageId>,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
     HardDeleteDecayed {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         hard_delete_after_days: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
@@ -292,6 +315,11 @@ pub(crate) enum WriteCmd {
         input: StageAutoImproveRun,
         reply: oneshot::Sender<StoreResult<StagedAutoImproveRun>>,
     },
+    StageAutoImproveRunForOwner {
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+        reply: oneshot::Sender<StoreResult<StagedAutoImproveRunReport>>,
+    },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -343,9 +371,7 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     AcceptStartupContext {
-        handoff_id: Option<HandoffId>,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
@@ -730,19 +756,18 @@ impl WriterHandle {
 
     /// Mark a handoff accepted by the given agent / session.
     ///
+    /// Returns whether this call is the one that claimed it; `false` means the
+    /// row was already taken, does not belong to the expected workspace and
+    /// project, or its owner does not admit this caller. The body must not reach
+    /// the agent on `false`. `receiving_cwd` is where the claiming session is
+    /// starting, and bounds the sweep of superseded automatic handoffs.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn accept_handoff(
-        &self,
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-    ) -> StoreResult<()> {
+    pub async fn accept_handoff(&self, acceptance: HandoffAcceptance) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
-            handoff_id,
-            accepting_agent,
-            accepting_session,
+            acceptance,
             reply: tx,
         })
         .await?;
@@ -752,14 +777,24 @@ impl WriterHandle {
     /// Mark an open handoff expired so it will no longer be consumed.
     ///
     /// Returns `true` when an open handoff was changed, `false` when the id was
-    /// already accepted/expired or missing.
+    /// already accepted/expired, outside the expected workspace and project,
+    /// or missing.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn cancel_handoff(&self, handoff_id: HandoffId) -> StoreResult<bool> {
+    pub async fn cancel_handoff(
+        &self,
+        handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CancelHandoff {
             handoff_id,
+            workspace_id,
+            project_id,
+            owner_filter,
             reply: tx,
         })
         .await?;
@@ -837,9 +872,55 @@ impl WriterHandle {
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
     pub async fn bump_access(&self, page_ids: Vec<PageId>) -> StoreResult<()> {
+        self.bump_access_for_actor(page_ids, None).await
+    }
+
+    /// Bump shared access counters and record each identified operator once per
+    /// page for the optional access-breadth retention term.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn bump_access_for_actor(
+        &self,
+        page_ids: Vec<PageId>,
+        actor: Option<IdentityKey>,
+    ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
             page_ids,
+            actor,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one explicit feedback signal for a page and update its
+    /// derived salience. Returns `None` when the path has no latest
+    /// version in that scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_page_feedback(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        kind: ai_memory_core::FeedbackKind,
+        reason: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        params: crate::decay::DecayParams,
+    ) -> StoreResult<Option<(PageId, f64)>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordPageFeedback {
+            workspace_id,
+            project_id,
+            path,
+            kind,
+            reason,
+            author_id,
+            params,
             reply: tx,
         })
         .await?;
@@ -860,14 +941,21 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Hard-delete pages soft-deleted by the sweep more than
-    /// `hard_delete_after_days` ago.
+    /// Hard-delete pages in one workspace/project that were soft-deleted by
+    /// the sweep more than `hard_delete_after_days` ago.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn hard_delete_decayed(&self, hard_delete_after_days: i64) -> StoreResult<usize> {
+    pub async fn hard_delete_decayed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        hard_delete_after_days: i64,
+    ) -> StoreResult<usize> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::HardDeleteDecayed {
+            workspace_id,
+            project_id,
             hard_delete_after_days,
             reply: tx,
         })
@@ -1112,6 +1200,32 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete every version of `path` only if `expected_latest_id` is still
+    /// the latest version. Returns `false` without mutation when the page was
+    /// refreshed or removed after the caller selected it.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
+    /// SQL error from the conditional delete.
+    pub async fn delete_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeletePageIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new user. `new_user` MUST already have been validated by
     /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
     /// caller (CLI or admin handler) generates the plaintext token,
@@ -1208,6 +1322,23 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::StageAutoImproveRun { input, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Stage an auto-improvement run in an optional typed operator bucket,
+    /// reporting target collisions without discarding sibling proposals.
+    pub async fn stage_auto_improve_run_for_owner(
+        &self,
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+    ) -> StoreResult<StagedAutoImproveRunReport> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StageAutoImproveRunForOwner {
+            input,
+            owner,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1354,16 +1485,12 @@ impl WriterHandle {
     /// handoff remains open and both result fields are false.
     pub async fn accept_startup_context(
         &self,
-        handoff_id: Option<HandoffId>,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
-            handoff_id,
-            accepting_agent,
-            accepting_session,
+            handoff,
             managed_run_id,
             reply: tx,
         })
@@ -1480,6 +1607,23 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ops::delete_page(&mut conn, workspace_id, project_id, &path, author_id);
                 send_or_warn(reply, result, "delete_page");
             }
+            WriteCmd::DeletePageIfLatest {
+                workspace_id,
+                project_id,
+                path,
+                expected_latest_id,
+                reply,
+            } => {
+                let result = ops::delete_page_if_latest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    expected_latest_id,
+                    None,
+                );
+                send_or_warn(reply, result, "delete_page_if_latest");
+            }
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);
                 send_or_warn(reply, result, "upsert_pages_batch");
@@ -1592,22 +1736,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
             }
-            WriteCmd::AcceptHandoff {
-                handoff_id,
-                accepting_agent,
-                accepting_session,
-                reply,
-            } => {
-                let result = ops::accept_handoff(
-                    &mut conn,
-                    &handoff_id,
-                    accepting_agent,
-                    accepting_session.as_ref(),
-                );
+            WriteCmd::AcceptHandoff { acceptance, reply } => {
+                let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
             }
-            WriteCmd::CancelHandoff { handoff_id, reply } => {
-                let result = ops::cancel_handoff(&mut conn, &handoff_id);
+            WriteCmd::CancelHandoff {
+                handoff_id,
+                workspace_id,
+                project_id,
+                owner_filter,
+                reply,
+            } => {
+                let result = ops::cancel_handoff(
+                    &mut conn,
+                    &handoff_id,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                );
                 send_or_warn(reply, result, "cancel_handoff");
             }
             WriteCmd::Reorg {
@@ -1618,8 +1764,35 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::reorg_sessions(&mut conn, &workspace_id, &plan);
                 send_or_warn(reply, result, "reorg_sessions");
             }
-            WriteCmd::BumpAccess { page_ids, reply } => {
-                let result = ops::bump_access_for_pages(&mut conn, &page_ids);
+            WriteCmd::RecordPageFeedback {
+                workspace_id,
+                project_id,
+                path,
+                kind,
+                reason,
+                author_id,
+                params,
+                reply,
+            } => {
+                let result = ops::record_page_feedback(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    kind,
+                    reason.as_deref(),
+                    author_id,
+                    &params,
+                );
+                send_or_warn(reply, result, "record_page_feedback");
+            }
+            WriteCmd::BumpAccess {
+                page_ids,
+                actor,
+                reply,
+            } => {
+                let result =
+                    ops::bump_access_for_pages_for_actor(&mut conn, &page_ids, actor.as_ref());
                 send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
@@ -1627,10 +1800,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "soft_delete_for_decay");
             }
             WriteCmd::HardDeleteDecayed {
+                workspace_id,
+                project_id,
                 hard_delete_after_days,
                 reply,
             } => {
-                let result = ops::hard_delete_decayed_pages(&mut conn, hard_delete_after_days);
+                let result = ops::hard_delete_decayed_pages(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    hard_delete_after_days,
+                );
                 send_or_warn(reply, result, "hard_delete_decayed_pages");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {
@@ -1781,6 +1961,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::auto_improve::stage_run(&mut conn, &input);
                 send_or_warn(reply, result, "stage_auto_improve_run");
             }
+            WriteCmd::StageAutoImproveRunForOwner {
+                input,
+                owner,
+                reply,
+            } => {
+                let result =
+                    crate::auto_improve::stage_run_for_owner(&mut conn, &input, owner.as_ref());
+                send_or_warn(reply, result, "stage_auto_improve_run_for_owner");
+            }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);
                 send_or_warn(reply, result, "reject_auto_improve_proposal");
@@ -1856,9 +2045,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "accept_managed_run_context");
             }
             WriteCmd::AcceptStartupContext {
-                handoff_id,
-                accepting_agent,
-                accepting_session,
+                handoff,
                 managed_run_id,
                 reply,
             } => {
@@ -1873,13 +2060,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     if managed_run_id.is_some() && !managed_context_accepted {
                         return Ok(StartupContextAcceptance::default());
                     }
-                    let handoff_accepted = match handoff_id {
-                        Some(handoff_id) => ops::accept_handoff_in_transaction(
-                            &tx,
-                            &handoff_id,
-                            accepting_agent,
-                            accepting_session.as_ref(),
-                        )?,
+                    let handoff_accepted = match handoff {
+                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
                         None => false,
                     };
                     tx.commit()?;
@@ -1919,6 +2101,8 @@ mod tests {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         }
     }
 

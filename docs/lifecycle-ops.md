@@ -149,6 +149,10 @@ This command also does not rename a source checkout or rewrite any native agent
 session locator. See [managed workstream rename
 behavior](managed-workstreams.md#project-and-directory-renames) before
 physically renaming a checkout that has native sessions.
+After a successful CLI rename, the client also rekeys its local `show` checkout
+link. A direct `/admin/rename-project` request cannot update other machines'
+client registries; the next successful managed `run` from a checkout refreshes
+its link.
 
 Failure modes:
 
@@ -242,6 +246,11 @@ a low-level re-stamp:
    `workstreams`). Native workstream sessions, runs, and events remain attached
    through `workstream_id`; `page_embeddings` and `links` remain attached
    through `page_id`, so none of those rows need a direct re-stamp.
+
+After a successful CLI true move, or a completed copy-purge move, the client
+rekeys its local `show` checkout link. Existing destination links win during a
+merge. Direct admin API callers leave client-local registries untouched; a
+later successful managed `run` repairs the relevant link.
 
 Ordering is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of
 disk**: a rename failure touches nothing; a crash between the two steps leaves

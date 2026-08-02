@@ -1,6 +1,7 @@
 //! `ai-memory curator` — rule-based report-only maintenance review.
 
 use ai_memory_consolidate::CuratorReport;
+use ai_memory_store::SkippedProposal;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,8 @@ struct StageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    #[serde(default)]
+    skipped: Vec<SkippedProposal>,
     report: CuratorReport,
 }
 
@@ -49,14 +52,7 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
         if args.json {
             println!("{}", serde_json::to_string_pretty(&response)?);
         } else {
-            println!("Staged curator report run {}", response.run_id);
-            for (id, path) in response
-                .proposal_ids
-                .iter()
-                .zip(response.sidecar_paths.iter())
-            {
-                println!("  - {id}: {path}");
-            }
+            println!("{}", render_stage_human(&response));
         }
     } else {
         let report: CuratorReport = post_json(&endpoint, "/admin/curator", &request).await?;
@@ -71,6 +67,19 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
     Ok(())
 }
 
+fn render_stage_human(response: &StageResponse) -> String {
+    let mut lines = vec![format!("Staged curator report run {}", response.run_id)];
+    lines.extend(
+        response
+            .proposal_ids
+            .iter()
+            .zip(response.sidecar_paths.iter())
+            .map(|(id, path)| format!("  - {id}: {path}")),
+    );
+    lines.extend(super::skipped_proposal_lines(&response.skipped));
+    lines.join("\n")
+}
+
 fn print_human_report(report: &CuratorReport, project: &str) {
     println!("\nCurator dry-run for {project}\n");
     println!("Summary: {}", report.summary);
@@ -83,5 +92,49 @@ fn print_human_report(report: &CuratorReport, project: &str) {
     }
     if report.findings.len() > 10 {
         println!("  ... {} more", report.findings.len() - 10);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(skipped: Vec<SkippedProposal>) -> StageResponse {
+        StageResponse {
+            run_id: "run-1".into(),
+            proposal_ids: Vec::new(),
+            sidecar_paths: Vec::new(),
+            skipped,
+            report: CuratorReport {
+                workspace: "default".into(),
+                project: "project".into(),
+                generated_at: "2026-01-01T00:00:00Z".into(),
+                dry_run: false,
+                summary: "summary".into(),
+                params: ai_memory_consolidate::CuratorParams::default(),
+                findings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn staged_collision_reaches_human_and_json_output() {
+        let response = response(vec![SkippedProposal {
+            target_path: "_reports/curator.md".into(),
+            reason: "a proposal is already pending review for this path".into(),
+        }]);
+        let human = render_stage_human(&response);
+        assert!(human.contains("_reports/curator.md"), "{human}");
+        assert!(human.contains("already pending review"), "{human}");
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["skipped"][0]["target_path"], "_reports/curator.md");
+    }
+
+    #[test]
+    fn older_server_response_without_skipped_still_parses() {
+        let mut json = serde_json::to_value(response(Vec::new())).unwrap();
+        json.as_object_mut().unwrap().remove("skipped");
+        let parsed: StageResponse = serde_json::from_value(json).unwrap();
+        assert!(parsed.skipped.is_empty());
     }
 }

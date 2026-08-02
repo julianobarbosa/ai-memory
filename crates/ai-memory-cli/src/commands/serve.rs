@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ScheduledAutoImproveSettings,
-    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep,
+    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -15,7 +15,9 @@ use ai_memory_hooks::{
     workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
-use ai_memory_mcp::{AdminState, AiMemoryServer, ScopeInvalidation, admin_router};
+use ai_memory_mcp::{
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
+};
 use ai_memory_store::{ReaderPool, Store, WriterHandle};
 use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
@@ -85,6 +87,45 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
             "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
         ),
     }
+}
+
+fn configured(value: Option<&String>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Validate the trusted proxy's least-privilege credential and optional stable
+/// root identity before binding the server.
+fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
+    let proxy_enabled = configured(auth.actor_proxy_bearer_token.as_ref());
+    if proxy_enabled && !configured(auth.bearer_token.as_ref()) {
+        anyhow::bail!(
+            "[auth].actor_proxy_bearer_token requires [auth].bearer_token so administration keeps a distinct root credential"
+        );
+    }
+    if proxy_enabled
+        && auth.actor_proxy_bearer_token.as_deref().map(str::trim)
+            == auth.bearer_token.as_deref().map(str::trim)
+    {
+        anyhow::bail!(
+            "[auth].actor_proxy_bearer_token must differ from [auth].bearer_token; sharing the root credential would let a missing proxy identity fall through as root"
+        );
+    }
+    let root_issuer = configured(auth.root_issuer.as_ref());
+    let root_subject = configured(auth.root_subject.as_ref());
+    if root_issuer != root_subject {
+        anyhow::bail!(
+            "[auth].root_issuer and [auth].root_subject must be configured together because an OIDC subject is unique only within its issuer"
+        );
+    }
+    Ok(())
+}
+
+/// Can a trusted proxy actually assert identities on this server?
+///
+/// The MCP admin gates read this to know that distinct operators are in play
+/// even when a proxied deployment never writes a `users` row.
+fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
+    configured(auth.actor_proxy_bearer_token.as_ref())
 }
 
 struct ConsolidatorSetup {
@@ -210,6 +251,7 @@ async fn run_session_consolidation_worker(
             false,
             ai_memory_core::ActorContext::anonymous(),
             None,
+            None,
         );
         tokio::pin!(consolidation);
         let result = tokio::select! {
@@ -317,6 +359,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
+    validate_trusted_proxy_auth(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -408,15 +451,19 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         max_entries = config.auto_scope.max_entries,
         "active-project isolation mode"
     );
+    let decay_params = config.decay.decay_params();
     let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
         .with_wiki(wiki.clone())
-        .with_decay_params(config.decay)
+        .with_decay_params(decay_params)
+        .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
         ))
         .with_active_project(active_project.clone())
-        .with_sanitizer(sanitizer.clone());
+        .with_sanitizer(sanitizer.clone())
+        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
+        .with_per_user_slots(config.slots.per_user);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -538,6 +585,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
+                per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
                 )),
@@ -552,6 +600,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 )),
                 home_dir: config.home_dir.clone(),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -559,32 +608,36 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
-            let admin = admin_router(AdminState {
-                writer: store.writer.clone(),
-                reader: store.reader.clone(),
-                wiki: wiki.clone(),
-                llm: admin_llm,
-                auto_improve_require_approval: config.auto_improve.require_approval,
-                auto_improve_review_config: auto_improve_review_config_from_settings(
-                    &config.auto_improve,
-                ),
-                embedder: embedder.clone(),
-                provider_health: provider_health.clone(),
-                decay_params: config.decay,
-                data_dir: config.data_dir.clone(),
-                db_path: store.db_path().to_path_buf(),
-                bind: bind.clone(),
-                home_dir: config.home_dir.clone(),
-                bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                token_pepper: config
-                    .auth
-                    .token_pepper
-                    .as_ref()
-                    .filter(|p| !p.trim().is_empty())
-                    .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
-                active_project: active_project.clone(),
-                scope_invalidator: Some(scope_invalidator),
-            });
+            let admin = admin_router_with_decay_breadth(
+                AdminState {
+                    writer: store.writer.clone(),
+                    reader: store.reader.clone(),
+                    wiki: wiki.clone(),
+                    llm: admin_llm,
+                    auto_improve_require_approval: config.auto_improve.require_approval,
+                    auto_improve_review_config: auto_improve_review_config_from_settings(
+                        &config.auto_improve,
+                    ),
+                    embedder: embedder.clone(),
+                    provider_health: provider_health.clone(),
+                    decay_params,
+                    data_dir: config.data_dir.clone(),
+                    db_path: store.db_path().to_path_buf(),
+                    bind: bind.clone(),
+                    home_dir: config.home_dir.clone(),
+                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    token_pepper: config
+                        .auth
+                        .token_pepper
+                        .as_ref()
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
+                    active_project: active_project.clone(),
+                    scope_invalidator: Some(scope_invalidator),
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                },
+                config.decay.breadth_weight,
+            );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
             //     stays as-is, middleware injects anonymous actor.
@@ -595,14 +648,38 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
-            let root_user = config.auth.root_username.clone();
-            if root_user.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            let root_user = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_issuer = config
+                .auth
+                .root_issuer
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_subject = config
+                .auth
+                .root_subject
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            if root_user.is_some() || root_issuer.is_some() {
                 auth_state = auth_state.with_root_actor(ai_memory_core::ActorContext {
                     user: root_user,
+                    issuer: root_issuer,
+                    sub: root_subject,
                     name: config.auth.root_name.clone(),
                     email: config.auth.root_email.clone(),
                     ..ai_memory_core::ActorContext::default()
                 });
+            }
+            if let Some(proxy_token) = config
+                .auth
+                .actor_proxy_bearer_token
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                auth_state = auth_state.with_trusted_proxy_bearer(proxy_token.clone());
             }
             if let Some(pepper) = config
                 .auth
@@ -744,7 +821,7 @@ async fn start_maintenance_scheduler(
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
-    decay: ai_memory_store::DecayParams,
+    decay: crate::config::DecaySettings,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -759,6 +836,7 @@ async fn start_maintenance_scheduler(
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
+        let wiki = wiki.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -782,10 +860,18 @@ async fn start_maintenance_scheduler(
                 move || {
                     let reader = reader.clone();
                     let writer = writer.clone();
+                    let wiki = wiki.clone();
                     let decay = decay;
                     async move {
                         let started = std::time::Instant::now();
-                        let outcome = run_scheduled_sweep_tick(&reader, &writer, &decay).await?;
+                        let outcome = run_scheduled_sweep_tick(
+                            &reader,
+                            &writer,
+                            &wiki,
+                            &decay.decay_params(),
+                            decay.breadth_weight,
+                        )
+                        .await?;
                         if outcome.errors > 0 {
                             anyhow::bail!(
                                 "scheduled forget sweep had {} scope errors",
@@ -796,6 +882,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
@@ -979,6 +1066,7 @@ async fn start_maintenance_scheduler(
                         scopes = outcome.scopes,
                         scopes_with_candidates = outcome.scopes_with_candidates,
                         reviewed = outcome.reviewed,
+                        skipped = outcome.skipped,
                         errors = outcome.errors,
                         elapsed_ms = started.elapsed().as_millis(),
                         "scheduled auto-improve tick completed"
@@ -1006,6 +1094,7 @@ struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    expired: usize,
     hard_deleted: usize,
     errors: usize,
 }
@@ -1013,7 +1102,9 @@ struct ScheduledSweepTickOutcome {
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
+    wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
+    breadth_weight: f64,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1022,12 +1113,14 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep(
+        match run_sweep_with_breadth(
             reader,
             writer,
+            Some(wiki),
             scope.workspace_id,
             scope.project_id,
             decay,
+            breadth_weight,
             false,
         )
         .await
@@ -1035,6 +1128,7 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.len();
+                outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
             }
             Err(e) => {
@@ -1191,7 +1285,9 @@ async fn configure_embedder(
     // M9 — pluggable embedder. Stored rows carry provider/model/dim so
     // query paths can ignore stale vectors after an embedding config change.
     let Some(cfg) = config.embedder_config()? else {
-        info!("AI_MEMORY_EMBEDDING_PROVIDER unset; hybrid search disabled (FTS5-only)");
+        info!(
+            "AI_MEMORY_EMBEDDING_PROVIDER unset; vector search disabled (FTS5 + entity + graph active)"
+        );
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();
@@ -1254,6 +1350,10 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
+    // Validate the reranker setting before the provider early-return, so
+    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
+    // looking enabled while eligible queries keep their normal ranking.
+    let want_reranker = config.reranker_choice()?;
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
     // the hook router (for PreCompact checkpointing), and the admin
@@ -1263,6 +1363,13 @@ fn configure_consolidator(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
         );
+        if want_reranker {
+            anyhow::bail!(
+                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
+                 judges candidates with the configured LLM provider. Set a provider or \
+                 unset AI_MEMORY_RERANKER."
+            );
+        }
         return Ok(ConsolidatorSetup {
             server,
             consolidator: None,
@@ -1279,15 +1386,30 @@ fn configure_consolidator(
         model = llm.model(),
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let consolidator = Arc::new(Consolidator::new(
-        store.reader.clone(),
-        store.writer.clone(),
-        wiki.clone(),
-        llm.clone(),
-        workspace_id,
-        project_id,
-    ));
+    let consolidator = Arc::new(
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            workspace_id,
+            project_id,
+        )
+        .with_per_user_slots(config.slots.per_user),
+    );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
+    // Optional post-RRF reranking rides on the same provider, so it is
+    // only reachable once an LLM is configured at all. Off unless the
+    // operator asked for it: it puts an LLM call on the memory_query
+    // hot path.
+    if want_reranker {
+        info!(
+            provider = llm.name(),
+            model = llm.model(),
+            "project/scopes memory_query reranking enabled (adds LLM latency)",
+        );
+        server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
+    }
     Ok(ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
@@ -1485,6 +1607,51 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_requires_distinct_credentials() {
+        let missing_root = AuthSettings {
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&missing_root).is_err());
+
+        let shared = AuthSettings {
+            bearer_token: Some("same-token".into()),
+            actor_proxy_bearer_token: Some(" same-token ".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&shared).is_err());
+
+        let valid = AuthSettings {
+            bearer_token: Some("root-token".into()),
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&valid).is_ok());
+        assert!(trusted_proxy_identity_enabled(&valid));
+    }
+
+    #[test]
+    fn root_oidc_identity_requires_issuer_and_subject_together() {
+        for (issuer, subject, valid) in [
+            (None, None, true),
+            (Some("https://idp.example"), None, false),
+            (None, Some("root-subject"), false),
+            (Some("https://idp.example"), Some("root-subject"), true),
+        ] {
+            let auth = AuthSettings {
+                root_issuer: issuer.map(str::to_string),
+                root_subject: subject.map(str::to_string),
+                ..AuthSettings::default()
+            };
+            assert_eq!(
+                validate_trusted_proxy_auth(&auth).is_ok(),
+                valid,
+                "issuer={issuer:?}, subject={subject:?}"
+            );
         }
     }
 
@@ -1869,7 +2036,7 @@ mod tests {
             wiki,
             None,
             None,
-            ai_memory_store::DecayParams::default(),
+            crate::config::DecaySettings::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -1913,7 +2080,7 @@ mod tests {
                 wiki,
                 None,
                 None,
-                ai_memory_store::DecayParams::default(),
+                crate::config::DecaySettings::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -2029,6 +2196,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2174,7 +2342,7 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &decay)
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay, 0.0)
             .await
             .unwrap();
 
@@ -2387,6 +2555,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reranker_without_llm_provider_fails_server_setup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let config = Config {
+            reranker: Some("llm".into()),
+            ..Config::default()
+        };
+
+        let result = configure_consolidator(
+            &config,
+            server,
+            &store,
+            &wiki,
+            ws,
+            proj,
+            &ProviderHealth::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("provider-less reranking must fail server setup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

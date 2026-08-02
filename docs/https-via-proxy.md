@@ -416,9 +416,10 @@ sits in front. The bearer token middleware reads `Authorization`
 directly off the request, which proxies forward verbatim. The
 `/api/v1` ETag is computed from request-independent fields. The
 `/web` cookie set after Basic auth uses `SameSite=Lax` without
-`Secure`, which lets it ride either transport — when fronted with
-HTTPS, modern browsers automatically tighten the cookie to the proxy
-origin's secure flag set anyway.
+`Secure` so local plain-HTTP use continues to work. An HTTPS proxy does not add
+that cookie attribute automatically: close direct HTTP access to the public
+hostname, or redirect it to HTTPS, so the browser never has an insecure route
+on which it could resend the cookie.
 
 The only thing to mind: **`AI_MEMORY_ALLOWED_HOSTS` must include the
 public hostname**, not just `localhost`. The host-allowlist middleware

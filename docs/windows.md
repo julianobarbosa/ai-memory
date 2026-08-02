@@ -6,8 +6,8 @@ agent CLI actually runs.
 ## Rule Of Thumb
 
 Run `install-mcp` and `install-hooks` from the same environment that
-launches Claude Code, Codex, Devin CLI, Cursor, Gemini CLI, Kimi Code, or
-another agent.
+launches Claude Code, Codex, Devin CLI, Cursor, Gemini CLI, Kimi Code,
+Antigravity CLI, or another agent.
 
 - If the agent runs inside WSL2, install ai-memory inside WSL2.
 - If the agent runs as a native Windows process, install ai-memory from
@@ -33,9 +33,15 @@ installed and launched inside a WSL2 distro.
 ```bash
 # Inside WSL2.
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \
-    -o ~/.local/bin/ai-memory
-chmod +x ~/.local/bin/ai-memory
+wrapper_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper
+wrapper_tmp="$(mktemp -d)"
+trap 'rm -rf "$wrapper_tmp"' EXIT
+curl -fsSL "$wrapper_base" -o "$wrapper_tmp/ai-memory-wrapper"
+curl -fsSL "$wrapper_base.sha256" -o "$wrapper_tmp/ai-memory-wrapper.sha256"
+(cd "$wrapper_tmp" && sha256sum -c ai-memory-wrapper.sha256)
+install -m 0755 "$wrapper_tmp/ai-memory-wrapper" ~/.local/bin/ai-memory
+rm -rf "$wrapper_tmp"
+trap - EXIT
 export PATH="$HOME/.local/bin:$PATH"
 
 docker run -d --name ai-memory \
@@ -69,10 +75,26 @@ the ai-memory server to run from the Docker image.
 # Install the Windows Docker wrapper.
 $UserBin = "$HOME\bin"
 New-Item -ItemType Directory -Force $UserBin | Out-Null
-foreach ($File in @("ai-memory.ps1", "ai-memory.cmd")) {
+$ReleaseBase = "https://github.com/akitaonrails/ai-memory/releases/latest/download"
+$WrapperAssets = @{
+    "ai-memory.ps1" = "ai-memory-wrapper.ps1"
+    "ai-memory.cmd" = "ai-memory-wrapper.cmd"
+}
+foreach ($Entry in $WrapperAssets.GetEnumerator()) {
+    $File = $Entry.Key
+    $Asset = $Entry.Value
     Invoke-WebRequest `
-        -Uri "https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/$File" `
+        -Uri "$ReleaseBase/$Asset" `
         -OutFile "$UserBin\$File"
+    Invoke-WebRequest `
+        -Uri "$ReleaseBase/$Asset.sha256" `
+        -OutFile "$UserBin\$File.sha256"
+    $Expected = ((Get-Content "$UserBin\$File.sha256" -Raw) -split '\s+')[0]
+    $Actual = (Get-FileHash "$UserBin\$File" -Algorithm SHA256).Hash.ToLower()
+    if ($Actual -ne $Expected.ToLower()) {
+        throw "Checksum mismatch for $Asset"
+    }
+    Remove-Item "$UserBin\$File.sha256"
 }
 Get-ChildItem "$UserBin\ai-memory.*" | Unblock-File
 
@@ -325,8 +347,8 @@ Windows agent builds.
   Claude Code invokes hooks as a direct binary call (no shell) by default;
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` restores the Git Bash `bash -c`
   path. WSL2 Claude Code uses normal WSL `.sh` paths.
-- Codex, Devin CLI, OpenCode, Cursor, Gemini CLI, Grok Build CLI, Zero,
-  Kimi Code, and OpenClaw may each choose different
+- Codex, Devin CLI, OpenCode, Cursor, Gemini CLI, Antigravity CLI, Grok Build
+  CLI, Zero, Kimi Code, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
   installations.

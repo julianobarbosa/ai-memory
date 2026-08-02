@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${AI_MEMORY_ACCEPTANCE_BIN:-"$ROOT/target/debug/ai-memory"}
 KEEP=${AI_MEMORY_ACCEPTANCE_KEEP:-0}
 DETERMINISTIC_ONLY=${AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY:-0}
-HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi grok"}
+HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi grok antigravity"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-workstream-acceptance.XXXXXX")
 DATA="$TMP/data"
 REPO="$TMP/repo"
@@ -109,9 +109,21 @@ current_delivery_cursor() {
      ), 0);"
 }
 
+agent_observation_count() {
+  local agent=$1
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT COUNT(*)
+       FROM observations AS o
+       JOIN sessions AS s ON s.id = o.session_id
+      WHERE s.agent_kind = '$agent';"
+}
+
 # Assert the deterministic boundaries of one real or fake managed leg:
-# the harness produced a new assistant event, and any assigned context delta
-# was acknowledged by its hook/launcher delivery path. Model recall is not a
+# the harness produced new portable evidence, and any assigned context delta
+# was acknowledged by its hook/launcher delivery path. Adapters with readable
+# transcripts persist an assistant event. Antigravity deliberately does not
+# decode private trajectory protobuf, so its startup hook must instead persist
+# an observation and link the exact native conversation. Model recall is not a
 # protocol oracle: large hook results may be file-backed, and whether a model
 # chooses to read that file must not decide acceptance.
 assert_managed_leg() {
@@ -121,21 +133,42 @@ assert_managed_leg() {
   local before_delivery=$4
   local expect_context=$5
   local log=$6
-  local native_id delivery sync_after sync_through context_delivered
+  local before_observations=${7:-0}
+  local native_id delivery sync_after sync_through context_delivered after_observations
 
-  native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
-    "SELECT native_session_id FROM workstream_events
-       WHERE workstream_id = x'$hex'
-         AND sequence > $before_sequence
-         AND agent_kind = '$expected_agent'
-         AND role = 'assistant'
-       ORDER BY sequence DESC LIMIT 1;")
-  [ -n "$native_id" ] || {
-    printf '%s did not persist a new assistant event after ledger sequence %s\n' \
-      "$expected_agent" "$before_sequence" >&2
-    tail -120 "$log" >&2
-    return 1
-  }
+  if [ "$expected_agent" = antigravity-cli ]; then
+    native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+      "SELECT native_session_id FROM workstream_native_sessions
+        WHERE workstream_id = x'$hex'
+          AND agent_kind = '$expected_agent'
+          AND is_current = 1;")
+    [ -n "$native_id" ] || {
+      printf '%s did not link a native conversation\n' "$expected_agent" >&2
+      tail -120 "$log" >&2
+      return 1
+    }
+    after_observations=$(agent_observation_count "$expected_agent")
+    [ "$after_observations" -gt "$before_observations" ] || {
+      printf '%s did not persist a startup-hook observation (before: %s, after: %s)\n' \
+        "$expected_agent" "$before_observations" "$after_observations" >&2
+      tail -120 "$log" >&2
+      return 1
+    }
+  else
+    native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+      "SELECT native_session_id FROM workstream_events
+         WHERE workstream_id = x'$hex'
+           AND sequence > $before_sequence
+           AND agent_kind = '$expected_agent'
+           AND role = 'assistant'
+         ORDER BY sequence DESC LIMIT 1;")
+    [ -n "$native_id" ] || {
+      printf '%s did not persist a new assistant event after ledger sequence %s\n' \
+        "$expected_agent" "$before_sequence" >&2
+      tail -120 "$log" >&2
+      return 1
+    }
+  fi
 
   if [ "$expect_context" = 1 ]; then
     if [ "$before_sequence" -le "$before_delivery" ]; then
@@ -241,6 +274,42 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-GROK}
     printf '{"type":"user","content":[{"type":"text","text":"%s"}]}\n' "$sentinel" >>"$chat"
     printf '{"type":"assistant","content":"%s reply"}\n' "$sentinel" >>"$chat"
+    ;;
+  antigravity)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      if [ "$previous_arg" = --conversation ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    if [ -z "$session_id" ]; then
+      session_id=${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_SESSION_ID:?antigravity fake mode requires a fresh session id}
+    fi
+    conversations="$HOME/.gemini/antigravity-cli/conversations"
+    mkdir -p "$conversations"
+    database="$conversations/$session_id.db"
+    if [ ! -f "$database" ]; then
+      uri="file://$PWD"
+      uri_hex=$(printf '%s' "$uri" | od -An -tx1 | tr -d ' \n')
+      printf -v uri_length '%02x' "${#uri}"
+      nested="0a${uri_length}${uri_hex}"
+      printf -v nested_length '%02x' "$((2 + ${#uri}))"
+      metadata="0a${nested_length}${nested}"
+      sqlite3 "$database" \
+        "CREATE TABLE trajectory_metadata_blob (id text DEFAULT 'main', data blob, PRIMARY KEY (id));
+         INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', x'$metadata');
+         CREATE TABLE trajectory_blob (data blob);
+         INSERT INTO trajectory_blob (data) VALUES (x'414d57532d505249564154452d5452414a4543544f5259');"
+    fi
+    payload=$(jq -nc --arg id "$session_id" --arg cwd "$PWD" \
+      '{invocationNum: 0, conversationId: $id, workspacePaths: [$cwd]}')
+    printf '%s' "$payload" | \
+      AI_MEMORY_HOOK_URL="${AI_MEMORY_SERVER_URL:?}" \
+      "$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK" \
+      >"$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK_LOG"
     ;;
 esac
 EOF
@@ -551,6 +620,106 @@ kimi_current_id=$(sqlite3 "$DATA/db/memory.sqlite" \
   exit 1
 }
 
+# Antigravity fake-mode fixture: `agy` owns the conversation id and SQLite
+# database, while its real PreInvocation hook links that id and accepts any
+# pending workstream context. The private trajectory table is never decoded or
+# copied into the ledger.
+ANTIGRAVITY_FAKE_HOME="$CONFIG/antigravity-fake"
+ANTIGRAVITY_FAKE_ID="a0d5ac62-2501-4780-b783-76d159c56cb3"
+ANTIGRAVITY_HOOK="$ROOT/hooks/antigravity-cli/session-start.sh"
+mkdir -p "$ANTIGRAVITY_FAKE_HOME"
+antigravity_first_observations=$(agent_observation_count antigravity-cli)
+(
+  cd "$REPO"
+  HOME="$ANTIGRAVITY_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=antigravity \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/antigravity-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_SESSION_ID="$ANTIGRAVITY_FAKE_ID" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK="$ANTIGRAVITY_HOOK" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK_LOG="$TMP/antigravity-first-hook.json" \
+    "$BIN" --data-dir "$DATA" run --new edge-antigravity --executable "$FAKE" \
+      --yolo antigravity >"$LOGS/edge-antigravity-first.log" 2>&1
+)
+diff -u <(printf '%s\n' --dangerously-skip-permissions) \
+  "$TMP/antigravity-first-argv.log"
+antigravity_ws_hex=$(workstream_hex edge-antigravity)
+[ "${#antigravity_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-antigravity workstream id\n' >&2
+  exit 1
+}
+antigravity_native=$(assert_managed_leg "$antigravity_ws_hex" antigravity-cli 0 0 0 \
+  "$LOGS/edge-antigravity-first.log" "$antigravity_first_observations")
+[ "$antigravity_native" = "$ANTIGRAVITY_FAKE_ID" ] || {
+  printf 'Antigravity linked native conversation %s, expected %s\n' \
+    "$antigravity_native" "$ANTIGRAVITY_FAKE_ID" >&2
+  exit 1
+}
+antigravity_ws_id="${antigravity_ws_hex:0:8}-${antigravity_ws_hex:8:4}-${antigravity_ws_hex:12:4}-${antigravity_ws_hex:16:4}-${antigravity_ws_hex:20:12}"
+private_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$antigravity_ws_id" --limit 100 --json "PRIVATE")
+jq -e 'length == 0' <<<"$private_hits" >/dev/null || {
+  printf 'Antigravity private trajectory payload leaked into the workstream ledger\n' >&2
+  exit 1
+}
+
+antigravity_second_before=$(latest_workstream_sequence "$antigravity_ws_hex")
+antigravity_second_delivery=$(current_delivery_cursor "$antigravity_ws_hex" antigravity-cli)
+antigravity_second_observations=$(agent_observation_count antigravity-cli)
+(
+  cd "$REPO"
+  HOME="$ANTIGRAVITY_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=antigravity \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/antigravity-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_SESSION_ID="$ANTIGRAVITY_FAKE_ID" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK="$ANTIGRAVITY_HOOK" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK_LOG="$TMP/antigravity-second-hook.json" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-antigravity \
+      --executable "$FAKE" agy >"$LOGS/edge-antigravity-second.log" 2>&1
+)
+diff -u <(printf '%s\n' --conversation "$ANTIGRAVITY_FAKE_ID") \
+  "$TMP/antigravity-second-argv.log"
+returned_antigravity=$(assert_managed_leg "$antigravity_ws_hex" antigravity-cli \
+  "$antigravity_second_before" "$antigravity_second_delivery" 0 \
+  "$LOGS/edge-antigravity-second.log" "$antigravity_second_observations")
+[ "$returned_antigravity" = "$ANTIGRAVITY_FAKE_ID" ] || {
+  printf 'returning Antigravity launch did not resume %s\n' "$ANTIGRAVITY_FAKE_ID" >&2
+  exit 1
+}
+
+# A fresh Antigravity conversation joining Kimi's established workstream must
+# receive the prior visible ledger through the real hook's injectSteps output.
+ANTIGRAVITY_CROSS_HOME="$CONFIG/antigravity-cross"
+ANTIGRAVITY_CROSS_ID="9576275f-7c4e-4709-b372-22d1ad2a0af8"
+mkdir -p "$ANTIGRAVITY_CROSS_HOME"
+antigravity_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
+antigravity_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" antigravity-cli)
+antigravity_cross_observations=$(agent_observation_count antigravity-cli)
+(
+  cd "$REPO"
+  HOME="$ANTIGRAVITY_CROSS_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=antigravity \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/antigravity-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_SESSION_ID="$ANTIGRAVITY_CROSS_ID" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK="$ANTIGRAVITY_HOOK" \
+  AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK_LOG="$TMP/antigravity-cross-hook.json" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      antigravity-cli >"$LOGS/edge-antigravity-cross.log" 2>&1
+)
+if grep -q . "$TMP/antigravity-cross-argv.log"; then
+  printf 'fresh Antigravity launch unexpectedly received a session selector\n' >&2
+  cat "$TMP/antigravity-cross-argv.log" >&2
+  exit 1
+fi
+jq -e '.injectSteps[0].ephemeralMessage | contains("AMWS-FAKE-KIMI")' \
+  "$TMP/antigravity-cross-hook.json" >/dev/null || {
+  printf 'Antigravity hook did not receive the prior Kimi workstream history\n' >&2
+  cat "$TMP/antigravity-cross-hook.json" >&2
+  exit 1
+}
+assert_managed_leg "$kimi_ws_hex" antigravity-cli "$antigravity_cross_before" \
+  "$antigravity_cross_delivery" 1 "$LOGS/edge-antigravity-cross.log" \
+  "$antigravity_cross_observations" >/dev/null
+
 # Grok fake-mode fixture: the fake grok honors the wrapper's `--session-id`
 # (fresh) and `--resume <id>` (returning) selectors, writes the native store
 # layout ($GROK_HOME/sessions/<bucket>/<id>/summary.json plus
@@ -736,9 +905,12 @@ for requested_harness in "${requested_harnesses[@]}"; do
   case "$requested_harness" in
     kimi-code | kimi-cli) harness=kimi ;;
     grok-build) harness=grok ;;
+    antigravity-cli | agy) harness=antigravity ;;
     *) harness=$requested_harness ;;
   esac
-  if command -v "$harness" >/dev/null 2>&1; then
+  harness_command=$harness
+  [ "$harness" != antigravity ] || harness_command=agy
+  if command -v "$harness_command" >/dev/null 2>&1; then
     harnesses+=("$harness")
   else
     printf 'skipping unavailable harness: %s\n' "$requested_harness" >&2
@@ -762,10 +934,14 @@ OMP_AGENT_DIR="$CONFIG/omp/agent"
 CRUSH_DATA_DIR="$CONFIG/crush/data"
 KIMI_ACCEPTANCE_HOME="$CONFIG/kimi-home"
 GROK_ACCEPTANCE_HOME="$CONFIG/grok-home"
+ANTIGRAVITY_ACCEPTANCE_HOME="$CONFIG/antigravity-home"
+ANTIGRAVITY_HOOKS="$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/config/hooks.json"
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")" "$(dirname "$CODEX_HOOKS")" \
   "$(dirname "$OPENCODE_PLUGIN")" "$(dirname "$PI_EXTENSION")" \
   "$(dirname "$OMP_EXTENSION")" "$OMP_AGENT_DIR" "$OPENCODE_DATA_HOME/opencode" \
-  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME" "$GROK_ACCEPTANCE_HOME"
+  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME" "$GROK_ACCEPTANCE_HOME" \
+  "$(dirname "$ANTIGRAVITY_HOOKS")" \
+  "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/antigravity-cli"
 
 # Redirect native transcript stores into the fixture while reusing only the
 # minimum authentication material required for real model calls.
@@ -829,6 +1005,26 @@ for relative in auth.json config.toml; do
   fi
 done
 
+# Antigravity resolves login, settings, hooks, and conversation databases below
+# ~/.gemini. Copy only the minimum OAuth and settings files into an isolated
+# HOME; private history, conversation databases, logs, and caches stay out.
+for relative in google_accounts.json oauth_creds.json installation_id; do
+  if [ -f "$HOME/.gemini/$relative" ]; then
+    cp "$HOME/.gemini/$relative" \
+      "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/$relative"
+  fi
+done
+for relative in antigravity-oauth-token installation_id jetski_state.pbtxt settings.json; do
+  if [ -f "$HOME/.gemini/antigravity-cli/$relative" ]; then
+    cp "$HOME/.gemini/antigravity-cli/$relative" \
+      "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/antigravity-cli/$relative"
+  fi
+done
+if [ -f "$HOME/.gemini/config/config.json" ]; then
+  cp "$HOME/.gemini/config/config.json" \
+    "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/config/config.json"
+fi
+
 install_hook() {
   local agent=$1
   local target=$2
@@ -838,7 +1034,7 @@ install_hook() {
     --config-file "$target"
   )
   case "$agent" in
-    claude-code | codex | kimi-code)
+    claude-code | codex | kimi-code | antigravity-cli)
       command+=(--hooks-dir "$ROOT/hooks")
       ;;
   esac
@@ -852,12 +1048,14 @@ install_hook opencode "$OPENCODE_PLUGIN"
 install_hook pi "$PI_EXTENSION"
 install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
+install_hook antigravity-cli "$ANTIGRAVITY_HOOKS"
 
 agent_wire_name() {
   case "$1" in
     claude) printf 'claude-code\n' ;;
     opencode) printf 'open-code\n' ;;
     kimi) printf 'kimi-code\n' ;;
+    antigravity) printf 'antigravity-cli\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -876,9 +1074,11 @@ run_harness() {
   local expected_agent
   local before_sequence=0
   local before_delivery=0
+  local before_observations=0
   local existing_hex
   local -a wrapper_args native_args
   expected_agent=$(agent_wire_name "$harness")
+  before_observations=$(agent_observation_count "$expected_agent")
   existing_hex=$(workstream_hex "$WORKSTREAM_NAME")
   if [ -n "$existing_hex" ]; then
     before_sequence=$(latest_workstream_sequence "$existing_hex")
@@ -924,6 +1124,10 @@ run_harness() {
       native_args=(-p "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_GROK_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_GROK_MODEL" "$prompt")
       ;;
+    antigravity)
+      native_args=(-p --print-timeout "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_TIMEOUT:-5m}" "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_MODEL:-}" ] || native_args=(-p --print-timeout "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_TIMEOUT:-5m}" --model "$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_MODEL" "$prompt")
+      ;;
     *)
       printf 'unsupported acceptance harness: %s\n' "$harness" >&2
       return 1
@@ -957,6 +1161,10 @@ run_harness() {
     (cd "$REPO" && GROK_HOME="$GROK_ACCEPTANCE_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
+  elif [ "$harness" = antigravity ]; then
+    (cd "$REPO" && HOME="$ANTIGRAVITY_ACCEPTANCE_HOME" \
+      "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
+      >"$log" 2>&1
   else
     (cd "$REPO" && "$BIN" --data-dir "$DATA" run \
       "${wrapper_args[@]}" "$harness" "${native_args[@]}") >"$log" 2>&1
@@ -971,7 +1179,8 @@ run_harness() {
     return 1
   }
   if ! native_id=$(assert_managed_leg "$hex" "$expected_agent" \
-    "$before_sequence" "$before_delivery" "$expect_context" "$log"); then
+    "$before_sequence" "$before_delivery" "$expect_context" "$log" \
+    "$before_observations"); then
     return 1
   fi
   printf '%s\n' "$native_id"

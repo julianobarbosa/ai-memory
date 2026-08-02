@@ -94,17 +94,17 @@ pub enum ActiveProjectMode {
 /// Composite identity used to key per-actor entries.
 ///
 /// - `PerSession` mode populates only `session_id`.
-/// - `PerActor` mode populates both (`user` is the username row from
-///   `users`, or the configured `root_username` for rung 1 callers).
+/// - `PerActor` mode populates both (`user` holds the qualified identity key:
+///   `user:<name>` or an issuer-qualified OIDC subject).
 ///
 /// An [`ActorKey`] with both fields `None` is treated the same as "no actor"
 /// — the request falls back to the single slot. That keeps anonymous /
 /// pre-identity callers working without a special branch at every call site.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ActorKey {
-    /// Stable username when the request was authenticated as a known user
-    /// (rung 1 root with `root_username`, or rung 2 DB user). `None` for
-    /// anonymous calls.
+    /// Qualified stable identity when the request was authenticated as a known
+    /// user. The field name is retained for API compatibility; values are
+    /// produced by `ActorContext::identity_key`, not copied from raw headers.
     pub user: Option<String>,
     /// Per-agent-run session identifier published by the lifecycle hooks
     /// (Claude Code, Codex, OpenCode, …). `None` when the call site has no

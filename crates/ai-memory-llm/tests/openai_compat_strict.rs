@@ -4,9 +4,10 @@
 //! The strict path is the load-bearing addition from PR #70: when
 //! `compat_strict=true`, the provider sends `response_format=json_schema`
 //! first; on a *parse-shape* failure (HTTP 200 with bad JSON, or 200
-//! with a non-object) it falls back to the tolerant prose-JSON parser
-//! the default mode uses. On transport / HTTP-status / auth failures
-//! it propagates without retry. These tests assert those four outcomes
+//! with a non-object), or an explicit structured-output capability
+//! rejection, it falls back to the tolerant prose-JSON parser. Other
+//! transport / HTTP-status / auth failures propagate without retry.
+//! These tests assert those outcomes
 //! end-to-end against synthesised upstream responses.
 //!
 //! Why not unit-test in `openai_compat.rs`: the strict path delegates
@@ -227,6 +228,57 @@ async fn strict_upstream_401_propagates_without_fallback_retry() {
         1,
         "401 must NOT trigger the tolerant retry"
     );
+}
+
+/// Older compatibility endpoints may reject the structured-output field
+/// before running the model. That specific capability failure is safe to
+/// retry without `response_format`; a generic 400 remains non-retryable.
+#[tokio::test]
+async fn strict_response_format_rejection_falls_back_to_tolerant_parser() {
+    let server = MockServer::start().await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &Request| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            let request: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("request body is JSON");
+            if request.get("response_format").is_some() {
+                ResponseTemplate::new(400).set_body_string("unsupported parameter: response_format")
+            } else {
+                ResponseTemplate::new(200).set_body_json(body_with_content("result: {\"ok\":true}"))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let provider = strict_provider(server.uri());
+    let value = provider
+        .complete_structured_raw(tiny_request(), tiny_schema())
+        .await
+        .expect("capability rejection must use tolerant fallback");
+    assert_eq!(value, json!({"ok": true}));
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn strict_generic_400_propagates_without_fallback_retry() {
+    let server = MockServer::start().await;
+    let responder = CountingResponder::raw(400, "unknown model");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(responder.clone())
+        .mount(&server)
+        .await;
+
+    let provider = strict_provider(server.uri());
+    let err = provider
+        .complete_structured_raw(tiny_request(), tiny_schema())
+        .await
+        .expect_err("generic 400 must surface");
+    assert!(err.to_string().contains("400"));
+    assert_eq!(responder.count(), 1);
 }
 
 /// Reasoning models (DeepSeek / Qwen3 / MiniMax M2.7) embed

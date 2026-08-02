@@ -37,6 +37,7 @@ pub mod move_project;
 pub mod openclaw_plugin;
 pub mod path_util;
 pub mod pending_writes;
+pub mod project_registry;
 pub mod purge_project;
 pub mod read_page;
 pub mod reindex;
@@ -50,6 +51,7 @@ pub mod run;
 pub mod search;
 pub mod serve;
 pub mod setup_agent;
+pub mod show;
 pub mod status;
 pub mod uninstall;
 pub mod user;
@@ -145,6 +147,51 @@ pub(crate) fn resolve_scope(
             scope.path.display()
         );
     }
+    Ok((workspace, project))
+}
+
+/// Resolve `(workspace, project)` for an explicit local directory without
+/// changing the process working directory or consulting wrapper cwd overrides.
+///
+/// The policy matches [`resolve_scope`]: a marker may pin either half, an
+/// unpinned project under a marker follows that marker's strategy, and a tree
+/// without a scope marker falls back to the main repository root.
+pub(crate) fn resolve_scope_for_path(
+    config: &Config,
+    cwd: &std::path::Path,
+) -> Result<(String, String)> {
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("canonicalizing project candidate {}", cwd.display()))?;
+    let identity = cwd.to_string_lossy().into_owned();
+    let marker = crate::marker::read_scope(&identity, &config.runtime_env);
+    let workspace = marker
+        .as_ref()
+        .and_then(|scope| scope.workspace.clone())
+        .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
+    let project = match marker.as_ref() {
+        Some(scope) => scope
+            .project
+            .clone()
+            .or_else(|| {
+                if scope.is_repo_root() {
+                    crate::marker::repo_root_project(&identity)
+                } else {
+                    ai_memory_consolidate::derive_project_name(
+                        &cwd,
+                        ai_memory_consolidate::ProjectNameStrategy::Basename,
+                    )
+                    .map(|(name, _)| name)
+                }
+            })
+            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        None => ai_memory_consolidate::derive_project_name(
+            &cwd,
+            ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        )
+        .map(|(name, _)| name)
+        .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+    };
     Ok((workspace, project))
 }
 
@@ -257,9 +304,8 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
             "the `ai-memory` wrapper at ~/.local/bin/ai-memory looks stale \
              (it didn't pass AI_MEMORY_HOST_CWD into the container). Without \
              this, every project would land in `default/work` regardless of \
-             which host dir you ran from. Fix:\n  \
-             curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \\\n    \
-               -o ~/.local/bin/ai-memory && chmod +x ~/.local/bin/ai-memory\n  \
+             which host dir you ran from. Reinstall the checksum-verified \
+             wrapper from the latest GitHub Release as documented in README.md,\n  \
              (or run `ai-memory upgrade` if your existing wrapper is recent enough \
              to know that command)"
         );
@@ -284,6 +330,27 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
          pass --project explicitly",
         cwd.display()
     ))
+}
+
+/// Human-readable lines for the proposals the server refused to stage.
+///
+/// Empty when nothing was skipped, so a clean run prints nothing extra. Every
+/// staging command shares this: a skipped proposal is otherwise
+/// indistinguishable from one the reviewer never produced — the run reports
+/// success either way, only with one proposal fewer — and the operator has no
+/// way to learn that a paid review result was dropped.
+pub(crate) fn skipped_proposal_lines(skipped: &[ai_memory_store::SkippedProposal]) -> Vec<String> {
+    if skipped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(skipped.len() + 1);
+    lines.push(format!("Skipped {} proposal(s):", skipped.len()));
+    lines.extend(
+        skipped
+            .iter()
+            .map(|s| format!("  - {}: {}", s.target_path, s.reason)),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -312,6 +379,27 @@ mod tests {
         };
 
         assert_eq!(resolve_project_name(&config, None).unwrap(), "my-project");
+    }
+
+    #[test]
+    fn skipped_proposal_lines_are_empty_on_a_clean_run() {
+        assert!(skipped_proposal_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn skipped_proposal_lines_name_the_path_and_the_reason() {
+        let lines = skipped_proposal_lines(&[ai_memory_store::SkippedProposal {
+            target_path: "procedures/release.md".into(),
+            reason: "a proposal is already pending review for this path".into(),
+        }]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains('1'), "{lines:?}");
+        assert!(lines[1].contains("procedures/release.md"), "{lines:?}");
+        assert!(
+            lines[1].contains("already pending review"),
+            "the reason has to travel with the path, or the operator only \
+             learns that something vanished: {lines:?}"
+        );
     }
 
     /// Build a config whose scope resolution walks up from `cwd`, and drop a
@@ -364,6 +452,50 @@ mod tests {
             resolve_scope(&config, Some("flagged"), None).unwrap(),
             ("flagged".to_string(), "cli".to_string()),
             "an explicit workspace must not restore the main-repo fallback"
+        );
+    }
+
+    #[test]
+    fn explicit_path_scope_matches_marker_and_non_repo_fallback_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_tree = tmp.path().join("workspace-tree");
+        let workspace_child = workspace_tree.join("child");
+        std::fs::create_dir_all(&workspace_child).unwrap();
+        std::fs::write(
+            workspace_tree.join(".ai-memory.toml"),
+            "workspace = \"acme\"\n",
+        )
+        .unwrap();
+
+        let pinned = tmp.path().join("pinned-checkout");
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(
+            pinned.join(".ai-memory.toml"),
+            "project = \"shared-project\"\n",
+        )
+        .unwrap();
+
+        let plain = tmp.path().join("plain-checkout");
+        std::fs::create_dir(&plain).unwrap();
+        let config = Config::default();
+
+        assert_eq!(
+            resolve_scope_for_path(&config, &workspace_child).unwrap(),
+            ("acme".to_owned(), "child".to_owned())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&config, &pinned).unwrap(),
+            (
+                crate::config::DEFAULT_WORKSPACE.to_owned(),
+                "shared-project".to_owned()
+            )
+        );
+        assert_eq!(
+            resolve_scope_for_path(&config, &plain).unwrap(),
+            (
+                crate::config::DEFAULT_WORKSPACE.to_owned(),
+                "plain-checkout".to_owned()
+            )
         );
     }
 

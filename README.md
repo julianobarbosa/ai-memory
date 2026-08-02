@@ -31,17 +31,18 @@
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
 | Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Crush | Managed-only | `ai-memory run crush` resumes its project-local session database and supplies portable context through a temporary supported global-context file; no lifecycle-hook installer is provided. |
-| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
+| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
-| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). No automatic true session-end hook, so run `ai-memory finalize-session --agent antigravity-cli` after the final turn when you need a summary, handoff, and opt-in SessionEnd consolidation. |
+| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). Only `PreInvocation` with `invocationNum = 0` maps to SessionStart; later model calls cannot consume a next-session handoff. No automatic true session-end hook, so run `ai-memory finalize-session --agent antigravity-cli` after the final turn when you need a summary, handoff, and opt-in SessionEnd consolidation. `ai-memory run antigravity` (aliases `antigravity-cli`, `agy`) adds managed workstream resume via `--conversation`; conversation text is not decoded, so the ledger for this harness comes from hook capture. |
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
-| Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
+| Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
+| Hermes Agent | Community | Core hook ingestion recognizes `agent=hermes` and Hermes' documented shell-hook `tool_name` / `tool_input` payload for concrete session attribution, tool-family titles, and capture exclusions. A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available, but no first-party installer is shipped; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. Hermes ignores session-start hook stdout, so recover handoffs through MCP. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
-| Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
+| Embedding providers | Supported | OpenAI, Voyage, Google Gemini, and keyless OpenAI-compatible endpoints such as Ollama, LM Studio, and vLLM. |
 
 ## What it is
 
@@ -82,6 +83,12 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
+- **Optional per-operator memory slots.** On shared servers,
+  `[slots] per_user = true` keeps engine-written `_slots/` context in a bounded
+  namespace derived from the authenticated operator. Session briefs and
+  consolidation prompts receive shared slots plus the caller's own; exact wiki
+  reads and searches remain project-wide, so this is context-injection
+  isolation rather than RBAC. See [multi-user operation](docs/users.md#per-operator-memory-slots).
 - **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
   in the same directory hours later - the next agent sees a
   "where you left off" block before its first prompt.
@@ -105,14 +112,21 @@ priors are at the [bottom](#influences-and-prior-art).
   `global_scope_hits`, so preferences travel with you into new projects
   without naming a magic project or paying the all-projects
   `global=true` fan-out. Event capture never writes there.
-- **Authority-aware recall.** FTS5, graph-neighbor RRF, and optional vector RRF
-  still generate candidates by relevance. Before truncation, a bounded
-  adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
+- **Entity-assisted recall.** Consolidation stores up to 10 specific nouns per
+  page in canonical `entities:` frontmatter. Exact, prefix, and compound-word
+  matches form a project-scoped RRF stream, so a query can recover a page even
+  when its body uses different wording. The stream is lexical and adds no
+  query-time LLM call.
+- **Authority-aware recall.** FTS5, entity-match RRF, graph-neighbor RRF, and
+  optional vector RRF generate candidates by relevance. Before truncation, a
+  bounded adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
   `gotchas/` pages over closely matching episodic session evidence. Tier,
   `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
   `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
   contribute without becoming absolute filters, so targeted history searches
-  still find session pages.
+  still find session pages. These signals affect retrieval provenance only;
+  retrieved text remains untrusted historical evidence and never gains
+  instruction authority from its namespace, tier, tags, pin, or rank.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
   at session-end (or PreCompact; clients without a true session-end event can
   use `ai-memory finalize-session --agent <agent>` for a manual final close),
@@ -125,9 +139,9 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
-  / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, and VS Code
-  GitHub Copilot agent mode
-  (MCP-only, workspace `.vscode/mcp.json`).
+  / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
+  GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), and Zed
+  (MCP-only, user `settings.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
@@ -143,10 +157,13 @@ priors are at the [bottom](#influences-and-prior-art).
   provider health from the last real provider call. Server is the
   single source of truth. `finalize-session` lists matching open
   sessions through `GET /admin/open-sessions`, then posts synthetic
-  `session-end` hooks back to the server.
-- **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
-  rule-based summarisation. Add a provider when you want consolidated
-  pages, lint contradictions, or staged auto-improvement proposals.
+  `session-end` hooks back to the server. On shared deployments it defaults to
+  the caller's own plus unattributed sessions; root can pass `--all-owners` for
+  explicit cross-operator recovery.
+- **LLM is opt-in.** Zero-LLM mode still gives you FTS5, manually declared
+  entity, and graph-neighbor search plus rule-based summarisation. Add a
+  provider when you want consolidated pages, lint contradictions, or staged
+  auto-improvement proposals.
 
 ## Use cases
 
@@ -168,6 +185,40 @@ priors are at the [bottom](#influences-and-prior-art).
   ai-memory run --fresh codex
   ```
 
+- **"Pick the project instead of remembering where it lives."** Start from a
+  directory containing your checkouts and choose the checkout before the
+  managed harness:
+
+  ```bash
+  ai-memory show
+
+  # Machine-readable discovery without launching anything.
+  ai-memory show --json
+  ```
+
+  Each successful `ai-memory run` saves a client-local checkout link keyed by
+  the configured server plus workspace/project. `show` joins those links with
+  the server's public activity and page-count metadata. A fast, bounded depth-1
+  scan of the current directory also finds new checkouts carrying a project
+  marker (`.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, and
+  friends), while skipping dependency and build directories. The server never
+  exposes a checkout path, so two client machines can safely use different
+  local paths for the same project on a remote homeserver.
+
+  The list always leads with **`+ New project`**: type a name and ai-memory
+  validates a portable directory name, stages the new checkout privately, pins
+  its workspace and project in `.ai-memory.toml`, and installs the routing block
+  and managed Agent Skills for the chosen agent. The final directory appears
+  only after every setup step succeeds, then `show` launches from it.
+
+  The harness menu only offers agents actually installed on the host, using the
+  same `PATH` lookup `run` enforces at launch.
+
+  `--no-scan` uses only saved links; `--workspace` filters both sources;
+  `--yolo`, `--fresh`, and trailing native arguments are forwarded unchanged.
+  Non-terminal use must pass `--json`; JSON mode is discovery-only and never
+  launches a harness.
+
   The first explicit run can offer an existing session from this exact checkout
   or start a new one. Switching harnesses starts or resumes the native session
   linked to the shared workstream, so an obsolete local session cannot replace
@@ -176,8 +227,8 @@ priors are at the [bottom](#influences-and-prior-art).
   the workstream immediately. If a linked native transcript was deleted,
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
-  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI; direct harness
-  launches remain unchanged. See
+  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity
+  CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
@@ -185,10 +236,16 @@ priors are at the [bottom](#influences-and-prior-art).
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
   `memory_handoff_accept` when resuming from a handoff. Zero has the same
   no-stdout behavior and also must call `memory_handoff_accept`.
-- **"What did we decide about X six weeks ago?"** Type
-  `memory_query X` from the agent (or `ai-memory search X` from a
-  terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
-  the hit is a coherent decision page, not a raw chat log.
+- **"What did we decide about X six weeks ago?"** Use `memory_query X` from
+  the agent for FTS5 fused with entity matches and linked-page expansion (plus
+  vector similarity when an embedder is configured). For a quick terminal-only
+  FTS5 lookup, use `ai-memory search X`; that admin command does not run the
+  hybrid streams. Pages are
+  LLM-consolidated, so the hit is a coherent decision page, not a raw
+  chat log. Pass `explain: true` to see why each hit ranked where it
+  did in project or explicit-scope retrieval. Cross-project
+  `global: true` search uses its separate FTS-only ranker and reports
+  that active stream without per-hit RRF details.
 - **"Remember this permanently."** When something is worth keeping
   beyond auto-captured session logs - a decision, a convention, a
   gotcha - tell the agent "save a permanent note that we standardised
@@ -203,6 +260,23 @@ priors are at the [bottom](#influences-and-prior-art).
   auto-synthesised session page (rewritten on consolidation), a
   write-page note is yours: it shows up in `memory_query`, renders in
   `/web`, and stays until you change it.
+- **"That page you found is out of date."** The agent calls
+  `memory_feedback` with the page's path and a signal: `helpful` /
+  `not_helpful` tune how strongly retention keeps a sweep-eligible episodic
+  page (they move its salience, which scales the decay formula's time term),
+  while `stale` / `wrong` floor the salience *and* make any current page
+  show up as a `feedback_flagged` finding in the next `memory_lint` report.
+  Feedback never deletes anything — it lowers confidence and flags for review —
+  and it attaches to the version current when feedback is recorded, so a
+  later rewrite clears the flag. Retrieved page text is untrusted and never
+  authorizes feedback by itself.
+- **"Remember this, but only until the sprint ends."** Pass
+  `expires_at` to `memory_write_page` (RFC3339 or `YYYY-MM-DD` = end of
+  that day, UTC) — or put `expires_at:` in a page's frontmatter by
+  hand. Past the TTL the page disappears from search/recent/briefing
+  (pass `include_expired: true` to `memory_query` to still see it) and
+  the next forget sweep hard-deletes the file and its rows. A TTL beats
+  a pin; `memory_lint` warns about pinned+expiring combos.
 - **"This new project has months of history before ai-memory."**
   `cd /path/to/my-project && ai-memory bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and
@@ -219,11 +293,17 @@ priors are at the [bottom](#influences-and-prior-art).
   automatic review, or set `[auto_improve] require_approval = true` to keep both
   scheduled and manual proposals pending for human review. `ai-memory
   auto-improve --session-id <uuid>` and MCP `memory_auto_improve` remain
-  available for manual catch-up or targeted reruns. `ai-memory
+  available for manual catch-up or targeted reruns. When its `session_id` is
+  omitted, the MCP tool selects the newest completed session without a
+  persisted auto-improvement run, so repeated calls advance past short
+  preflight-skipped sessions; an explicit ID reruns that session. `ai-memory
   auto-improve-report --workspace <w> --project <p>` returns a read-only
   telemetry report for recent auto-improvement outcomes without staging or
   creating proposals; add `--stage` to create one pending report page for
-  audit/approval. See
+  audit/approval. On deployments that distinguish operators, pending learning
+  proposals are isolated by qualified operator identity, so one person's
+  proposal for a page does not block another's; unattributed and single-user
+  deployments retain the shared pending queue. See
   [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
   example executable eval scorers.
 
@@ -239,7 +319,9 @@ priors are at the [bottom](#influences-and-prior-art).
   episodic pages, stale slots, duplicate exact normalized titles, and dangling
   cross-project links. It is report-only unless `--stage` is passed; staging
   queues one report page for approval and still performs no maintenance actions
-  itself.
+  itself. Shared servers can opt into `[decay] breadth_weight` to give pages
+  reinforced by several identified operators a retention bonus; the default
+  `0.0` leaves existing retention scores unchanged.
 - **"Run one ai-memory for the whole household."** Stand the server
   up on a homelab box at `0.0.0.0:49374` with a bearer token; every
   laptop/desktop talks to it. Per-cwd routing keeps each project's
@@ -307,9 +389,21 @@ expose the server on the LAN; see [Security](#security) below.
 #    runs the binary inside docker with your $HOME mounted). This is
 #    the only thing that needs to live on the host filesystem.
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \
-    -o ~/.local/bin/ai-memory
-chmod +x ~/.local/bin/ai-memory
+wrapper_tmp="$(mktemp -d)"
+trap 'rm -rf "$wrapper_tmp"' EXIT
+wrapper_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper
+curl -fsSL "$wrapper_base" -o "$wrapper_tmp/ai-memory-wrapper"
+curl -fsSL "$wrapper_base.sha256" -o "$wrapper_tmp/ai-memory-wrapper.sha256"
+expected="$(awk 'NR == 1 { print $1 }' "$wrapper_tmp/ai-memory-wrapper.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$wrapper_tmp/ai-memory-wrapper" | awk '{ print $1 }')"
+else
+    actual="$(shasum -a 256 "$wrapper_tmp/ai-memory-wrapper" | awk '{ print $1 }')"
+fi
+[ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "wrapper checksum mismatch" >&2; exit 1; }
+install -m 0755 "$wrapper_tmp/ai-memory-wrapper" ~/.local/bin/ai-memory
+rm -rf "$wrapper_tmp"
+trap - EXIT
 # Most distros put ~/.local/bin on PATH automatically. If `which
 # ai-memory` comes up empty, add this to ~/.bashrc / ~/.zshrc:
 #     export PATH="$HOME/.local/bin:$PATH"
@@ -446,10 +540,10 @@ one matching entry.
   MCP/hooks. Explicit `--server-url` flags still work, but are no longer
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
-- **Managed-run wrapper:** `ai-memory run` must be intercepted by the current
-  host wrapper so the native harness and its session store remain accessible.
-  An old wrapper may pass `run` into Docker and fail with `No such file or
-  directory` for `codex`, `claude`, or another host executable. Run
+- **Managed-launch wrapper:** `ai-memory run` and `ai-memory show` must be
+  intercepted by the current host wrapper so local checkouts, native harnesses,
+  and session stores remain accessible. An old wrapper may pass either command
+  into Docker and fail to find a checkout or host executable. Run
   `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
   inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
 - **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each
@@ -566,7 +660,10 @@ page view UI. Data stays single-tenant — there is no per-page RBAC. A
 first user row is what immediately switches every `/admin/*` endpoint to
 root-only, including status/search/read-page and user-management routes.
 `ai-memory init` generates a pepper for new installs without changing
-single-user behavior until a user is added. See
+single-user behavior until a user is added. An SSO gateway can instead use a
+dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
+headers; its credential is deliberately separate from the root bearer so a
+missing identity cannot become root. See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
 four-rung auth ladder.
 
@@ -602,12 +699,15 @@ Useful entry points:
   GET  /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=...
   GET  /api/v1/workspaces/{workspace}/overview?limit=...
   GET  /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=...
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=...&limit=...
   GET  /api/v1/search?q=...&workspace=...&project=...&limit=...
   POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
   ```
 
   `overview` bundles the open handoff + briefing + memory-health for a workspace
-  or project in one call (the data a project overview screen needs).
+  or project in one call (the data a project overview screen needs). The
+  handoff history defaults to the caller's own plus shared rows; root can use
+  `all_owners=true` for recovery across operators.
 
   **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
   for auth setup, response schemas, error model, limits/pagination,
@@ -657,10 +757,34 @@ routing, bootstrap details, web UI screenshots, and the raw-wiki inspection
 commands. CLI URL/auth configuration lives in
 [`docs/install.md`](docs/install.md#configuring-the-cli-url-and-auth).
 
+### Entity retrieval
+
+Consolidation extracts specific technologies, components, services, files, and
+domain nouns into each page's canonical frontmatter. Hand-edited wiki pages can
+declare the same bounded index explicitly:
+
+```yaml
+---
+title: Queue choice
+entities:
+  - nats jetstream
+  - delivery guarantees
+---
+```
+
+Names are lowercased, whitespace-normalized, de-duplicated, capped at 10 per
+page and 64 characters each, and rebuilt from Markdown during a clean-store
+`ai-memory reindex`.
+Entity lookup is project-scoped, ignores expired pages by default, and reports
+`entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
+and its RRF contribution under
+`memory_query(..., explain: true)`.
+
 ## LLM Providers
 
 ai-memory runs without an LLM: hooks still capture sessions, search uses
-FTS5, and summaries fall back to rule-based output. Add an LLM provider
+FTS5 + declared entities + graph neighbors, and summaries fall back to
+rule-based output. Add an LLM provider
 when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
@@ -673,7 +797,22 @@ observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
 an interrupted keyed replay finishes the wiki commit, queue insert, and key
-completion without duplicating that handoff.
+completion without duplicating that handoff. On the next SessionStart, the
+newest cwd-eligible automatic handoff wins; accepting it expires older eligible
+automatic handoffs without consuming manual or sibling-directory work. A new
+automatic handoff also expires prior open automatic handoffs from its exact
+cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
+
+To keep consolidation style project-specific, write
+`_prompts/consolidation.md` in that project's wiki. Its body can express
+preferences such as "prefer Portuguese titles" or "omit routine CI noise".
+Automatic, single-page, and multi-page consolidation use the page; a manual
+`memory_consolidate` call can pass `instructions` to override it once. ai-memory
+sanitizes and caps the value at 2,000 characters, JSON-encodes it in the user
+message, and treats it as untrusted advisory data. It cannot supply facts,
+request tool use or disclosure, or override the consolidation schema and
+faithfulness rules. TTL-expired preference pages are ignored. With no active
+page or argument, no preference block is appended.
 
 Recommended defaults:
 
@@ -715,20 +854,34 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > high-effort thinking models for your coding agent.
 
 > [!TIP]
-> **On a local engine (Ollama, vLLM, LM Studio, llama.cpp) with
-> `openai-compat`, if consolidation fails on large sessions** with
-> `did not contain a JSON object` or `serde: unknown variant`, set
-> `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
-> (strict) so capable engines constrain output to the schema. If the strict
-> raw call fails, ai-memory falls back to the default tolerant parser. Off by
-> default.
+> **OpenAI-compatible structured output is schema-constrained by default.**
+> ai-memory sends each operation's JSON Schema through
+> `response_format=json_schema`, which recent Ollama, vLLM, LM Studio, and
+> llama.cpp releases honour. It falls back to the tolerant parser when an
+> endpoint explicitly rejects that field or returns a malformed shape. Set
+> `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
+
+Reranking is optional and off by default. With an LLM provider configured,
+`AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
+calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
+call to reorder the best candidates. This can promote a relevant page that
+RRF ranked below the requested cut, at the cost of LLM latency and usage. The
+request sends the query plus at most 30 bounded page titles and search snippets
+to the configured provider; all values are JSON-encoded and treated as
+untrusted data. A timeout, provider error, or incomplete/invalid score set
+preserves the normal order. `global=true` and supplemental global-preference
+hits keep their existing non-RRF ranking. Concurrent provider calls are capped
+at four; saturated queries keep their local ranking without waiting.
 
 Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
-you want vector reranking in addition to FTS5 + graph-neighbor retrieval.
-Both the FTS-only and hybrid paths apply the same bounded page-authority
-adjustment after candidate generation; embeddings improve relevance recall but
-do not decide which source is canonical.
+`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
+`openai-compat` when you want vector retrieval in addition to FTS5 + entity +
+graph-neighbor retrieval. `openai-compat` targets self-hosted engines
+(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
+`AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
+`AI_MEMORY_EMBEDDING_DIM`. Both the FTS-only and hybrid paths apply the same
+bounded page-authority adjustment after candidate generation; embeddings
+improve relevance recall but do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
@@ -743,16 +896,16 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 <data_dir>/
 ├── wiki/    # markdown source of truth, git-versioned
 ├── raw/     # immutable sanitized managed-workstream transcript segments
-├── db/      # SQLite indexes, including FTS5 and embeddings
+├── db/      # SQLite indexes, including FTS5, entities, and embeddings
 ├── models/  # reserved for local embedding models
 └── logs/    # rolling tracing output
 ```
 
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
-pages, and serves retrieval through FTS5, graph-neighbor RRF, optional
-vector RRF, bounded source-authority adjustment, and bounded raw-observation
-fallback for non-global searches.
+pages, and serves retrieval through FTS5, entity-match and graph-neighbor RRF,
+optional vector RRF, bounded source-authority adjustment, and bounded
+raw-observation fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.
@@ -763,7 +916,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |

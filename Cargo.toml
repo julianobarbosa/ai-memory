@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.19.2"
+version = "1.22.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -26,15 +26,15 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "1.19.2" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "1.19.2" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.19.2" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.19.2" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.19.2" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.19.2" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.19.2" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "1.19.2" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.19.2" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "1.22.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "1.22.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.22.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.22.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.22.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.22.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.22.0" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "1.22.0" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.22.0" }
 
 # (Workspace shared deps follow below)
 
@@ -51,6 +51,9 @@ serde = { version = "1", features = ["derive"] }
 # cosmetic diff the user didn't ask for.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+# Zed's settings.json is JSONC despite the .json suffix. Its CST lets
+# install/uninstall preserve comments, trailing commas, and unrelated layout.
+jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 
 # Async runtime.
 tokio = { version = "1", features = ["full"] }
@@ -72,6 +75,12 @@ clap = { version = "4", features = ["derive", "env"] }
 # same derived `Command` the parser uses, so completions can never drift
 # from the actual CLI surface.
 clap_complete = "4"
+# Raw-mode key reading for `ai-memory show`'s interactive picker. The CLI had
+# no terminal crate before this: `anstyle` arrives transitively through clap
+# and only styles text, it cannot read arrow keys. crossterm is the portable
+# option that keeps one code path across Linux, macOS, and Windows consoles
+# instead of a `#[cfg]` split over termios and the Win32 console API.
+crossterm = "0.29"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;

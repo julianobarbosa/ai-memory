@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentKind, HandoffId, ProjectId, SessionId, WorkspaceId};
+use crate::{
+    OwnerFilter,
+    ids::{AgentKind, HandoffId, ProjectId, SessionId, WorkspaceId},
+};
 
 /// State machine of a single handoff row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +79,35 @@ pub struct NewHandoff {
     pub next_steps: Vec<String>,
     /// Files touched in the session.
     pub files_touched: Vec<String>,
+    /// Operator this handoff belongs to, as an
+    /// [`crate::IdentityKey::storage_key`] string. `None` publishes it to the
+    /// whole project (the pre-ownership behaviour, and what a caller with no
+    /// actor produces).
+    #[serde(default)]
+    pub owner_user: Option<String>,
+}
+
+/// Scope, ownership, and receiver metadata for an atomic handoff claim.
+#[derive(Debug, Clone)]
+pub struct HandoffAcceptance {
+    /// Handoff being claimed.
+    pub handoff_id: HandoffId,
+    /// Workspace the caller resolved before the claim.
+    pub workspace_id: WorkspaceId,
+    /// Project the caller resolved before the claim.
+    pub project_id: ProjectId,
+    /// Agent CLI accepting the handoff.
+    pub accepting_agent: AgentKind,
+    /// Session accepting the handoff, when known.
+    pub accepting_session: Option<SessionId>,
+    /// Operator accepting the handoff, in [`crate::IdentityKey::storage_key`]
+    /// form.
+    pub accepting_user: Option<String>,
+    /// Ownership boundary the caller is authorized to claim through.
+    pub owner_filter: OwnerFilter,
+    /// Working directory of the receiving session, used to bound automatic
+    /// handoff supersession.
+    pub receiving_cwd: Option<String>,
 }
 
 /// Materialised view of a handoff row.
@@ -113,4 +145,10 @@ pub struct Handoff {
     pub accepted_at: Option<Timestamp>,
     /// Session that accepted, if any.
     pub accepted_by_session: Option<SessionId>,
+    /// Operator this handoff belongs to ([`crate::IdentityKey::storage_key`]
+    /// form); `None` means shared with the project.
+    pub owner_user: Option<String>,
+    /// Operator that accepted it. Unlike [`Handoff::accepted_by`] (the agent
+    /// CLI), this answers "which teammate took the baton".
+    pub accepted_by_user: Option<String>,
 }

@@ -89,7 +89,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 ## 5. Embedding & LLM
 
 **Embeddings:**
-- The original prototype proposed a default local `ort` / `fastembed-rs` model. The shipped v1 posture is instead **off by default**, with opt-in OpenAI, Voyage, or Google Gemini embeddings. Local ONNX embeddings remain future work; the current provider and model reference lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- The original prototype proposed a default local `ort` / `fastembed-rs` model. The shipped v1 posture is instead **off by default**, with opt-in OpenAI, Voyage, Google Gemini, or keyless OpenAI-compatible embeddings. The compatible path requires an explicit base URL, model, and dimension because self-hosted engines have no safe common defaults, and it uses a distinct provider identity to prevent vector-family mixing. Local ONNX embeddings remain future work; the current provider and model reference lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - Persist `{provider, model, dim}` next to every vector. On mismatch, warn and ignore stale vectors until `ai-memory embed --force` or scheduled backfill re-embeds them (agentmemory #469 lesson, without blocking startup).
 - Any future local model cache belongs under `<data_dir>/models/`, never `/tmp` (basic-memory #741).
 - The shipped provider implementations share the `Embedder` trait and are selected through typed configuration.
@@ -156,7 +156,7 @@ effect alone is small.
 Three scheduled MCP operations:
 
 - **`memory_ingest`** (auto-called by hooks): one observation → write-fan-out to ~5–15 wiki pages. New page if no match; supersede + version if the page already exists. No-LLM fallback: append to a per-day digest page if no provider configured.
-- **`memory_query`** (called by agent on demand): hierarchical - search `index.md` first, then page-level FTS+vector, then optional graph-walk expansion. RRF-fused. Agentmemory hit 95.2% R@5 with this pattern.
+- **`memory_query`** (called by agent on demand): project-scoped FTS + lexical entity + graph retrieval, with optional vectors, RRF-fused before bounded authority and optional LLM reranking. Agentmemory's earlier triple-stream result motivated the fusion shape.
 - **`memory_lint`** (scheduled hourly + on session-end): scans for contradictions, orphan pages, broken links, stale claims, low-confidence + zero-reinforcement entries. Pure LLM with strict JSON output.
 
 Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; soft-deletes via `is_latest=false` + `superseded_at`; hard-deletes only after 180 days *and* zero accesses. Never silently destroys anything user-pinned.
@@ -191,7 +191,13 @@ struct Handoff {
 }
 ```
 
-MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is stored with no cwd and so is project-wide, and is preferred over the auto SessionEnd handoff (then the most specific cwd, then the most recent) so an explicit "where we left off" baton is never shadowed by the heuristic one.
+MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. On an operator-distinguishing server, delivery is owner-scoped first: callers see their own plus deliberately shared rows; `shared=true` publishes a manual handoff to the project, while root-only `any_owner=true` is the recovery escape hatch for accept/cancel. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is project-wide by cwd and is preferred over the auto SessionEnd handoff so an explicit "where we left off" baton is never shadowed by the heuristic one. Among cwd-eligible automatic handoffs the newest wins, with cwd specificity only breaking timestamp ties, so stale subdirectory context cannot shadow a newer parent-session handoff. Creating an automatic handoff expires prior open automatic handoffs from the exact cwd and owner. Accepting one atomically expires older automatic candidates eligible for that receiving cwd and carrying the same owner; manual, sibling-directory, and other-owner handoffs remain open.
+
+Handoffs are a next-session transfer rather than live inter-agent messaging.
+Antigravity CLI exposes `PreInvocation` instead of SessionStart, and it fires
+before every model call; only `invocationNum = 0` may perform the destructive
+handoff fetch. This keeps a manual handoff created during wind-down open for
+the next session instead of feeding it back to the same execution loop.
 
 agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
 
@@ -201,7 +207,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 
 | Tool | Purpose | Annotation |
 |---|---|---|
-| `memory_query` | Search + retrieve, FTS5 + optional hybrid RRF | read-only |
+| `memory_query` | Search + retrieve, FTS5 + entity + graph + optional vector RRF | read-only |
 | `memory_recent` | Most-recently-updated `is_latest=1` pages for the project | read-only |
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
 | `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |
@@ -209,11 +215,12 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
 | `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
 | `memory_handoff_cancel` | Mark an exact mistakenly-created open handoff expired | destructive |
-| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
+| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out); target-project `_prompts/consolidation.md` supplies bounded untrusted advisory preferences and `instructions` overrides them once | destructive |
 | `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
+| `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
 | `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical slim CLAUDE.md / AGENTS.md routing block, managed Agent Skill payloads, target hints, and overwrite guidance | read-only |
@@ -293,8 +300,9 @@ Top-line rules carved into the codebase:
 ## 15. Managed workstreams use a portable ledger, not native format conversion
 
 Managed cross-harness continuity is explicitly opt-in through `ai-memory run`.
-Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build
-CLI launches retain the existing hook and single-use handoff behavior. There is
+Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI,
+and Antigravity CLI launches retain the existing hook and single-use handoff
+behavior. There is
 no process-global mode or manual harness switch: the wrapper selects the
 current repository/worktree workstream and each adapter applies that harness's
 native create/resume syntax.

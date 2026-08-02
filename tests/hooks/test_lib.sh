@@ -88,6 +88,62 @@ PAYLOAD_WINDOWS='{"session_id":"x","cwd":"C:\\dev\\myproject"}'
 assert_eq "extract cwd unescapes Windows JSON path" 'C:\dev\myproject' \
     "$(ai_memory_extract_cwd "$PAYLOAD_WINDOWS")"
 
+antigravity_initial() {
+    if ai_memory_antigravity_is_initial_invocation "$1"; then
+        printf 'yes'
+    else
+        printf 'no'
+    fi
+}
+assert_eq "antigravity invocation zero is initial" "yes" \
+    "$(antigravity_initial '{"invocationNum":0,"conversationId":"agy"}')"
+assert_eq "antigravity later invocation is not initial" "no" \
+    "$(antigravity_initial '{"invocationNum":3,"conversationId":"agy"}')"
+assert_eq "antigravity missing invocation fails closed" "no" \
+    "$(antigravity_initial '{"conversationId":"agy"}')"
+assert_eq "antigravity quoted invocation fails closed" "no" \
+    "$(antigravity_initial '{"invocationNum":"0","conversationId":"agy"}')"
+assert_eq "antigravity fractional invocation fails closed" "no" \
+    "$(antigravity_initial '{"invocationNum":0.5,"conversationId":"agy"}')"
+assert_eq "extract antigravity conversation id" "agy" \
+    "$(ai_memory_extract_session_id '{"conversationId":"agy"}')"
+
+FAKE_CURL_BIN="$TMP/fake-curl-bin"
+FAKE_CURL_LOG="$TMP/fake-curl.log"
+mkdir -p "$FAKE_CURL_BIN"
+cat >"$FAKE_CURL_BIN/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$AI_MEMORY_CURL_LOG"
+case "$*" in
+    *'/handoff?'*) printf 'next-session-context' ;;
+esac
+EOF
+chmod +x "$FAKE_CURL_BIN/curl"
+
+rm -f "$FAKE_CURL_LOG"
+AGY_LATER_OUTPUT=$(printf '%s' '{"invocationNum":2,"conversationId":"agy","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/antigravity-cli/session-start.sh)
+assert_eq "antigravity later invocation returns empty hook output" "{}" "$AGY_LATER_OUTPUT"
+assert_eq "antigravity later invocation makes no HTTP request" "0" \
+    "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+
+rm -f "$FAKE_CURL_LOG"
+AGY_INITIAL_OUTPUT=$(printf '%s' '{"invocationNum":0,"conversationId":"agy","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/antigravity-cli/session-start.sh)
+assert_eq "antigravity initial invocation injects handoff" \
+    '{"injectSteps":[{"ephemeralMessage":"next-session-context"}]}' "$AGY_INITIAL_OUTPUT"
+assert_eq "antigravity initial invocation posts then fetches" "2" \
+    "$(wc -l <"$FAKE_CURL_LOG" | tr -d ' ')"
+assert_eq "antigravity handoff fetch carries conversation id" "yes" \
+    "$(grep -q '/handoff?.*session_id=agy' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
+
+PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocation' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q '\$AntigravityPreInvocationOutput -and -not' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
+
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
 next line'

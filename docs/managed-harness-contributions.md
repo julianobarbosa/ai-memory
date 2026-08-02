@@ -1,10 +1,10 @@
 # Adding a managed harness
 
 Managed-workstream support is narrower than MCP or lifecycle-hook support. This
-release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and
-Grok Build CLI. Gemini CLI, Devin CLI, Cursor, and the other integrations in
-the README support matrix do not become managed merely because ai-memory can
-capture their hooks.
+release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP,
+Grok Build CLI, and Antigravity CLI. Gemini CLI, Devin CLI, Cursor, and the
+other integrations in the README support matrix do not become managed merely
+because ai-memory can capture their hooks.
 
 A managed adapter must preserve a harness's real native session, deliver the
 portable workstream delta exactly once, and import only visible history without
@@ -78,8 +78,9 @@ continue, or fork selector.
 
 ## 4. Discover and export read-only
 
-Implement candidate discovery and incremental export in
-`crates/ai-memory-workstream/src/transcript.rs`.
+Implement candidate discovery in `crates/ai-memory-workstream/src/transcript.rs`.
+Implement incremental export only when a documented or repeatably observed
+native format exposes visible conversation records without private state.
 
 The adapter must:
 
@@ -87,17 +88,19 @@ The adapter must:
 - honor documented store-root environment and command-line overrides;
 - open SQLite stores read-only and never create, migrate, vacuum, or repair
   them;
-- tolerate an incomplete final JSONL record or an in-progress tool call without
-  advancing past it;
-- emit deterministic source record and event ids;
-- resume from a persisted source cursor without duplicates;
-- normalize visible user/assistant messages, completed tool calls/results, and
-  compaction summaries; and
+- when export is supported, tolerate an incomplete final record or in-progress
+  tool call without advancing past it;
+- when export is supported, emit deterministic source record and event ids and
+  resume from a persisted source cursor without duplicates;
+- normalize only visible user/assistant messages, completed tool calls/results,
+  and compaction summaries; and
 - exclude system/developer prompts, hidden reasoning, binary payloads,
   credentials, provider metadata, and unsupported records.
 
-Extraction gaps should become bounded loss annotations. They must not cause the
-adapter to copy a private record "just in case."
+Extraction gaps should become bounded loss annotations. If the conversation
+payload is opaque or undocumented, return such an annotation and rely on
+sanitized lifecycle-hook capture instead of guessing. Never copy a private
+record "just in case."
 
 ## 5. Deliver context before acknowledging it
 
@@ -147,10 +150,13 @@ A managed-harness PR should include focused coverage for:
 - deterministic fake-process acceptance in
   `scripts/managed-workstream-acceptance.sh`; and
 - a manual real-harness pass that switches into the new harness, records
-  successful delivery of its assigned context delta, persists a new assistant
-  event, and resumes its original native session when revisited. Do not make
-  pass/fail depend on the model quoting packet text: some harnesses externalize
-  large hook results to a file, making recall depend on a model tool-use choice.
+  successful delivery of its assigned context delta, and resumes its original
+  native session when revisited. Require a new assistant event when the adapter
+  has a readable transcript. A deliberately hook-only adapter must instead
+  prove that a correlated lifecycle observation was persisted and document the
+  bounded transcript-loss annotation. Do not make pass/fail depend on the model
+  quoting packet text: some harnesses externalize large hook results to a file,
+  making recall depend on a model tool-use choice.
 
 The deterministic phase remains credential-free and suitable for frequent
 local runs. Real model calls stay opt-in and outside CI. Record the tested CLI

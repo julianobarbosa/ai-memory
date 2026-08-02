@@ -30,6 +30,7 @@ use crate::http_client::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PREPARE_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
@@ -50,10 +51,35 @@ struct AutoSessionCandidate {
     session: NativeSessionCandidate,
 }
 
+#[derive(Debug, Default)]
+struct HeartbeatHealth {
+    consecutive_failures: u64,
+}
+
+impl HeartbeatHealth {
+    fn record_failure(&mut self) -> bool {
+        let first = self.consecutive_failures == 0;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        first
+    }
+
+    fn record_success(&mut self) -> bool {
+        let recovered = self.consecutive_failures > 0;
+        self.consecutive_failures = 0;
+        recovered
+    }
+}
+
 /// Run one native harness and return its exact process exit code.
 pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let cwd = std::env::current_dir().context("getting managed run working directory")?;
-    let repository = inspect_repository(&cwd)?;
+    run_from(config, args, &cwd).await
+}
+
+/// Run one native harness from an explicit checkout without changing the
+/// parent process's working directory.
+pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
@@ -96,8 +122,8 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let prepare = PrepareManagedRunRequest {
-        workspace,
-        project,
+        workspace: workspace.clone(),
+        project: project.clone(),
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint,
         worktree_fingerprint: repository.worktree_fingerprint,
@@ -123,6 +149,17 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
             return Err(error);
         }
     };
+    if let Err(error) = super::project_registry::record_prepared_checkout(
+        config,
+        &endpoint,
+        &workspace,
+        &project,
+        &repository.cwd,
+    ) {
+        eprintln!(
+            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+        );
+    }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
     macro_rules! acquired_try {
         ($result:expr) => {
@@ -305,7 +342,12 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     }
 
     let started_at = SystemTime::now();
-    let mut command = Command::new(&plan.program);
+    // Spawn the resolved file rather than the bare name: on Windows the name
+    // alone can match an unlaunchable extension-less shim (see
+    // `resolve_program`). Falling back to the plan's own value keeps an
+    // unresolvable program reaching the spawn error below, which explains it.
+    let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
+    let mut command = Command::new(&program);
     command
         .args(&plan.args)
         .current_dir(&repository.cwd)
@@ -369,13 +411,16 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut heartbeat_health = HeartbeatHealth::default();
     let status = loop {
         tokio::select! {
             result = child.wait() => break acquired_try!(result.context("waiting for managed harness")),
             _ = heartbeat.tick() => {
-                if let Err(error) = post_empty(&endpoint, &format!("{run_path}/heartbeat")).await {
-                    eprintln!("ai-memory: managed workstream heartbeat failed: {error}");
-                }
+                let _ = send_managed_heartbeat(
+                    &endpoint,
+                    &run_path,
+                    &mut heartbeat_health,
+                ).await;
             }
         }
     };
@@ -452,6 +497,43 @@ async fn capture_interrupts(interrupted: Arc<AtomicBool>) {
     while tokio::signal::ctrl_c().await.is_ok() {
         interrupted.store(true, Ordering::SeqCst);
     }
+}
+
+async fn send_managed_heartbeat(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    health: &mut HeartbeatHealth,
+) -> Result<()> {
+    send_managed_heartbeat_with_timeout(endpoint, run_path, health, HEARTBEAT_REQUEST_TIMEOUT).await
+}
+
+async fn send_managed_heartbeat_with_timeout(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    health: &mut HeartbeatHealth,
+    request_timeout: Duration,
+) -> Result<()> {
+    let path = format!("{run_path}/heartbeat");
+    let result = tokio::time::timeout(request_timeout, post_empty(endpoint, &path))
+        .await
+        .map_err(|_| anyhow!("request timed out after {request_timeout:?}"))
+        .and_then(|result| result);
+    match &result {
+        Ok(()) if health.record_success() => {
+            eprintln!(
+                "ai-memory: server connection restored; managed workstream heartbeat resumed"
+            );
+        }
+        Ok(()) => {}
+        Err(error) if health.record_failure() => {
+            tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
+            eprintln!(
+                "ai-memory: server unavailable; managed workstream heartbeat will retry quietly"
+            );
+        }
+        Err(_) => {}
+    }
+    result
 }
 
 async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &str) {
@@ -628,33 +710,62 @@ fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsSt
     ))
 }
 
+/// Whether this harness's default executable resolves through `PATH`.
+///
+/// Shared with `show`, so the picker offers exactly the harnesses that
+/// [`ensure_executable_available`] would accept a moment later. Harnesses
+/// reached only through `--executable` are not covered: the picker has no way
+/// to ask for that path.
+pub(super) fn harness_available(choice: RunHarnessChoice) -> bool {
+    executable_available(OsStr::new(managed_harness(choice).executable()))
+}
+
 fn executable_available(program: &OsStr) -> bool {
+    resolve_program(program).is_some()
+}
+
+/// Resolve `program` to a concrete path the OS can actually start, or `None`
+/// when nothing launchable matches.
+///
+/// The bare name is not enough on Windows. An npm-style install drops three
+/// files next to each other — `opencode`, `opencode.cmd`, `opencode.ps1` — and
+/// only the ones carrying a `PATHEXT` extension are launchable: `CreateProcess`
+/// refuses the extension-less shell script, which exists for Git Bash. Probing
+/// for mere existence therefore reported harnesses as present that then failed
+/// to spawn with "program not found". Resolving to the concrete file keeps the
+/// availability check and the launch agreeing on one answer, and lets the
+/// launch use a path that works.
+pub(super) fn resolve_program(program: &OsStr) -> Option<std::path::PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return executable_path_available(path);
+        return resolve_candidate(path);
     }
-    std::env::var_os("PATH").is_some_and(|path_value| {
-        std::env::split_paths(&path_value)
-            .map(|dir| dir.join(path))
-            .any(|candidate| executable_path_available(&candidate))
+    std::env::var_os("PATH").and_then(|path_value| {
+        std::env::split_paths(&path_value).find_map(|dir| resolve_candidate(&dir.join(path)))
     })
 }
 
-fn executable_path_available(path: &Path) -> bool {
-    if executable_file(path) {
-        return true;
-    }
+/// Concrete launchable file for one candidate location.
+fn resolve_candidate(path: &Path) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
-    if path.extension().is_none() {
+    {
+        // An explicit extension is taken at face value; otherwise only a
+        // PATHEXT match counts. Never the extension-less sibling.
+        if path.extension().is_some() && executable_file(path) {
+            return Some(path.to_path_buf());
+        }
         let extensions =
             std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        return extensions
+        extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
             .map(|extension| path.with_extension(extension.trim_start_matches('.')))
-            .any(|candidate| executable_file(&candidate));
+            .find(|candidate| executable_file(candidate))
     }
-    false
+    #[cfg(not(windows))]
+    {
+        executable_file(path).then(|| path.to_path_buf())
+    }
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -816,19 +927,18 @@ async fn choose_native_session_interactive(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut heartbeat_health = HeartbeatHealth::default();
     let selection = loop {
         tokio::select! {
             result = &mut chooser => {
                 break result.context("waiting for the native session choice")?;
             }
             _ = heartbeat.tick() => {
-                if let Err(error) = post_empty(endpoint, &format!("{run_path}/heartbeat")).await {
-                    eprintln!("ai-memory: managed workstream heartbeat failed: {error}");
-                }
+                let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
             }
         }
     };
-    post_empty(endpoint, &format!("{run_path}/heartbeat"))
+    send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
         .await
         .context(
             "renewing the managed workstream after session selection; the agent was not started",
@@ -1112,6 +1222,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
+        RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
     }
 }
 
@@ -1124,6 +1235,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
         AgentKind::Grok => Some(ManagedHarness::Grok),
+        AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         _ => None,
     }
 }
@@ -1143,6 +1255,76 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    /// `show` filters its harness menu with this, so a false positive would
+    /// offer an agent that cannot start.
+    #[test]
+    fn executable_available_rejects_a_program_that_is_not_installed() {
+        assert!(!executable_available(OsStr::new(
+            "ai-memory-no-such-harness-binary"
+        )));
+    }
+
+    /// An absolute path that exists resolves without consulting `PATH`, which
+    /// is the branch `--executable` relies on.
+    #[test]
+    fn executable_available_accepts_an_existing_absolute_path() {
+        let current = std::env::current_exe().unwrap();
+        assert!(executable_available(current.as_os_str()));
+        assert_eq!(
+            resolve_program(current.as_os_str()).as_deref(),
+            Some(current.as_path())
+        );
+    }
+
+    /// npm-style installs drop an extension-less shell script beside the
+    /// `.cmd` wrapper. On Windows only the wrapper is launchable, so probing
+    /// for mere existence reported the harness as available and the launch
+    /// then failed with "program not found".
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_skips_the_extension_less_shim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("faux-harness"), "#!/bin/sh\n").unwrap();
+
+        assert_eq!(
+            resolve_candidate(&tmp.path().join("faux-harness")),
+            None,
+            "an extension-less script is not launchable by CreateProcess"
+        );
+
+        std::fs::write(
+            tmp.path().join("faux-harness.cmd"),
+            "@echo off\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let resolved =
+            resolve_candidate(&tmp.path().join("faux-harness")).expect("the wrapper resolves");
+        // PATHEXT is upper-case, and Windows paths are case-insensitive, so the
+        // resolved name carries whichever casing the probe used.
+        assert_eq!(
+            resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_ascii_lowercase),
+            Some("faux-harness.cmd".to_string()),
+            "the PATHEXT sibling is what should be launched"
+        );
+        assert!(resolved.is_file());
+
+        let status = std::process::Command::new(&resolved)
+            .status()
+            .expect("the resolved wrapper starts");
+        assert!(status.success(), "the resolved wrapper exits successfully");
+    }
+
+    /// Unix has no PATHEXT: the file itself is the answer.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_resolution_returns_the_file_itself() {
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(resolve_candidate(&current), Some(current));
+    }
 
     fn candidates() -> Vec<NativeSessionCandidate> {
         vec![
@@ -1179,6 +1361,64 @@ mod tests {
     fn lease_owner_uses_the_resolved_host_and_process() {
         assert_eq!(lease_owner_label(Some("workstation"), 42), "workstation:42");
         assert_eq!(lease_owner_label(None, 42), "localhost:42");
+    }
+
+    #[test]
+    fn heartbeat_health_reports_each_outage_and_recovery_once() {
+        let mut health = HeartbeatHealth::default();
+
+        assert!(health.record_failure());
+        assert!(!health.record_failure());
+        assert!(!health.record_failure());
+        assert!(health.record_success());
+        assert!(!health.record_success());
+        assert!(health.record_failure());
+    }
+
+    #[tokio::test]
+    async fn managed_heartbeat_times_out_and_recovers() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs/{run_id}/heartbeat",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let mut health = HeartbeatHealth::default();
+
+        assert!(
+            send_managed_heartbeat_with_timeout(
+                &endpoint,
+                "/workstream/runs/test",
+                &mut health,
+                Duration::from_millis(10),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(health.consecutive_failures, 1);
+        send_managed_heartbeat_with_timeout(
+            &endpoint,
+            "/workstream/runs/test",
+            &mut health,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+
+        server.abort();
     }
 
     #[tokio::test]

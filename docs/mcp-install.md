@@ -38,7 +38,7 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
+Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -77,6 +77,15 @@ live ai-memory server. In particular, bearer tokens and endpoint settings
 should stay in environment or local config references rather than generated
 plugin source files.
 
+The hook router does recognize `agent=hermes` as a concrete session kind and
+accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
+tool-family metadata and capture-exclusion enforcement. A custom bridge should
+map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's
+canonical `session-start`, `post-tool-use`, and `session-end` event names while
+forwarding the original JSON object. This protocol recognition does not install
+or trust a third-party plugin. Hermes ignores session-start hook stdout, so it
+cannot consume an automatic handoff there; use MCP `memory_handoff_accept`.
+
 The same lifecycle guidance below applies to Hermes or any other external
 bridge: map known events onto ai-memory's canonical hook events where
 possible, and use extension metadata for source-specific events instead of
@@ -111,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -275,6 +284,56 @@ Aliases: `copilot`, `github-copilot`.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
   <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
+
+---
+
+## Zed
+
+**Status:** MCP supported through Zed's native remote context-server
+configuration. No lifecycle hooks or managed-workstream adapter.
+
+**Config file:** Zed stores MCP servers in its user `settings.json`:
+
+- macOS: `~/.config/zed/settings.json`
+- Linux: `$XDG_CONFIG_HOME/zed/settings.json`, defaulting to
+  `~/.config/zed/settings.json`
+- Windows: `%APPDATA%\Zed\settings.json`
+
+The server map is the top-level `context_servers` key. Remote servers use a
+`url` and may include bearer authentication in `headers`:
+
+```json
+{
+  "context_servers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+Print or apply the configuration with:
+
+```bash
+ai-memory install-mcp --client zed
+ai-memory install-mcp --client zed --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+`--apply` preserves JSONC comments, trailing commas, unrelated Zed settings,
+and other context servers. Zed can call ai-memory's MCP tools, but it does not
+expose compatible session or tool lifecycle hooks. Automatic capture,
+automatic handoff injection, and
+`ai-memory run` continuity are therefore not available; ask the agent to call
+`memory_handoff_begin` before leaving and `memory_handoff_accept` when
+resuming when you need manual continuity.
+
+Sources: <https://zed.dev/docs/ai/mcp>,
+<https://zed.dev/docs/configuring-zed>.
 
 ---
 
@@ -490,9 +549,11 @@ The rendered hooks config looks like:
   the conversation. After the final turn, run
   `ai-memory finalize-session --agent antigravity-cli` to create the final
   summary and automatic handoff and to queue opt-in SessionEnd consolidation.
-- `memory_handoff_begin` always creates an explicit, project-wide manual
-  handoff with no `from_session_id` and `from_agent = other`; that
-  session-neutral shape is the same for every MCP client. Handoffs carrying a
+- `memory_handoff_begin` always creates an explicit manual handoff with no
+  `from_session_id` and `from_agent = other`; it is project-wide for cwd
+  matching but belongs to the creating operator by default. Pass `shared=true`
+  only to publish it to every operator in the project. That session-neutral
+  shape is the same for every MCP client. Handoffs carrying a
   Codex or Claude session id came from canonical SessionEnd processing, not
   from the manual tool. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.
@@ -850,7 +911,8 @@ You: List the MCP tools you can call. Use one of them to check
 Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
-     memory_consolidate, memory_auto_improve, memory_write_page, memory_read_page, memory_delete_page,
+     memory_consolidate, memory_auto_improve, memory_write_page,
+     memory_read_page, memory_delete_page, memory_feedback,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```

@@ -79,7 +79,7 @@ impl OpenAiEmbedder {
         // (small model, but still up to ~30s on first request after
         // unload). Subsequent requests with OLLAMA_KEEP_ALIVE warm are
         // sub-second. When the embedder still fails, memory_query
-        // degrades gracefully to BM25-only (see server.rs).
+        // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
@@ -184,6 +184,73 @@ fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>>
     Ok(first.embedding)
 }
 
+/// Shared OpenAI-shape embedding request: head-truncate, POST
+/// `/embeddings` (bearer auth only when a key is present — local
+/// engines such as Ollama and LM Studio run keyless), retry 429 with
+/// backoff, parse, dim-check, unit-normalise.
+async fn openai_style_embed(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&SecretString>,
+    model: &str,
+    dim: u32,
+    text: &str,
+) -> LlmResult<Vec<f32>> {
+    let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
+    let url = normalize_openai_base(base_url, "embeddings");
+    debug!(
+        url,
+        model,
+        input_chars = input.len(),
+        "POST openai/embeddings"
+    );
+    let req = OpenAiEmbeddingRequest {
+        input: &input,
+        model,
+    };
+    let mut attempt = 0u32;
+    loop {
+        let mut builder = client.post(&url);
+        if let Some(key) = api_key {
+            builder = builder.bearer_auth(key.expose_secret());
+        }
+        let resp = builder.json(&req).send().await?;
+        let status = resp.status();
+        if status.as_u16() == 429 && attempt < 5 {
+            attempt += 1;
+            let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+            debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        // Client errors (e.g. input > 8192 tokens) are not retried.
+        if status.as_u16() == 400 {
+            let body = provider_error_body(resp).await;
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        if !status.is_success() {
+            let body = provider_error_body(resp).await;
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = response_text_limited(resp).await?;
+        let values = parse_openai_embedding_values(&body, status.as_u16())?;
+        if values.len() as u32 != dim {
+            return Err(LlmError::UnexpectedShape(format!(
+                "expected dim {}, got {}",
+                dim,
+                values.len()
+            )));
+        }
+        return Ok(normalise(values));
+    }
+}
+
 #[async_trait]
 impl Embedder for OpenAiEmbedder {
     fn provider(&self) -> &'static str {
@@ -199,61 +266,83 @@ impl Embedder for OpenAiEmbedder {
     }
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
-        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
-        let url = normalize_openai_base(&self.base_url, "embeddings");
-        debug!(
-            url,
-            model = %self.model,
-            input_chars = input.len(),
-            "POST openai/embeddings"
-        );
-        let req = OpenAiEmbeddingRequest {
-            input: &input,
-            model: &self.model,
-        };
-        let mut attempt = 0u32;
-        loop {
-            let resp = self
-                .client
-                .post(&url)
-                .bearer_auth(self.api_key.expose_secret())
-                .json(&req)
-                .send()
-                .await?;
-            let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
-                attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-                debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            // Client errors (e.g. input > 8192 tokens) are not retried.
-            if status.as_u16() == 400 {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            let body = response_text_limited(resp).await?;
-            let values = parse_openai_embedding_values(&body, status.as_u16())?;
-            if values.len() as u32 != self.dim {
-                return Err(LlmError::UnexpectedShape(format!(
-                    "expected dim {}, got {}",
-                    self.dim,
-                    values.len()
-                )));
-            }
-            return Ok(normalise(values));
-        }
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            Some(&self.api_key),
+            &self.model,
+            self.dim,
+            text,
+        )
+        .await
+    }
+}
+
+/// OpenAI-compatible embeddings endpoint (Ollama / LM Studio / vLLM /
+/// OpenRouter). Same wire shape as [`OpenAiEmbedder`], but the base
+/// URL is required, the API key is optional (local engines run
+/// keyless), and vectors are stored under the distinct provider label
+/// `openai-compat` so the `{provider, model, dim}` refuse-on-mismatch
+/// check treats them as their own family.
+pub struct OpenAiCompatEmbedder {
+    client: reqwest::Client,
+    api_key: Option<SecretString>,
+    base_url: String,
+    model: String,
+    dim: u32,
+}
+
+impl OpenAiCompatEmbedder {
+    /// Construct a compat embedder against `base_url`.
+    ///
+    /// # Errors
+    /// Propagates any `reqwest::Error` thrown while building the HTTP
+    /// client.
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<SecretString>,
+        model: impl Into<String>,
+        dim: u32,
+    ) -> LlmResult<Self> {
+        // Same cold-load tolerance as OpenAiEmbedder: first request
+        // after an Ollama model unload can take ~30s.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        Ok(Self {
+            client,
+            api_key,
+            base_url: base_url.into(),
+            model: model.into(),
+            dim,
+        })
+    }
+}
+
+#[async_trait]
+impl Embedder for OpenAiCompatEmbedder {
+    fn provider(&self) -> &'static str {
+        "openai-compat"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_ref(),
+            &self.model,
+            self.dim,
+            text,
+        )
+        .await
     }
 }
 
@@ -276,7 +365,7 @@ impl VoyageEmbedder {
         // (small model, but still up to ~30s on first request after
         // unload). Subsequent requests with OLLAMA_KEEP_ALIVE warm are
         // sub-second. When the embedder still fails, memory_query
-        // degrades gracefully to BM25-only (see server.rs).
+        // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;

@@ -113,6 +113,8 @@ impl MultiUserHarness {
                     pinned: false,
                     links: Vec::new(),
                     author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .expect("seed page");
@@ -161,11 +163,13 @@ impl MultiUserHarness {
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
+            per_user_slots: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
             )),
             home_dir: None,
+            trusted_proxy_identity: false,
         });
 
         // Production-equivalent Bearer middleware. Pepper + reader are

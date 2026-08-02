@@ -37,6 +37,9 @@ pub enum Command {
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
     Run(RunArgs),
+    /// Pick a local project and installed harness, then launch from that
+    /// checkout. Removes the `cd` step `run` requires.
+    Show(ShowArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -231,6 +234,35 @@ pub enum RunHarnessChoice {
     /// Grok Build CLI (xAI).
     #[value(alias = "grok-build")]
     Grok,
+    /// Google Antigravity CLI (`agy`).
+    #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
+    Antigravity,
+}
+
+/// Arguments for `show`.
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// Only list local projects resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Use saved local checkout links only; skip the depth-1 directory scan.
+    #[arg(long)]
+    pub no_scan: bool,
+    /// Print structured project and harness choices instead of opening menus.
+    /// Required when stdin or stdout is not a terminal.
+    #[arg(long)]
+    pub json: bool,
+    /// Disable native permission prompts using the selected harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming or adopting an existing
+    /// harness session. Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
+    /// Native harness arguments, forwarded byte-for-byte and in order.
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    pub native_args: Vec<OsString>,
 }
 
 /// Arguments for `workstream-search`.
@@ -1012,6 +1044,13 @@ pub struct FinalizeSessionArgs {
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
+    /// Finalize sessions belonging to OTHER operators too.
+    ///
+    /// By default only your own (and unattributed) sessions are considered, so
+    /// finalizing cannot end a colleague's live session. Use this to recover a
+    /// teammate's session that died without emitting SessionEnd.
+    #[arg(long, default_value_t = false)]
+    pub all_owners: bool,
     /// Finalize every matching open session instead of just the latest one.
     #[arg(long)]
     pub all: bool,
@@ -1081,6 +1120,11 @@ pub enum McpClient {
     /// design. See `install-mcp --client vscode-copilot`.
     #[value(name = "vscode-copilot", alias = "copilot", alias = "github-copilot")]
     VsCodeCopilot,
+    /// Zed editor - user-level `settings.json` under the platform config
+    /// directory. Zed reads remote MCP servers from the top-level
+    /// `context_servers` map. This integration is MCP-only because Zed
+    /// does not expose ai-memory-compatible lifecycle hooks.
+    Zed,
 }
 
 /// Arguments for `commit`.
@@ -1663,6 +1707,36 @@ mod tests {
     }
 
     #[test]
+    fn show_parses_listing_and_launch_flags_without_consuming_native_args() {
+        let listing = Cli::try_parse_from(["ai-memory", "show", "--json", "--no-scan"])
+            .expect("show listing parses");
+        let Command::Show(listing) = listing.command else {
+            panic!("expected show command");
+        };
+        assert!(listing.json);
+        assert!(listing.no_scan);
+
+        let launch = Cli::try_parse_from([
+            "ai-memory",
+            "show",
+            "--workspace",
+            "team",
+            "--yolo",
+            "--fresh",
+            "--model",
+            "fast",
+        ])
+        .expect("show launch parses");
+        let Command::Show(launch) = launch.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(launch.workspace.as_deref(), Some("team"));
+        assert!(launch.yolo);
+        assert!(launch.fresh);
+        assert_eq!(launch.native_args, ["--model", "fast"]);
+    }
+
+    #[test]
     fn claude_session_aware_mcp_flag_parses() {
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -2119,6 +2193,24 @@ mod tests {
                 "alias {alias} must resolve to the VS Code Copilot MCP client"
             );
         }
+    }
+
+    #[test]
+    fn zed_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "zed",
+            "--server-url",
+            "http://example.test:49374/mcp",
+        ])
+        .unwrap();
+
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp command");
+        };
+        assert!(matches!(args.client, McpClient::Zed));
     }
 
     #[test]

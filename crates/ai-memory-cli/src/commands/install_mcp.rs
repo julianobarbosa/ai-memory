@@ -17,6 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
@@ -38,6 +40,8 @@ enum JsonMcpLocation {
     /// Code documents `servers`, not `mcpServers`, and writing the
     /// wrong key produces a silent no-op rather than an error.
     RootServers,
+    /// Top-level `context_servers` key used by Zed's settings.json.
+    RootContextServers,
 }
 
 /// Run the `install-mcp` subcommand.
@@ -72,6 +76,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
+        McpClient::Zed => render_zed(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -182,7 +187,22 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .context("could not resolve current dir for .vscode/mcp.json default")?
             .join(".vscode")
             .join("mcp.json"),
+        McpClient::Zed => {
+            let config_dir = if cfg!(target_os = "macos") {
+                home()?.join(".config")
+            } else {
+                dirs::config_dir().context("could not locate user config directory for Zed")?
+            };
+            zed_config_path_in(&config_dir, std::env::consts::OS)
+        }
     })
+}
+
+/// Resolve Zed's user settings from the platform config root. The root is
+/// injected so path behavior can be tested without consulting the real home.
+fn zed_config_path_in(config_dir: &Path, target_os: &str) -> PathBuf {
+    let app_dir = if target_os == "windows" { "Zed" } else { "zed" };
+    config_dir.join(app_dir).join("settings.json")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -332,6 +352,7 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         McpClient::Grok => apply_atomic(&path, |existing| {
             mutate_toml(existing, |doc| grok_upsert_mcp_server(doc, args))
         })?,
+        McpClient::Zed => apply_atomic(&path, |existing| zed_upsert_mcp_server(existing, args))?,
         _ => apply_atomic(&path, |existing| {
             mutate_json(existing, |root| upsert_json_mcp_entry(root, args))
         })?,
@@ -349,6 +370,44 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     Ok(())
 }
 
+/// Merge ai-memory into Zed's JSONC settings without discarding comments,
+/// trailing commas, or unrelated formatting.
+fn zed_upsert_mcp_server(existing: &str, args: &InstallMcpArgs) -> Result<String> {
+    let root = CstRootNode::parse(existing, &ParseOptions::default())
+        .context("parsing Zed settings.json as JSONC")?;
+    let settings = root
+        .object_value_or_create()
+        .context("Zed settings.json root is present but not an object")?;
+    let servers = settings
+        .object_value_or_create("context_servers")
+        .context("`context_servers` is present but not an object")?;
+    let entry = serde_json_to_cst(build_json_mcp_entry(args)?);
+    if let Some(existing_entry) = servers.get(&args.name) {
+        existing_entry.set_value(entry);
+    } else {
+        servers.append(&args.name, entry);
+    }
+    Ok(root.to_string())
+}
+
+fn serde_json_to_cst(value: serde_json::Value) -> CstInputValue {
+    match value {
+        serde_json::Value::Null => CstInputValue::Null,
+        serde_json::Value::Bool(value) => CstInputValue::Bool(value),
+        serde_json::Value::Number(value) => CstInputValue::Number(value.to_string()),
+        serde_json::Value::String(value) => CstInputValue::String(value),
+        serde_json::Value::Array(values) => {
+            CstInputValue::Array(values.into_iter().map(serde_json_to_cst).collect())
+        }
+        serde_json::Value::Object(values) => CstInputValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, serde_json_to_cst(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
     match client {
         McpClient::ClaudeCode
@@ -364,6 +423,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         // shape OpenClaw uses.
         McpClient::Openclaw | McpClient::Zero => Some(JsonMcpLocation::NestedMcpServers),
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
+        McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
@@ -424,6 +484,14 @@ fn upsert_json_mcp_entry(
                 .context("`servers` is present but not an object")?;
             servers.insert(args.name.clone(), entry);
         }
+        JsonMcpLocation::RootContextServers => {
+            let servers = root
+                .entry("context_servers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`context_servers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
     }
     Ok(())
 }
@@ -443,6 +511,9 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
             }),
             JsonMcpLocation::RootServers => json!({
                 "servers": { args.name.as_str(): entry }
+            }),
+            JsonMcpLocation::RootContextServers => json!({
+                "context_servers": { args.name.as_str(): entry }
             }),
         };
     Ok(serde_json::to_string_pretty(&fragment)?)
@@ -507,7 +578,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("command".into(), json!("npx"));
             entry.insert("args".into(), serde_json::Value::Array(cmd_args));
         }
-        McpClient::Cursor => {
+        McpClient::Cursor | McpClient::Zed => {
             entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
@@ -1032,6 +1103,23 @@ fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_zed(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Zed - merge into settings.json:\n\
+         #   - macOS:   ~/.config/zed/settings.json\n\
+         #   - Linux:   $XDG_CONFIG_HOME/zed/settings.json\n\
+         #              (defaults to ~/.config/zed/settings.json)\n\
+         #   - Windows: %APPDATA%\\Zed\\settings.json\n\
+         #\n\
+         # Zed reads remote MCP servers from the top-level\n\
+         # `context_servers` map. This is MCP-only: Zed does not expose\n\
+         # ai-memory-compatible lifecycle hooks, so automatic capture and\n\
+         # managed-workstream continuity are not active.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1181,114 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn zed_config_path_uses_platform_conventions() {
+        for (target_os, root, expected) in [
+            (
+                "linux",
+                "/home/alice/.config",
+                "/home/alice/.config/zed/settings.json",
+            ),
+            (
+                "macos",
+                "/Users/alice/.config",
+                "/Users/alice/.config/zed/settings.json",
+            ),
+            (
+                "windows",
+                "C:/Users/alice/AppData/Roaming",
+                "C:/Users/alice/AppData/Roaming/Zed/settings.json",
+            ),
+        ] {
+            assert_eq!(
+                zed_config_path_in(Path::new(root), target_os),
+                PathBuf::from(expected),
+                "target OS: {target_os}"
+            );
+        }
+    }
+
+    #[test]
+    fn zed_renderer_uses_context_servers_and_native_remote_http() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::Zed)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "context_servers": {
+                    "ai-memory": {
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        }
+                    }
+                }
+            })
+        );
+        assert!(
+            render_zed(&args_for(McpClient::Zed))
+                .unwrap()
+                .contains("MCP-only")
+        );
+    }
+
+    #[test]
+    fn zed_apply_preserves_settings_and_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{
+  // Keep this user comment.
+  "theme": "One Dark",
+  "context_servers": {
+    // Keep this sibling comment.
+    "other": { "url": "https://other.example/mcp" },
+  },
+}
+"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::Zed);
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(second.contains("// Keep this user comment."));
+        assert!(second.contains("// Keep this sibling comment."));
+        let root = CstRootNode::parse(&second, &ParseOptions::default()).unwrap();
+        let value = root.to_serde_value().unwrap();
+        assert_eq!(value["theme"], "One Dark");
+        assert_eq!(
+            value["context_servers"]["other"]["url"],
+            "https://other.example/mcp"
+        );
+        assert_eq!(
+            value["context_servers"]["ai-memory"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+    }
+
+    #[test]
+    fn zed_apply_rejects_non_object_context_servers_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        let original = "{\n  // User-owned invalid shape.\n  \"context_servers\": false,\n}\n";
+        fs::write(&config_path, original).unwrap();
+        let mut args = args_for(McpClient::Zed);
+        args.config_file = Some(config_path.clone());
+
+        let error = apply_to_config_file(&args).unwrap_err();
+
+        assert!(error.to_string().contains("not an object"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
     }
 
     #[test]
@@ -1289,6 +1485,7 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
+            McpClient::Zed => render_zed(&args).unwrap(),
         }
     }
 
@@ -1311,6 +1508,7 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::VsCodeCopilot,
+            McpClient::Zed,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -1347,6 +1545,7 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::VsCodeCopilot,
+            McpClient::Zed,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -1376,6 +1575,7 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
+            McpClient::Zed => render_zed(&args).unwrap(),
         }
     }
 
@@ -1536,6 +1736,10 @@ mod tests {
         assert!(vsc.contains("\"servers\""));
         assert!(!vsc.contains("\"mcpServers\""));
         assert!(vsc.contains("\"type\": \"http\""));
+        let zed = render_for_test(McpClient::Zed);
+        assert!(zed.contains("\"context_servers\""));
+        assert!(!zed.contains("\"mcpServers\""));
+        assert!(!zed.contains("\"type\": \"http\""));
     }
 
     /// Kimi Code resolves its mcp.json under $KIMI_CODE_HOME when the env

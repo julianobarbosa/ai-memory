@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 
 use ai_memory_core::{ProjectId, Tier, WorkspaceId};
-use ai_memory_store::{DecayParams, ReaderPool, retention_score};
+use ai_memory_store::{DecayParams, ReaderPool, retention_score_with_breadth};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+
+use crate::sweep::access_breadth_for_scoring;
 
 const US_PER_DAY: f64 = 86_400_000_000.0;
 
@@ -81,11 +83,49 @@ pub async fn run_curator_report(
     project_name: &str,
     params: CuratorParams,
 ) -> ai_memory_store::StoreResult<CuratorReport> {
+    run_curator_report_with_breadth(
+        reader,
+        workspace_id,
+        project_id,
+        workspace_name,
+        project_name,
+        params,
+        0.0,
+    )
+    .await
+}
+
+/// Build a curator report using the same optional access-breadth term as the
+/// forget sweep.
+///
+/// # Errors
+/// Propagates store failures and rejects negative or non-finite breadth
+/// coefficients.
+pub async fn run_curator_report_with_breadth(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workspace_name: &str,
+    project_name: &str,
+    params: CuratorParams,
+    breadth_weight: f64,
+) -> ai_memory_store::StoreResult<CuratorReport> {
+    if !breadth_weight.is_finite() || breadth_weight < 0.0 {
+        return Err(ai_memory_store::StoreError::InvalidState(
+            "decay breadth_weight must be a finite number greater than or equal to zero".into(),
+        ));
+    }
     let now = Timestamp::now();
     let now_us = now.as_microsecond();
     let mut findings = Vec::new();
 
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
+    // `cold_episodic` is a prediction of what the forget sweep would evict, so
+    // it has to score pages the way the sweep scores them. Scoring blind to
+    // breadth reported pages as cold that the sweep, with `breadth_weight > 0`,
+    // will never touch.
+    let breadth =
+        access_breadth_for_scoring(reader, workspace_id, project_id, breadth_weight).await?;
     let mut cold = Vec::new();
     for c in &candidates {
         if c.tier != Tier::Episodic || c.pinned || frontmatter_pinned(&c.frontmatter_json) {
@@ -93,11 +133,14 @@ pub async fn run_curator_report(
         }
         let page_age_days = age_days(now_us, c.updated_at_us);
         let days_since_access = c.last_accessed_at_us.map(|us| age_days(now_us, us));
-        let score = retention_score(
+        let score = retention_score_with_breadth(
             &params.decay_params,
             page_age_days,
             c.access_count,
             days_since_access,
+            c.salience,
+            breadth.get(&c.id).copied().unwrap_or(0),
+            breadth_weight,
         );
         if score < params.decay_params.cold_threshold {
             cold.push(CuratorFinding {
@@ -506,6 +549,8 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();

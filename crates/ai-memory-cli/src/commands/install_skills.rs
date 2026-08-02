@@ -69,6 +69,11 @@ pub(super) fn run_prepared(prepared: PreparedInstall) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn run_prepared_quiet(prepared: PreparedInstall) -> Result<()> {
+    let _ = apply_prepared_install(prepared)?;
+    Ok(())
+}
+
 fn print_reports(reports: Vec<InstallReport>) {
     for report in reports {
         println!(

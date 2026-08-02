@@ -8,6 +8,13 @@ use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
 
+#[cfg(unix)]
+fn sha256_file(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -20,6 +27,7 @@ fn read_repo(path: &str) -> String {
     let path = repo_root().join(path);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 // Unix-only alongside run_wrapper_on_fake_macos below — these helpers'
@@ -150,6 +158,23 @@ fn aur_packages_install_all_native_assets() {
 fn docker_source_build_uses_vendored_tailwind() {
     let dockerfile = read_repo("docker/Dockerfile");
     assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli"));
+}
+
+#[test]
+fn docker_context_excludes_operator_deployment_files() {
+    let dockerignore = read_repo(".dockerignore");
+    let protected_suffix = concat!(
+        "# Operator-specific deployment files. Keep this block last so a later negation\n",
+        "# cannot re-include credentials or host configuration in the build context.\n",
+        "/bin/deploy.env\n",
+        "/docker/.env.production\n",
+        "/docker/docker-compose.prod.yml\n",
+    );
+
+    assert!(
+        dockerignore.ends_with(protected_suffix),
+        "operator deployment exclusions must remain the final Docker ignore rules"
+    );
 }
 
 #[test]
@@ -337,6 +362,409 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     );
     assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
     assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
+}
+
+#[test]
+fn wrapper_updates_and_install_docs_use_verified_release_assets() {
+    let wrapper = read_repo("bin/ai-memory");
+    assert!(wrapper.contains("releases/latest/download/ai-memory-wrapper"));
+    assert!(wrapper.contains("WRAPPER_SHA256_URL"));
+    assert!(wrapper.contains("wrapper checksum mismatch; refusing update"));
+    assert!(!wrapper.contains("raw.githubusercontent.com/akitaonrails/ai-memory/main"));
+
+    let release = read_repo(".github/workflows/release.yml");
+    for asset in [
+        "ai-memory-wrapper",
+        "ai-memory-wrapper.ps1",
+        "ai-memory-wrapper.cmd",
+        "ai-memory-install-hooks",
+        "ai-memory-hooks.tar.gz",
+    ] {
+        assert!(release.contains(asset), "release must publish {asset}");
+        assert!(
+            release.contains(&format!("{asset}.sha256")),
+            "release must publish a checksum for {asset}"
+        );
+    }
+    assert!(release.contains("permissions:\n  contents: read"));
+    assert!(release.contains("github-release:"));
+    assert!(release.contains("contents: write"));
+
+    for path in ["README.md", "docs/install.md", "docs/windows.md"] {
+        let docs = read_repo(path);
+        assert!(
+            !docs.contains("raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory"),
+            "{path} must not install an executable from mutable main"
+        );
+    }
+    let install_docs = read_repo("docs/install.md");
+    assert!(
+        !install_docs.contains("raw.githubusercontent.com/akitaonrails/ai-memory/main/scripts"),
+        "hook installation docs must not execute mutable main"
+    );
+    let hook_installer = read_repo("scripts/install-hooks.sh");
+    assert!(hook_installer.contains("ARCHIVE=\"ai-memory-hooks.tar.gz\""));
+    assert!(hook_installer.contains("$BASE_URL/$ARCHIVE.sha256"));
+    assert!(hook_installer.contains("hook bundle checksum mismatch; refusing installation"));
+    assert!(hook_installer.contains("tar -xOf"));
+    assert!(!hook_installer.contains("tar -xzf"));
+    assert!(!hook_installer.contains("raw.githubusercontent.com"));
+}
+
+#[test]
+fn github_actions_are_pinned_to_full_commits() {
+    for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let workflow = read_repo(path);
+        for line in workflow.lines().filter(|line| line.contains("uses: ")) {
+            let Some(reference) = line
+                .split('@')
+                .nth(1)
+                .and_then(|value| value.split_whitespace().next())
+            else {
+                continue;
+            };
+            assert!(
+                reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()),
+                "{path} action is not pinned to a full commit: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
+    for (path, expected_fixed_jobs) in [
+        (".github/workflows/ci.yml", 1),
+        (".github/workflows/release.yml", 3),
+    ] {
+        let workflow = read_repo(path);
+        let lines = workflow.lines().collect::<Vec<_>>();
+        let mut fixed_jobs = 0;
+        for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
+            line.contains("uses: dtolnay/rust-toolchain@") && line.ends_with("# 1.95")
+        }) {
+            fixed_jobs += 1;
+            assert_eq!(
+                lines.get(index + 1).map(|line| line.trim()),
+                Some("with:"),
+                "{path} must configure the fixed toolchain after: {line}"
+            );
+            assert_eq!(
+                lines.get(index + 2).map(|line| line.trim()),
+                Some("toolchain: \"1.95\""),
+                "{path} must keep its # 1.95 job on Rust 1.95"
+            );
+        }
+
+        assert_eq!(
+            fixed_jobs, expected_fixed_jobs,
+            "{path} has an unexpected number of fixed Rust jobs"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_self_upgrade_rejects_a_checksum_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let wrapper = bin_dir.join("ai-memory");
+    let original = read_repo("bin/ai-memory");
+    std::fs::write(&wrapper, &original).unwrap();
+
+    let payload = tmp.path().join("hostile-wrapper");
+    std::fs::write(
+        &payload,
+        "#!/usr/bin/env bash\nprintf 'hostile payload executed\\n' >&2\nexit 91\n",
+    )
+    .unwrap();
+    let curl = bin_dir.join("curl");
+    std::fs::write(
+        &curl,
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         url=''\n\
+         out=''\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -*) shift ;;\n\
+             *) url=\"$1\"; shift ;;\n\
+           esac\n\
+         done\n\
+         case \"$url\" in\n\
+           *.sha256) printf '%064d  ai-memory-wrapper\\n' 0 > \"$out\" ;;\n\
+           *) cp \"$FAKE_WRAPPER_PAYLOAD\" \"$out\" ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    let docker = bin_dir.join("docker");
+    std::fs::write(&docker, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in [&wrapper, &payload, &curl, &docker] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let path = format!(
+        "{}:{}",
+        shell_path(&bin_dir),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = shell_script_command(&wrapper)
+        .arg("upgrade")
+        .env("PATH", path)
+        .env("HOME", tmp.path())
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env(
+            "AI_MEMORY_WRAPPER_URL",
+            "https://example.invalid/ai-memory-wrapper",
+        )
+        .env("FAKE_WRAPPER_PAYLOAD", &payload)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "upgrade failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("wrapper checksum mismatch; refusing update"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("hostile payload executed"));
+    assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_self_upgrade_installs_and_runs_a_verified_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let wrapper = bin_dir.join("ai-memory");
+    std::fs::write(&wrapper, read_repo("bin/ai-memory")).unwrap();
+
+    let payload = tmp.path().join("verified-wrapper");
+    let payload_body = "#!/usr/bin/env bash\nprintf 'verified wrapper executed\\n'\n";
+    std::fs::write(&payload, payload_body).unwrap();
+    let curl = bin_dir.join("curl");
+    std::fs::write(
+        &curl,
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         url=''\n\
+         out=''\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -*) shift ;;\n\
+             *) url=\"$1\"; shift ;;\n\
+           esac\n\
+         done\n\
+         case \"$url\" in\n\
+           *.sha256) printf '%s  ai-memory-wrapper\\n' \"$FAKE_WRAPPER_CHECKSUM\" > \"$out\" ;;\n\
+           *) cp \"$FAKE_WRAPPER_PAYLOAD\" \"$out\" ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in [&wrapper, &payload, &curl] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let path = format!(
+        "{}:{}",
+        shell_path(&bin_dir),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = shell_script_command(&wrapper)
+        .arg("upgrade")
+        .env("PATH", path)
+        .env("HOME", tmp.path())
+        .env(
+            "AI_MEMORY_WRAPPER_URL",
+            "https://example.invalid/ai-memory-wrapper",
+        )
+        .env("FAKE_WRAPPER_PAYLOAD", &payload)
+        .env("FAKE_WRAPPER_CHECKSUM", sha256_file(&payload))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "upgrade failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("verified wrapper executed"));
+    assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), payload_body);
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_installer_rejects_a_checksum_mismatch_before_writing_scripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let curl = bin_dir.join("curl");
+    std::fs::write(
+        &curl,
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         url=''\n\
+         out=''\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -*) shift ;;\n\
+             *) url=\"$1\"; shift ;;\n\
+           esac\n\
+         done\n\
+         case \"$url\" in\n\
+           *.sha256) printf '%064d  ai-memory-hooks.tar.gz\\n' 0 > \"$out\" ;;\n\
+           *) printf 'not the expected archive' > \"$out\" ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        shell_path(&bin_dir),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let destination = tmp.path().join("hooks");
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "claude-code", "--to"])
+        .arg(&destination)
+        .env("PATH", path)
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "checksum mismatch must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("hook bundle checksum mismatch; refusing installation")
+    );
+    let agent_dir = destination.join("claude-code");
+    assert!(
+        !agent_dir.exists() || std::fs::read_dir(agent_dir).unwrap().next().is_none(),
+        "no hook script may be written before archive verification"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
+    const HOOKS: &[&str] = &[
+        "post-tool-use",
+        "pre-compact",
+        "pre-tool-use",
+        "session-end",
+        "session-start",
+        "stop",
+        "user-prompt-submit",
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = tmp.path().join("bundle/hooks/claude-code");
+    std::fs::create_dir_all(&bundle).unwrap();
+    for hook in HOOKS {
+        std::fs::write(
+            bundle.join(format!("{hook}.sh")),
+            format!("#!/usr/bin/env bash\nprintf '{hook}\\n'\n"),
+        )
+        .unwrap();
+    }
+    let archive = tmp.path().join("ai-memory-hooks.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(tmp.path().join("bundle"))
+        .arg("hooks")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let curl = bin_dir.join("curl");
+    std::fs::write(
+        &curl,
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         url=''\n\
+         out=''\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -*) shift ;;\n\
+             *) url=\"$1\"; shift ;;\n\
+           esac\n\
+         done\n\
+         case \"$url\" in\n\
+           *.sha256) printf '%s  ai-memory-hooks.tar.gz\\n' \"$FAKE_HOOK_CHECKSUM\" > \"$out\" ;;\n\
+           *) cp \"$FAKE_HOOK_ARCHIVE\" \"$out\" ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        shell_path(&bin_dir),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let destination = tmp.path().join("installed-hooks");
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "claude-code", "--to"])
+        .arg(&destination)
+        .env("PATH", path)
+        .env("HOME", tmp.path())
+        .env("FAKE_HOOK_ARCHIVE", &archive)
+        .env("FAKE_HOOK_CHECKSUM", sha256_file(&archive))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed = destination.join("claude-code");
+    let mut names = std::fs::read_dir(&installed)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut expected = HOOKS
+        .iter()
+        .map(|hook| format!("{hook}.sh"))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(names, expected);
+    use std::os::unix::fs::PermissionsExt as _;
+    for name in names {
+        assert_ne!(
+            std::fs::metadata(installed.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
 }
 
 #[cfg(unix)]

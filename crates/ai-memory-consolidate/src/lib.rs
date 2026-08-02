@@ -56,13 +56,13 @@ pub use consolidator::{
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
-    run_curator_report,
+    run_curator_report, run_curator_report_with_breadth,
 };
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
-pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};
+pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep, run_sweep_with_breadth};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
     SlotKind,

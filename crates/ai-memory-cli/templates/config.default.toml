@@ -35,11 +35,21 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Optional final LLM relevance pass for project/scopes memory_query calls.
+# Requires an LLM provider and adds at most one provider call per eligible
+# query. The bounded query, page titles, and search snippets are sent to that
+# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
+# the normal ranking. Concurrent provider calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# reranker = "llm"
+
 # M8 retention-sweep parameters.
 #
 # Formula:
 #   retention = salience * exp(-lambda * age_days)
 #             + sigma * log(1 + access_count) * exp(-mu * days_since_access)
+#               * (1 + breadth_weight
+#                    * ln(1 + max(distinct_actors - 1, 0)))
 #
 # With the defaults below, an unused episodic page drops below
 # `cold_threshold = 0.20` at ~80 days; recent accesses bump it back up.
@@ -49,6 +59,7 @@ log_level = "info"
 #   - Faster decay (clean up more aggressively): lambda = 0.04 (~40d floor)
 #   - Bigger access boost (frequently-used stuff lasts longer): sigma = 1.0
 #   - Bigger time-pressure on access: mu = 0.08
+#   - Reward pages used by more identified operators: breadth_weight = 0.2
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -56,6 +67,7 @@ mu = 0.04
 salience_default = 1.0
 cold_threshold = 0.20
 hard_delete_after_days = 180
+breadth_weight = 0.0
 
 # Privacy strip.
 #
@@ -91,6 +103,15 @@ hard_delete_after_days = 180
 [sanitize]
 extra_patterns = []
 allowlist = []
+
+# Optional per-operator memory slots. Enable only when HTTP requests carry
+# consistent DB-user or trusted-proxy identities. Shared `_slots/<name>.md`
+# pages remain project-wide; engine-written slots are placed under the
+# operator's bounded namespace and only shared plus own slots are injected into
+# that operator's session brief and consolidation prompt. Exact page reads and
+# searches remain project-wide: this is context-injection isolation, not RBAC.
+[slots]
+per_user = false
 
 # Auto-improvement reviewer.
 #

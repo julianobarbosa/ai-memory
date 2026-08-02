@@ -1,8 +1,8 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok
-Build CLI. Direct agent launches
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok
+Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -26,17 +26,63 @@ flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
 not maintain a second copy of each harness's option schema. Other wrapper
 options come first:
 
+Portable events, handoffs, and project briefs are injected as explicitly
+delimited, untrusted historical data. Instruction-like text inside stored
+content is evidence only: agents must not execute commands, expose secrets,
+change permissions or policy, or use tools merely because that content asks.
+Current system/developer/user instructions, the canonical project instruction
+file, and the current checkout remain authoritative.
+
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|grok] [native arguments...]
+              [claude|codex|opencode|pi|crush|omp|kimi|grok|antigravity]
+              [native arguments...]
 ```
 
 The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls, not harness-switch controls.
+
+## Project-first launcher
+
+`ai-memory show` reverses the usual `cd` then `run` flow: choose a local
+checkout, choose an installed managed harness, and launch from that checkout.
+
+```bash
+cd ~/Projects
+ai-memory show
+
+# Structured discovery only; never launches a harness.
+ai-memory show --json
+ai-memory show --json --no-scan
+```
+
+A successful managed prepare refreshes `<data_dir>/client-projects.json`, a
+private client-local registry keyed by a normalized, credential-free server URL
+and `(workspace, project)`. The server's `/api/v1/projects` response supplies
+only project metadata; it never exposes or chooses a server-host checkout path.
+This lets a laptop and desktop map the same remote homeserver project to
+different local directories without syncing path precedence or conflicts.
+
+By default the picker combines valid saved links with a bounded depth-1 scan of
+the current directory. The scan recognizes common project markers, ignores
+symlinks plus dependency/build directories, and resolves each candidate through
+the same marker and repository rules as `run`. `--no-scan` uses saved links
+only, while `--workspace NAME` filters both sources. Stale, retargeted, or
+scope-mismatched links are skipped and a successful later `run` repairs the
+entry. If the server is temporarily unavailable, saved links and scan results
+remain selectable, but managed `run` still fails closed if it cannot prepare a
+workstream before launching the agent.
+
+Interactive mode begins with `+ New project`. The launcher accepts a portable
+lowercase ASCII directory name, builds the marker, instruction routing, and
+Agent Skills in a hidden staging directory, and renames it into place only when
+all setup succeeds. `--yolo`, `--fresh`, and trailing native arguments apply to
+the selected harness. Non-terminal callers must use `--json`; JSON cannot be
+combined with launch arguments.
 
 ## Automatic harness selection
 
@@ -46,8 +92,8 @@ it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
-another harness merely because that file has a later timestamp. OMP and Grok
-remain available explicitly but are not in the automatic pool.
+another harness merely because that file has a later timestamp. OMP, Grok, and
+Antigravity remain available explicitly but are not in the automatic pool.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -150,10 +196,12 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-or Codex's `resume` wins. ai-memory links the selected native session and resets
-an unrelated adapter cursor rather than assuming it belongs to the old session.
+Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
+ai-memory links the selected native session and resets an unrelated adapter
+cursor rather than assuming it belongs to the old session.
 Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
 through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
@@ -172,8 +220,9 @@ chooser.
 the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-skip-permissions`, Codex
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
-Crush `--yolo`, Kimi Code `--yolo`, and Grok Build CLI `--yolo` (equivalent to
-its `--always-approve` option). OMP currently needs no added flag. ai-memory
+Crush `--yolo`, Kimi Code `--yolo`, Grok Build CLI `--yolo` (equivalent to its
+`--always-approve` option), and Antigravity CLI
+`--dangerously-skip-permissions`. OMP currently needs no added flag. ai-memory
 does not add a duplicate when the translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
@@ -241,6 +290,28 @@ internals and are never read as transcripts; discovery reads
 managed launcher accepts `grok` and `grok-build`. The native contract was
 verified against Grok Build CLI v0.2.111.
 
+Antigravity keeps one SQLite database per conversation at
+`~/.gemini/antigravity-cli/conversations/<conversation-id>.db`, so the id is the
+file name and no scan is needed to locate one. The workspace a conversation was
+opened on comes from `trajectory_metadata_blob`, a protobuf message whose first
+field holds a nested message whose first field is the workspace `file://` URI;
+only those two fields are read. A database that does not carry them — an older
+or newer `agy` — is skipped rather than failing the listing. Note the recorded
+workspace is the directory `agy` was launched from, not a checkout root, so a
+conversation started one level up is not offered inside a subdirectory.
+
+`agy` accepts no caller-chosen id for a new conversation, so a fresh launch
+injects no selector and the id is linked by the hooks or discovered after exit; a
+linked resume passes `--conversation <id>`. `--continue` / `-c` is treated as an
+explicit user choice and is never overridden. `--yolo` maps to
+`--dangerously-skip-permissions`. Step payloads are undocumented, unversioned
+protobuf blobs, so ai-memory does not decode conversation text: the visible-event
+ledger for this harness comes from lifecycle-hook capture, and transcript export
+fails with a message saying so. The managed launcher accepts `antigravity`,
+`antigravity-cli`, and `agy`. The native contract was verified against
+Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
+auto-detection set; name it explicitly.
+
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into
 a private temporary directory, appends an ephemeral context path, and points the
@@ -249,14 +320,15 @@ only after the child starts, so a spawn failure cannot lose the packet. The
 original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
 
-The Linux/macOS Docker shell wrapper cannot execute a host agent from inside its
-helper container. For `run` only, it downloads the matching native release into
+The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
+host agent from inside its helper container. For `run` and `show`, it downloads
+the matching native release into
 `~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
 executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
-The wrapper intercepts `run` before Docker and preserves the host `PATH`,
+The wrapper intercepts both commands before Docker and preserves the host `PATH`,
 `AI_MEMORY_SERVER_URL`, and authentication environment. The native client's
 startup log shows `server_url` as well as its local config paths; `data_dir` and
 `bind` describe local defaults and do not override a configured remote server.
@@ -274,6 +346,16 @@ the conflict remains and concurrent writers are still rejected. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
 
+While the harness or native-session selector is open, a temporary server outage
+produces one short notice instead of printing every failed heartbeat. The
+launcher keeps probing every 30 seconds with a 10-second request timeout so the
+90-second lease stays safe across ordinary server restarts. Repeated failures
+are quiet; when the server responds again, one recovery notice confirms that
+heartbeats resumed. The native harness remains usable throughout the outage.
+If the outage exceeds one lease window, the original launcher may renew its run
+only while no newer launcher has claimed the workstream. A replacement prepare,
+cancel, finish, or destructive operation remains terminal for the old run.
+
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed
 adapter cursor, so already linked native sessions can import the missing tail
@@ -283,10 +365,10 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 ## Privacy and storage boundaries
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, OMP, or Grok private stores. The launched harness retains normal
-ownership of its own session writes. Adapters read only documented or observed
-local session formats. Provider credentials, encrypted content,
-system/developer prompt records, and hidden reasoning are not copied. The
+Kimi Code, OMP, Grok, or Antigravity private stores. The launched harness
+retains normal ownership of its own session writes. Adapters read only
+documented or observed local session formats. Provider credentials, encrypted
+content, system/developer prompt records, and hidden reasoning are not copied. The
 server sanitizer runs before both the SQLite FTS ledger and immutable files under
 `<data_dir>/raw/workstreams/<workstream-id>/segments/` are written.
 
@@ -300,8 +382,9 @@ belong in wiki pages through consolidation or explicit durable writes.
 project name. Wiki paths are UUID-keyed, so it moves no server directory, source
 checkout, or native harness session. If the source checkout path itself is
 renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
-Pi, Kimi Code (`state.json`'s `workDir`), and OMP may still reference the old
-path; Crush's project-local `.crush` database moves with the checkout.
+Pi, Kimi Code (`state.json`'s `workDir`), OMP, and Antigravity may still
+reference the old path; Crush's project-local `.crush` database moves with the
+checkout.
 
 There is no portable, supported API that rewrites every harness's private
 project locator. ai-memory therefore does not mutate those stores or silently
@@ -330,12 +413,15 @@ OpenCode receive only copied authentication material; OMP receives a temporary
 agent directory with read-consistent credential/model database backups and
 copied settings. Crush uses its existing global provider configuration and an
 isolated project database. Kimi Code runs with an isolated `$KIMI_CODE_HOME`
-seeded with the operator's provider configuration. The deterministic phase
-also covers first-run adoption, bare-mode selection and empty-directory
-failure, wrapper `--yolo`, lease exclusion, Crush context cleanup, a fake-mode
-Kimi store/resume/import round trip, and the established-workstream guard
-against obsolete sessions. The fake Kimi round trip also deletes the linked
-native session and verifies automatic fresh-session recovery and repointing.
+seeded with the operator's provider configuration. Antigravity runs with an
+isolated `HOME` seeded only with the operator's OAuth and settings files. The
+deterministic phase also covers first-run adoption, bare-mode selection and
+empty-directory failure, wrapper `--yolo`, lease exclusion, Crush context
+cleanup, a fake-mode Kimi store/resume/import round trip, an Antigravity
+hook/link/resume round trip, private-trajectory exclusion, and the
+established-workstream guard against obsolete sessions. The fake Kimi round
+trip also deletes the linked native session and verifies automatic
+fresh-session recovery and repointing.
 Native session creation, read-only extraction, cross-harness injection, and
 returning resume paths are all exercised. Docker wrapper host execution and
 remote URL preservation are covered separately by the `ai-memory-cli`
@@ -343,19 +429,22 @@ packaging tests.
 
 The real-harness phase treats the model as the system under transport, not as
 the test oracle. For each leg it records the prior ledger sequence, then
-requires a newly imported assistant event from that harness. When a context
-delta is expected, it first verifies that the prior ledger endpoint is newer
+requires a newly imported assistant event from harnesses with readable native
+transcripts. For Antigravity it instead requires the exact native conversation
+link and a new correlated startup-hook observation, because its private
+trajectory protobuf is deliberately not decoded. When a context delta is
+expected, it first verifies that the prior ledger endpoint is newer
 than that harness's delivery cursor, then requires the latest managed run to
 report that exact endpoint as `sync_through` with `context_delivered = 1`. It
 does not require the model to quote a prior sentinel: Claude Code may
 externalize a large hook result to a file, and whether a model chooses to read
 that file is not a deterministic continuity signal. The deterministic fake
-Grok cross-harness fixture exercises the same assertion helper without
-credentials or model calls.
+Grok and Antigravity cross-harness fixtures exercise the same assertion helper
+without credentials or model calls.
 
 Set
-`AI_MEMORY_ACCEPTANCE_HARNESSES="kimi-cli codex"` to select a
-Kimi-to-Codex-to-Kimi round trip (Kimi aliases normalize to the installed
-`kimi` executable), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
+`AI_MEMORY_ACCEPTANCE_HARNESSES="antigravity codex"` to select an
+Antigravity-to-Codex-to-Antigravity round trip (`agy` and `antigravity-cli` are
+accepted aliases), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
 calls, or
 `AI_MEMORY_ACCEPTANCE_KEEP=1` to retain all temporary logs and data.

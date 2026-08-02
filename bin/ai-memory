@@ -10,6 +10,7 @@
 # Special wrapper-only subcommands (not forwarded to the binary):
 #   ai-memory upgrade       Pull the latest image + remind to re-stage hooks.
 #   ai-memory run ...       Use a cached native client so it can exec host agents.
+#   ai-memory show ...      Use that client for host project/harness discovery.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -22,7 +23,10 @@
 #   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native ai-memory binary used for `run` (optional)
+#   AI_MEMORY_NATIVE_BIN    native ai-memory binary used for `run`/`show` (optional)
+#   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
+#                           .sha256 companion is required)
+#   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
 #   CLAUDE_CONFIG_DIR       Claude Code config root (forwarded to the helper;
 #                           paths under $HOME are covered by the home bind mount)
 set -euo pipefail
@@ -33,7 +37,8 @@ DATA_VOLUME="${AI_MEMORY_DATA_VOLUME:-ai-memory-data}"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ai-memory"
 VERSION_CHECK_FILE="${CACHE_DIR}/last-version-check"
 HOOKS_STAGE_DIR="${HOME}/.local/share/ai-memory/hooks"
-WRAPPER_RAW_URL="${AI_MEMORY_WRAPPER_URL:-https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory}"
+WRAPPER_URL="${AI_MEMORY_WRAPPER_URL:-https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper}"
+WRAPPER_SHA256_URL="${AI_MEMORY_WRAPPER_SHA256_URL:-${WRAPPER_URL}.sha256}"
 
 # ---- version-check helpers (best-effort; never block the wrapper) --------
 
@@ -75,13 +80,35 @@ maybe_warn_outdated() {
 self_upgrade_script() {
   command -v curl >/dev/null 2>&1 || { echo "  curl not found; skipping wrapper self-upgrade" >&2; return 0; }
   # Portable script-path resolution (works without GNU readlink/realpath).
-  local script_dir script_path tmp
+  local script_dir script_path tmp checksum_file expected_sum actual_sum
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
   echo "→ checking for wrapper script updates (${script_path})"
-  tmp="$(mktemp)" || return 0
-  if ! curl -fsSL "${WRAPPER_RAW_URL}" -o "${tmp}" 2>/dev/null; then
-    echo "  could not fetch ${WRAPPER_RAW_URL}; skipping self-upgrade"
+  tmp="$(mktemp "${script_dir}/.ai-memory-wrapper.XXXXXX")" || return 0
+  checksum_file="$(mktemp)" || { rm -f "${tmp}"; return 0; }
+  if ! curl -fsSL "${WRAPPER_URL}" -o "${tmp}" 2>/dev/null; then
+    echo "  could not fetch ${WRAPPER_URL}; skipping self-upgrade"
+    rm -f "${tmp}" "${checksum_file}"
+    return 0
+  fi
+  if ! curl -fsSL "${WRAPPER_SHA256_URL}" -o "${checksum_file}" 2>/dev/null; then
+    echo "  could not fetch ${WRAPPER_SHA256_URL}; refusing an unverified wrapper update"
+    rm -f "${tmp}" "${checksum_file}"
+    return 0
+  fi
+  expected_sum="$(awk 'NR == 1 && $1 ~ /^[0-9A-Fa-f]{64}$/ { print tolower($1) }' "${checksum_file}")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sum="$(sha256sum "${tmp}" | awk '{ print $1 }')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_sum="$(shasum -a 256 "${tmp}" | awk '{ print $1 }')"
+  else
+    echo "  sha256sum/shasum not found; refusing an unverified wrapper update"
+    rm -f "${tmp}" "${checksum_file}"
+    return 0
+  fi
+  rm -f "${checksum_file}"
+  if [ -z "${expected_sum}" ] || [ "${actual_sum}" != "${expected_sum}" ]; then
+    echo "  wrapper checksum mismatch; refusing update"
     rm -f "${tmp}"
     return 0
   fi
@@ -197,10 +224,10 @@ cmd_upgrade() {
   touch "${VERSION_CHECK_FILE}"
 }
 
-# `ai-memory run` must execute on the host: native harnesses and their
-# native transcript stores are host resources, not contents of the helper
+# `ai-memory run` and `show` must execute on the host: checkouts, harnesses,
+# and native transcript stores are host resources, not contents of the helper
 # container. Keep a checksum-verified release client beside the wrapper cache.
-native_run_binary() {
+native_host_binary() {
   if [ -n "${AI_MEMORY_NATIVE_BIN:-}" ]; then
     [ -x "${AI_MEMORY_NATIVE_BIN}" ] || {
       echo "ai-memory: AI_MEMORY_NATIVE_BIN is not executable: ${AI_MEMORY_NATIVE_BIN}" >&2
@@ -216,7 +243,7 @@ native_run_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary and run: ai-memory run <harness> ..." >&2
+      echo "install the native release binary to use ai-memory run/show" >&2
       return 1
       ;;
   esac
@@ -224,7 +251,7 @@ native_run_binary() {
     x86_64 | amd64) arch="x86_64" ;;
     aarch64 | arm64) arch="aarch64" ;;
     *)
-      echo "ai-memory: no managed-run release binary is published for $(uname -m)" >&2
+      echo "ai-memory: no host-launch release binary is published for $(uname -m)" >&2
       return 1
       ;;
   esac
@@ -253,13 +280,13 @@ native_run_binary() {
 
   if [ "${need_refresh}" -eq 1 ]; then
     command -v curl >/dev/null 2>&1 || {
-      echo "ai-memory: curl is required to install the native managed-run client" >&2
+      echo "ai-memory: curl is required to install the native host-launch client" >&2
       return 1
     }
     tmp="${native_dir}/.install-$$"
     rm -rf "${tmp}"
     mkdir -p "${tmp}"
-    echo "ai-memory: installing checksum-verified native managed-run client (${artifact})" >&2
+    echo "ai-memory: installing checksum-verified native host-launch client (${artifact})" >&2
     curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz"
     curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -268,7 +295,7 @@ native_run_binary() {
       remote_sum=$(awk 'NR == 1 { print $1 }' "${tmp}/${artifact}.tar.gz.sha256")
       local_sum=$(shasum -a 256 "${tmp}/${artifact}.tar.gz" | awk '{ print $1 }')
       [ "${remote_sum}" = "${local_sum}" ] || {
-        echo "ai-memory: native managed-run client checksum mismatch" >&2
+        echo "ai-memory: native host-launch client checksum mismatch" >&2
         rm -rf "${tmp}"
         return 1
       }
@@ -291,10 +318,11 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run)
+  run | show)
+    NATIVE_HOST_COMMAND=$1
     shift
-    NATIVE_RUN_BIN=$(native_run_binary)
-    exec "${NATIVE_RUN_BIN}" run "$@"
+    NATIVE_HOST_BIN=$(native_host_binary)
+    exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
     ;;
 esac
 

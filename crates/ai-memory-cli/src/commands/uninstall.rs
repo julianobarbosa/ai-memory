@@ -281,6 +281,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             AntigravityCli,
             Zero,
             VsCodeCopilot,
+            Zed,
             Devin,
             KimiCode,
         ] {
@@ -941,6 +942,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
+        McpClient::Zed => Some(&["context_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
@@ -996,11 +998,55 @@ fn strip_mcp_json_client(
     let mut new_content = content.to_string();
     let mut removed = Vec::new();
     for candidate in mcp_url_candidates(client, url) {
-        let (next, mut hits) = strip_mcp_json(&new_content, client, name, &candidate)?;
+        let (next, mut hits) = if matches!(client, McpClient::Zed) {
+            strip_zed_mcp_jsonc(&new_content, name, &candidate)?
+        } else {
+            strip_mcp_json(&new_content, client, name, &candidate)?
+        };
         new_content = next;
         removed.append(&mut hits);
     }
     Ok((new_content, removed))
+}
+
+/// Remove matching entries from Zed's JSONC settings while preserving user
+/// comments, trailing commas, and unrelated formatting.
+fn strip_zed_mcp_jsonc(
+    content: &str,
+    name: Option<&str>,
+    url: &str,
+) -> Result<(String, Vec<String>)> {
+    use jsonc_parser::ParseOptions;
+    use jsonc_parser::cst::CstRootNode;
+
+    let root = CstRootNode::parse(content, &ParseOptions::default())
+        .context("parsing Zed settings.json as JSONC")?;
+    let Some(settings) = root.object_value() else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+    let Some(servers) = settings.object_value("context_servers") else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+
+    let mut removed = Vec::new();
+    for property in servers.properties() {
+        let Some(key) = property.name().and_then(|key| key.decoded_value().ok()) else {
+            continue;
+        };
+        let Some(entry) = property.to_serde_value() else {
+            continue;
+        };
+        if mcp_entry_is_ours(&key, &entry, name, url) {
+            property.remove();
+            removed.push(key);
+        }
+    }
+    if servers.properties().is_empty()
+        && let Some(context_servers) = settings.get("context_servers")
+    {
+        context_servers.remove();
+    }
+    Ok((root.to_string(), removed))
 }
 
 /// Remove ai-memory's MCP server from a JSON client config. Returns
@@ -1763,6 +1809,37 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["servers"].get("ai-memory").is_none());
         assert!(v["servers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_zed_context_servers_preserves_other_settings() {
+        let content = r#"{
+  // Keep this user comment.
+  "theme": "One Dark",
+  "context_servers": {
+    "ai-memory": { "url": "http://127.0.0.1:49374/mcp" },
+    // Keep this sibling comment.
+    "other": { "url": "http://x" },
+  },
+}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::Zed,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("// Keep this user comment."));
+        assert!(out.contains("// Keep this sibling comment."));
+        let root =
+            jsonc_parser::cst::CstRootNode::parse(&out, &jsonc_parser::ParseOptions::default())
+                .unwrap();
+        let value = root.to_serde_value().unwrap();
+        assert_eq!(value["theme"], "One Dark");
+        assert!(value["context_servers"].get("ai-memory").is_none());
+        assert!(value["context_servers"].get("other").is_some());
     }
 
     #[test]

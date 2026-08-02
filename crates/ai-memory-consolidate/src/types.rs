@@ -125,6 +125,14 @@ pub struct ConsolidatedPageUpdate {
     /// current behaviour.
     #[serde(default)]
     pub slot_kind: SlotKind,
+    /// Salient nouns this page is about — the specific technologies,
+    /// components, services, and files the content names. Indexed as a
+    /// retrieval stream so a query naming one of them finds the page
+    /// even when the wording differs. Normalised and capped
+    /// (`ai_memory_core::normalize_entities`) before storage; defaults
+    /// to empty so older structured outputs still deserialise.
+    #[serde(default)]
+    pub entities: Vec<String>,
 }
 
 /// Batch produced by [`ConsolidatorMulti`].

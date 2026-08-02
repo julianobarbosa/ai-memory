@@ -167,16 +167,15 @@ Compounding this at the time of the run: openai-compat providers
 parser path, so the schema was descriptive, not coercive. The
 provider opt-in for coercive structured output is documented below.
 
-#### Opting into strict structured output for openai-compat
+#### Strict structured output for openai-compat
 
-Set `AI_MEMORY_LLM_COMPAT_STRICT=true` to make `openai-compat` send
-`response_format={ type: "json_schema", strict: true }` first. On a
+`openai-compat` sends
+`response_format={ type: "json_schema", strict: true }` by default. On a
 parse-shape failure (the upstream returned a response but it wasn't a
-valid JSON object), ai-memory falls back to the tolerant parser the
-default mode uses; on HTTP 4xx / 5xx / auth / transport errors the
-strict call propagates without retry (a tolerant retry would just hit
-the same wall and double cost — see `is_parse_shape_error` in
-`crates/ai-memory-llm/src/openai_compat.rs`).
+valid JSON object), or an explicit 400/422 rejection naming
+`response_format`, `json_schema`, or structured output, ai-memory falls back to
+the tolerant parser. Other HTTP / auth / transport errors propagate without
+retry. Set `AI_MEMORY_LLM_COMPAT_STRICT=false` to opt out.
 
 **Cost.** Strict mode is one HTTP call when the upstream honours
 `response_format`. When it doesn't, you pay a second call for the
@@ -184,9 +183,10 @@ tolerant fallback. Pick by engine:
 
 | Engine class | Setting |
 |---|---|
-| Modern Ollama / vLLM / LM Studio honouring `response_format=json_schema` | `AI_MEMORY_LLM_COMPAT_STRICT=true` (one call, schema-constrained) |
-| Reasoning models with `<think>…</think>` inside `content` (DeepSeek-R1, Qwen3-Thinking, MiniMax M2) | Leave OFF. Strict-then-fallback burns a call per consolidation; the tolerant path already strips `<think>` before parsing |
-| Older engines / proxies that ignore `response_format` | Leave OFF. Strict adds latency and recovers nothing |
+| Modern Ollama / vLLM / LM Studio honouring `response_format=json_schema` | Keep the default (one call, schema-constrained) |
+| Reasoning models with `<think>…</think>` inside `content` (DeepSeek-R1, Qwen3-Thinking, MiniMax M2) | Set `AI_MEMORY_LLM_COMPAT_STRICT=false` if the strict-then-fallback double call is frequent |
+| Older engines / proxies that reject `response_format` explicitly | Keep the default; ai-memory retries without it |
+| Older engines / proxies that mishandle the field without a recognizable rejection | Set `AI_MEMORY_LLM_COMPAT_STRICT=false` |
 
 The prompt still has to do the load-bearing work when strict mode is
 off or the strict call falls back.
@@ -703,10 +703,9 @@ Re-run this harness when any of the following changes:
   drops for Ollama)
 - A new fixture is added to `evals/fixtures/`
 - The home server hardware changes
-- A new local engine ships first-class
-  `response_format=json_schema` support, making
-  `AI_MEMORY_LLM_COMPAT_STRICT=true` worth re-benchmarking against
-  the tolerant-parser baseline
+- A local engine changes its `response_format=json_schema` implementation,
+  making a fresh default-vs-`AI_MEMORY_LLM_COMPAT_STRICT=false` comparison
+  worthwhile
 
 ## How to reproduce
 
