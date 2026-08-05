@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|cursor|gemini-cli|kimi-code|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,9 +46,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|cursor|gemini-cli|kimi-code|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    kiro) AGENT="kiro-cli" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | kimi-code | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
 
@@ -104,6 +105,19 @@ SCRIPTS=(
 # hooks/claude-code/, which ships them); the default list omits them.
 if [[ "$AGENT" == "kimi-code" ]]; then
     SCRIPTS+=("subagent-start" "subagent-stop")
+fi
+
+# kiro-cli v2's hook vocabulary is exactly five events —
+# no pre-compact/session-end equivalents exist, so fetching them would
+# 404 and abort the install.
+if [[ "$AGENT" == "kiro-cli" ]]; then
+    SCRIPTS=(
+        "session-start"
+        "user-prompt-submit"
+        "pre-tool-use"
+        "post-tool-use"
+        "stop"
+    )
 fi
 
 DEST="$TO/$AGENT"

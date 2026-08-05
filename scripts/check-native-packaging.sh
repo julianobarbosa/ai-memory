@@ -94,8 +94,12 @@ main() {
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory show --json --no-scan
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory continue --workspace work --yolo
   assert_contains "${wrapper_log}" "run codex --yolo"
   assert_contains "${wrapper_log}" "show --json --no-scan"
+  assert_contains "${wrapper_log}" "continue --workspace work --yolo"
 
   log "Creating temporary alternate root"
   mkdir -p \

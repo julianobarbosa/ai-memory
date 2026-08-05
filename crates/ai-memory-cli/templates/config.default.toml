@@ -113,6 +113,14 @@ allowlist = []
 [slots]
 per_user = false
 
+# LLM consolidation prompt limits. These are approximate because tokenizers
+# differ by provider and model. Their sum must fit the model's context window;
+# leave additional headroom for tokenizer variance. Small local models must
+# lower both values together. Startup minimums are 6000 input and 1000 output.
+[consolidation]
+max_input_tokens = 100000
+max_output_tokens = 32000
+
 # Auto-improvement reviewer.
 #
 # The background scheduler reviews newly-completed sessions in every project

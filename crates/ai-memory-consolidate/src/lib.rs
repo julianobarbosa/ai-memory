@@ -52,7 +52,9 @@ pub use bootstrap::{
     plan_bootstrap_chunks, prune_sources_to_budget,
 };
 pub use consolidator::{
-    BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
+    BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
+    DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+    MIN_CONSOLIDATION_MAX_INPUT_TOKENS, MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

@@ -75,6 +75,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Zero => render_zero(&args)?,
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
+        McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
     };
@@ -111,7 +112,35 @@ fn validate_args(args: &InstallMcpArgs) -> Result<()> {
     if args.session_aware && !matches!(args.client, McpClient::ClaudeCode) {
         bail!("--session-aware is supported only for --client claude-code");
     }
+    if matches!(args.client, McpClient::KiroCli) {
+        validate_kiro_remote_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL))?;
+    }
     Ok(())
+}
+
+/// Kiro accepts HTTPS remote MCP endpoints and plain HTTP only on loopback.
+/// Reject an unusable registration before `--apply` mutates user config.
+fn validate_kiro_remote_url(server_url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(server_url).context("Kiro MCP URL is not a valid URL")?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let normalized = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        normalized.eq_ignore_ascii_case("localhost")
+            || normalized
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    bail!(
+        "Kiro CLI requires HTTPS for remote MCP servers (plain HTTP is accepted only on localhost); configure an HTTPS reverse proxy or pass a loopback URL"
+    )
 }
 
 /// Default MCP config-file path for a client (ignores any
@@ -178,6 +207,9 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
         McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
+        McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
+            .join("settings")
+            .join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -317,6 +349,17 @@ fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
         .join(".kimi-code"))
 }
 
+/// Kiro CLI's global configuration root: `$KIRO_HOME` when set, otherwise
+/// `~/.kiro`. The override is injected to keep path tests process-local.
+fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Kiro configuration")?
+        .join(".kiro"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
@@ -417,7 +460,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
-        | McpClient::KimiCode => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::KimiCode
+        | McpClient::KiroCli => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -524,17 +568,25 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
 /// in tool parameter schemas (issue #155's `anyOf` on `memory_read_page`),
 /// and the server answers flavored requests with flat schemas. Idempotent
 /// so re-runs never stack duplicate query pairs.
-pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
-    const FLAVOR: &str = "flavor=moonshot";
+fn flavored_mcp_url(server_url: &str, flavor: &str) -> String {
+    let marker = format!("flavor={flavor}");
     let url = server_url.trim();
     let already_marked = url
         .split_once('?')
-        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == FLAVOR));
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == marker));
     if already_marked {
         return url.to_string();
     }
     let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}{FLAVOR}")
+    format!("{url}{separator}{marker}")
+}
+
+pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
+    flavored_mcp_url(server_url, "moonshot")
+}
+
+pub(crate) fn bedrock_flavored_mcp_url(server_url: &str) -> String {
+    flavored_mcp_url(server_url, "bedrock")
 }
 
 /// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
@@ -618,6 +670,12 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // field as streamable-HTTP; `transport` is only for legacy
             // SSE endpoints.
             entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::KiroCli => {
+            entry.insert("url".into(), json!(bedrock_flavored_mcp_url(server_url)));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1079,6 +1137,24 @@ fn render_kimi_code(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Kiro CLI - merge into $KIRO_HOME/settings/mcp.json\n\
+         # (defaults to ~/.kiro/settings/mcp.json):\n\
+         #\n\
+         # Kiro accepts HTTPS remote endpoints and plain HTTP only on\n\
+         # localhost. `?flavor=bedrock` removes unsupported root-level\n\
+         # schema combinators while handler validation remains unchanged.\n\
+         # Lifecycle capture for the documented v2 engine is installed\n\
+         # separately with `install-hooks --agent kiro-cli`. Kiro v3 hook\n\
+         # capture remains unsupported pending fixture-verified lifecycle\n\
+         # and built-in tool payloads for its standalone schema.\n\
+         # Managed workstreams are not installed by this command.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -1484,6 +1560,7 @@ mod tests {
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
+            McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1507,6 +1584,7 @@ mod tests {
             McpClient::Zero,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::KiroCli,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1544,6 +1622,7 @@ mod tests {
             McpClient::Zero,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::KiroCli,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1574,6 +1653,7 @@ mod tests {
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
+            McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1728,6 +1808,14 @@ mod tests {
         let kimi_with_token = render_with_token(McpClient::KimiCode);
         assert!(kimi_with_token.contains("\"headers\""));
         assert!(kimi_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
+        let kiro = render_for_test(McpClient::KiroCli);
+        assert!(kiro.contains("\"mcpServers\""));
+        assert!(kiro.contains("http://127.0.0.1:49374/mcp?flavor=bedrock"));
+        assert!(!kiro.contains("\"transport\""));
+        assert!(kiro.contains("install-hooks --agent kiro-cli"));
+        assert!(kiro.contains("Kiro v3 hook"));
+        let kiro_with_token = render_with_token(McpClient::KiroCli);
+        assert!(kiro_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the
         // `mcpServers` form is silently ignored by VS Code's MCP
         // framework. Regression guard against a future copy-paste
@@ -1756,6 +1844,17 @@ mod tests {
         // An empty override falls back to the default home-based dir.
         assert_eq!(kimi_code_home(Some("".into())).unwrap(), default);
         assert_eq!(kimi_code_home(None).unwrap(), default);
+    }
+
+    #[test]
+    fn kiro_home_honours_env_override() {
+        assert_eq!(
+            kiro_home(Some("/tmp/custom-kiro-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-kiro-home")
+        );
+        let default = home_dir().unwrap().join(".kiro");
+        assert_eq!(kiro_home(Some("".into())).unwrap(), default);
+        assert_eq!(kiro_home(None).unwrap(), default);
     }
 
     /// Pin the append rules: `?` on a bare endpoint, `&` with an existing
@@ -1787,6 +1886,72 @@ mod tests {
         ] {
             assert_eq!(moonshot_flavored_mcp_url(input), expected, "input: {input}");
         }
+    }
+
+    #[test]
+    fn bedrock_flavored_mcp_url_appends_marker_idempotently() {
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp"),
+            "https://memory.example/mcp?flavor=bedrock"
+        );
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp?token=x"),
+            "https://memory.example/mcp?token=x&flavor=bedrock"
+        );
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp?flavor=bedrock"),
+            "https://memory.example/mcp?flavor=bedrock"
+        );
+    }
+
+    #[test]
+    fn kiro_rejects_plain_http_for_non_loopback_servers() {
+        for allowed in [
+            "http://localhost:49374/mcp",
+            "http://127.0.0.1:49374/mcp",
+            "http://[::1]:49374/mcp",
+            "https://memory.example/mcp",
+        ] {
+            let mut args = args_for(McpClient::KiroCli);
+            args.server_url = Some(allowed.into());
+            validate_args(&args).unwrap_or_else(|error| panic!("{allowed}: {error:#}"));
+        }
+
+        let mut args = args_for(McpClient::KiroCli);
+        args.server_url = Some("http://192.168.0.90:49374/mcp".into());
+        let error = validate_args(&args).unwrap_err();
+        assert!(error.to_string().contains("requires HTTPS"), "{error:#}");
+    }
+
+    #[test]
+    fn kiro_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"url":"https://other.example/mcp"}},"userSetting":true}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::KiroCli);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["userSetting"], true);
+        assert_eq!(
+            value["mcpServers"]["other"]["url"],
+            "https://other.example/mcp"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["url"],
+            "https://memory.example/mcp?flavor=bedrock"
+        );
     }
 
     #[test]

@@ -138,6 +138,9 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
+        // Kiro v2 tool hooks use `tool_name` + `tool_input`. Unknown payload
+        // shapes fail safe to metadata-only under an active policy.
+        AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -156,7 +159,10 @@ pub(crate) fn tool_observation_metadata(
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
             _ => object
                 .get(
-                    if matches!(agent, AgentKind::ClaudeCode | AgentKind::Hermes) {
+                    if matches!(
+                        agent,
+                        AgentKind::ClaudeCode | AgentKind::Hermes | AgentKind::KiroCli
+                    ) {
                         "tool_input"
                     } else {
                         "args"
@@ -176,6 +182,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
+            None => ToolOutcome::Unknown,
+        },
+        AgentKind::KiroCli => match raw
+            .get("tool_response")
+            .and_then(|response| response.get("success"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => ToolOutcome::Success,
+            Some(false) => ToolOutcome::Error,
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
@@ -518,7 +533,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::Cursor
         | AgentKind::GeminiCli
         | AgentKind::Devin
-        | AgentKind::Hermes => object
+        | AgentKind::Hermes
+        | AgentKind::KiroCli => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -584,13 +600,14 @@ fn family(name: &str) -> ToolFamily {
         | "view_file"
         | "replace_file_content"
         | "multi_replace_file_content"
-        | "write_to_file" => ToolFamily::File,
+        | "write_to_file"
+        | "fs_read"
+        | "fs_write" => ToolFamily::File,
         "read_file" | "write_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
-        "bash" | "shell" | "execute" | "run_command" | "web_search" | "terminal" => {
-            ToolFamily::NonFile
-        }
+        "bash" | "shell" | "execute" | "run_command" | "web_search" | "terminal"
+        | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -625,6 +642,21 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
             return None;
         }
         if entries.len() > MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        for entry in entries {
+            let paths_in_entry = direct_paths(entry.as_object()?)?;
+            if paths.len().checked_add(paths_in_entry.len())? > MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            paths.extend(paths_in_entry);
+        }
+    }
+    if name.eq_ignore_ascii_case("fs_read")
+        && let Some(operations) = object.get("operations")
+    {
+        let entries = operations.as_array()?;
+        if entries.is_empty() || entries.len() > MAX_CAPTURE_CANDIDATES {
             return None;
         }
         for entry in entries {

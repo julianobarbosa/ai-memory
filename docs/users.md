@@ -142,6 +142,18 @@ to — and consumed by — the next session to start, whoever it belongs to.
   multi-user mode.
 - `ai-memory finalize-session --all-owners` does the same for sessions, and
   `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+  `--session-id <uuid>` / `session_id=<uuid>` narrows the same owner-scoped
+  lookup to one exact open session; it cannot be combined with `--all` /
+  `all=true`.
+- `GET /admin/sessions/by-agent` reports how many sessions each agent CLI
+  opened in a scope. It follows the same rule: the caller's own sessions
+  plus the unowned ones, with `all_owners=true` to see every operator's. Pass
+  the required `workspace` and `project` query parameters and optionally
+  `since_days=N`; zero or omission means all history. Results use the stable
+  shape `{"by_agent":[{"agent":"codex","sessions":3}]}`, ordered by count
+  descending and then agent name. An unknown scope returns 404 without creating
+  it. Like every `/admin/*` route, this endpoint is root-only when the
+  deployment distinguishes operators.
 - The read-only handoff listing (`GET
   /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
   fields — `summary`, `open_questions`, `next_steps` — to a caller the server
@@ -164,17 +176,36 @@ proxied caller on the single-operator escape hatch that waves admin through.
 One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
 the ownership stamped on handoffs and sessions all ask it.
 
+## MCP client activity
+
+`GET /admin/activity/by-client` reports server-wide MCP tool calls rather than
+lifecycle sessions or project-owned data. Stateful HTTP and stdio use the
+sanitized MCP `clientInfo.name`; stateless requests fall back to an
+authenticated proxy's actor-agent label and then `unknown`. Results have the
+stable shape
+`{"by_client":[{"client":"claude-code","reads":12,"writes":3}]}` and are
+ordered by total calls, then client name.
+
+`since_days=N` includes every UTC day bucket intersecting that lookback; zero
+or omission means all history. Calls flush on a one-minute background interval
+even if no later request arrives, and retry failed batches once per interval;
+process exit can lose the current interval. Each UTC day stores at most 128
+distinct labels and folds additional labels into `other`. The endpoint takes
+no workspace or project because many MCP-only clients do not provide reliable
+per-call scope. Like every `/admin/*` route, it is root-only when the deployment
+distinguishes operators.
+
 ## Per-operator memory slots
 
 The "absent means shared" rule extends to memory slots, so a single-operator
 server behaves exactly as it always has. `_slots/current-focus.md` is injected
 into every operator's context; `_slots/<segment>/current-focus.md` is injected
 only into the operator whose `path_segment()` is `<segment>` (`u-alice`,
-`uh-<uuid>` for a path-hostile username, or `o-<uuid>` for a complete OIDC
-issuer/subject pair). What the feature scopes is injection, not access: a slot
-is an ordinary wiki page, so exact reads and searches remain project-wide like
-every other page. Every slot written before this is unnamespaced, therefore
-shared.
+`uh-<uuid>` for a mixed-case, trailing-period, or otherwise path-hostile
+username, or `o-<uuid>` for a complete OIDC issuer/subject pair). What the
+feature scopes is injection, not access: a slot is an ordinary wiki page, so
+exact reads and searches remain project-wide like every other page. Every slot
+written before this is unnamespaced, therefore shared.
 
 `[slots] per_user` (default off) is the switch for the whole regime. With it
 ON:
@@ -196,9 +227,13 @@ With it OFF a nested slot path means nothing in particular — every slot goes
 into every brief, exactly as before the feature existed — so turning it back
 off makes personal slots visible to everyone again rather than stranding them.
 
-The `<segment>` is derived from the qualified identity on this server: a safe
-username stays readable, while a path-hostile username or complete OIDC
-issuer/subject pair becomes a bounded deterministic identifier. The OIDC pair
+The `<segment>` is derived from the qualified identity on this server: a short,
+lowercase, path-safe ASCII username stays readable, while a mixed-case,
+trailing-period, or otherwise path-hostile username or complete OIDC
+issuer/subject pair becomes a bounded deterministic identifier. Restricting
+readable segments to lowercase without trailing periods prevents distinct
+identities from producing pathnames that compare alike on supported
+case-insensitive filesystems. The OIDC pair
 outranks the username; see "Identity keys" above. Every named operator owns a
 working namespace, and long or path-hostile values never fall back onto the
 shared slot. One consequence of qualified segments is worth stating: a nested
@@ -206,6 +241,16 @@ path written before the feature
 (`_slots/backend/…`) spells a segment no qualified identity can produce, so
 with the flag ON it belongs to nobody and reaches no brief until the flag is
 turned back off or an admin re-homes it.
+
+Before the case-insensitive namespace fix, a mixed-case username such as
+`Alice` used the readable segment `u-Alice`, and a username ending in a period
+kept that period; both now use deterministic `uh-<uuid>` segments. ai-memory
+cannot safely move the old directory automatically because a case-insensitive
+filesystem may already have combined it with another identity. Administrators
+upgrading a shared deployment with `[slots] per_user = true` must inspect any
+affected `u-…` slot directories and re-home confirmed content into the owning
+operator's new namespace. Preserve the old pages until ownership is
+established; do not infer it from filename casing alone.
 
 One gap is deliberate and documented rather than closed: `ai-memory bootstrap`
 writes pages at paths the model picks from the repository's own README, docs

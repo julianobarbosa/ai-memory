@@ -38,8 +38,8 @@ use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, build_claude_code_payload, build_devin_payload,
-    build_grok_payload, hook_script_for_current_platform,
+    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, build_claude_code_payload,
+    build_devin_payload, build_grok_payload, hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -149,6 +149,12 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         // script listing is deduplicated below; apply-mode owns the exact
         // `[[hooks]]` TOML merge into the user's config.toml.
         AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
+        // Kiro v2 embeds its lifecycle hooks in agent configs. Kiro v3 is
+        // withheld until its live lifecycle and built-in tool payloads are
+        // captured in fixtures.
+        AgentChoice::KiroCli => {
+            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
+        }
         AgentChoice::OpenCode
         | AgentChoice::Pi
         | AgentChoice::Omp
@@ -675,5 +681,33 @@ mod tests {
         );
         assert_eq!(KIMI_CODE_EVENTS.len(), 10);
         assert_eq!(paths.len(), 9);
+    }
+
+    #[test]
+    fn kiro_cli_manual_script_paths_cover_v2_event_set() {
+        let root = Path::new("/hooks/kiro-cli");
+        let v2_paths = event_script_paths(root, &[&KIRO_CLI_V2_EVENTS]);
+        let rendered = v2_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for script in [
+            "session-start",
+            "user-prompt-submit",
+            "pre-tool-use",
+            "post-tool-use",
+            "stop",
+        ] {
+            assert!(
+                rendered.contains(script),
+                "Kiro CLI setup-agent must list {script}; got:\n{rendered}"
+            );
+        }
+        // The documented v2 vocabulary has no PreCompact, SessionEnd, or
+        // subagent equivalents.
+        assert_eq!(KIRO_CLI_V2_EVENTS.len(), 5);
+        assert_eq!(v2_paths.len(), 5);
     }
 }

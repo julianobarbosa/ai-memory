@@ -6,7 +6,7 @@ agent CLI actually runs.
 ## Rule Of Thumb
 
 Run `install-mcp` and `install-hooks` from the same environment that
-launches Claude Code, Codex, Devin CLI, Cursor, Gemini CLI, Kimi Code,
+launches Claude Code, Codex, Devin CLI, Cursor, Gemini CLI, Kimi Code, Kiro CLI,
 Antigravity CLI, or another agent.
 
 - If the agent runs inside WSL2, install ai-memory inside WSL2.
@@ -143,13 +143,22 @@ for each native Windows agent so existing hook entries receive the current
 command form.
 
 Use the matching `--client` / `--agent` values for other clients, for
-example `codex`, `devin`, `kimi-code`, `cursor`, or `gemini-cli`.
+example `codex`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 
 For Devin, `install-mcp --client devin --apply` writes MCP config to
 `%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`
 writes lifecycle hooks to `%USERPROFILE%\.devin\hooks.v1.json` by default;
 pass `--config-file "%USERPROFILE%\.devin\config.json"` if you want hooks under
 the `hooks` key in Devin's main config file.
+
+For Kiro CLI, `install-mcp --client kiro-cli --apply` writes
+`%USERPROFILE%\.kiro\settings\mcp.json` unless `$env:KIRO_HOME` overrides the
+root. `install-hooks --agent kiro-cli --apply` updates existing v2 agent files
+under `.kiro\agents`; use `--config-file` for a project-local agent. Kiro v3
+hook capture remains unsupported pending sanitized live lifecycle and built-in
+tool payload fixtures for its documented standalone schema. Run these commands
+from the same native Windows environment that launches Kiro so generated
+executable paths remain valid.
 
 ## Scenario C: Prebuilt Release Binary (No Toolchain)
 

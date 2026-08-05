@@ -210,6 +210,8 @@ pub enum AgentKind {
     Devin,
     /// Kimi Code CLI (Moonshot AI).
     KimiCode,
+    /// AWS Kiro CLI (verified v2 lifecycle protocol).
+    KiroCli,
     /// Hermes Agent (Nous Research).
     Hermes,
     /// Anything else (manual capture, future agents).
@@ -222,7 +224,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -238,6 +240,7 @@ impl AgentKind {
         Self::Zero,
         Self::Devin,
         Self::KimiCode,
+        Self::KiroCli,
         Self::Hermes,
         Self::Other,
     ];
@@ -261,6 +264,7 @@ impl AgentKind {
             Self::Zero => "zero",
             Self::Devin => "devin",
             Self::KimiCode => "kimi-code",
+            Self::KiroCli => "kiro-cli",
             Self::Hermes => "hermes",
             Self::Other => "other",
         }
@@ -287,6 +291,7 @@ impl AgentKind {
             "zero" => Self::Zero,
             "devin" => Self::Devin,
             "kimi-code" | "kimi" => Self::KimiCode,
+            "kiro-cli" | "kiro" => Self::KiroCli,
             "hermes" | "hermes-agent" => Self::Hermes,
             _ => Self::Other,
         }
@@ -438,6 +443,23 @@ mod tests {
         );
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kiro_cli_round_trips_and_injects_at_session_start() {
+        assert_eq!(AgentKind::KiroCli.as_str(), "kiro-cli");
+        assert_eq!(AgentKind::from_wire("kiro-cli"), AgentKind::KiroCli);
+        assert_eq!(AgentKind::from_wire("kiro"), AgentKind::KiroCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KiroCli).unwrap(),
+            "\"kiro-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kiro-cli\"").unwrap(),
+            AgentKind::KiroCli
+        );
+        assert!(AgentKind::KiroCli.session_start_injects_handoff());
+        assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
     }
 
     #[test]

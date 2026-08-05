@@ -129,7 +129,6 @@ pub(super) fn rekey_scope(
         if !destination_exists {
             source.workspace = to_workspace.to_owned();
             source.project = to_project.to_owned();
-            source.linked_at = jiff::Timestamp::now().to_string();
             registry.links.push(source);
         }
         Ok(true)
@@ -394,5 +393,29 @@ mod tests {
         let links = links_for_server(&config, &endpoint).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].path, destination.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn rekey_preserves_the_source_link_timestamp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let config = config_at(&tmp.path().join("data"));
+        let endpoint = endpoint("http://memory:49374");
+        record_prepared_checkout(&config, &endpoint, "from", "app", &source).unwrap();
+        let original_linked_at = "2025-01-02T03:04:05Z";
+        update_registry(&config, |registry| {
+            registry.links[0].linked_at = original_linked_at.to_owned();
+            Ok(true)
+        })
+        .unwrap();
+
+        rekey_scope(&config, &endpoint, "from", "app", "to", "renamed").unwrap();
+
+        let links = links_for_server(&config, &endpoint).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].workspace, "to");
+        assert_eq!(links[0].project, "renamed");
+        assert_eq!(links[0].linked_at, original_linked_at);
     }
 }

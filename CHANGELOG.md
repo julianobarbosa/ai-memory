@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory finalize-session --session-id <uuid>` targets exactly one open
+  session instead of "the latest open one for this agent+scope". Agents with
+  no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on
+  `finalize-session` to synthesize the summary+handoff, and the
+  newest-first default breaks down with several concurrent sessions for the
+  same agent in one project — e.g. multiple terminal tabs each running Kiro
+  CLI against the same repo — where it can close out a still-active session
+  instead of the one that actually finished. Backed by a new optional
+  `session_id` filter on `GET /admin/open-sessions`, composed with (not
+  bypassing) the existing owner filter: a session id belonging to another
+  operator is still unreachable without `--all-owners`, same as the default
+  query ([#374]).
+
 ### Changed
 - Hook capture now honors the documented 200 ms latency budget on every
   transport. The shell hooks posted with a 500 ms `curl --max-time`, the
@@ -20,6 +34,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The synchronous handoff fetch is deliberately unchanged: it feeds the
   resuming agent's context and is not a fire-and-forget path, so invariant 5
   does not govern it. (#NNN)
+
+## [1.24.0] - 2026-08-04
+
+### Added
+- MCP-only clients are now visible in the operator's traffic picture.
+  Every MCP tool call is counted against its caller — the sanitized
+  `clientInfo.name` from the initialize handshake when the HTTP
+  transport runs stateful (`--http-stateful`) or over stdio, else the
+  `X-Memory-Actor-Agent` overlay an ingress proxy asserts, else
+  `unknown` — split into reads and writes and bucketed per UTC day in a
+  new `client_activity` table (V46). A new multi-user root-gated
+  `GET /admin/activity/by-client?since_days=N` reports the aggregate,
+  volume-descending with a name tiebreak (`0`/absent = whole history).
+  Counts buffer in memory and flush from one background task on a one-minute
+  interval, even when the server becomes quiet; failed batches remain bounded
+  in memory and retry once per interval. Process exit can still lose the
+  current interval. Each UTC day retains at most 128 distinct names and folds
+  additional names into `other`, preventing untrusted client names from
+  causing traffic-proportional row growth. Unknown future tools count as
+  writes, so an unclassified tool surfaces as suspicious growth instead of
+  hiding among reads. This complements
+  `/admin/sessions/by-agent`: hook-driven agents open sessions,
+  MCP-only clients (VS Code Copilot, Claude Desktop, scripts) never do,
+  and until now left no trace at all. (#366)
+- Added explicit Kiro CLI v2 managed-workstream launches through `ai-memory run
+  kiro` / `kiro-cli`, including native `--resume-id` reuse, `$KIRO_HOME`
+  discovery, v2 `--yolo` translation, read-only visible-event import, and
+  checkout-scoped UUID/metadata validation. Non-v2 engines pass through
+  without session injection. Kiro remains outside bare automatic selection
+  until a logged-in current-format acceptance run is available, and v3 managed
+  sessions remain unsupported (#356).
+- Added verified Kiro CLI v2 lifecycle hooks. CamelCase hooks merge into
+  existing agent configs, honor `$KIRO_HOME`, preserve unrelated hooks and
+  per-agent project strategies, fail before changing any target when one is
+  invalid, infer remote connectivity from the managed Kiro MCP entry, inject
+  handoffs through `agentSpawn` stdout, enforce capture exclusions for known
+  v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
+  capture remains unsupported pending sanitized live lifecycle and built-in
+  tool payload fixtures, despite its now-documented standalone schema (#355).
+- Added `[consolidation] max_input_tokens` and `max_output_tokens`
+  (`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` /
+  `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`) for provider-specific context
+  limits. Input sizing now accounts for the rendered system/user messages,
+  bounded current-page or slot context, structured-output schema, and provider
+  envelope reserve instead of budgeting only the observation dump. Unsupported
+  minimums are rejected at startup (#369).
+
+### Fixed
+- Mixed-case and trailing-period usernames now use deterministic hashed
+  per-operator slot namespaces, preventing distinct identities from sharing one
+  physical directory on case-insensitive filesystems (#364).
+- Consolidation prompts no longer ignore system, schema, instructions, and
+  dynamic slot/current-page overhead when allocating observations. The
+  provider-neutral estimate is deliberately conservative and documents the
+  remaining tokenizer variance instead of claiming an exact token ceiling
+  (#369).
+- A failing LLM no longer costs a session its PreCompact/PostCompaction
+  checkpoint. Provider failures (context overflow, rate limit, outage) and
+  unmappable structured output now degrade to the rule-based checkpoint a
+  zero-LLM install writes, so configuring a provider can no longer be worse
+  than leaving it unset. The fallback keeps the `consolidate` admission event;
+  admission rejections, wiki/store failures, and unresolvable sessions still
+  fail closed (#369).
+- Native-session checkout matching now fails closed when either path cannot be
+  canonicalized, instead of treating two missing or inaccessible paths as the
+  same checkout during managed resume or adoption (#356).
+
+## [1.23.0] - 2026-08-03
+
+### Changed
+- Documented provider-neutral coexistence with structural code-intelligence
+  tools: use ai-memory for historical intent and continuity, use the current
+  checkout or structural provider for live symbols and impact analysis, verify
+  historical structural claims before acting, and keep source, builds, tests,
+  and observed runtime behavior authoritative. No provider coupling, automatic
+  querying, or persisted structural-evidence schema was added (#353).
+
+### Fixed
+- Antigravity CLI's generated native `PreToolUse` hook now returns the required
+  `{"decision":"allow"}` response on normal capture, malformed input, and
+  capture-policy drops. Local installs default to the native spool-based hook
+  command, whose generic `{}` response caused Antigravity to deny every tool
+  call even though the staged shell and PowerShell hooks already returned the
+  correct decision (#352).
+
+### Added
+- Kiro CLI is now supported as an MCP-only client through `install-mcp
+  --client kiro-cli` (alias `kiro`). The installer preserves existing
+  `$KIRO_HOME/settings/mcp.json` content, adds bearer headers when configured,
+  honors `$KIRO_HOME`, and appends a Bedrock schema flavor that removes only
+  unsupported root-level JSON Schema combinators. Non-loopback Kiro endpoints
+  must use HTTPS and are rejected before `--apply` writes an unusable config.
+  Kiro lifecycle hooks and managed workstreams remain deferred because its v2
+  and early-access v3 engines use incompatible hook and session formats
+  (#351).
+- Added `ai-memory continue`, which resumes the most recently launched managed
+  checkout from any directory. `run`'s bare mode already continues the current
+  checkout, but its workstream lookup is keyed by repository and worktree
+  fingerprints, so it requires a `cd` first. `continue` orders the client-local
+  checkout links by their `linked_at` stamp, revalidates the newest one's path
+  and resolved scope, and then delegates to the same bare-mode launch. Stale,
+  retargeted, scope-mismatched, or corrupt-ordering links are announced on
+  stderr and skipped rather than silently resuming a different project. It
+  accepts `--workspace`,
+  `--yolo`, and `--fresh`; native harness arguments and `--executable` remain
+  unavailable because bare mode does not know which harness it will pick.
+  Docker-wrapper installs route the command through the checksum-verified host
+  client so it can inspect local checkouts, session stores, and harnesses
+  (#350).
+- New `GET /admin/sessions/by-agent` endpoint reporting how many sessions
+  each agent CLI opened in one scope (`claude-code`, `cursor`, `codex`, …),
+  so a dashboard can answer "where is this project's memory coming from".
+  `sessions.agent_kind` already carried the answer but no read surface
+  exposed it — the existing `/admin/open-sessions` takes the agent as a
+  *filter* and returns neither the kind nor a total. Counts cover open and
+  ended sessions alike, take an optional `since_days` window (`0` or absent
+  = whole history), and order count-descending with an agent-name tiebreak
+  so equal counts do not reorder between calls. Like the other scoped admin
+  reads it reports the caller's own sessions plus unowned ones, with
+  `all_owners=true` as the recovery switch. Unknown scopes 404 rather than
+  being auto-created. No migration. (#349)
 
 ## [1.22.0] - 2026-08-01
 
@@ -2914,7 +3049,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.24.0...HEAD
+[1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
+[1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
 [1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0
 [1.21.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.21.0
 [1.20.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.2

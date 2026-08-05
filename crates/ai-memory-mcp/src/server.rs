@@ -14,7 +14,11 @@ use ai_memory_core::{
     ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
+use ai_memory_store::{
+    AutoImproveProposalOperation, CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
+    CLIENT_ACTIVITY_MAX_NAME_CHARS, CLIENT_ACTIVITY_OVERFLOW_CLIENT, NewAutoImproveProposal,
+    StageAutoImproveRun,
+};
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -375,6 +379,11 @@ pub struct AiMemoryServer {
     /// Optional post-RRF reranker. When `None`, `memory_query` returns
     /// fused, authority-adjusted order and stays on the zero-LLM path.
     reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
+    /// Per-client MCP tool-call counters, buffered in memory and folded
+    /// into `client_activity` at most once per flush interval so a query
+    /// burst costs the writer one tiny upsert batch, not one write per
+    /// call (same reasoning as the M8 access-bump throttle).
+    client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
     /// Shared across cloned request handlers so concurrent searches cannot
     /// create an unbounded number of billable provider calls.
     rerank_gate: Arc<tokio::sync::Semaphore>,
@@ -590,6 +599,180 @@ const RERANK_MAX_IN_FLIGHT: usize = 4;
 /// Wall-clock budget for one rerank call. Past this, `memory_query`
 /// answers from the adjusted pre-rerank order instead of waiting.
 const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Microseconds in one UTC day, for `client_activity` bucketing.
+const US_PER_DAY: i64 = 86_400_000_000;
+/// How long buffered client-activity counts may age before a background
+/// task flushes them to the store. Counts inside the window are lost on
+/// process exit; failed writes stay bounded in memory and retry.
+const CLIENT_ACTIVITY_FLUSH: std::time::Duration = std::time::Duration::from_secs(60);
+
+type ClientActivityEntry = (String, i64, u32, u32);
+
+/// In-memory accumulation of per-client tool-call counts between
+/// flushes. Keyed by `(client, utc_day)` so a flush that straddles
+/// midnight books each call to the day it actually happened.
+struct ClientActivityBuffer {
+    pending: HashMap<(String, i64), (u32, u32)>,
+    flush_scheduled: bool,
+}
+
+impl ClientActivityBuffer {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            flush_scheduled: false,
+        }
+    }
+
+    /// Record a delta and return whether the caller must start the sole
+    /// background flusher for this shared buffer.
+    fn record(&mut self, client: String, day: i64, is_write: bool) -> bool {
+        self.record_delta(client, day, u32::from(!is_write), u32::from(is_write));
+        if self.flush_scheduled {
+            false
+        } else {
+            self.flush_scheduled = true;
+            true
+        }
+    }
+
+    fn record_delta(&mut self, client: String, day: i64, reads: u32, writes: u32) {
+        let client = if client == CLIENT_ACTIVITY_OVERFLOW_CLIENT
+            || self.pending.contains_key(&(client.clone(), day))
+        {
+            client
+        } else {
+            let named_clients = self
+                .pending
+                .keys()
+                .filter(|(name, bucket_day)| {
+                    *bucket_day == day && name.as_str() != CLIENT_ACTIVITY_OVERFLOW_CLIENT
+                })
+                .count();
+            if named_clients < CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+                client
+            } else {
+                CLIENT_ACTIVITY_OVERFLOW_CLIENT.to_string()
+            }
+        };
+        let slot = self.pending.entry((client, day)).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(reads);
+        slot.1 = slot.1.saturating_add(writes);
+    }
+
+    fn take_entries(&mut self) -> Vec<ClientActivityEntry> {
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|((client, day), (reads, writes))| (client, day, reads, writes))
+            .collect()
+    }
+
+    fn restore_entries(&mut self, entries: Vec<ClientActivityEntry>) {
+        for (client, day, reads, writes) in entries {
+            self.record_delta(client, day, reads, writes);
+        }
+    }
+}
+
+async fn flush_client_activity_loop(
+    buffer: Arc<Mutex<ClientActivityBuffer>>,
+    writer: WriterHandle,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let entries = {
+            let mut buffer = buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if buffer.pending.is_empty() {
+                buffer.flush_scheduled = false;
+                None
+            } else {
+                Some(buffer.take_entries())
+            }
+        };
+        let Some(entries) = entries else {
+            return;
+        };
+
+        if let Err(error) = writer.bump_client_activity(entries.clone()).await {
+            let mut buffer = buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buffer.restore_entries(entries);
+            drop(buffer);
+            tracing::warn!(%error, "client activity flush failed; retrying");
+            continue;
+        }
+
+        let mut buffer = buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buffer.pending.is_empty() {
+            buffer.flush_scheduled = false;
+            return;
+        }
+    }
+}
+
+/// Whether an MCP tool mutates server state, for the reads/writes split
+/// in `client_activity`. Anything unknown counts as a write: failing
+/// toward "write" means a future tool added without updating this list
+/// shows up as suspicious growth in the write column instead of being
+/// silently misfiled as harmless reads.
+fn tool_call_is_write(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "memory_query"
+            | "memory_read_page"
+            | "memory_recent"
+            | "memory_briefing"
+            | "memory_explore"
+            | "memory_status"
+            | "memory_install_self_routing"
+    )
+}
+
+/// Trim, drop control characters, and cap an untrusted client name.
+/// `None` when nothing printable remains.
+fn sanitize_client_name(raw: &str) -> Option<String> {
+    let printable: String = raw
+        .trim()
+        .chars()
+        .filter_map(|c| {
+            if is_bidi_control(c) {
+                None
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else if c.is_control() {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    let cleaned: String = printable
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(CLIENT_ACTIVITY_MAX_NAME_CHARS)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
 
 /// Cap on the free-text `reason` stored with a feedback signal.
 const MAX_FEEDBACK_REASON_CHARS: usize = 500;
@@ -1007,6 +1190,7 @@ impl AiMemoryServer {
             decay_breadth_weight: 0.0,
             embedder: None,
             reranker: None,
+            client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
             rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
@@ -3419,6 +3603,20 @@ impl ServerHandler for AiMemoryServer {
     }
 
     // Declared manually so `#[tool_handler]` skips its generated
+    // `call_tool`: every tool invocation passes through here once, which
+    // is the single choke point where the caller's client identity is
+    // still attached (issue-style: guard the door, not each room).
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        self.record_client_activity(&request.name, &context);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    // Declared manually so `#[tool_handler]` skips its generated
     // `list_tools` and the flavor patch runs on every tools/list.
     async fn list_tools(
         &self,
@@ -3429,28 +3627,27 @@ impl ServerHandler for AiMemoryServer {
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
-        let moonshot = context
+        let restricted_schema = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| parts.uri.query())
-            .is_some_and(|query| query.split('&').any(|pair| pair == "flavor=moonshot"));
-        if moonshot {
-            Ok(ListToolsResult::with_all_items(moonshot_safe_tool_list(
-                tools,
-            )))
+            .is_some_and(has_restricted_schema_flavor);
+        if restricted_schema {
+            Ok(ListToolsResult::with_all_items(
+                restricted_schema_tool_list(tools),
+            ))
         } else {
             Ok(ListToolsResult::with_all_items(tools))
         }
     }
 }
 
-/// Moonshot ("moonshot flavored json schema") rejects root-level
+/// Bedrock and Moonshot reject root-level
 /// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
-/// `tools/list` time. Requests marked `?flavor=moonshot` (the URL
-/// `install-mcp --client kimi-code` writes) get the tool list with
-/// those root keys stripped; nested combinators stay, and the handlers'
-/// runtime validation still enforces the arg contracts.
-fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
+/// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
+/// `?flavor=bedrock` both get schemas with those root keys stripped;
+/// nested combinators stay, and runtime validation remains unchanged.
+fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
     tools
         .into_iter()
@@ -3469,6 +3666,12 @@ fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
             tool
         })
         .collect()
+}
+
+fn has_restricted_schema_flavor(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| matches!(pair, "flavor=moonshot" | "flavor=bedrock"))
 }
 
 /// A page's access counter is bumped at most once per this window. Repeated
@@ -3527,6 +3730,50 @@ impl AiMemoryServer {
             .extensions
             .get::<ai_memory_core::ActorContext>()
             .and_then(ai_memory_core::ActorContext::identity_key)
+    }
+
+    /// Record one MCP tool call against its client and start the shared
+    /// background flusher when needed. Client identity
+    /// prefers the MCP `clientInfo.name` from the initialize handshake
+    /// (present in stateful HTTP / stdio); a stateless transport carries
+    /// no handshake, so the `X-Memory-Actor-Agent` overlay is the
+    /// fallback, then the literal `unknown`.
+    fn record_client_activity(
+        &self,
+        tool: &str,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) {
+        let client = context
+            .peer
+            .peer_info()
+            .and_then(|init| sanitize_client_name(&init.client_info.name))
+            .or_else(|| {
+                context
+                    .extensions
+                    .get::<http::request::Parts>()
+                    .and_then(|parts| parts.extensions.get::<ai_memory_core::ActorContext>())
+                    .and_then(|actor| actor.agent.as_deref())
+                    .and_then(sanitize_client_name)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let day = jiff::Timestamp::now()
+            .as_microsecond()
+            .div_euclid(US_PER_DAY);
+        let is_write = tool_call_is_write(tool);
+        let schedule_flush = {
+            let mut buffer = self
+                .client_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buffer.record(client, day, is_write)
+        };
+        if schedule_flush {
+            tokio::spawn(flush_client_activity_loop(
+                self.client_activity.clone(),
+                self.writer.clone(),
+                CLIENT_ACTIVITY_FLUSH,
+            ));
+        }
     }
 
     /// Fire-and-forget access-counter bump for the M8 reinforcement term,
@@ -6434,7 +6681,7 @@ mod tests {
 
     // Pins what the patch strips (root combinators) and what it preserves.
     #[test]
-    fn moonshot_safe_tool_list_strips_root_combinators_only() {
+    fn restricted_schema_tool_list_strips_root_combinators_only() {
         let schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
@@ -6453,7 +6700,7 @@ mod tests {
             .unwrap();
         let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
 
-        let patched = moonshot_safe_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool]);
         let out = &patched[0].input_schema;
 
         for key in ["anyOf", "oneOf", "allOf"] {
@@ -6473,7 +6720,7 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_safe_tool_list_leaves_flat_tools_untouched() {
+    fn restricted_schema_tool_list_leaves_flat_tools_untouched() {
         let schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({
                 "type": "object",
@@ -6483,10 +6730,22 @@ mod tests {
         let tool = Tool::new("memory_status", "Status counts", schema);
         let before = serde_json::to_value(&tool).unwrap();
 
-        let patched = moonshot_safe_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool]);
         let after = serde_json::to_value(&patched[0]).unwrap();
 
         assert_eq!(before, after, "flat tools must pass through unchanged");
+    }
+
+    #[test]
+    fn restricted_schema_flavor_matches_complete_query_pairs_only() {
+        assert!(has_restricted_schema_flavor("flavor=moonshot"));
+        assert!(has_restricted_schema_flavor(
+            "client=kiro&flavor=bedrock&debug=false"
+        ));
+        assert!(!has_restricted_schema_flavor("flavor=unknown"));
+        assert!(!has_restricted_schema_flavor(
+            "note=flavor=bedrock&client=kiro"
+        ));
     }
 
     // Issue #155: the neither-arg error must teach a looping model what a
@@ -9557,5 +9816,131 @@ mod tests {
         // Each operator is still throttled against THEMSELVES.
         assert!(select_bumpable(&mut seen, vec![page], Some(&alice), t10, cooldown).is_empty());
         assert!(select_bumpable(&mut seen, vec![page], Some(&bob), t10, cooldown).is_empty());
+    }
+    #[test]
+    fn tool_write_classification_fails_toward_write() {
+        for read in [
+            "memory_query",
+            "memory_read_page",
+            "memory_recent",
+            "memory_briefing",
+            "memory_explore",
+            "memory_status",
+            "memory_install_self_routing",
+        ] {
+            assert!(!tool_call_is_write(read), "{read}");
+        }
+        for write in [
+            "memory_write_page",
+            "memory_delete_page",
+            "memory_feedback",
+            "memory_consolidate",
+            "memory_forget_sweep",
+            "memory_handoff_begin",
+        ] {
+            assert!(tool_call_is_write(write), "{write}");
+        }
+        // The deliberate default: a tool this list has never met counts as
+        // a write, so forgetting to classify a future tool is visible.
+        assert!(tool_call_is_write("memory_some_future_tool"));
+    }
+
+    #[test]
+    fn client_names_are_sanitized_and_bounded() {
+        assert_eq!(
+            sanitize_client_name("  Visual  \t Studio\nCode  ").as_deref(),
+            Some("Visual Studio Code"),
+        );
+        assert_eq!(
+            sanitize_client_name("evil\u{7}name").as_deref(),
+            Some("evilname")
+        );
+        assert_eq!(
+            sanitize_client_name("left\u{202e}right").as_deref(),
+            Some("leftright"),
+            "bidirectional display controls must not reach operator output"
+        );
+        assert_eq!(sanitize_client_name("   \u{0}\u{1} "), None);
+        let long = "x".repeat(500);
+        assert_eq!(
+            sanitize_client_name(&long).unwrap().chars().count(),
+            CLIENT_ACTIVITY_MAX_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn client_activity_buffer_schedules_once_and_bounds_each_day() {
+        let mut buffer = ClientActivityBuffer::new();
+        assert!(buffer.record("client-000".into(), 7, false));
+        assert!(!buffer.record("client-000".into(), 7, true));
+        for idx in 1..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            assert!(!buffer.record(format!("client-{idx:03}"), 7, false));
+        }
+        assert!(!buffer.record("overflow-a".into(), 7, false));
+        assert!(!buffer.record("overflow-b".into(), 7, true));
+
+        assert_eq!(
+            buffer.pending.len(),
+            CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY + 1
+        );
+        assert_eq!(
+            buffer
+                .pending
+                .get(&(CLIENT_ACTIVITY_OVERFLOW_CLIENT.to_string(), 7)),
+            Some(&(1, 1))
+        );
+        assert_eq!(buffer.pending.get(&("client-000".into(), 7)), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn failed_client_activity_batch_restores_without_breaking_the_bound() {
+        let mut buffer = ClientActivityBuffer::new();
+        for idx in 0..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            buffer.record_delta(format!("old-{idx:03}"), 7, 1, 0);
+        }
+        let failed = buffer.take_entries();
+
+        for idx in 0..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            buffer.record_delta(format!("new-{idx:03}"), 7, 0, 1);
+        }
+        buffer.restore_entries(failed);
+
+        assert_eq!(
+            buffer.pending.len(),
+            CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY + 1,
+            "restoring a failed batch must not double the cardinality budget"
+        );
+        let totals = buffer.pending.values().fold((0_u64, 0_u64), |sum, delta| {
+            (sum.0 + u64::from(delta.0), sum.1 + u64::from(delta.1))
+        });
+        assert_eq!(
+            totals,
+            (
+                CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY as u64,
+                CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY as u64
+            ),
+            "retry coalescing must preserve every delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_activity_flushes_without_a_later_tool_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let buffer = Arc::new(Mutex::new(ClientActivityBuffer::new()));
+        {
+            let mut locked = buffer.lock().unwrap();
+            assert!(locked.record("quiet-client".into(), 99, false));
+        }
+
+        flush_client_activity_loop(buffer.clone(), store.writer.clone(), Duration::ZERO).await;
+
+        let rows = store.reader.client_activity_since(Some(99)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client, "quiet-client");
+        assert_eq!((rows[0].reads, rows[0].writes), (1, 0));
+        let locked = buffer.lock().unwrap();
+        assert!(locked.pending.is_empty());
+        assert!(!locked.flush_scheduled);
     }
 }

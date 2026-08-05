@@ -41,7 +41,8 @@ Webhooks fire on these `op` values today (extensible enum):
 - `write_page` — direct writes via MCP `memory_write_page`, the CLI
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
 - `consolidate` — LLM consolidation writes from the consolidator
-  (SessionEnd opt-in + PreCompact + manual `memory_consolidate`).
+  (SessionEnd opt-in + PreCompact + manual `memory_consolidate`) and the
+  rule-based PreCompact/PostCompaction fallback after a provider failure.
   **Fires up to twice per consolidation**: once as an admission *preflight*
   before the LLM call — with an **empty body** and the target page path (for
   multi-page runs, the canonical `sessions/<id>.md` anchor path) — and again

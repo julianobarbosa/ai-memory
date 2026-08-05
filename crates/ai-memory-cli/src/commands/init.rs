@@ -219,6 +219,14 @@ mod tests {
         );
         assert!(loaded.auth.bearer_token.is_none());
         assert!(!loaded.slots.per_user);
+        assert_eq!(
+            loaded.consolidation.max_input_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS
+        );
+        assert_eq!(
+            loaded.consolidation.max_output_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS
+        );
         assert!(loaded.auth.root_username.is_none());
     }
 

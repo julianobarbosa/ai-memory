@@ -267,6 +267,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
+| `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
@@ -411,20 +412,20 @@ the explicit `install-mcp --client claude-code --session-aware` option.
 
 ```
 init                 status               run
-show                 workstream-search    audit-contamination
-search               read-page            write-page
-delete-page          serve                reset
-backup               restore              reindex
-install-hooks        hook                 install-mcp
-commit               checkpoints          restore-page
-llm-test             forget-sweep         lint
-curator              auto-improve-report  auto-improve
-finalize-session     pending-writes       embed
-generate-auth-token  setup-agent          bootstrap
-install-instructions install-skills       reorg
-purge-project        rename-project       move-project
-uninstall            auth                 user
-completions
+show                 continue             workstream-search
+audit-contamination  search               read-page
+write-page           delete-page          serve
+reset                backup               restore
+reindex              install-hooks        hook
+install-mcp          commit               checkpoints
+restore-page         llm-test             forget-sweep
+lint                 curator              auto-improve-report
+auto-improve         finalize-session     pending-writes
+embed                generate-auth-token  setup-agent
+bootstrap            install-instructions install-skills
+reorg                purge-project        rename-project
+move-project         uninstall            auth
+user                 completions
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -497,6 +498,12 @@ breadth_weight = 0.0               # opt-in reward for distinct operators
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
+
+[consolidation]                    # LLM consolidation prompt sizing
+max_input_tokens = 100000          # approximate whole-input target; min 6000
+max_output_tokens = 32000          # provider generation limit; min 1000
+                                   # their sum must fit the model context window;
+                                   # leave headroom for tokenizer variance
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

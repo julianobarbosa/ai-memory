@@ -367,6 +367,23 @@ fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_jso
     true
 }
 
+fn write_success_response<W: std::io::Write>(
+    stdout: &mut W,
+    agent: AgentKind,
+    event: HookEvent,
+) -> std::io::Result<()> {
+    if agent == AgentKind::KiroCli {
+        // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
+        // context, and v2 Stop parses stdout for a block decision. Capture-only
+        // hooks therefore stay silent unless SessionStart has real context.
+        Ok(())
+    } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
+        writeln!(stdout, r#"{{"decision": "allow"}}"#)
+    } else {
+        writeln!(stdout, "{{}}")
+    }
+}
+
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
         serde_json::json!({
@@ -414,24 +431,24 @@ where
     W: std::io::Write,
     S: FnOnce(&Path) -> std::io::Result<()>,
 {
+    let agent_kind = AgentKind::from_wire(&args.agent);
+    let hook_event = HookEvent::parse(&args.event);
     let (mut payload, mut json) = match parse_hook_payload(payload) {
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!(
                 "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
             );
-            writeln!(stdout, "{{}}")?;
+            write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
         }
     };
-    let agent_kind = AgentKind::from_wire(&args.agent);
-    let hook_event = HookEvent::parse(&args.event);
     // Antigravity exposes PreInvocation rather than a true SessionStart. It
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
     if !should_process_hook_event(agent_kind, hook_event, &json) {
-        writeln!(stdout, "{{}}")?;
+        write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
     // Assistant/Stop capture (#196). On an opted-in install
@@ -483,7 +500,7 @@ where
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
-                writeln!(stdout, "{{}}")?;
+                write_success_response(stdout, agent_kind, hook_event)?;
                 return Ok(());
             }
             CaptureDisposition::MetadataOnly => {
@@ -613,8 +630,14 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                let envelope = session_start_handoff_envelope(agent_kind, handoff);
-                writeln!(stdout, "{envelope}")?;
+                if agent_kind == AgentKind::KiroCli {
+                    // Kiro v2 consumes agentSpawn stdout verbatim and defines
+                    // no wrapper envelope.
+                    writeln!(stdout, "{handoff}")?;
+                } else {
+                    let envelope = session_start_handoff_envelope(agent_kind, handoff);
+                    writeln!(stdout, "{envelope}")?;
+                }
                 return Ok(());
             }
         }
@@ -707,7 +730,7 @@ where
         );
     }
 
-    writeln!(stdout, "{{}}")?;
+    write_success_response(stdout, agent_kind, hook_event)?;
     Ok(())
 }
 
@@ -877,6 +900,76 @@ mod tests {
             HookEvent::PostToolUse,
             &serde_json::json!({})
         ));
+    }
+
+    #[test]
+    fn hook_success_response_is_specific_to_antigravity_pre_tool_use() {
+        for (agent, event, expected) in [
+            (
+                AgentKind::AntigravityCli,
+                HookEvent::PreToolUse,
+                b"{\"decision\": \"allow\"}\n".as_slice(),
+            ),
+            (
+                AgentKind::AntigravityCli,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                HookEvent::PreToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (AgentKind::KiroCli, HookEvent::PreToolUse, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::SessionStart, b"".as_slice()),
+        ] {
+            let mut output = Vec::new();
+            write_success_response(&mut output, agent, event).unwrap();
+            assert_eq!(output, expected, "{agent:?} {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_pre_tool_use_allows_and_spools_valid_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            serde_json::json!({
+                "conversationId": "agy-session",
+                "workspacePaths": [tmp.path()],
+                "toolCall": {"name": "view_file", "args": {"AbsolutePath": "README.md"}}
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 1);
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_pre_tool_use_fails_open_on_malformed_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            "not-json".into(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
     #[test]
@@ -1657,7 +1750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_workspace_path_drops_before_side_effects() {
+    async fn antigravity_pre_tool_capture_drop_still_allows_the_tool() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join(".ai-memory.toml"),
@@ -1665,7 +1758,7 @@ mod tests {
         )
         .unwrap();
         let data_dir = tmp.path().join("data");
-        let mut args = devin_hook_args("post-tool-use");
+        let mut args = devin_hook_args("pre-tool-use");
         args.agent = "antigravity-cli".into();
         let mut stdout = Vec::new();
         let raw = serde_json::json!({"workspacePaths":[tmp.path()],"toolCall":{"name":"Edit","args":{"path":"secret/a"}}});
@@ -1679,7 +1772,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stdout, b"{}\n");
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
@@ -1732,9 +1825,21 @@ mod tests {
         }
     }
 
-    fn antigravity_hook_args(server_url: &str) -> HookArgs {
+    fn kiro_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
-            event: "session-start".into(),
+            event: event.into(),
+            agent: "kiro-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
+    fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
             agent: "antigravity-cli".into(),
             server_url: server_url.into(),
             auth_token: None,
@@ -1791,7 +1896,7 @@ mod tests {
         let mut stdout = Vec::new();
         run_with_payload(
             Some(tmp.path().join("data")),
-            antigravity_hook_args(&base),
+            antigravity_hook_args("session-start", &base),
             serde_json::json!({
                 "invocationNum": 0,
                 "initialNumSteps": 0,
@@ -1839,7 +1944,7 @@ mod tests {
         let mut stdout = Vec::new();
         run_with_payload(
             Some(data_dir.clone()),
-            antigravity_hook_args(&base),
+            antigravity_hook_args("session-start", &base),
             serde_json::json!({
                 "invocationNum": 4,
                 "initialNumSteps": 12,
@@ -1856,6 +1961,40 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(first_request(&mut requests).await.is_none());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn kiro_session_start_prints_handoff_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "KIRO-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            kiro_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "kiro-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"KIRO-HANDOFF\n");
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=kiro-cli")
+                    && request.contains("session_id=kiro-session")
+            }),
+            "{recorded:?}"
+        );
     }
 
     #[tokio::test]

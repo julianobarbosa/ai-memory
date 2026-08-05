@@ -370,20 +370,21 @@ impl IdentityKey {
 
     /// A bounded, filesystem-safe namespace component for operator-owned data.
     ///
-    /// Readable usernames are retained when they are short and contain only
-    /// path/GLOB-safe ASCII. All other usernames, and every OIDC identity, use
-    /// a deterministic UUIDv5 derived from the fully qualified storage key.
-    /// This keeps the OIDC issuer in the identity while avoiding filesystem
-    /// component limits for long or path-hostile values.
+    /// Readable usernames are retained when they are short, contain only
+    /// lowercase path/GLOB-safe ASCII, and do not end in a period. Mixed-case
+    /// and all other usernames, plus every OIDC identity, use a deterministic
+    /// UUIDv5 derived from the fully qualified storage key. This avoids
+    /// platform pathname equivalences between distinct identities.
     #[must_use]
     pub fn path_segment(&self) -> String {
         match self {
             Self::User(user)
                 if user.len() <= 64
                     && !user.is_empty()
-                    && user
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
+                    && !user.ends_with('.')
+                    && user.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    }) =>
             {
                 format!("u-{user}")
             }
@@ -712,6 +713,35 @@ mod tests {
             );
             assert_eq!(segment, identity.path_segment());
         }
+    }
+
+    #[test]
+    fn username_path_segments_remain_distinct_under_ascii_case_folding() {
+        let lowercase = IdentityKey::User("alice".into()).path_segment();
+        let titlecase = IdentityKey::User("Alice".into()).path_segment();
+        let uppercase = IdentityKey::User("ALICE".into()).path_segment();
+        let trailing_dot = IdentityKey::User("alice.".into()).path_segment();
+
+        assert_eq!(lowercase, "u-alice");
+        assert!(titlecase.starts_with("uh-"), "{titlecase}");
+        assert!(uppercase.starts_with("uh-"), "{uppercase}");
+        assert!(trailing_dot.starts_with("uh-"), "{trailing_dot}");
+        assert_ne!(
+            lowercase.to_ascii_lowercase(),
+            titlecase.to_ascii_lowercase()
+        );
+        assert_ne!(
+            lowercase.to_ascii_lowercase(),
+            uppercase.to_ascii_lowercase()
+        );
+        assert_ne!(
+            titlecase.to_ascii_lowercase(),
+            uppercase.to_ascii_lowercase()
+        );
+        assert_ne!(
+            lowercase.to_ascii_lowercase(),
+            trailing_dot.trim_end_matches('.').to_ascii_lowercase()
+        );
     }
 
     #[test]

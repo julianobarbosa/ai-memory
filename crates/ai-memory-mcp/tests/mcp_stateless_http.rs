@@ -215,6 +215,28 @@ async fn stateless_moonshot_flavor_strips_root_any_of() {
     );
 }
 
+/// Kiro's Bedrock requests use the same restricted root-schema dialect while
+/// retaining a provider-specific marker for diagnostics and compatibility.
+#[tokio::test]
+async fn stateless_bedrock_flavor_strips_root_any_of() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=bedrock", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "bedrock flavor must strip root `{key}`: {schema}"
+        );
+    }
+    assert!(schema.get("properties").is_some());
+}
+
 /// Control: without the marker, tools/list keeps the upstream root `anyOf`.
 #[tokio::test]
 async fn stateless_tools_list_without_flavor_keeps_root_any_of() {

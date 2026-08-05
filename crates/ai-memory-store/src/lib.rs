@@ -47,13 +47,14 @@ pub use ops::{
     ReorgSummary,
 };
 pub use reader::{
-    ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
-    ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
-    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    ObservationHit, OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta,
-    PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions,
-    ScopeRow, SearchExplain, SessionEndDisposition, StatusCounts, StoredEmbedding, StoredPageBody,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
+    BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
+    ContaminationSummary, DecayCandidate, DerivedIndexStatus, EmbeddingTripleCount,
+    FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, OpenSession, PageAuthor,
+    PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
+    ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    SessionEndDisposition, StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
+    WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
@@ -70,6 +71,14 @@ pub use writer::{StartupContextAcceptance, WriterHandle};
 
 /// Filename used inside the data dir's `db/` subdirectory.
 pub const DB_FILENAME: &str = "memory.sqlite";
+
+/// Maximum Unicode scalar count accepted for a persisted MCP client label.
+pub const CLIENT_ACTIVITY_MAX_NAME_CHARS: usize = 64;
+/// Maximum distinct named MCP clients persisted for one UTC day. Calls from
+/// additional labels are folded into [`CLIENT_ACTIVITY_OVERFLOW_CLIENT`].
+pub const CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY: usize = 128;
+/// Stable label used when a UTC day's client-cardinality budget is exhausted.
+pub const CLIENT_ACTIVITY_OVERFLOW_CLIENT: &str = "other";
 
 /// Default soft cap for the read-only connection pool.
 const READER_POOL_SOFT_CAP: usize = 4;

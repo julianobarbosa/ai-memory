@@ -1,6 +1,6 @@
 //! `ai-memory finalize-session` — manually synthesize SessionEnd for an agent.
 
-use ai_memory_core::AgentKind;
+use ai_memory_core::{AgentKind, SessionId};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         agent,
         args.all,
         args.all_owners,
+        args.session_id,
     )
     .await?;
     if sessions.is_empty() {
@@ -100,21 +101,22 @@ async fn fetch_open_sessions(
     agent: AgentKind,
     all: bool,
     all_owners: bool,
+    session_id: Option<SessionId>,
 ) -> Result<Vec<OpenSessionEntry>> {
     let all = if all { "true" } else { "false" };
     let all_owners = if all_owners { "true" } else { "false" };
-    let result = get_json::<OpenSessionsResponse>(
-        endpoint,
-        "/admin/open-sessions",
-        &[
-            ("workspace", workspace),
-            ("project", project),
-            ("agent", agent.as_str()),
-            ("all", all),
-            ("all_owners", all_owners),
-        ],
-    )
-    .await;
+    let mut query = vec![
+        ("workspace", workspace),
+        ("project", project),
+        ("agent", agent.as_str()),
+        ("all", all),
+        ("all_owners", all_owners),
+    ];
+    let session_id = session_id.map(|sid| sid.to_string());
+    if let Some(sid) = session_id.as_deref() {
+        query.push(("session_id", sid));
+    }
+    let result = get_json::<OpenSessionsResponse>(endpoint, "/admin/open-sessions", &query).await;
     match result {
         Ok(response) => Ok(response.sessions),
         Err(e) => {
@@ -300,6 +302,79 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].session_id, latest);
+    }
+
+    /// Regression for the race a blind wrapper hits when several terminal
+    /// tabs each run Kiro CLI against the same repo: two sessions for the
+    /// same agent+scope are open at once (`older` started first, `latest`
+    /// started after — e.g. opened in a second tab while the first was
+    /// still running). Targeting `older` by its exact id must return only
+    /// `older`, never falling back to "the newest open one" and closing
+    /// out the still-active `latest` session instead.
+    #[tokio::test]
+    async fn exact_session_id_targets_that_session_even_with_a_newer_one_open() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        for id in [older, latest] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::KiroCli,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let selected = store
+            .reader
+            .open_session_for_scope_agent_by_id(
+                ws,
+                proj,
+                AgentKind::KiroCli,
+                ai_memory_core::OwnerFilter::Any,
+                older,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selected.map(|session| session.session_id),
+            Some(older),
+            "must target the requested session, not the newest open one"
+        );
+
+        // The other, still-open session must be untouched and independently
+        // discoverable — proving the exact-id filter didn't just narrow the
+        // default query, it left the sibling session alone.
+        let still_open = store
+            .reader
+            .open_session_for_scope_agent_by_id(
+                ws,
+                proj,
+                AgentKind::KiroCli,
+                ai_memory_core::OwnerFilter::Any,
+                latest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_open.map(|session| session.session_id), Some(latest));
     }
 
     #[test]

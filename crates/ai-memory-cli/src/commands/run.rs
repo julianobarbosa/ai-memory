@@ -16,8 +16,9 @@ use ai_memory_core::{
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
     allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, has_native_session_selector, inspect_repository, list_native_sessions,
-    native_session_exists, wait_for_transcript_flush,
+    export_transcript, has_native_session_selector, inspect_repository,
+    kiro_selects_non_default_engine, list_native_sessions, native_session_exists,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -293,6 +294,16 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         }
     }
     if args.yolo || trailing_yolo {
+        // Kiro's official dangerous mode exists on the v2 engine only
+        // (`--trust-all-tools`); the v3 engine replaced it with
+        // permissions.yaml and documents no CLI equivalent, so the wrapper
+        // maps nothing there and says so instead of failing silently.
+        if harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args) {
+            eprintln!(
+                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+            );
+        }
         apply_yolo(harness, &mut plan.args);
     }
     if plan.mode == LaunchMode::Session
@@ -1221,6 +1232,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
     }
@@ -1234,6 +1246,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         _ => None,
@@ -1646,6 +1659,32 @@ mod tests {
             args.native_args,
             ["--model", "kimi-for-coding"].map(OsString::from).to_vec()
         );
+    }
+
+    #[test]
+    fn kiro_cli_alias_selects_the_kiro_adapter() {
+        for name in ["kiro", "kiro-cli"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--model"),
+                OsStr::new("sonnet"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert!(
+                matches!(args.harness, Some(crate::cli::RunHarnessChoice::Kiro)),
+                "{name}"
+            );
+            assert_eq!(
+                args.native_args,
+                ["--model", "sonnet"].map(OsString::from).to_vec()
+            );
+            assert_eq!(managed_harness(args.harness.unwrap()), ManagedHarness::Kiro);
+        }
     }
 
     #[test]

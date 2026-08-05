@@ -77,6 +77,30 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Kiro CLI v2-engine lifecycle events. Each pair is
+/// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
+///
+/// The v2 engine embeds hooks in agent configs (`~/.kiro/agents/*.json`)
+/// keyed by camelCase triggers, per kiro.dev/docs/hooks and the
+/// shipping `HookTrigger` serde in aws/amazon-q-developer-cli
+/// (`crates/chat-cli/src/cli/agent/hook.rs`). The vocabulary is exactly
+/// these five events — there is no PreCompact/SessionEnd/subagent
+/// equivalent. Adding a hook event means updating this list AND adding
+/// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
+/// install-hooks parity test fails if the bundle drifts.
+///
+/// Kiro's v3 engine uses a documented standalone registration format, but its
+/// live lifecycle and built-in tool payloads have not been accepted as
+/// fixtures. Do not advertise or install v3 hooks until those exact contracts
+/// are captured and tested.
+pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
+    ("agentSpawn", "session-start.sh"),
+    ("userPromptSubmit", "user-prompt-submit.sh"),
+    ("preToolUse", "pre-tool-use.sh"),
+    ("postToolUse", "post-tool-use.sh"),
+    ("stop", "stop.sh"),
+];
+
 /// Devin lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Devin-settings, POSIX hook-script-filename)`.
 ///
@@ -796,6 +820,73 @@ fn kimi_code_hook_commands_for_platform(
             (*event, command)
         })
         .collect()
+}
+
+/// Build the `hooks` map for a Kiro CLI v2-engine agent config. Entry
+/// shape per the shipping `Hook` struct (aws/amazon-q-developer-cli
+/// `crates/chat-cli/src/cli/agent/hook.rs`): a flat
+/// `{ "command": … }` object per trigger. Two deliberate omissions:
+///
+/// - no `matcher` key: in Kiro v2 an *absent* matcher applies the hook
+///   to every tool, while an empty-string matcher is a tool-name
+///   pattern that matches nothing — the opposite of Claude Code's
+///   empty-matcher convention, so `HookShape::Flat` must not be reused;
+/// - no `type` key: the v2 `Hook` struct has no such field.
+///
+/// `agentSpawn` sets `max_output_size` above the 10 KiB default so a
+/// fetched handoff + compiled project brief is not truncated mid-JSON
+/// before Kiro adds it to the agent context.
+pub(crate) fn build_kiro_cli_v2_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    build_kiro_cli_v2_hooks_value_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandPlatform::current(),
+        data_dir,
+        project_strategy,
+    )
+}
+
+/// Session-start context injection ceiling for Kiro v2 (`max_output_size`).
+/// Kiro truncates hook stdout beyond this; 64 KiB comfortably covers a
+/// handoff plus a `[briefing]`-budgeted brief.
+pub(crate) const KIRO_CLI_V2_SESSION_START_MAX_OUTPUT: usize = 64 * 1024;
+
+fn build_kiro_cli_v2_hooks_value_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut hooks = serde_json::Map::new();
+    for (event, script) in KIRO_CLI_V2_EVENTS {
+        let script = script_for_platform(script, platform);
+        let abs = emit_root.join(script.as_ref());
+        let command = hook_command(
+            &abs,
+            server_url,
+            auth_token,
+            HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("command".to_string(), Value::String(command));
+        if event == "agentSpawn" {
+            entry.insert(
+                "max_output_size".to_string(),
+                Value::from(KIRO_CLI_V2_SESSION_START_MAX_OUTPUT),
+            );
+        }
+        hooks.insert(event.to_string(), json!([Value::Object(entry)]));
+    }
+    hooks
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

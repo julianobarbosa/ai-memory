@@ -38,8 +38,8 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they expose
-long-term memory to their LLMs via ai-memory's MCP tools
+Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they
+expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
 endpoint. The trade-off:
@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -792,6 +792,78 @@ same pattern as Gemini CLI.
   same event. `PostToolUse` and `PostToolUseFailure` reuse one handler command,
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
+
+## Kiro CLI
+
+**Status:** MCP, v2 lifecycle hooks, and explicit v2 managed workstreams are
+supported. Bare automatic workstream selection remains unsupported pending a
+logged-in current-format v2 acceptance run. V3 hooks and managed sessions need
+their own documented, fixture-tested payload and store contracts.
+
+**Config file:** `$KIRO_HOME/settings/mcp.json`, defaulting to
+`~/.kiro/settings/mcp.json`. Use `--config-file .kiro/settings/mcp.json` when
+you intentionally want Kiro's lower-scope project configuration instead.
+
+```bash
+ai-memory install-mcp --client kiro-cli --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+```
+
+The `kiro` alias is equivalent. The command preserves unrelated settings and
+servers, and merges this entry idempotently:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "https://memory.example/mcp?flavor=bedrock",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Kiro sends MCP tool schemas through Amazon Bedrock, which rejects root-level
+`anyOf`, `oneOf`, and `allOf`. The installer appends `?flavor=bedrock`; the
+server strips only those root combinators for that request while preserving
+nested schemas and the handlers' runtime validation. Kimi Code's existing
+`?flavor=moonshot` behavior remains supported independently.
+
+Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
+`localhost`, `127.0.0.1`, or another loopback address; `install-mcp` rejects a
+non-loopback HTTP URL before writing the config. See
+[HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
+
+ai-memory supports Kiro's documented v2 hook registration format:
+
+```bash
+# v2: update every existing global agent definition.
+ai-memory install-hooks --agent kiro-cli --apply
+
+# v2 project-local agent: target the active definition explicitly.
+ai-memory install-hooks --agent kiro-cli --apply \
+    --config-file .kiro/agents/<agent-name>.json
+```
+
+The v2 installer refuses to create a synthetic agent file and parses every
+target before changing any of them. Project-local Kiro agents override global
+agents, so `--config-file` is required when the active definition lives under
+`.kiro/agents/`. The integration remains fail-open, injects pending handoffs
+through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
+not installed: its standalone schema and generic command context are now
+documented, but sanitized live lifecycle and built-in tool payload fixtures are
+still needed to validate capture, exclusions, and fail-open behavior. Follow
+[#355](https://github.com/akitaonrails/ai-memory/issues/355) for v3 hook support
+and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for automatic
+selection and broader version-aware managed support. Explicit
+`ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
+non-v2 engine selections pass through without session injection or import.
+
+Sources: <https://kiro.dev/docs/mcp/configuration/>,
+<https://kiro.dev/docs/reference/settings/>,
+<https://kiro.dev/docs/hooks/>,
+<https://kiro.dev/docs/hooks/types/>, and
+<https://kiro.dev/docs/cli/v3/hooks-migration/>.
 
 ## OpenClaw
 

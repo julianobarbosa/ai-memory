@@ -40,6 +40,8 @@ fn command_with_home(home: &Path) -> Command {
         // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code
         // config sweep out of the sandbox; tests opt back in explicitly.
         .env_remove("KIMI_CODE_HOME")
+        // The same isolation is required for Kiro's relocatable config root.
+        .env_remove("KIRO_HOME")
         // Keep Claude installer/removal tests inside their temp HOME unless a
         // test explicitly opts into a relocated config root.
         .env_remove("CLAUDE_CONFIG_DIR");
@@ -1082,6 +1084,104 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     assert!(
         !after.contains("AI_MEMORY_HOOK_URL") && !after.contains("--agent kimi-code"),
         "no ai-memory hook command may remain: {after}"
+    );
+}
+
+#[test]
+fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let kiro = home.path().join(".kiro");
+
+    // v2 engine surface: an agent config with a third-party hook next to ours.
+    let agents = kiro.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let agent_config = agents.join("dev.json");
+    std::fs::write(
+        &agent_config,
+        r#"{
+  "name": "dev",
+  "tools": ["*"],
+  "hooks": {
+    "agentSpawn": [
+      {"command": "git status"},
+      {"command": "echo ai-memory status"},
+      {"command": "AI_MEMORY_HOOK_URL=http://h /x/hooks/kiro-cli/session-start.sh", "max_output_size": 65536}
+    ],
+    "stop": [
+      {"command": "'/usr/local/bin/ai-memory' hook --event stop --agent kiro-cli --server-url http://h:49374"}
+    ]
+  }
+}"#,
+    )
+    .unwrap();
+
+    let local_agent = project.path().join(".kiro/agents/local.json");
+    write_file(
+        &local_agent,
+        r#"{"name":"local","hooks":{"stop":[{"command":"/x/hooks/kiro-cli/stop.sh"}]}}"#,
+    );
+
+    // v3 remains unsupported without accepted live payload fixtures.
+    // Uninstall must leave even an ai-memory-looking standalone file untouched.
+    let hooks_dir = kiro.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let v3_file = hooks_dir.join("ai-memory.json");
+    std::fs::write(
+        &v3_file,
+        r#"{
+  "version": "v1",
+  "hooks": [
+    {"name": "ai-memory-session-start", "trigger": "SessionStart",
+     "action": {"type": "command", "command": "/x/kiro-cli/session-start.sh"}, "timeout": 10},
+    {"name": "lint-on-save", "trigger": "PostFileSave", "matcher": "\\.rs$",
+     "action": {"type": "command", "command": "cargo fmt"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    // A neighbouring third-party hooks file must never be touched.
+    let third_party_file = hooks_dir.join("team-hooks.json");
+    let third_party_body = r#"{"version":"v1","hooks":[{"name":"security-check","trigger":"PreToolUse","action":{"type":"command","command":"/usr/bin/audit"}}]}"#;
+    std::fs::write(&third_party_file, third_party_body).unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let agent_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&agent_config).unwrap()).unwrap();
+    assert_eq!(agent_after["name"], "dev", "agent definition must survive");
+    let spawn = agent_after["hooks"]["agentSpawn"].as_array().unwrap();
+    assert_eq!(spawn.len(), 2, "only exact ai-memory entries removed");
+    assert_eq!(spawn[0]["command"], "git status");
+    assert_eq!(spawn[1]["command"], "echo ai-memory status");
+    assert!(
+        agent_after["hooks"].get("stop").is_none(),
+        "an event array left empty is dropped"
+    );
+    let local_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local_agent).unwrap()).unwrap();
+    assert!(
+        local_after.get("hooks").is_none(),
+        "project-local ai-memory hooks must also be removed"
+    );
+
+    assert!(
+        std::fs::read_to_string(&v3_file)
+            .unwrap()
+            .contains("ai-memory-session-start"),
+        "unsupported v3 hook files must remain untouched"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&third_party_file).unwrap(),
+        third_party_body,
+        "third-party hooks files must stay byte-identical"
     );
 }
 

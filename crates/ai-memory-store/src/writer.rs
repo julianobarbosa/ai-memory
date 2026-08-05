@@ -188,6 +188,11 @@ pub(crate) enum WriteCmd {
         actor: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    BumpClientActivity {
+        /// `(client, utc_day, reads_delta, writes_delta)` buckets.
+        entries: Vec<(String, i64, u32, u32)>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     RecordPageFeedback {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -892,6 +897,24 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Fold buffered per-client MCP tool-call counts into their
+    /// `(client, day)` buckets. Entries are deltas, not totals. Labels must
+    /// already be normalized; each UTC day retains a bounded number of named
+    /// clients and folds later names into the stable overflow bucket.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`], rejects malformed labels with
+    /// [`StoreError::InvalidState`], or propagates SQL errors.
+    pub async fn bump_client_activity(
+        &self,
+        entries: Vec<(String, i64, u32, u32)>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BumpClientActivity { entries, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1794,6 +1817,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result =
                     ops::bump_access_for_pages_for_actor(&mut conn, &page_ids, actor.as_ref());
                 send_or_warn(reply, result, "bump_access_for_pages");
+            }
+            WriteCmd::BumpClientActivity { entries, reply } => {
+                let result = ops::bump_client_activity(&mut conn, &entries);
+                send_or_warn(reply, result, "bump_client_activity");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
                 let result = ops::soft_delete_for_decay(&mut conn, &page_ids);

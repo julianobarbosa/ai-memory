@@ -135,8 +135,8 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
             eprintln!(
                 "note: neither CLAUDE.md nor AGENTS.md exists in {}; \
                  creating CLAUDE.md. If you use Codex / OpenCode / \
-                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code, \
-                 re-run with `--target AGENTS.md`.",
+                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code / \
+                 Kiro CLI, re-run with `--target AGENTS.md`.",
                 cwd.display()
             );
             Ok(vec![claude_md])

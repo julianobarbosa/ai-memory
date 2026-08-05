@@ -40,6 +40,9 @@ pub enum Command {
     /// Pick a local project and installed harness, then launch from that
     /// checkout. Removes the `cd` step `run` requires.
     Show(ShowArgs),
+    /// Resume the most recently launched managed checkout from anywhere,
+    /// without `cd` and without picking from a list.
+    Continue(ContinueArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -231,6 +234,9 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// Amazon Kiro CLI (v2 engine).
+    #[value(name = "kiro", alias = "kiro-cli")]
+    Kiro,
     /// Grok Build CLI (xAI).
     #[value(alias = "grok-build")]
     Grok,
@@ -263,6 +269,26 @@ pub struct ShowArgs {
     /// Native harness arguments, forwarded byte-for-byte and in order.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub native_args: Vec<OsString>,
+}
+
+/// Arguments for `continue`.
+///
+/// Deliberately smaller than [`ShowArgs`]: `continue` always delegates to
+/// `run`'s bare mode, which rejects native argv and `--executable` because
+/// their meaning depends on a harness the user did not name.
+#[derive(Debug, Args)]
+pub struct ContinueArgs {
+    /// Only consider checkouts resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Disable native permission prompts using the resolved harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming the linked one.
+    /// Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 /// Arguments for `workstream-search`.
@@ -988,6 +1014,12 @@ pub enum AgentChoice {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
+    /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
+    /// schema is documented but lacks accepted live lifecycle and built-in
+    /// tool payload fixtures.
+    #[value(alias = "kiro")]
+    KiroCli,
 }
 
 impl AgentChoice {
@@ -1013,6 +1045,7 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
+            Self::KiroCli => AgentKind::KiroCli,
         }
     }
 
@@ -1052,8 +1085,16 @@ pub struct FinalizeSessionArgs {
     #[arg(long, default_value_t = false)]
     pub all_owners: bool,
     /// Finalize every matching open session instead of just the latest one.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "session_id")]
     pub all: bool,
+    /// Finalize exactly this session id instead of "the latest open one"
+    /// (still subject to `--all-owners`). Use this when other sessions for
+    /// the same agent may be open concurrently in the same project (e.g.
+    /// multiple terminal tabs each running Kiro CLI against one repo) —
+    /// picking "latest" in that case risks closing out the wrong
+    /// (still-active) session.
+    #[arg(long, conflicts_with = "all")]
+    pub session_id: Option<ai_memory_core::SessionId>,
     /// Emit a JSON summary.
     #[arg(long)]
     pub json: bool,
@@ -1107,6 +1148,11 @@ pub enum McpClient {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI - `$KIRO_HOME/settings/mcp.json` (default
+    /// `~/.kiro/settings/mcp.json`). Pair with
+    /// `install-hooks --agent kiro-cli` for verified v2 lifecycle capture.
+    #[value(alias = "kiro")]
+    KiroCli,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -1679,6 +1725,44 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn finalize_session_parses_typed_id_and_rejects_ambiguous_selection() {
+        let session_id = ai_memory_core::SessionId::new();
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "finalize-session",
+            "--session-id",
+            &session_id.to_string(),
+        ])
+        .expect("valid session id parses");
+        let Command::FinalizeSession(args) = parsed.command else {
+            panic!("expected finalize-session command");
+        };
+        assert_eq!(args.session_id, Some(session_id));
+
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "finalize-session",
+                "--session-id",
+                "not-a-uuid",
+            ])
+            .is_err(),
+            "malformed session ids must fail at the CLI boundary"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "finalize-session",
+                "--all",
+                "--session-id",
+                &session_id.to_string(),
+            ])
+            .is_err(),
+            "--all and --session-id must be mutually exclusive"
+        );
+    }
+
+    #[test]
     fn architecture_lists_every_visible_cli_subcommand() {
         let architecture = include_str!("../../../docs/ARCHITECTURE.md");
         let cli_section = architecture
@@ -1704,6 +1788,34 @@ mod tests {
             documented, visible,
             "docs/ARCHITECTURE.md CLI subcommands must match `ai-memory --help`"
         );
+    }
+
+    /// `continue` always delegates to `run`'s bare mode, which refuses native
+    /// argv and `--executable`. Rejecting them at parse time keeps that
+    /// contract visible in `--help` instead of failing after the launch has
+    /// already started resolving a workstream.
+    #[test]
+    fn continue_takes_wrapper_flags_only() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "continue", "--workspace", "work", "--yolo"])
+                .expect("continue parses wrapper flags");
+        let Command::Continue(args) = parsed.command else {
+            panic!("expected continue command");
+        };
+        assert_eq!(args.workspace.as_deref(), Some("work"));
+        assert!(args.yolo);
+        assert!(!args.fresh);
+
+        for rejected in [
+            vec!["ai-memory", "continue", "claude"],
+            vec!["ai-memory", "continue", "--model", "opus"],
+            vec!["ai-memory", "continue", "--executable", "/bin/claude"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&rejected).is_err(),
+                "{rejected:?} must not parse"
+            );
+        }
     }
 
     #[test]
@@ -2061,6 +2173,25 @@ mod tests {
     }
 
     #[test]
+    fn kiro_mcp_aliases_parse() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "https://memory.example/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse Kiro MCP alias {alias}: {e}"));
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp command for Kiro alias {alias}");
+            };
+            assert!(matches!(args.client, McpClient::KiroCli));
+        }
+    }
+
+    #[test]
     fn devin_hook_agent_parses() {
         let hook_cli = Cli::try_parse_from([
             "ai-memory",
@@ -2075,6 +2206,40 @@ mod tests {
             panic!("expected install-hooks command for devin");
         };
         assert!(matches!(hook_args.agent, AgentChoice::Devin));
+    }
+
+    #[test]
+    fn kiro_v2_hook_aliases_parse_and_v3_is_not_advertised() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Kiro v2 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Kiro v2 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::KiroCli);
+        }
+        for unsupported in ["kiro-cli-v3", "kiro-v3"] {
+            let error = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                unsupported,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("invalid value"),
+                "v3 must remain unsupported until its live payload fixtures are verified: {error}"
+            );
+        }
     }
 
     #[test]

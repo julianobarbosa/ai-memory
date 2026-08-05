@@ -6,7 +6,7 @@ mod transcript;
 
 pub use harness::{
     LaunchMode, LaunchPlan, ManagedHarness, allows_native_session_adoption, apply_yolo,
-    build_launch_plan, has_native_session_selector,
+    build_launch_plan, has_native_session_selector, kiro_selects_non_default_engine,
 };
 pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{

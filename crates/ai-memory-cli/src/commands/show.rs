@@ -421,7 +421,12 @@ fn available_harnesses() -> Vec<RunHarnessChoice> {
         .collect()
 }
 
-fn validate_registered_path(path: &Path) -> Result<PathBuf> {
+/// Re-check a stored checkout path immediately before it is used.
+///
+/// The canonical-equality check is the load-bearing one: it rejects a
+/// recorded directory that has since been replaced by a symlink pointing
+/// somewhere else, before any harness is launched inside it.
+pub(super) fn validate_registered_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("stored checkout path is not absolute");
     }
@@ -633,7 +638,7 @@ fn harness_name(harness: RunHarnessChoice) -> String {
         .map_or_else(|| "unknown".to_owned(), |value| value.get_name().to_owned())
 }
 
-fn terminal_text(text: &str) -> String {
+pub(super) fn terminal_text(text: &str) -> String {
     text.chars()
         .map(|character| {
             if character.is_control() {

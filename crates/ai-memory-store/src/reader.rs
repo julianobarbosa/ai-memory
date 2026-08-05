@@ -430,6 +430,32 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Aggregate MCP tool-call counts for one client, from
+/// `client_activity` — the MCP-only complement to
+/// [`AgentSessionCount`]: hook-less clients (VS Code Copilot, Claude
+/// Desktop, scripts) never open sessions but still read and write
+/// memory through tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientActivity {
+    /// Sanitized client name (`clientInfo.name`, actor overlay, or
+    /// `unknown`).
+    pub client: String,
+    /// Read-shaped tool calls (query/read/recent/briefing/…).
+    pub reads: u64,
+    /// Write-shaped tool calls (write_page/feedback/consolidate/…).
+    pub writes: u64,
+}
+
+/// How many sessions one agent CLI opened in a scope — the shape behind
+/// "where is this project's memory actually coming from".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentSessionCount {
+    /// `AgentKind` as stored (`claude-code`, `cursor`, …).
+    pub agent: String,
+    /// Sessions this agent opened in the window, ended or still open.
+    pub sessions: u64,
+}
+
 /// How a `SessionEnd` event should treat its target session — see
 /// [`ReaderPool::session_end_disposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1688,6 +1714,130 @@ impl ReaderPool {
         .await
     }
 
+    /// Sum per-client MCP tool-call counters, optionally bounded to
+    /// buckets at or after `since_day` (UTC days since the epoch;
+    /// `None` = whole history). Ordered by total volume descending
+    /// with a client-name tiebreak so equal totals do not reorder
+    /// between calls.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn client_activity_since(
+        &self,
+        since_day: Option<i64>,
+    ) -> StoreResult<Vec<ClientActivity>> {
+        self.with_conn(move |conn| {
+            let since_clause = if since_day.is_some() {
+                " WHERE day >= :since"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT client, SUM(reads), SUM(writes) FROM client_activity\
+                 {since_clause} \
+                 GROUP BY client \
+                 ORDER BY SUM(reads) + SUM(writes) DESC, client ASC"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let map = |row: &rusqlite::Row<'_>| {
+                let client: String = row.get(0)?;
+                let reads: i64 = row.get(1)?;
+                let writes: i64 = row.get(2)?;
+                Ok((client, reads, writes))
+            };
+            let rows = match &since_day {
+                Some(since) => stmt.query_map(&[(":since", since as &dyn rusqlite::ToSql)], map)?,
+                None => stmt.query_map([], map)?,
+            };
+            let mut out = Vec::new();
+            for row in rows {
+                let (client, reads, writes) = row?;
+                out.push(ClientActivity {
+                    client,
+                    reads: u64::try_from(reads).unwrap_or(0),
+                    writes: u64::try_from(writes).unwrap_or(0),
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Count sessions per agent CLI in one scope, newest window first.
+    ///
+    /// Counts every session the window covers, open or ended — the question
+    /// is which tools produced this project's memory, not which are running
+    /// right now (`open_sessions_for_scope_agent` answers that).
+    ///
+    /// `since_us` is an inclusive lower bound on `started_at`; `None` counts
+    /// the project's whole history. The scan rides
+    /// `idx_sessions_recent (workspace_id, project_id, started_at DESC)`, so
+    /// it stays bounded by scope rather than table-wide.
+    ///
+    /// Ordering is count-descending with an agent-name tiebreak, so equal
+    /// counts do not reorder between calls.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_counts_by_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        since_us: Option<i64>,
+    ) -> StoreResult<Vec<AgentSessionCount>> {
+        self.with_conn(move |conn| {
+            // Same reasoning as `open_sessions_for_scope_agent`: without the
+            // owner predicate a shared server reports a teammate's activity as
+            // the caller's own.
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND actor_user IS NULL",
+            };
+            let since_clause = if since_us.is_some() {
+                " AND started_at >= :since"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT agent_kind, COUNT(*) AS n FROM sessions \
+                 WHERE workspace_id = :ws AND project_id = :proj\
+                 {since_clause}{owner_clause} \
+                 GROUP BY agent_kind \
+                 ORDER BY n DESC, agent_kind ASC"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+            ];
+            if let Some(since) = &since_us {
+                named.push((":since", since));
+            }
+            if let OwnerFilter::User(user) = &owner_filter {
+                named.push((":actor", user));
+            }
+            let rows = stmt.query_map(named.as_slice(), |row| {
+                let agent: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((agent, n))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (agent, n) = row?;
+                out.push(AgentSessionCount {
+                    agent,
+                    sessions: u64::try_from(n).unwrap_or(0),
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return open sessions matching one scoped project and agent.
     ///
     /// Results are newest-first so callers can default to finalizing only the
@@ -1703,6 +1853,56 @@ impl ReaderPool {
         owner_filter: OwnerFilter,
         limit: Option<usize>,
     ) -> StoreResult<Vec<OpenSession>> {
+        self.open_sessions_for_scope_agent_filtered(
+            workspace_id,
+            project_id,
+            agent_kind,
+            owner_filter,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// Return one exact open session for a scoped project and agent.
+    ///
+    /// The id narrows the scope, agent, open-state, and owner predicates; it
+    /// never replaces them. A known id therefore cannot expose or finalize a
+    /// colleague's session unless the caller explicitly uses
+    /// [`OwnerFilter::Any`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_session_for_scope_agent_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        session_id: SessionId,
+    ) -> StoreResult<Option<OpenSession>> {
+        let mut sessions = self
+            .open_sessions_for_scope_agent_filtered(
+                workspace_id,
+                project_id,
+                agent_kind,
+                owner_filter,
+                Some(1),
+                Some(session_id),
+            )
+            .await?;
+        Ok(sessions.pop())
+    }
+
+    async fn open_sessions_for_scope_agent_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        limit: Option<usize>,
+        exact_session_id: Option<SessionId>,
+    ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
             let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
@@ -1714,10 +1914,20 @@ impl ReaderPool {
                 OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
                 OwnerFilter::Unattributed => " AND actor_user IS NULL",
             };
+            let session_id_placeholder = if matches!(owner_filter, OwnerFilter::User(_)) {
+                "?5"
+            } else {
+                "?4"
+            };
+            let session_id_clause = if exact_session_id.is_some() {
+                format!(" AND id = {session_id_placeholder}")
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause} \
+                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause}{session_id_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1726,12 +1936,31 @@ impl ReaderPool {
                 let cwd: Option<String> = row.get(1)?;
                 Ok((id_bytes, cwd))
             };
-            let rows = match &owner_filter {
-                OwnerFilter::User(user) => stmt.query_map(
+            let rows = match (&owner_filter, exact_session_id) {
+                (OwnerFilter::User(user), Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        user,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (OwnerFilter::User(user), None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent, user],
                     row_map,
                 )?,
-                _ => stmt.query_map(
+                (_, Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (_, None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
                     row_map,
                 )?,
