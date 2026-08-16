@@ -37,6 +37,7 @@ pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
 pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
+    MidSessionRouting,
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,

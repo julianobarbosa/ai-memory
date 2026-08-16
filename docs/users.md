@@ -15,6 +15,16 @@ default. Every `/admin/*` endpoint stays root-only once the deployment has a
 DB user or trusted-proxy identities, including read-only
 status/search/read-page helpers.
 
+Hook session identifiers are also owner-bound. A hook authenticated as one
+operator cannot reuse another operator's UUID to append events or trigger a
+summary/handoff/end transition. Shared legacy sessions remain available to all
+callers. Cross-owner recovery is limited to root's explicit
+`finalize-session --all-owners` path.
+
+Authenticated clients sharing one server must emit a distinct agent-run id for
+each run and forward that same id on their MCP requests when using session-aware
+auto-scope. Legacy sessions whose stored owner is `NULL` remain shared.
+
 If you run ai-memory alone, you can skip this page — your install
 keeps working unchanged.
 
@@ -71,6 +81,7 @@ Configure a distinct proxy credential:
 [auth]
 bearer_token = "<root-token>"                    # direct administration
 actor_proxy_bearer_token = "<different-token>"  # SSO proxy only
+secure_cookie = true                              # when `/web` is HTTPS-only
 
 # Optional stable identity for the root human behind an OIDC proxy.
 root_issuer = "https://idp.example"
@@ -81,6 +92,9 @@ root_subject = "<root-subject>"
   differ from `bearer_token`, and `serve` refuses startup otherwise or when the
   root bearer is absent.
 - Only set it when the server is reachable *only* through that proxy.
+- `secure_cookie` is independent of proxy identity. Enable it when a trusted
+  reverse proxy terminates HTTPS for `/web`; ai-memory never trusts forwarded
+  protocol headers to infer it. Direct HTTP browsers will not send that cookie.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
   appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —

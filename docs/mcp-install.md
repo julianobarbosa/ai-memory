@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -547,8 +547,9 @@ The rendered hooks config looks like:
 - Antigravity CLI does not expose a true session-end hook. `Stop` records a
   stop observation only because it marks the end of one execution loop, not
   the conversation. After the final turn, run
-  `ai-memory finalize-session --agent antigravity-cli` to create the final
-  summary and automatic handoff and to queue opt-in SessionEnd consolidation.
+  `ai-memory finalize-session --agent antigravity-cli` to close the session and,
+  when it contains substantive events, create the final summary and automatic
+  handoff and queue opt-in SessionEnd consolidation.
 - `memory_handoff_begin` always creates an explicit manual handoff with no
   `from_session_id` and `from_agent = other`; it is project-wide for cwd
   matching but belongs to the creating operator by default. Pass `shared=true`
@@ -600,6 +601,41 @@ ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+## Swival CLI
+
+**Status:** MCP supported. Lifecycle hooks and managed workstreams are not
+supported: Swival invokes one shared startup/exit callback without exposing a
+stable session identifier, so concurrent sessions cannot be correlated safely.
+
+**Config file:** Swival reads the project-scoped `.swival/mcp.json` by
+default (its own documented default lookup), so `install-mcp --client
+swival --apply` merges under that path at the nearest `.git` or `swival.toml`
+ancestor, matching Swival's own project-root discovery. Pass `--config-file`
+only to target a different MCP JSON file.
+
+```bash
+ai-memory install-mcp --client swival --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+which merges into `.swival/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+`uninstall --only mcp --apply --yes` removes the matching ai-memory entry from
+that file and preserves all unrelated MCP servers.
 
 ## Grok Build CLI
 
@@ -774,9 +810,9 @@ script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
 default for local installs; the staged scripts under
 `~/.local/share/ai-memory/hooks/kimi-code/` are the compatibility fallback).
-Capture is fire-and-forget; a pending handoff is injected at `SessionStart`
-via the hook's stdout (Kimi Code appends stdout to context on exit 0), the
-same pattern as Gemini CLI.
+Capture is fire-and-forget; a pending handoff is injected at
+`UserPromptSubmit` via the hook's stdout (Kimi Code discards `SessionStart`
+stdout but prepends successful user-prompt hook output to the turn).
 
 **Gotchas:**
 - Do not add a `transport` field for HTTP servers: `url` alone means
@@ -792,6 +828,60 @@ same pattern as Gemini CLI.
   same event. `PostToolUse` and `PostToolUseFailure` reuse one handler command,
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
+
+## Command Code
+
+**Status:** MCP and the four stable shell-hook events are supported. Managed
+workstreams and experimental Mods are not installed.
+
+**Config files:** `~/.commandcode/mcp.json` for MCP and
+`~/.commandcode/settings.json` for lifecycle hooks.
+
+```bash
+ai-memory install-mcp --client command-code --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent command-code --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer writes the documented user-scope remote shape:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "transport": "http",
+      "enabled": true,
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+The hook installer registers `SessionStart`, `PreToolUse`, `PostToolUse`, and
+`Stop`. It omits the outer `matcher` from every definition because Command
+Code documents omission as matching every tool and says a matcher prevents
+the non-tool `SessionStart` and `Stop` events from firing. Native installs
+spool events locally, enforce capture exclusions for the documented tool
+envelope, and inject pending handoffs with
+`hookSpecificOutput.additionalContext` at `SessionStart`.
+
+`Stop` is only a turn boundary. Run `ai-memory finalize-session --agent
+command-code` after the final turn (or add `--session-id <uuid>` when several
+sessions share the project). ai-memory does not generate a Mod: that API is
+experimental and unsandboxed. Command Code officially documents its
+project-scoped append-only JSONL location, native resume selectors, `--yolo`,
+and Windows aliases, but not the JSONL record schema. A managed adapter remains
+deferred until a real logged-in client acceptance test supplies sanitized
+structural fixtures and validates checkout ownership, incremental visible-event
+import, resume identity, normal-exit finalization, and native Windows execution.
+
+Sources: <https://commandcode.ai/docs/mcp>,
+<https://commandcode.ai/docs/hooks>,
+<https://commandcode.ai/docs/mods>, and
+<https://commandcode.ai/docs/reference/cli>, plus the native-session contract at
+<https://commandcode.ai/docs/sessions>.
 
 ## Kiro CLI
 
@@ -834,7 +924,8 @@ Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
 non-loopback HTTP URL before writing the config. See
 [HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
 
-ai-memory supports Kiro's documented v2 hook registration format:
+ai-memory supports both documented Kiro hook registration formats through
+explicit engine targets:
 
 ```bash
 # v2: update every existing global agent definition.
@@ -843,21 +934,30 @@ ai-memory install-hooks --agent kiro-cli --apply
 # v2 project-local agent: target the active definition explicitly.
 ai-memory install-hooks --agent kiro-cli --apply \
     --config-file .kiro/agents/<agent-name>.json
+
+# v3: standalone global registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply
+
+# v3 project-local registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --config-file .kiro/hooks/ai-memory.json
 ```
+
+The standalone format was acceptance-tested with an interactive Kiro CLI
+2.16.2 `--v3` session.
 
 The v2 installer refuses to create a synthetic agent file and parses every
 target before changing any of them. Project-local Kiro agents override global
 agents, so `--config-file` is required when the active definition lives under
 `.kiro/agents/`. The integration remains fail-open, injects pending handoffs
-through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
-not installed: its standalone schema and generic command context are now
-documented, but sanitized live lifecycle and built-in tool payload fixtures are
-still needed to validate capture, exclusions, and fail-open behavior. Follow
-[#355](https://github.com/akitaonrails/ai-memory/issues/355) for v3 hook support
-and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for automatic
-selection and broader version-aware managed support. Explicit
-`ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
-non-v2 engine selections pass through without session injection or import.
+through `agentSpawn` stdout, and honors `$KIRO_HOME`. The v3 installer writes
+the standalone `v1` file with PascalCase triggers, preserves third-party
+entries, and shares the same fail-open sanitizer and capture-exclusion
+boundary. `ai-memory run kiro` (alias `kiro-cli`) manages the default v2
+engine; add `--v3`, `--mode`, or `--agent-engine v3` for the incompatible v3
+store. Once linked, later plain Kiro launches recover that engine
+transparently, and bare `ai-memory run` considers checkout-local sessions from
+both engines without cross-resuming them.
 
 Sources: <https://kiro.dev/docs/mcp/configuration/>,
 <https://kiro.dev/docs/reference/settings/>,
@@ -1027,8 +1127,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn. MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

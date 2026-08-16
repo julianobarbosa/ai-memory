@@ -1,6 +1,7 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,6 +92,22 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
 
 fn configured(value: Option<&String>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Refuse accidental unauthenticated network exposure after the listener has
+/// selected its actual local address (which may differ from the bind input).
+fn validate_http_exposure(
+    local_addr: SocketAddr,
+    auth_enabled: bool,
+    allow_insecure_no_auth: bool,
+) -> Result<()> {
+    if local_addr.ip().is_loopback() || auth_enabled || allow_insecure_no_auth {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing unauthenticated plain HTTP on non-loopback address {local_addr}: anyone on the network could access ai-memory. Configure AI_MEMORY_AUTH_TOKEN or bind to a loopback address. For intentional LAN use, pass --allow-insecure-no-auth explicitly and review TLS options in docs/https-via-proxy.md."
+    );
 }
 
 /// Validate the trusted proxy's least-privilege credential and optional stable
@@ -608,6 +625,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 )),
                 home_dir: config.home_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                mid_session_routing: config.routing.mid_session,
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -654,7 +672,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     the users-table lookup, including before the first user is
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
-            let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
+            let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
+                .with_secure_cookie(config.auth.secure_cookie);
             let root_user = config
                 .auth
                 .root_username
@@ -765,24 +784,24 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("binding {bind}"))?;
+            let local_addr = listener
+                .local_addr()
+                .context("reading bound HTTP listener address")?;
+            validate_http_exposure(local_addr, auth_enabled, args.allow_insecure_no_auth)?;
             info!(
-                %bind,
+                %local_addr,
                 auth = auth_enabled,
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
-            if !auth_enabled && !bind.starts_with("127.") {
-                // Loud warning: a non-loopback bind with no auth is
-                // the audit's critical-#1 scenario. The operator gets
-                // a one-line "you sure?" instead of silent exposure.
+            if !auth_enabled && !local_addr.ip().is_loopback() {
                 tracing::warn!(
-                    %bind,
-                    "no AI_MEMORY_AUTH_TOKEN configured AND binding to a non-loopback \
-                     address — anyone on the network can call destructive MCP tools. \
-                     Generate a token with `ai-memory generate-auth-token` and set \
-                     AI_MEMORY_AUTH_TOKEN in the server's environment."
+                    %local_addr,
+                    "starting unauthenticated plain HTTP on a non-loopback address because \
+                     --allow-insecure-no-auth was supplied — anyone on the network can call \
+                     destructive MCP tools"
                 );
-            } else if auth_enabled && !bind.starts_with("127.") {
+            } else if auth_enabled && !local_addr.ip().is_loopback() {
                 // Auth IS configured but the server is reachable from
                 // the network on plain HTTP. The bearer token (and
                 // multi-user per-user tokens from `ai-memory user
@@ -791,7 +810,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 // log at startup, not refusal to serve (operators may
                 // be testing, behind their own proxy already, etc.).
                 tracing::warn!(
-                    %bind,
+                    %local_addr,
                     "AI_MEMORY_AUTH_TOKEN is set but the server is bound to a \
                      non-loopback address on plain HTTP — bearer tokens travel \
                      cleartext on the network. Front ai-memory with a TLS-terminating \
@@ -1134,7 +1153,7 @@ async fn run_scheduled_sweep_tick(
         {
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
-                outcome.evicted += report.evicted.len();
+                outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
             }
@@ -1617,6 +1636,31 @@ mod tests {
                         result.is_ok(),
                         should_pass,
                         "users={users_exist}, pepper={pepper_label}, bearer={bearer_label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unauthenticated_non_loopback_http_requires_explicit_override() {
+        let addresses = [
+            ("127.0.0.1:49374", true),
+            ("[::1]:49374", true),
+            ("0.0.0.0:49374", false),
+            ("[::]:49374", false),
+            ("192.168.1.90:49374", false),
+        ];
+
+        for (address, loopback) in addresses {
+            let local_addr: SocketAddr = address.parse().expect("valid test address");
+            for auth_enabled in [false, true] {
+                for allow_override in [false, true] {
+                    let allowed = loopback || auth_enabled || allow_override;
+                    assert_eq!(
+                        validate_http_exposure(local_addr, auth_enabled, allow_override).is_ok(),
+                        allowed,
+                        "address={address}, auth={auth_enabled}, override={allow_override}"
                     );
                 }
             }
@@ -2291,7 +2335,9 @@ mod tests {
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         let ws = store
             .writer
             .get_or_create_workspace("default")

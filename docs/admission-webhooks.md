@@ -129,6 +129,12 @@ and `/admin/delete-workspace` paths, and before source teardown in
 Each webhook opts into the ops it cares about via `events`; the chain checks the
 op against `WebhookConfig::events` before dispatching.
 
+Forget-sweep decay eviction uses the same conditional `delete` notification
+before removing the Markdown file and writing its tombstone. Aged cleanup
+never removes a file: if Markdown has reappeared at the path, it is preserved
+and reindexed before only the old SQLite version chain is removed. There is no
+file-mirror event for that DB-only history purge.
+
 A copy-purge `/admin/move-project` fires **two** webhook events from
 one request: one or more `write_page` notifications as the pages copy
 into the destination, then one terminal `purge_project` notification
@@ -158,13 +164,10 @@ terminal `purge_project` notification is unchanged.
   the scope and the acting operator. A handoff is SQLite rows, so a file mirror
   has no file change to reconcile from one; what it gets is the lifecycle
   event, not a page.
-- **Forget-sweep decay soft-delete and aged-tombstone cleanup** —
-  project-scoped and DB-only (`is_latest=0` / row delete); the markdown file
-  stays on disk, so there is nothing for a file mirror to do. This exemption
-  does not include frontmatter TTL expiry: that path uses the wiki's normal
-  conditional page delete, removes the file and rows, and runs the
-  `delete_page` admission chain. (`purge_project` remains the bulk-removal
-  path.)
+- **Aged decay-history cleanup** — only the old SQLite version chain changes;
+  any Markdown file at the path remains authoritative and is reindexed first
+  when necessary. Initial decay eviction and frontmatter TTL expiry use the
+  conditional `delete` admission path.
 - **`rename-project`** — a `projects.name` column update; the on-disk path
   is the stable UUID, so no file moves and nothing to propagate.
 - **`rename-workspace`** — a `workspaces.name` column update plus refreshed

@@ -21,7 +21,12 @@ what the project is and is not designed to defend against.
 - **Local data confidentiality.** Wiki files and the SQLite database live
   under a single data directory controlled by the operating-system user who
   runs the server. We rely on filesystem permissions; no additional
-  encryption at rest is provided in v1.
+  encryption at rest is provided in v1. On Unix, newly created data
+  directories are owner-only (`0700`) and newly created configuration,
+  SQLite, managed-workstream segment, and downloaded backup files are owner
+  read/write only (`0600`), independent of umask. Existing installations are
+  not chmodded automatically. Windows uses its filesystem ACLs rather than
+  POSIX mode bits.
 
 - **Network exposure when binding to non-loopback addresses.** If you run
   `ai-memory serve --bind 0.0.0.0:…` you are exposing the MCP and admin
@@ -30,8 +35,16 @@ what the project is and is not designed to defend against.
     checked on every request).
   - Firewall rules or a reverse proxy with TLS.
 
-  The server logs a loud warning if it detects a non-loopback bind without a
-  configured auth token.
+  The server fails closed before serving unauthenticated non-loopback HTTP.
+  `--allow-insecure-no-auth` is a deliberate dangerous override for an
+  intentional plain-HTTP LAN deployment. Authentication does not encrypt
+  bearer tokens, so use a TLS reverse proxy for traffic beyond loopback; see
+  [`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+
+  For `/web` behind that proxy, set `AI_MEMORY_AUTH__SECURE_COOKIE=true` to
+  make its browser session cookie HTTPS-only. ai-memory does not trust
+  forwarded-protocol headers to decide this. Close or redirect direct HTTP
+  access; browsers intentionally withhold Secure cookies over HTTP.
 
 - **Host-header DNS rebinding.** The HTTP server enforces an
   `AI_MEMORY_ALLOWED_HOSTS` allowlist (defaulting to `127.0.0.1` and

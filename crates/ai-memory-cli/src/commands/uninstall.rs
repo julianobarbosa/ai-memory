@@ -44,6 +44,8 @@ enum RewriteOp {
     KimiCodeHooksToml,
     /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
     KiroCliV2HooksJson,
+    /// Kiro CLI v3 standalone hooks with exact generated names and commands.
+    KiroCliV3HooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -67,6 +69,7 @@ enum DeleteKind {
     OpenClawPackageJson,
     OpenClawManifest,
     OpenClawEntrypoint,
+    KiroCliV3Hooks,
     ManagedSkill,
 }
 
@@ -79,6 +82,7 @@ impl DeleteKind {
             Self::OpenClawPackageJson => "OpenClaw package manifest",
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
+            Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
             Self::ManagedSkill => "managed Agent Skill",
         }
     }
@@ -165,6 +169,10 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 install_hooks::gemini_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::command_code_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
             // Grok's ~/.grok/hooks/ai-memory.json shares Claude Code's
             // JSON shape, so the same strip pass removes our entries.
             (
@@ -218,6 +226,29 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 path,
                 removal.removed_events,
                 RewriteOp::KiroCliV2HooksJson,
+            );
+        }
+
+        let mut kiro_v3_paths = vec![install_hooks::kiro_cli_v3_hooks_path()?];
+        kiro_v3_paths.push(cwd.join(".kiro/hooks/ai-memory.json"));
+        kiro_v3_paths.sort();
+        kiro_v3_paths.dedup();
+        for path in kiro_v3_paths {
+            if !path.exists() {
+                continue;
+            }
+            if generated_file_is_ours(&path, DeleteKind::KiroCliV3Hooks) {
+                push_generated_delete(&mut plan, path, DeleteKind::KiroCliV3Hooks);
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let removal = strip_kiro_cli_v3_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                path,
+                removal.removed_events,
+                RewriteOp::KiroCliV3HooksJson,
             );
         }
 
@@ -307,6 +338,8 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Devin,
             KimiCode,
             KiroCli,
+            CommandCode,
+            Swival,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -493,6 +526,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
+                        RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -838,6 +872,34 @@ fn strip_kiro_cli_v2_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+fn strip_kiro_cli_v3_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return Ok(());
+        };
+        hooks.retain(|entry| {
+            if !install_hooks::is_ai_memory_kiro_v3_hook_entry(entry) {
+                return true;
+            }
+            let label = entry
+                .get("trigger")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            removed_events.push(format!("kiro-cli-v3.{label}"));
+            false
+        });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
 /// Remove ai-memory hook entries from Devin's `hooks.v1.json`, whose root
 /// object is the hook-event map. This is intentionally separate from
 /// `strip_ai_memory_hooks` so we never infer a flat shape for other agents.
@@ -986,6 +1048,22 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                         .and_then(|additional| additional.as_bool())
                         == Some(false)
             }),
+        DeleteKind::KiroCliV3Hooks => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|root| {
+                root.len() == 2
+                    && root.get("version").and_then(serde_json::Value::as_str) == Some("v1")
+                    && root
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|hooks| {
+                            !hooks.is_empty()
+                                && hooks
+                                    .iter()
+                                    .all(install_hooks::is_ai_memory_kiro_v3_hook_entry)
+                        })
+            }),
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
     }
 }
@@ -1002,6 +1080,8 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::AntigravityCli
         | McpClient::KimiCode
         | McpClient::KiroCli
+        | McpClient::CommandCode
+        | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
@@ -2059,6 +2139,23 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
+    fn strip_mcp_swival_root_servers_preserves_siblings() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"command":"other-mcp"}}}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::Swival,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-mcp");
+    }
+
+    #[test]
     fn mcp_url_candidates_adds_client_schema_flavors() {
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
@@ -2119,6 +2216,48 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(value["mcpServers"].get("ai-memory").is_none());
         assert!(value["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn kiro_v3_uninstall_ownership_requires_exact_name_trigger_and_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("ai-memory.json");
+        let command = "'/usr/bin/ai-memory' hook --event session-start --agent kiro-cli --server-url https://memory.example";
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "version": "v1",
+                "hooks": [{
+                    "name": "ai-memory-session-start",
+                    "trigger": "SessionStart",
+                    "action": {"type": "command", "command": command}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::KiroCliV3Hooks));
+
+        let shared = serde_json::json!({
+            "version": "v1",
+            "hooks": [
+                {
+                    "name": "ai-memory-session-start",
+                    "trigger": "SessionStart",
+                    "action": {"type": "command", "command": command}
+                },
+                {
+                    "name": "audit",
+                    "trigger": "PreToolUse",
+                    "action": {"type": "command", "command": "audit-tool"}
+                }
+            ]
+        });
+        let removal = strip_kiro_cli_v3_hooks(&serde_json::to_string(&shared).unwrap()).unwrap();
+        assert_eq!(removal.removed_events, ["kiro-cli-v3.SessionStart"]);
+        let after: serde_json::Value = serde_json::from_str(&removal.new_content).unwrap();
+        assert_eq!(after["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(after["hooks"][0]["name"], "audit");
     }
 
     /// The plan matched the flavored Kimi Code entry but apply dispatched

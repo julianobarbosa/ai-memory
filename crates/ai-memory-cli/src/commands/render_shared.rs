@@ -89,16 +89,22 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
 /// install-hooks parity test fails if the bundle drifts.
 ///
-/// Kiro's v3 engine uses a documented standalone registration format, but its
-/// live lifecycle and built-in tool payloads have not been accepted as
-/// fixtures. Do not advertise or install v3 hooks until those exact contracts
-/// are captured and tested.
 pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
     ("agentSpawn", "session-start.sh"),
     ("userPromptSubmit", "user-prompt-submit.sh"),
     ("preToolUse", "pre-tool-use.sh"),
     ("postToolUse", "post-tool-use.sh"),
     ("stop", "stop.sh"),
+];
+
+/// Kiro CLI v3-engine lifecycle events. V3 uses PascalCase triggers in a
+/// standalone versioned hook file rather than v2's camelCase agent field.
+pub(crate) const KIRO_CLI_V3_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
 ];
 
 /// Devin lifecycle events ai-memory hooks. Each pair is
@@ -518,6 +524,10 @@ pub(crate) enum HookShape {
     /// Gemini CLI tolerates (but doesn't require) a sibling
     /// `sequential` key at the outer level — we don't set it.
     Nested,
+    /// Command Code's nested handler shape without an outer matcher. Its
+    /// stable hook schema treats omission as "all tools" and does not fire
+    /// SessionStart/Stop when a matcher is present.
+    NestedWithoutMatcher,
     /// Cursor: `"e": [ { "type":"command", "command":"...",
     /// "matcher":"" } ]` (no inner `hooks` array). Cursor's
     /// `hooks.json` also requires a sibling `version: 1` key at
@@ -551,6 +561,16 @@ pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle
+/// events but remain experimental, so the first-party integration uses only
+/// these documented stable boundaries.
+pub(crate) const COMMAND_CODE_EVENTS: [(&str, &str); 4] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
     ("Stop", "stop.sh"),
 ];
 
@@ -591,6 +611,10 @@ pub(crate) const GEMINI_EVENTS: [(&str, &str); 5] = [
 pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
     events: &CODEX_EVENTS,
     shape: HookShape::Nested,
+};
+pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
+    events: &COMMAND_CODE_EVENTS,
+    shape: HookShape::NestedWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -889,6 +913,47 @@ fn build_kiro_cli_v2_hooks_value_for_platform(
     hooks
 }
 
+/// Build Kiro CLI v3's standalone `{ "version": "v1", "hooks": [...] }`
+/// registration document. Each entry is deliberately named so apply and
+/// uninstall can prove ownership using both the name and command signature.
+pub(crate) fn build_kiro_cli_v3_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let platform = HookCommandPlatform::current();
+    let hooks = KIRO_CLI_V3_EVENTS
+        .iter()
+        .map(|(trigger, script)| {
+            let platform_script = script_for_platform(script, platform);
+            let command = hook_command(
+                &emit_root.join(platform_script.as_ref()),
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+            );
+            let name = script.strip_suffix(".sh").map_or_else(
+                || format!("ai-memory-{script}"),
+                |stem| format!("ai-memory-{stem}"),
+            );
+            let timeout = if *trigger == "SessionStart" { 5 } else { 1 };
+            json!({
+                "name": name,
+                "trigger": trigger,
+                "action": {
+                    "type": "command",
+                    "command": command,
+                },
+                "timeout": timeout,
+                "enabled": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"version": "v1", "hooks": hooks})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HookCommandPlatform {
     Posix,
@@ -1076,6 +1141,9 @@ fn build_hook_payload_for_platform(
         let entry = match shape {
             HookShape::Nested => json!([{
                 "matcher": "",
+                "hooks": [handler],
+            }]),
+            HookShape::NestedWithoutMatcher => json!([{
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
@@ -2142,7 +2210,9 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 HookCommandContext::new(platform, agent, None, None).allow_claude_windows_exec(),
             );
             match shape {
-                HookShape::Nested => v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone(),
+                HookShape::Nested | HookShape::NestedWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
+                }
                 HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
             }
         }
@@ -2238,6 +2308,25 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 .is_none(),
             "Antigravity must retain command-string schema: {antigravity}"
         );
+    }
+
+    #[test]
+    fn command_code_profile_omits_matchers_and_uses_native_agent_identity() {
+        let value = build_hook_payload_for_platform(
+            &COMMAND_CODE_EVENTS,
+            Path::new("/hooks"),
+            "http://memory:49374",
+            None,
+            HookShape::NestedWithoutMatcher,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "command-code", None, None),
+        );
+
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            let definition = &value["hooks"][event][0];
+            assert!(definition.get("matcher").is_none(), "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            assert!(command.contains("--agent command-code"), "{command}");
+        }
     }
 
     #[test]

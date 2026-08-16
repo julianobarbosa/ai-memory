@@ -6,10 +6,12 @@ mod transcript;
 
 pub use harness::{
     LaunchMode, LaunchPlan, ManagedHarness, allows_native_session_adoption, apply_yolo,
-    build_launch_plan, has_native_session_selector, kiro_selects_non_default_engine,
+    build_launch_plan, has_native_session_selector, kiro_explicit_session_id,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
 };
 pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{
     ExportedTranscript, NativeSessionCandidate, discover_native_session, export_transcript,
-    list_native_sessions, native_session_exists, wait_for_transcript_flush,
+    kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
+    native_session_exists, wait_for_transcript_flush,
 };

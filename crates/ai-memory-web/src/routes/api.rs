@@ -866,7 +866,8 @@ async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSear
 }
 
 fn internal_error(e: impl std::fmt::Display) -> Response {
-    json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "web API internal error");
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
 fn not_found(message: impl Into<String>) -> Response {
@@ -1161,9 +1162,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::serves_handoff_body;
+    use super::{internal_error, serves_handoff_body};
     use ai_memory_core::{AuthLevel, OwnerFilter};
-    use axum::Extension;
+    use axum::{Extension, body::to_bytes};
 
     /// The `all_owners` recovery switch routes `Any` into the listing. Reading
     /// past ownership must cost root — not merely a token the server accepted,
@@ -1210,5 +1211,23 @@ mod tests {
             &OwnerFilter::Unattributed,
             Some(Extension(AuthLevel::User))
         ));
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_expose_their_cause() {
+        let sentinel = "web-api-secret /srv/ai-memory/db/memory.sqlite";
+        let response = internal_error(sentinel);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body should be readable");
+        let body = std::str::from_utf8(&body).expect("error response body should be UTF-8");
+        assert_eq!(body, r#"{"error":"internal server error"}"#);
+        assert!(!body.contains(sentinel));
+        assert!(!body.contains("/srv/ai-memory"));
     }
 }

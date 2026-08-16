@@ -512,6 +512,51 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
 }
 
 #[test]
+fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let nested = project.path().join("src").join("nested");
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let mcp = project.path().join(".swival/mcp.json");
+    write_file(&mcp, r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#);
+
+    let install = command_with_home(home.path())
+        .args(["install-mcp", "--client", "swival", "--apply"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["command"], "other-mcp",
+        "install must preserve sibling servers"
+    );
+
+    let uninstall = run_uninstall(
+        &nested,
+        home.path(),
+        &["uninstall", "--apply", "--only", "mcp", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(removed["mcpServers"]["other"]["command"], "other-mcp");
+}
+
+#[test]
 fn uninstall_mcp_name_narrows_endpoint_match() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -1088,7 +1133,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
 }
 
 #[test]
-fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
+fn uninstall_kiro_cli_hooks_removes_v2_and_v3_entries_but_preserves_user_hooks() {
     let _guard = cli_test_lock();
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -1123,8 +1168,7 @@ fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
         r#"{"name":"local","hooks":{"stop":[{"command":"/x/hooks/kiro-cli/stop.sh"}]}}"#,
     );
 
-    // v3 remains unsupported without accepted live payload fixtures.
-    // Uninstall must leave even an ai-memory-looking standalone file untouched.
+    // v3 standalone surface: one ai-memory hook next to a third-party hook.
     let hooks_dir = kiro.join("hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
     let v3_file = hooks_dir.join("ai-memory.json");
@@ -1134,7 +1178,7 @@ fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
   "version": "v1",
   "hooks": [
     {"name": "ai-memory-session-start", "trigger": "SessionStart",
-     "action": {"type": "command", "command": "/x/kiro-cli/session-start.sh"}, "timeout": 10},
+     "action": {"type": "command", "command": "/x/hooks/kiro-cli/session-start.sh"}, "timeout": 10},
     {"name": "lint-on-save", "trigger": "PostFileSave", "matcher": "\\.rs$",
      "action": {"type": "command", "command": "cargo fmt"}}
   ]
@@ -1171,12 +1215,15 @@ fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
         "project-local ai-memory hooks must also be removed"
     );
 
-    assert!(
-        std::fs::read_to_string(&v3_file)
-            .unwrap()
-            .contains("ai-memory-session-start"),
-        "unsupported v3 hook files must remain untouched"
+    let v3_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&v3_file).unwrap()).unwrap();
+    let v3_hooks = v3_after["hooks"].as_array().unwrap();
+    assert_eq!(
+        v3_hooks.len(),
+        1,
+        "only the exact ai-memory v3 hook is removed"
     );
+    assert_eq!(v3_hooks[0]["name"], "lint-on-save");
 
     assert_eq!(
         std::fs::read_to_string(&third_party_file).unwrap(),

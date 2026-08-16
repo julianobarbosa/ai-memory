@@ -37,9 +37,10 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::install_mcp;
 use crate::commands::render_shared::{
-    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, build_claude_code_payload,
-    build_devin_payload, build_grok_payload, hook_script_for_current_platform,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
+    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
+    build_claude_code_payload, build_devin_payload, build_grok_payload,
+    hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -135,6 +136,9 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
         AgentChoice::Devin => emit_devin(&emit_root, &args)?,
         AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
+        AgentChoice::CommandCode => {
+            emit_other(&emit_root, agent_sub, &args, &[COMMAND_CODE_PROFILE.events])
+        }
         AgentChoice::Cursor => emit_other(&emit_root, agent_sub, &args, &[CURSOR_PROFILE.events]),
         AgentChoice::GeminiCli => {
             emit_other(&emit_root, agent_sub, &args, &[GEMINI_PROFILE.events]);
@@ -149,11 +153,11 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         // script listing is deduplicated below; apply-mode owns the exact
         // `[[hooks]]` TOML merge into the user's config.toml.
         AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
-        // Kiro v2 embeds its lifecycle hooks in agent configs. Kiro v3 is
-        // withheld until its live lifecycle and built-in tool payloads are
-        // captured in fixtures.
         AgentChoice::KiroCli => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
+        }
+        AgentChoice::KiroCliV3 => {
+            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::OpenCode
         | AgentChoice::Pi
@@ -709,5 +713,18 @@ mod tests {
         // subagent equivalents.
         assert_eq!(KIRO_CLI_V2_EVENTS.len(), 5);
         assert_eq!(v2_paths.len(), 5);
+    }
+
+    #[test]
+    fn kiro_cli_manual_script_paths_cover_v3_event_set() {
+        let root = Path::new("/hooks/kiro-cli");
+        let paths = event_script_paths(root, &[&KIRO_CLI_V3_EVENTS]);
+        assert_eq!(KIRO_CLI_V3_EVENTS.len(), 5);
+        assert_eq!(paths.len(), 5);
+        assert_eq!(
+            paths,
+            event_script_paths(root, &[&KIRO_CLI_V2_EVENTS]),
+            "v2 and v3 use different trigger names but the same bounded script bundle"
+        );
     }
 }

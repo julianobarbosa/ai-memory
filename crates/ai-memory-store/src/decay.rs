@@ -25,10 +25,10 @@ pub struct DecayParams {
     pub mu: f64,
     /// Default salience used when a page doesn't have an explicit one.
     pub salience_default: f64,
-    /// Below this score, an episodic page is a soft-delete candidate.
+    /// Below this score, an episodic page is an eviction candidate.
     pub cold_threshold: f64,
-    /// Days a soft-deleted (sweep-evicted) page must survive before
-    /// hard-delete, *with* zero subsequent access.
+    /// Days an evicted page's tombstone and version ancestry survive before
+    /// permanent deletion.
     pub hard_delete_after_days: i64,
 }
 

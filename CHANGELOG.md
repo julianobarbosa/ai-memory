@@ -7,20 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- `ai-memory finalize-session --session-id <uuid>` targets exactly one open
-  session instead of "the latest open one for this agent+scope". Agents with
-  no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on
-  `finalize-session` to synthesize the summary+handoff, and the
-  newest-first default breaks down with several concurrent sessions for the
-  same agent in one project — e.g. multiple terminal tabs each running Kiro
-  CLI against the same repo — where it can close out a still-active session
-  instead of the one that actually finished. Backed by a new optional
-  `session_id` filter on `GET /admin/open-sessions`, composed with (not
-  bypassing) the existing owner filter: a session id belonging to another
-  operator is still unreachable without `--all-owners`, same as the default
-  query ([#374]).
-
 ### Changed
 - Hook capture now honors the documented 200 ms latency budget on every
   transport. The shell hooks posted with a 500 ms `curl --max-time`, the
@@ -34,6 +20,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The synchronous handoff fetch is deliberately unchanged: it feeds the
   resuming agent's context and is not a fire-and-forget path, so invariant 5
   does not govern it. (#NNN)
+
+## [1.27.0] - 2026-08-16
+
+### Added
+- Added `[routing] mid_session` to choose how a mid-session event is attributed
+  once the agent's cwd has moved. `follow-cwd` (default) keeps the historical
+  per-event resolution; `sticky` keeps the session's project wherever the agent
+  wanders, closing the cross-repo `cd` case that split one session's raw record
+  across two projects. Lifecycle hooks now tag each `project` override with its
+  provenance (`project_src=marker` or `project_src=repo-root`), so `sticky`
+  overrules a host-derived repo name while a `.ai-memory.toml` marker still
+  wins in both modes. Clients older than this release send no provenance and
+  keep their overrides authoritative (#394).
+- Added `[auth].secure_cookie` for HTTPS reverse-proxy deployments to mark
+  `/web` browser authentication cookies `Secure` while preserving plain-HTTP
+  loopback compatibility by default (#396).
+
+### Changed
+- Unauthenticated HTTP binds beyond loopback now fail closed before accepting
+  requests. Intentional insecure LAN use requires `--allow-insecure-no-auth`;
+  authenticated non-loopback HTTP remains available with its TLS warning
+  (#396).
+- `/api/v1` internal failures now return the fixed body
+  `{"error":"internal server error"}` instead of the source error chain, which
+  could expose data-directory paths and configuration to a browser. The
+  detailed cause is logged server-side (#396).
+- The `/web` browser authentication cookie is now `SameSite=Strict` rather than
+  `SameSite=Lax`, so it no longer rides top-level cross-site navigations into
+  the UI. Existing sessions stay valid (#396).
+
+### Fixed
+- Mid-session hook events that resolve to a different project than their
+  session — the ordinary result of an agent `cd`-ing into another checkout —
+  are recorded again instead of being dropped as a session-UUID collision.
+  Owner and agent still identify a session and a mismatch there remains
+  terminal; a `SessionEnd` naming a foreign scope is still dropped without
+  ending the session (#396).
+- Hook session UUIDs now reject cross-owner reuse atomically before ingest-key,
+  observation, summary, handoff, or end-state mutation; explicit root
+  `finalize-session --all-owners` recovery remains available (#396).
+- Newly created data directories, configuration files, SQLite databases,
+  managed-workstream segments, and downloaded backups now receive owner-only
+  Unix permissions before sensitive content is written, independent of the
+  ambient umask. Existing installations are left unchanged; Windows relies on
+  filesystem ACLs (#396).
+- Under the `repo-root` project strategy, mid-session events whose cwd sits
+  outside any git repository and any `.ai-memory.toml` marker (agent scratch
+  directories, `/tmp`, data folders) now inherit the session's project instead
+  of minting phantom basename projects (`scratchpad`, `data`, `tmp`, ...). The
+  host-side hook resolves the repository root itself and sends
+  `project=<root name>`, so a missing override already proves the cwd is
+  unresolvable; session-sticky attribution now accepts these events even
+  outside the session's cwd subtree, with the broad-anchor guards unchanged.
+  Deliberate rescopes keep working: git checkouts and markers arrive as
+  explicit overrides and never reach stickiness, and the default `basename`
+  strategy is untouched (#394).
+
+## [1.26.1] - 2026-08-14
+
+### Fixed
+- Forget-sweep decay now removes the authoritative Markdown file while
+  conditionally tombstoning the selected page, preventing reconciliation from
+  resurrecting evicted content. Aged cleanup recognizes rewritten heads,
+  deletes their complete `supersedes` ancestry, ignores lifetime access counts,
+  and preserves a newer page recreated at the same path. The corrected scoped
+  tombstone index is added by a new migration rather than rewriting history
+  (#391).
+- The `pages_fts_rows` and `observations_fts_rows` status counters now count
+  indexed documents instead of content-table rows. Both FTS tables use external
+  content, so `SELECT COUNT(*)` against them was answered from `pages` /
+  `observations` and the `fts: N/M` health pair could never diverge, no matter
+  how far the index had drifted (#392).
+
+## [1.26.0] - 2026-08-12
+
+### Added
+- Added MCP-only Swival CLI support. `install-mcp --client swival --apply`
+  merges ai-memory's native HTTP entry into the project-root
+  `.swival/mcp.json`, and `uninstall` removes only the matching ai-memory
+  entry while preserving sibling servers. Lifecycle capture and managed
+  workstreams remain unsupported because Swival's callback contract does not
+  expose a stable session identifier (#385).
+
+### Fixed
+- Lifecycle-only sessions containing only `SessionStart` / `SessionEnd` now
+  close without generating an empty session page, fallback handoff, or LLM
+  consolidation job. Startup handoff claims are bound to the native receiver
+  session when clients expose one; if that receiver exits without substantive
+  work, the same transaction that ends it returns the accepted handoff to the
+  open pool. Tool-bearing zero-prompt sessions remain substantive. Shipped
+  Claude Code, Codex, OpenCode, Command Code, Kiro, Antigravity, Devin, Cursor,
+  Gemini CLI, and Kimi Code delivery paths forward their available session ids
+  so an empty receiver cannot permanently consume real work (#386).
+- The `bin/ai-memory` wrapper now detects rootless mode and SELinux under
+  podman, so host-file commands stop failing with `Permission denied (os error
+  13)` on podman-based distros. Both the `-u 0:0` remap and `--security-opt
+  label=disable` were decided from `docker info --format
+  '{{.SecurityOptions}}'`, a Docker-only field that podman cannot evaluate;
+  the swallowed error left both gates off exactly where they were needed.
+  Podman's `.Host.Security.*` keys are consulted when that probe comes back
+  empty. `bootstrap` is now covered as well: it only reads host files, but an
+  unmapped UID blocks reads just as hard, and it degraded silently to "no
+  `.git` found" before dying. Restore archives, explicit config paths, and
+  commands using a host-backed `AI_MEMORY_DATA_DIR` now receive the same
+  host-file treatment (#388).
+
+## [1.25.0] - 2026-08-07
+
+### Added
+- Added version-aware Kiro CLI v3 managed workstreams. `ai-memory run kiro
+  --v3` reads the authenticated 2.16.2 nested `session.json` / `messages.jsonl`
+  store through a visible-event allowlist, persists the incompatible engine
+  flavor in its cursor, resumes with exact `--v3 --resume-id`, and joins bare
+  automatic selection alongside v2 without cross-resuming either store. Plain
+  returning Kiro launches recover the linked engine transparently; v3 wrapper
+  `--yolo` adds no flag because Kiro replaced `--trust-all-tools` with
+  `permissions.yaml`. A targeted compatibility path also handles Kiro 2.16.2
+  writing v3 sessions to default `~/.kiro` despite custom `KIRO_HOME`: only a
+  resume proven to live in that fallback drops the override for its child
+  process. The optional deterministic acceptance runner now covers fresh,
+  resume, and import round trips for both engines. The server automatic-harness
+  validator now accepts the Kiro candidate pool advertised by the client,
+  preventing bare `ai-memory run` from rejecting a discovered Kiro session
+  before launch (#356).
+- Added first-party Command Code MCP and stable lifecycle-hook support.
+  `install-mcp --client command-code` merges the documented user-scope HTTP
+  entry; `install-hooks --agent command-code` preserves existing settings and
+  registers only `SessionStart`, `PreToolUse`, `PostToolUse`, and `Stop` with
+  native session attribution, capture exclusions, and startup handoff
+  injection. `ai-memory run command-code` now adds v3 checkout-scoped
+  transcript discovery, exact `--session <uuid>` resume, automatic harness
+  selection, native `--yolo` translation, and a visible-event allowlist that
+  retains branch parent ids and summaries while excluding hidden reasoning,
+  images, custom/Mod records, and provider metadata. Deterministic acceptance
+  covers fresh, resume, and incremental-import round trips. Experimental unsandboxed Mods remain
+  excluded, and the turn-only Stop boundary is documented with the manual
+  finalizer workflow (#373).
+- `ai-memory finalize-session --session-id <uuid>` targets exactly one open
+  session instead of "the latest open one for this agent+scope". Agents with
+  no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on
+  `finalize-session` to synthesize the summary+handoff, and the
+  newest-first default breaks down with several concurrent sessions for the
+  same agent in one project — e.g. multiple terminal tabs each running Kiro
+  CLI against the same repo — where it can close out a still-active session
+  instead of the one that actually finished. Backed by a new optional
+  `session_id` filter on `GET /admin/open-sessions`, composed with (not
+  bypassing) the existing owner filter: a session id belonging to another
+  operator is still unreachable without `--all-owners`, same as the default
+  query ([#374]).
+
+### Fixed
+- Kimi Code 0.34.0 managed runs now discover checkout-local sessions from the
+  current `state.json` `cwd` field as well as the legacy `workDir` alias. The
+  parser rejects conflicting aliases and persisted ids that disagree with the
+  session directory, and deterministic acceptance now exercises the current
+  state schema (#382).
+- Prevented delayed post-tool and shutdown hook tails from redirecting the
+  shared active-project fallback after work moved to another project. Only
+  session starts, user prompts, and pre-tool events now advance shared or
+  identity-only fallbacks; other events refresh exact session mappings, and
+  dropped-subagent preflight no longer publishes scope (#372).
+- The Anthropic provider stopped sending `temperature` to Claude 4.7 and later
+  models, including the Claude 5 families, and to Claude Mythos Preview. Those
+  models reject non-default sampling parameters, which made `bootstrap`,
+  consolidation, `lint`, and auto-improvement fail with an upstream 400. Both
+  `anthropic` and `anthropic-oauth` now omit the field for affected models and
+  preserve it elsewhere. `llm-test` also sends a representative 0.2 value
+  before provider normalization, so it exercises the same compatibility path
+  as the real pipeline (#377).
+- Both wrappers (`bin/ai-memory` and `bin/ai-memory.ps1`) now forward
+  `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` to the helper
+  container. Their API-key counterparts were already in the passthrough list,
+  so subscription-token setups (`claude setup-token`,
+  `AI_MEMORY_LLM_PROVIDER=anthropic-oauth`) silently lost their credential at
+  the container boundary. The visible symptom is that the retry `status`
+  itself recommends — `llm-test --provider anthropic-oauth` — fails with a
+  missing-token error, because `llm-test` runs client-side in the helper
+  rather than on the server. The PowerShell wrapper also trims trailing path
+  separators as individual characters, so Windows invocations reach Docker
+  instead of failing during path normalization (#379).
 
 ## [1.24.0] - 2026-08-04
 
@@ -65,14 +231,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without session injection. Kiro remains outside bare automatic selection
   until a logged-in current-format acceptance run is available, and v3 managed
   sessions remain unsupported (#356).
-- Added verified Kiro CLI v2 lifecycle hooks. CamelCase hooks merge into
-  existing agent configs, honor `$KIRO_HOME`, preserve unrelated hooks and
-  per-agent project strategies, fail before changing any target when one is
-  invalid, infer remote connectivity from the managed Kiro MCP entry, inject
-  handoffs through `agentSpawn` stdout, enforce capture exclusions for known
-  v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
-  capture remains unsupported pending sanitized live lifecycle and built-in
-  tool payload fixtures, despite its now-documented standalone schema (#355).
+- Added verified Kiro CLI lifecycle hooks for both incompatible engines. The
+  existing `kiro` / `kiro-cli` target keeps v2's camelCase hooks in agent
+  configs; the explicit `kiro-cli-v3` target atomically merges Kiro's
+  standalone `v1` registration under `$KIRO_HOME/hooks`. Both preserve
+  unrelated entries and project strategies, infer remote MCP connectivity,
+  inject startup handoffs, enforce capture exclusions for documented file-tool
+  payloads, and uninstall only proven ai-memory entries (#355).
 - Added `[consolidation] max_input_tokens` and `max_output_tokens`
   (`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` /
   `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`) for provider-specific context
@@ -3049,7 +3214,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.24.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.27.0...HEAD
+[1.27.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.27.0
+[1.26.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.1
+[1.26.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.0
+[1.25.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.25.0
 [1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
 [1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
 [1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0

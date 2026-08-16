@@ -212,6 +212,8 @@ pub enum AgentKind {
     KimiCode,
     /// AWS Kiro CLI (verified v2 lifecycle protocol).
     KiroCli,
+    /// Command Code CLI.
+    CommandCode,
     /// Hermes Agent (Nous Research).
     Hermes,
     /// Anything else (manual capture, future agents).
@@ -224,7 +226,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -241,6 +243,7 @@ impl AgentKind {
         Self::Devin,
         Self::KimiCode,
         Self::KiroCli,
+        Self::CommandCode,
         Self::Hermes,
         Self::Other,
     ];
@@ -265,6 +268,7 @@ impl AgentKind {
             Self::Devin => "devin",
             Self::KimiCode => "kimi-code",
             Self::KiroCli => "kiro-cli",
+            Self::CommandCode => "command-code",
             Self::Hermes => "hermes",
             Self::Other => "other",
         }
@@ -292,6 +296,7 @@ impl AgentKind {
             "devin" => Self::Devin,
             "kimi-code" | "kimi" => Self::KimiCode,
             "kiro-cli" | "kiro" => Self::KiroCli,
+            "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
             "hermes" | "hermes-agent" => Self::Hermes,
             _ => Self::Other,
         }
@@ -443,6 +448,24 @@ mod tests {
         );
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_command_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CommandCode.as_str(), "command-code");
+        for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CommandCode);
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CommandCode).unwrap(),
+            "\"command-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"command-code\"").unwrap(),
+            AgentKind::CommandCode
+        );
+        assert!(AgentKind::CommandCode.session_start_injects_handoff());
+        assert!(!AgentKind::CommandCode.user_prompt_injects_handoff());
     }
 
     #[test]

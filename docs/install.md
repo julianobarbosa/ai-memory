@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -33,6 +33,12 @@ path (docker + Claude Code). This page covers everything else:
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 
+> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
+> through the `podman-docker` `docker` shim or by pointing it at podman
+> directly with `AI_MEMORY_DOCKER=podman`. See
+> [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
+> engine's rootless and SELinux state.
+
 ---
 
 ## Server on a different machine
@@ -55,8 +61,15 @@ docker run -d --name ai-memory \
 ```
 
 See [Security](../README.md#security) in the README for why
-`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both
-required for any non-loopback bind.
+`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both required for
+normal non-loopback binds. Bearer auth does not encrypt traffic: use the ready
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates from the
+[HTTPS reverse-proxy guide](https-via-proxy.md) for LAN or remote access.
+When the proxy serves `/web` over HTTPS, also set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` in the server environment and close or
+redirect direct HTTP access to that hostname. Do not set it for direct HTTP:
+browsers then correctly withhold the session cookie.
 
 ### Client side (the laptop)
 
@@ -738,13 +751,71 @@ Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
 `install-hooks --apply` over hand edits.
 
+### Command Code
+
+Command Code keeps user-scope MCP and hook configuration in separate JSON
+files under `~/.commandcode/`. Install both integrations with:
+
+```bash
+ai-memory install-mcp --client command-code --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent command-code --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` are accepted. `install-mcp`
+merges a native HTTP entry into `~/.commandcode/mcp.json`; `install-hooks`
+merges only Command Code's four stable events (`SessionStart`, `PreToolUse`,
+`PostToolUse`, and `Stop`) into `~/.commandcode/settings.json`, preserving
+other settings and hook handlers. The hook definitions deliberately omit
+`matcher`: Command Code documents omission as "all tools", while any matcher
+on `SessionStart` or `Stop` prevents that lifecycle hook from firing.
+
+Local installs use the native `ai-memory hook` command, so Command Code's
+native `session_id` and `cwd` are attributed directly;
+recognized `shell_command`, `read_file`, `write_file`, and `edit_file`
+payloads pass through the same bounded capture-exclusion policy as other
+native integrations. A pending handoff is injected through
+`hookSpecificOutput.additionalContext` at `SessionStart`.
+
+Command Code's stable `Stop` event ends a turn, not a session. Finalize the
+open session after the last turn when you need immediate consolidation and a
+handoff:
+
+```bash
+ai-memory finalize-session --agent command-code
+ai-memory finalize-session --agent command-code --session-id <uuid>
+```
+
+ai-memory does not install Command Code Mods. Mods run arbitrary unsandboxed
+code and are not needed for the stable hook or managed-session paths.
+
+Managed sessions are opt-in:
+
+```bash
+ai-memory run command-code
+ai-memory run command-code --yolo --model <model-id>
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` select the same adapter. The
+default executable is `command-code` on Unix and `cmdc` on native Windows.
+Fresh sessions keep Command Code's native UUID; returning sessions use exact
+`--session <uuid>`. The read-only adapter accepts only the observed v3 header,
+requires its UUID filename and canonical `cwd` to match the checkout, excludes
+checkpoint/prompt sidecars, hidden reasoning, images, and provider metadata,
+and preserves `parentId` on visible events for branch provenance. An unknown
+future transcript version fails closed until its schema is audited. Direct
+`cmd`, `cmdc`, or `command-code` launches remain unchanged.
+
 ### Kiro CLI
 
-Kiro CLI has one MCP surface. ai-memory supports the documented v2 lifecycle
-hook surface. Kiro v3 now documents its incompatible standalone registration
-schema and generic command context, but ai-memory does not install it without
-sanitized live lifecycle and built-in tool payload fixtures. The global MCP
-file is `$KIRO_HOME/settings/mcp.json`, defaulting to
+Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
+ai-memory supports both through explicit installer targets: `kiro-cli` remains
+the v2 target, while `kiro-cli-v3` selects the standalone v3 registration. The
+global MCP file is `$KIRO_HOME/settings/mcp.json`, defaulting to
 `~/.kiro/settings/mcp.json`; pass `--config-file .kiro/settings/mcp.json` for a
 project-scoped entry.
 
@@ -790,6 +861,30 @@ through successful `agentSpawn` stdout. Verified v2 tool payloads enforce
 `[capture] ignore_paths`; an unrecognized payload shape is stored as bounded
 metadata rather than exposing file content.
 
+Install v3 hooks with the explicit `kiro-cli-v3` target. This distinction is
+intentional: `kiro` and `kiro-cli` continue to mean v2 so an upgrade cannot
+silently rewrite an existing installation into an incompatible format. The
+standalone registration was acceptance-tested with an interactive Kiro CLI
+2.16.2 `--v3` session.
+
+```bash
+# Global v3 registration under $KIRO_HOME/hooks (default ~/.kiro/hooks).
+ai-memory install-hooks --agent kiro-cli-v3 --apply
+
+# Project-local v3 registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --config-file .kiro/hooks/ai-memory.json
+```
+
+The v3 installer writes the documented standalone `version: "v1"` schema with
+PascalCase triggers. It preserves third-party entries in a shared file,
+refuses an unsupported schema version or a third-party collision with an
+ai-memory-reserved hook name, and bounds capture-only commands to one second.
+SessionStart gets five seconds so ai-memory's bounded handoff fetch can finish.
+Both engines use the same sanitized hook-ingress boundary: documented and live
+`tool_name`/`tool_input` file operations honor `[capture] ignore_paths`, while
+unknown file-tool payload shapes degrade to metadata-only capture.
+
 Kiro v2's `stop` event ends a turn, not the session. After the final turn, close
 the matching session explicitly; use the exact id when several Kiro sessions
 are open in the same project:
@@ -799,24 +894,16 @@ ai-memory finalize-session --agent kiro-cli
 ai-memory finalize-session --agent kiro-cli --session-id <uuid>
 ```
 
-Kiro v3 hook capture is intentionally not advertised or installed. Its
-[migration guide](https://kiro.dev/docs/cli/v3/hooks-migration/) documents the
-standalone registration schema, and the
-[shared hook reference](https://kiro.dev/docs/hooks/types/) documents generic
-command context plus `agentSpawn` and MCP tool examples. It does not yet
-establish the exact built-in file and shell tool payloads, and ai-memory has no
-sanitized live fixtures covering the complete v3 lifecycle. Supporting it
-without that evidence would risk silently losing capture and exclusion
-semantics. Add v3 only after real payload fixtures can exercise that boundary.
-
-`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory v2
-entries from global agents and the current project's `.kiro/agents` directory;
-it leaves standalone v3 files untouched. Explicit `ai-memory run kiro` (alias
-`kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`; Kiro stays
-outside no-argument automatic selection until its current event stream is
-validated in a logged-in real-harness acceptance run. `--v3`, `--mode`, and
-non-v2 `--agent-engine` invocations pass through without managed session
-injection. See [managed workstreams](managed-workstreams.md#native-adapter-behavior).
+`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory
+entries from global v2 agents, the current project's `.kiro/agents` directory,
+and ai-memory's global/current-project v3 registration. A purely generated v3
+file is deleted; third-party entries in a shared file remain. `ai-memory run
+kiro` (alias `kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`;
+add `--v3`, `--mode`, or `--agent-engine v3` for version-safe v3 resume. Once
+linked, a later plain Kiro launch recovers the stored engine transparently, and
+bare `ai-memory run` considers checkout-local sessions from both incompatible
+stores. See
+[managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
 ### OpenCode
 
@@ -965,6 +1052,14 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "https://memory.example"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client command-code    --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent command-code   --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -973,7 +1068,7 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, and OpenClaw support both
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
@@ -1187,7 +1282,18 @@ docker run -d --name ai-memory \
 ```
 
 Both `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are accepted;
-ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first.
+ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first. When either variable is exported
+on the host, the POSIX and PowerShell Docker wrappers forward its name to
+short-lived helper commands such as `llm-test`; the token value is inherited by
+Docker rather than placed in the wrapper's command line. The long-lived server
+container still needs the provider and token variables in its own environment,
+as in the example above.
+
+For both Anthropic providers, ai-memory omits `temperature` for Claude
+4.7 and later models and Claude Mythos Preview because those models reject
+non-default sampling parameters. `llm-test` deliberately starts with the same
+representative 0.2 value as bootstrap and consolidation, then exercises the
+provider's compatibility normalization before sending the request.
 
 > [!TIP]
 > **Pick a small, fast model.** ai-memory's LLM work — session
@@ -1373,7 +1479,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
@@ -1604,8 +1710,10 @@ docker run -d --name ai-memory \
 
 Notice the bind: `127.0.0.1:49374`, not `0.0.0.0:49374`. This is the
 critical pairing - **no bearer token AND loopback only** is the only
-safe combination. The startup log will warn loudly if you bind to a
-LAN address without setting `AI_MEMORY_AUTH_TOKEN`.
+safe combination. The server refuses an unauthenticated LAN bind before it
+accepts requests. `--allow-insecure-no-auth` can override that refusal only
+for an intentional dangerous plain-HTTP deployment; prefer
+`AI_MEMORY_AUTH_TOKEN` or loopback instead.
 
 Then wire up the agent CLI. Both commands default to no auth and
 `http://127.0.0.1:49374` - no extra flags needed for the local case:
@@ -1624,14 +1732,32 @@ URL as the generated agent config.
 #### SELinux-enforcing hosts
 
 On SELinux-enforcing Linux systems such as Fedora, RHEL, and openSUSE, normal
-home-directory labels can prevent the helper container from writing agent
+home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
-the host enforcement mode and Docker's advertised security options. For the
-short-lived helper commands that write host files (`install-*`, `setup-agent`,
-`uninstall`, and `backup`), it adds `--security-opt label=disable`; thin-client
-commands remain confined. This relaxes SELinux label confinement only for that
-trusted helper invocation. It does not modify the long-lived ai-memory server,
-which uses a Docker-managed named volume.
+the host enforcement mode and the engine's advertised security options. For the
+short-lived helper commands that touch host files (`install-*`, `setup-agent`,
+`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
+label=disable`; thin-client commands remain confined when they use the named
+data volume and implicit configuration. An explicit `--config` path or a valid
+host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
+relaxes SELinux label confinement only for that trusted helper invocation. It
+does not modify the long-lived ai-memory server, which uses an engine-managed
+named volume.
+
+`bootstrap` is in that list even though it only *reads* host files: an
+unmapped UID and a confined label block reads just as hard, and the failure is
+misleading — it degrades silently to `no .git found at /work; bootstrapping
+from README/docs/rules only` before dying with `Permission denied (os error
+13)`.
+
+The two engines report these facts under different keys. Docker answers
+`docker info --format '{{.SecurityOptions}}'`; podman has no such field and
+fails that template, so the wrapper falls back to podman's
+`{{.Host.Security.Rootless}}` and `{{.Host.Security.SELinuxEnabled}}` when the
+Docker probe comes back empty. Rootless engines additionally need `-u 0:0`,
+because only container UID 0 maps back to the invoking host user — on rootless
+podman with SELinux enforcing, both adjustments are required and neither alone
+lets the write land.
 
 Do not add `:z` or `:Z` to the wrapper's whole `$HOME` bind. Docker's
 [bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label)

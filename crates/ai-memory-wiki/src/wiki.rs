@@ -33,6 +33,16 @@ pub struct ReindexSummary {
     pub pages: usize,
 }
 
+enum PageStoreRemoval {
+    Delete {
+        author_id: Option<UserId>,
+        expected_latest_id: Option<PageId>,
+    },
+    Decay {
+        expected_latest_id: PageId,
+    },
+}
+
 /// Wiki filesystem handle.
 ///
 /// Owns the path of the wiki root (`<data_dir>/wiki/`) and a cloneable
@@ -475,13 +485,15 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
-        self.delete_page_locked(
+        self.remove_page_locked(
             workspace_id,
             project_id,
             path,
             admission_ctx,
-            author_id,
-            None,
+            PageStoreRemoval::Delete {
+                author_id,
+                expected_latest_id: None,
+            },
         )
         .await
         .map(|_| ())
@@ -518,25 +530,63 @@ impl Wiki {
         if current != Some(expected_latest_id) {
             return Ok(false);
         }
-        self.delete_page_locked(
+        self.remove_page_locked(
             workspace_id,
             project_id,
             path,
             admission_ctx,
-            None,
-            Some(expected_latest_id),
+            PageStoreRemoval::Delete {
+                author_id: None,
+                expected_latest_id: Some(expected_latest_id),
+            },
         )
         .await
     }
 
-    async fn delete_page_locked(
+    /// Remove the authoritative file and tombstone the expected latest page.
+    /// A stale candidate leaves both disk and store
+    /// untouched.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn evict_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("conditional page eviction requires a store reader")
+        })?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        self.remove_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            PageStoreRemoval::Decay { expected_latest_id },
+        )
+        .await
+    }
+
+    async fn remove_page_locked(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
-        author_id: Option<ai_memory_core::UserId>,
-        expected_latest_id: Option<PageId>,
+        removal: PageStoreRemoval,
     ) -> WikiResult<bool> {
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
@@ -554,17 +604,33 @@ impl Wiki {
             Err(e) => return Err(crate::WikiError::Io(e)),
         };
 
-        let delete_result = match expected_latest_id {
-            Some(expected) => {
+        let delete_result = match removal {
+            PageStoreRemoval::Delete {
+                expected_latest_id: Some(expected),
+                ..
+            } => {
                 self.writer
                     .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
                     .await
             }
-            None => self
+            PageStoreRemoval::Delete {
+                author_id,
+                expected_latest_id: None,
+            } => self
                 .writer
                 .delete_page(workspace_id, project_id, path.clone(), author_id)
                 .await
                 .map(|()| true),
+            PageStoreRemoval::Decay { expected_latest_id } => {
+                self.writer
+                    .soft_delete_for_decay_if_latest(
+                        workspace_id,
+                        project_id,
+                        path.clone(),
+                        expected_latest_id,
+                    )
+                    .await
+            }
         };
         let deleted = match delete_result {
             Ok(deleted) => deleted,
@@ -586,6 +652,57 @@ impl Wiki {
             chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", ctx);
         }
         Ok(true)
+    }
+
+    /// Permanently delete one aged decay tombstone and its ancestry chain.
+    ///
+    /// An existing Markdown file is always preserved. If the watcher has not
+    /// indexed it yet (including a legacy pre-fix eviction or an external
+    /// recreation), this method reindexes it under the exclusive mutation
+    /// guard before deleting only the old chain rooted at `tombstone_id`.
+    /// The writer repeats the observed latest-id check so a concurrent store
+    /// mutation fails closed.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn hard_delete_decay_tombstone(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        tombstone_id: PageId,
+        cutoff_us: i64,
+    ) -> WikiResult<usize> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self
+            .store_reader
+            .as_ref()
+            .ok_or_else(|| ai_memory_wiki_error("decay cleanup requires a store reader"))?;
+        let mut current_latest = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        let abs = self.abs_path(workspace_id, project_id, path);
+        if current_latest.is_none() && abs.try_exists()? {
+            current_latest = Some(
+                self.reindex_page_locked(workspace_id, project_id, path.clone())
+                    .await?,
+            );
+        }
+
+        self.writer
+            .hard_delete_decayed_page_chain(
+                workspace_id,
+                project_id,
+                path.clone(),
+                tombstone_id,
+                current_latest,
+                cutoff_us,
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Purge a whole project's wiki directory. When an admission chain is
@@ -1002,6 +1119,23 @@ impl Wiki {
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
 
+        self.reindex_page_locked(workspace_id, project_id, path)
+            .await
+    }
+
+    async fn reindex_page_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> WikiResult<PageId> {
+        let abs = self.abs_path(workspace_id, project_id, &path);
+        if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing to reindex symlinked page {}",
+                path.as_str()
+            ))));
+        }
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
@@ -1849,7 +1983,7 @@ fn restore_quarantined_file(quarantined: &Option<PathBuf>, path: &Path, page_pat
             path = %page_path.as_str(),
             quarantine = %quarantine.display(),
             %error,
-            "delete_page: conditional/DB delete failed and restoring quarantined file also failed"
+            "page removal: conditional store mutation failed and restoring quarantined file also failed"
         );
     }
 }
@@ -2676,6 +2810,166 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Karpathy LLM Wiki");
         assert!(hits[0].snippet.contains("compile"));
+    }
+
+    #[tokio::test]
+    async fn decay_eviction_refuses_a_stale_latest_id_without_touching_disk() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/stale-decay.md").unwrap();
+        let stale = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "old candidate",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+        let current = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "new current body",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            !wiki
+                .evict_page_if_latest(ws, proj, &path, stale, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            std::fs::read_to_string(wiki.abs_path(ws, proj, &path))
+                .unwrap()
+                .contains("new current body")
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(current),
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_delete_admission_leaves_decay_candidate_live() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/reject",
+            post(|| async { (StatusCode::FORBIDDEN, "retention denied") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/admission-decay.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "must remain live",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "retention-guard".into(),
+                url: format!("http://{addr}/reject"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::Delete],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .is_err()
+        );
+        assert!(wiki.abs_path(ws, proj, &path).exists());
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(page_id),
+        );
+    }
+
+    #[tokio::test]
+    async fn decay_cleanup_refuses_to_reindex_a_symlinked_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/symlink-decay.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "evicted body",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .unwrap()
+        );
+
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "outside secret must not be indexed").unwrap();
+        let linked = wiki.abs_path(ws, proj, &path);
+        if !create_test_symlink_file(&outside, &linked) {
+            return;
+        }
+
+        let error = wiki
+            .hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+            .await
+            .expect_err("symlinked recreation must fail closed");
+        assert!(error.to_string().contains("symlinked page"), "{error}");
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside secret must not be indexed"
+        );
+        assert_eq!(
+            store
+                .reader
+                .decay_tombstones_before(ws, proj, i64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "cleanup failure must leave the tombstone for a safe retry"
+        );
     }
 
     #[tokio::test]

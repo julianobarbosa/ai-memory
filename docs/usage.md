@@ -83,7 +83,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
@@ -297,6 +297,8 @@ Client cleanup hints:
 
 - Claude Code: check plugins, hooks, old SessionStart injection, and MCP servers.
 - Codex: check MCP config plus session/user-prompt/tool/compaction/stop hooks.
+- Command Code: check `~/.commandcode/mcp.json` and the four stable lifecycle
+  events in `~/.commandcode/settings.json`.
 - Devin CLI: check `.devin/config.json`, `.devin/hooks.v1.json`, and
   `.devin/skills` for stale MCP, hook, or routing-skill entries.
 - Gemini CLI and Antigravity CLI: check `settings.json` or equivalent hook/MCP
@@ -304,9 +306,9 @@ Client cleanup hints:
 - Kimi Code: check `~/.kimi-code/mcp.json` and the `[[hooks]]` entries in
   `~/.kimi-code/config.toml` (both under `$KIMI_CODE_HOME` when set) for stale
   MCP or hook entries.
-- Kiro CLI: check the `hooks` objects inside `~/.kiro/agents/*.json` (v2
-  engine) and `~/.kiro/settings/mcp.json` (both under `$KIRO_HOME` when set)
-  for stale ai-memory entries. ai-memory does not install Kiro v3 hook files.
+- Kiro CLI: check the `hooks` objects inside `~/.kiro/agents/*.json` (v2),
+  `~/.kiro/hooks/ai-memory.json` (v3), and `~/.kiro/settings/mcp.json` (all
+  under `$KIRO_HOME` when set) for stale ai-memory entries.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
   move old memory plugins to a disabled/quarantine directory before deleting.
 - VS Code Copilot, Claude Desktop, and Zed: these are MCP-only, so confirm
@@ -418,7 +420,7 @@ page and no argument, ai-memory appends no preference block.
 
 Durable project rules belong in the agent's rules file, not only in the
 wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-Cursor, Gemini CLI, Grok Build CLI, Kimi Code, and Kiro CLI it is usually
+Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
 `AGENTS.md`.
 
 The consolidator classifies compiled observations as `decision`,

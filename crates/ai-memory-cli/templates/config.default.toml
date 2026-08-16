@@ -161,3 +161,31 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+
+# How a mid-session event is attributed when the agent's cwd has moved since
+# the session started. Session-CREATING events always resolve from their own
+# cwd, and a `.ai-memory.toml` marker naming a project always wins in both
+# modes — a marker is a deliberate rescope, not drift.
+#
+#   follow-cwd  (default) Re-resolve every mid-session event from its own cwd.
+#               A `cd` into a sibling checkout records those observations in
+#               that checkout's project, splitting one session's raw record
+#               across two projects.
+#   sticky      Keep the session's project wherever the agent wanders. Matches
+#               the one-session-one-project model the rest of the system uses
+#               (`sessions.project_id` is single-valued, and consolidation
+#               writes one page in the session's project). Recommended when
+#               one agent session means one project.
+[routing]
+mid_session = "follow-cwd"
+
+# NOTE: `[auth]` must remain the LAST section in this template.
+# `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,
+# ...) as bare keys to the end of the rendered file, so any section added
+# below would silently capture them.
+# Browser session cookies are safe on plain loopback HTTP by default. For `/web`
+# behind a trusted HTTPS-terminating reverse proxy, set this to true so browsers
+# send the cookie only over HTTPS. Do not enable it for direct HTTP: browsers
+# will not send a Secure cookie there.
+[auth]
+secure_cookie = false

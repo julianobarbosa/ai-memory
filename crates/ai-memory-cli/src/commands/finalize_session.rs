@@ -82,6 +82,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
             &workspace,
             &project,
             agent,
+            args.all_owners,
         )
         .await?;
         finalized.push(session.session_id.clone());
@@ -165,6 +166,7 @@ fn print_report(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn post_session_end_batch(
     client: &reqwest::Client,
     endpoint: &ServerEndpoint,
@@ -173,9 +175,10 @@ async fn post_session_end_batch(
     workspace: &str,
     project: &str,
     agent: AgentKind,
+    all_owners: bool,
 ) -> Result<()> {
     let cwd = session.cwd.as_deref().unwrap_or(fallback_cwd);
-    let hook_url = session_end_hook_url(endpoint, cwd, workspace, project, agent)?;
+    let hook_url = session_end_hook_url(endpoint, cwd, workspace, project, agent, all_owners)?;
     let batch_url = endpoint.build_url("/hook/batch");
     let items = [HookBatchItem {
         url: hook_url,
@@ -214,6 +217,7 @@ fn session_end_hook_url(
     workspace: &str,
     project: &str,
     agent: AgentKind,
+    all_owners: bool,
 ) -> Result<String> {
     let mut url = reqwest::Url::parse(&endpoint.build_url("/hook"))
         .context("building synthetic session-end hook URL")?;
@@ -223,6 +227,9 @@ fn session_end_hook_url(
         .append_pair("cwd", cwd)
         .append_pair("workspace", workspace)
         .append_pair("project", project);
+    if all_owners {
+        url.query_pairs_mut().append_pair("all_owners", "true");
+    }
     Ok(url.into())
 }
 
@@ -378,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_end_url_uses_requested_antigravity_agent() {
+    fn synthetic_end_url_propagates_all_owners_once_when_requested() {
         let endpoint =
             ServerEndpoint::from_pair(Some("http://127.0.0.1:49374/base".to_string()), None);
         let url = session_end_hook_url(
@@ -387,18 +394,52 @@ mod tests {
             "default",
             "project",
             AgentKind::AntigravityCli,
+            true,
         )
         .unwrap();
         let parsed = reqwest::Url::parse(&url).unwrap();
-        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        let query: Vec<_> = parsed.query_pairs().into_owned().collect();
 
         assert_eq!(parsed.path(), "/base/hook");
-        assert_eq!(query.get("event").map(String::as_str), Some("session-end"));
         assert_eq!(
-            query.get("agent").map(String::as_str),
-            Some("antigravity-cli")
+            query,
+            vec![
+                ("event".to_string(), "session-end".to_string()),
+                ("agent".to_string(), "antigravity-cli".to_string()),
+                ("cwd".to_string(), "/tmp/project".to_string()),
+                ("workspace".to_string(), "default".to_string()),
+                ("project".to_string(), "project".to_string()),
+                ("all_owners".to_string(), "true".to_string()),
+            ]
         );
-        assert_eq!(query.get("workspace").map(String::as_str), Some("default"));
-        assert_eq!(query.get("project").map(String::as_str), Some("project"));
+    }
+
+    #[test]
+    fn synthetic_end_url_omits_all_owners_when_not_requested() {
+        let endpoint =
+            ServerEndpoint::from_pair(Some("http://127.0.0.1:49374/base".to_string()), None);
+        let url = session_end_hook_url(
+            &endpoint,
+            "/tmp/project",
+            "default",
+            "project",
+            AgentKind::AntigravityCli,
+            false,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let query: Vec<_> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(parsed.path(), "/base/hook");
+        assert_eq!(
+            query,
+            vec![
+                ("event".to_string(), "session-end".to_string()),
+                ("agent".to_string(), "antigravity-cli".to_string()),
+                ("cwd".to_string(), "/tmp/project".to_string()),
+                ("workspace".to_string(), "default".to_string()),
+                ("project".to_string(), "project".to_string()),
+            ]
+        );
     }
 }

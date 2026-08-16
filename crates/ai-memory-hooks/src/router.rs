@@ -15,11 +15,11 @@ use std::sync::{Arc, Weak};
 use ai_memory_consolidate::{Consolidator, ConsolidatorError};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
-    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
-    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
-    WorkstreamEventKind,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
+    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
+    WorkstreamEvent, WorkstreamEventKind,
 };
-use ai_memory_store::{IngestObservationOutcome, WriterHandle};
+use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -38,7 +38,8 @@ use crate::capture_policy::{
 };
 use crate::log;
 use crate::payload::{
-    HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
+    HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
+    parse_agent,
 };
 use crate::synth::synthesize_session_page;
 
@@ -493,6 +494,11 @@ pub struct HookState {
     pub trusted_proxy_identity: bool,
     /// Namespace slot injection by the qualified request identity.
     pub per_user_slots: bool,
+    /// `[routing] mid_session`: whether a mid-session event that wandered out
+    /// of the session's tree re-resolves from its own cwd (`follow-cwd`, the
+    /// default and historical behavior) or inherits the session's project
+    /// (`sticky`). Held here because the hooks crate makes no config reads.
+    pub mid_session_routing: ai_memory_core::MidSessionRouting,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -609,11 +615,7 @@ async fn handle_hook(
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
-    let actor_key = ActorKey {
-        user: actor_storage_key.clone(),
-        session_id: env.session_id.clone(),
-    };
-    if should_drop_subagent(&state, &env, &actor_key).await {
+    if should_drop_subagent(&state, &env).await {
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
@@ -632,7 +634,14 @@ async fn handle_hook(
     }
     tokio::spawn(async move {
         let _permit = permit;
-        process_envelope(state, env, actor, skip_webhooks).await;
+        process_envelope(
+            state,
+            env,
+            actor,
+            level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
+            skip_webhooks,
+        )
+        .await;
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -769,14 +778,10 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         };
-        let actor_key = ActorKey {
-            user: actor_storage_key.clone(),
-            session_id: env.session_id.clone(),
-        };
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
-        if should_drop_subagent(&state, &env, &actor_key).await {
+        if should_drop_subagent(&state, &env).await {
             accepted_indices.push(idx);
             continue;
         }
@@ -802,7 +807,23 @@ async fn handle_hook_batch(
             continue;
         }
         let _permit = permit;
-        if let Err(e) = process(&state, env, actor.clone(), skip_webhooks.clone()).await {
+        if let Err(e) = process_authorized(
+            &state,
+            env,
+            actor.clone(),
+            level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
+            skip_webhooks.clone(),
+        )
+        .await
+        {
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionCollision)
+            ) {
+                warn!("hook batch session collision/recovery rejection dropped");
+                accepted_indices.push(idx);
+                continue;
+            }
             warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
             return (
                 StatusCode::OK,
@@ -1058,7 +1079,7 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &ActorKey) -> bool {
+async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
     if !env.drop_subagent_requested {
         return false;
     }
@@ -1071,8 +1092,6 @@ async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &Act
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
-        actor,
-        env.recall_default_global_requested,
     )
     .await
     else {
@@ -1193,9 +1212,9 @@ async fn fetch_and_accept_handoff(
     // session, so resolving it twice was harmless); the handoff is single-use
     // and had no second chance.
     let managed = fetch_managed_context(state, &query, agent).await?;
-    // `/handoff` has no session_id in the request — `per_session` mode
-    // therefore falls back to the single slot (graceful degradation),
-    // while `per_actor` keys by `user` alone.
+    // Keep the active-project key compatible with MCP transports: the native
+    // session id is carried separately below to bind a destructive handoff
+    // claim to its exact receiver.
     let actor_key = ai_memory_core::ActorKey {
         user: actor.as_ref().map(IdentityKey::storage_key),
         session_id: None,
@@ -1206,12 +1225,15 @@ async fn fetch_and_accept_handoff(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
-        &actor_key,
-        // The /handoff query carries no recall preference; the main capture
-        // path is what publishes default_global for read tools.
-        false,
     )
     .await?;
+    // Session-start handoff delivery is a foreground action. Publish it so
+    // static MCP callers resolve to the directory that is opening now. The
+    // query carries no recall preference; the main capture path publishes
+    // `default_global` when its SessionStart arrives.
+    if has_publishable_scope_hint(query.cwd.as_deref(), query.project.as_deref()) {
+        state.active_project.set_for(&actor_key, ws, proj, false);
+    }
     // The actor is what makes this lookup safe on a shared server: without it
     // the newest open handoff in the project is returned to whoever starts a
     // session next, and the claim below consumes it — so one operator's baton
@@ -1283,6 +1305,26 @@ async fn fetch_and_accept_handoff(
         }
         None => (None, None),
     };
+    let accepting_session = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(resolve_native_session_id);
+    let receiving_session = if handoff.is_some() {
+        match accepting_session {
+            Some(id) => Some(NewSession {
+                id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: agent,
+                cwd: query.cwd.as_deref().map(std::path::PathBuf::from),
+                actor_user: owner_stamp_for_event(state, actor.as_ref()).await,
+            }),
+            None => None,
+        }
+    } else {
+        None
+    };
     let acceptance = if handoff.is_some() || managed.is_some() {
         state
             .writer
@@ -1294,12 +1336,13 @@ async fn fetch_and_accept_handoff(
                         workspace_id: ws,
                         project_id: proj,
                         accepting_agent: agent,
-                        accepting_session: None,
+                        accepting_session,
                         accepting_user: actor.as_ref().map(IdentityKey::storage_key),
                         owner_filter,
                         receiving_cwd: query.cwd.clone(),
                     }),
                 managed.as_ref().map(|managed| managed.run_id),
+                receiving_session,
             )
             .await?
     } else {
@@ -1740,7 +1783,13 @@ fn normalize_project_path_key(path: &str) -> String {
     }
 }
 
-/// Resolve the `(workspace_id, project_id)` pair for a hook event.
+fn has_publishable_scope_hint(cwd: Option<&str>, project_override: Option<&str>) -> bool {
+    cwd.is_some_and(|value| !value.is_empty()) || project_override.is_some()
+}
+
+/// Resolve the `(workspace_id, project_id)` pair for a hook event without
+/// publishing it as active. Callers decide separately whether the event is a
+/// foreground interaction allowed to advance fallback routing.
 ///
 /// Precedence:
 /// 1. `workspace_override` (typically declared by the agent's host-side
@@ -1753,15 +1802,12 @@ fn normalize_project_path_key(path: &str) -> String {
 /// project_strategy)` so the same `cwd` resolved with and without an
 /// override (e.g. during a hook-script upgrade window) doesn't poison each
 /// other's slot.
-#[allow(clippy::too_many_arguments)]
 async fn resolve_project_ids_inner(
     state: &HookState,
     cwd: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
-    actor: &ai_memory_core::ActorKey,
-    default_global: bool,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_norm = cwd
         .filter(|s| !s.is_empty())
@@ -1783,14 +1829,6 @@ async fn resolve_project_ids_inner(
     {
         let mut cache = state.project_cache.lock().await;
         if let Some(ids) = cache.get(&cache_key) {
-            // Republish on every hit: a cache hit still means the agent
-            // is active in this project *now*, which is exactly what the
-            // MCP read tools need as their default. Keyed by the actor so
-            // opt-in isolation modes (`per_session`/`per_actor`) keep
-            // concurrent callers separated.
-            state
-                .active_project
-                .set_for(actor, ids.0, ids.1, default_global);
             return Ok(ids);
         }
     }
@@ -1807,15 +1845,7 @@ async fn resolve_project_ids_inner(
         (Some(p), None) => (p.to_string(), None),
         (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
             Some(resolved) => resolved,
-            None => {
-                state.active_project.set_for(
-                    actor,
-                    state.workspace_id,
-                    state.project_id,
-                    default_global,
-                );
-                return Ok((state.workspace_id, state.project_id));
-            }
+            None => return Ok((state.workspace_id, state.project_id)),
         },
         (None, None) => {
             // The early-return at the top of the function guards
@@ -1824,12 +1854,6 @@ async fn resolve_project_ids_inner(
             // gets refactored. Same effect as `unreachable!`, but
             // visible at compile time instead of inside the panic
             // message.
-            state.active_project.set_for(
-                actor,
-                state.workspace_id,
-                state.project_id,
-                default_global,
-            );
             return Ok((state.workspace_id, state.project_id));
         }
     };
@@ -1846,9 +1870,6 @@ async fn resolve_project_ids_inner(
             "hook router: refusing to attribute event capture to the reserved \
              global scope; using the server-default project"
         );
-        state
-            .active_project
-            .set_for(actor, state.workspace_id, state.project_id, default_global);
         return Ok((state.workspace_id, state.project_id));
     }
 
@@ -2002,9 +2023,6 @@ async fn resolve_project_ids_inner(
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
-    state
-        .active_project
-        .set_for(actor, ws, proj, default_global);
     Ok(ids)
 }
 
@@ -2021,16 +2039,18 @@ async fn resolve_project_ids(
     project_strategy: ProjectStrategy,
     actor: &ai_memory_core::ActorKey,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    resolve_project_ids_inner(
+    let ids = resolve_project_ids_inner(
         state,
         cwd,
         workspace_override,
         project_override,
         project_strategy,
-        actor,
-        false,
     )
-    .await
+    .await?;
+    if has_publishable_scope_hint(cwd, project_override) {
+        state.active_project.set_for(actor, ids.0, ids.1, false);
+    }
+    Ok(ids)
 }
 
 /// Whether session-sticky attribution may apply: the event's cwd must sit
@@ -2043,18 +2063,9 @@ fn sticky_within_session_tree(
     event_cwd: Option<&str>,
     home_dir: Option<&str>,
 ) -> bool {
-    let Some(session_cwd) = session_cwd.filter(|s| !s.trim().is_empty()) else {
+    let Some(session_norm) = meaningful_session_anchor(session_cwd, home_dir) else {
         return false;
     };
-    let session_norm = normalize_project_path_key(session_cwd);
-    if session_norm == "/" {
-        return false;
-    }
-    if let Some(home) = home_dir
-        && normalize_project_path_key(home) == session_norm
-    {
-        return false;
-    }
     // A cwd-less event inside a known session still belongs to it — there
     // is no directory evidence to contradict the session (and per-event
     // resolution would only shrug it into the server default anyway).
@@ -2067,14 +2078,116 @@ fn sticky_within_session_tree(
     std::path::Path::new(&event_norm).starts_with(std::path::Path::new(&session_norm))
 }
 
+/// The session-cwd anchor guards shared by both stickiness predicates:
+/// a session with no recorded cwd, or rooted at the filesystem root or
+/// the user's home, never sticks — a broad anchor would fold every
+/// project beneath it into one bucket (the #103 catch-all failure
+/// mode). Returns the normalized session cwd when it is a meaningful
+/// anchor.
+fn meaningful_session_anchor(session_cwd: Option<&str>, home_dir: Option<&str>) -> Option<String> {
+    let session_cwd = session_cwd.filter(|s| !s.trim().is_empty())?;
+    let session_norm = normalize_project_path_key(session_cwd);
+    if session_norm == "/" {
+        return None;
+    }
+    if let Some(home) = home_dir
+        && normalize_project_path_key(home) == session_norm
+    {
+        return None;
+    }
+    Some(session_norm)
+}
+
+/// Out-of-tree stickiness for `repo-root` deployments (issue #394).
+///
+/// Under `repo-root` the host-side hook resolves the repository root
+/// itself (a containerized server cannot see the client's checkout)
+/// and sends `project=<root name>`; a marker declares its project
+/// explicitly. An event reaching stickiness with NO override therefore
+/// has a cwd outside both — an agent scratch directory, `/tmp` — and
+/// per-event derivation could only mint a basename phantom
+/// (`scratchpad`, `data`, …), so the session stays the source of truth
+/// even out of its tree. Deliberate rescopes still win (overrides never
+/// reach stickiness), broad anchors still never stick, and the default
+/// `basename` strategy is untouched: "no override" carries no
+/// fell-through signal there.
+fn sticky_out_of_tree_under_repo_root(
+    session_cwd: Option<&str>,
+    home_dir: Option<&str>,
+    strategy: ProjectStrategy,
+) -> bool {
+    matches!(strategy, ProjectStrategy::RepoRoot)
+        && meaningful_session_anchor(session_cwd, home_dir).is_some()
+}
+
+/// Whether this event's declared overrides leave room for session-sticky
+/// attribution at all (issue #394's `sticky` knob).
+///
+/// A marker-declared scope is a deliberate rescope in BOTH modes and always
+/// wins — that is the invariant the whole knob is built around. What `sticky`
+/// changes is the other kind of override: under `repo-root` the host hook
+/// derives `project=<checkout name>` from wherever the cwd happens to be, which
+/// carries no operator intent, so an established session may overrule it. The
+/// wire-level [`ProjectSource`] is what makes the two distinguishable; a client
+/// too old to tag its override reports `Unspecified` and keeps today's
+/// behavior, so `sticky` degrades safely rather than silently capturing
+/// deliberate rescopes.
+fn overrides_permit_sticky(
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
+    project_source: ProjectSource,
+    routing: MidSessionRouting,
+) -> bool {
+    // A workspace override only ever comes from a marker file.
+    if workspace_override.is_some() {
+        return false;
+    }
+    if project_override.is_none() {
+        return true;
+    }
+    routing.overrules_derived_override() && project_source.yields_to_session()
+}
+
+/// Whether the session's cwd anchor and the event's cwd admit stickiness.
+///
+/// `follow-cwd` keeps the two #394 paths: inside the session's own subtree, or
+/// out of tree under `repo-root` where a missing override already proves the
+/// cwd resolved to nothing. `sticky` extends out-of-tree inheritance to every
+/// strategy — the point of the knob is that mid-session navigation never
+/// rescopes, whether the agent wandered into `/tmp` or into a sibling
+/// checkout. The broad-anchor guard is deliberately NOT relaxed: a session
+/// rooted at `/` or `$HOME` still never sticks in either mode, or one stray
+/// session would fold every project beneath it into a single bucket (the #103
+/// catch-all failure mode).
+fn sticky_cwd_admits(
+    session_cwd: Option<&str>,
+    event_cwd: Option<&str>,
+    home_dir: Option<&str>,
+    strategy: ProjectStrategy,
+    routing: MidSessionRouting,
+) -> bool {
+    sticky_within_session_tree(session_cwd, event_cwd, home_dir)
+        || sticky_out_of_tree_under_repo_root(session_cwd, home_dir, strategy)
+        || (routing.overrules_derived_override()
+            && meaningful_session_anchor(session_cwd, home_dir).is_some())
+}
+
 async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
 ) {
-    if let Err(e) = process(&state, env, actor, skip_webhooks).await {
-        warn!(error = %e, "hook processing failed");
+    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
+        if matches!(
+            e.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ) {
+            warn!("hook session collision dropped");
+        } else {
+            warn!(error = %e, "hook processing failed");
+        }
     }
 }
 
@@ -2107,10 +2220,71 @@ async fn enqueue_session_end_consolidation(
     Ok(())
 }
 
+/// Only events that begin or actively advance work may move the legacy
+/// process-wide and identity-only fallbacks. Completion events can arrive
+/// after the operator has moved to another project, especially when a native
+/// hook spool drains after an agent process exits unexpectedly (#372).
+const fn advances_active_project_fallback(event: HookEvent) -> bool {
+    matches!(
+        event,
+        HookEvent::SessionStart | HookEvent::UserPrompt | HookEvent::PreToolUse
+    )
+}
+
+fn publish_active_project_for_event(
+    state: &HookState,
+    event: HookEvent,
+    actor: &ActorKey,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    default_global: bool,
+) {
+    if advances_active_project_fallback(event) {
+        state
+            .active_project
+            .set_for(actor, workspace_id, project_id, default_global);
+    } else {
+        state
+            .active_project
+            .set_scoped_for(actor, workspace_id, project_id, default_global);
+    }
+}
+
+#[cfg(test)]
 async fn process(
     state: &HookState,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+) -> anyhow::Result<()> {
+    match process_authorized(
+        state,
+        env,
+        actor,
+        ai_memory_core::AuthLevel::Anonymous,
+        skip_webhooks,
+    )
+    .await
+    {
+        // Match the asynchronous hook envelope: collisions are terminal
+        // rejections, but fire-and-forget ingress acknowledges the delivery.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionCollision)
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+async fn process_authorized(
+    state: &HookState,
+    env: HookEnvelope,
+    actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
     // Admission webhooks this request opted out of (see `admission_skips`).
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
@@ -2143,39 +2317,42 @@ async fn process(
     //   naming a project is a deliberate rescope, not drift.
     // - The event's cwd must sit INSIDE the session's own cwd subtree;
     //   `cd`-ing out of the session's tree (into a different project)
-    //   falls back to per-event resolution as before.
+    //   falls back to per-event resolution as before — except under
+    //   `repo-root`, where a no-override cwd is already proven outside
+    //   any repo and marker, so the session sticks instead (#394).
     // - A session rooted at a broad directory — the filesystem root or
     //   the user's home — never sticks, or a stray session started in
     //   `$HOME` would fold every project beneath it into one bucket
     //   (the same catch-all failure #103 healed for repo_path keys).
-    let sticky_scope = if env.project_override.is_none() && env.workspace_override.is_none() {
+    // - Under `[routing] mid_session = "sticky"` the session also overrules a
+    //   host-derived `repo-root` override, closing the cross-repo `cd` case;
+    //   marker-declared scopes still win. See `overrides_permit_sticky`.
+    let sticky_scope = if overrides_permit_sticky(
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_source,
+        state.mid_session_routing,
+    ) {
         state
             .reader
             .find_session_scope(session_id)
             .await?
             .filter(|(_, _, session_cwd)| {
-                sticky_within_session_tree(
+                sticky_cwd_admits(
                     session_cwd.as_deref(),
                     env.cwd.as_deref(),
                     state.home_dir.as_deref(),
+                    env.project_strategy,
+                    state.mid_session_routing,
                 )
             })
     } else {
         None
     };
+    let publishable_scope = sticky_scope.is_some()
+        || has_publishable_scope_hint(env.cwd.as_deref(), env.project_override.as_deref());
     let (mut ws, mut proj) = match sticky_scope {
-        Some((session_ws, session_proj, _)) => {
-            // Publish the pointer like resolve_project_ids does on a cache
-            // hit: this session being active is exactly what the MCP read
-            // tools should default to.
-            state.active_project.set_for(
-                &actor_key,
-                session_ws,
-                session_proj,
-                env.recall_default_global_requested,
-            );
-            (session_ws, session_proj)
-        }
+        Some((session_ws, session_proj, _)) => (session_ws, session_proj),
         None => {
             resolve_project_ids_inner(
                 state,
@@ -2183,69 +2360,10 @@ async fn process(
                 env.workspace_override.as_deref(),
                 env.project_override.as_deref(),
                 env.project_strategy,
-                &actor_key,
-                env.recall_default_global_requested,
             )
             .await?
         }
     };
-
-    if matches!(env.event, HookEvent::SessionEnd) {
-        match state
-            .reader
-            .session_end_disposition(session_id, ws, proj, env.agent)
-            .await?
-        {
-            ai_memory_store::SessionEndDisposition::Open => {}
-            ai_memory_store::SessionEndDisposition::DropInvalid => {
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "ignoring SessionEnd for missing, mismatched, or cross-agent session"
-                );
-                return Ok(());
-            }
-            ai_memory_store::SessionEndDisposition::AlreadyEnded => {
-                // End stamping and the legacy handoff commit atomically. A
-                // first delivery can still be cancelled after that transaction
-                // but before the wiki commit, durable LLM enqueue, or ingest-key
-                // completion. Re-run those idempotent tail effects before
-                // acknowledging the already-ended session.
-                let commit_msg = format!("repair session {}", short_id(&session_id.to_string()),);
-                match state.wiki.commit_all(&commit_msg) {
-                    Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
-                    Ok(None) => debug!("wiki clean during SessionEnd recovery"),
-                    Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
-                }
-                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
-                if let Some(key) = env.ingest_key {
-                    let completed = state
-                        .writer
-                        .complete_observation_ingest_if_claimed(proj, key.clone())
-                        .await?;
-                    debug!(key, completed, "SessionEnd recovery ingest-key completion");
-                }
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "recovered tail effects for already-ended SessionEnd"
-                );
-                return Ok(());
-            }
-            // The agent resumed an ended session under the same id and kept
-            // working (issue #152). Run the full end path again — page
-            // rewrite, ended_at bump, handoff, opt-in LLM consolidation — so
-            // the resumed work reaches the compiled session page instead of
-            // living only in raw observations.
-            ai_memory_store::SessionEndDisposition::ReEndWithNewWork => {
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "SessionEnd re-ends a resumed session with new work; re-running end path"
-                );
-            }
-        }
-    }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -2258,57 +2376,112 @@ async fn process(
     // shared, as before. The same value owns the SessionEnd handoff below, so
     // the session and its baton can never disagree about who they belong to.
     let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
-    let new_session = NewSession {
-        id: session_id,
-        workspace_id: ws,
-        project_id: proj,
-        agent_kind: env.agent,
-        cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
-        actor_user: owner_stamp.clone(),
-    };
-    if let Err(e) = state.writer.begin_session(new_session).await {
-        // The cached (workspace, project) may have been deleted out from
-        // under us — e.g. `purge-project` on a live server drops the row
-        // but leaves this in-memory cache pointing at the old id, so
-        // begin_session trips the project foreign key. Evict the stale
-        // slot, re-resolve (which recreates the project), and retry once.
-        warn!(error = %e, "begin_session failed; evicting stale project cache and retrying");
-        let cwd_norm = env
-            .cwd
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(normalize_project_path_key);
-        let key = cache_key_for(
-            cwd_norm.as_deref(),
-            env.workspace_override.as_deref(),
-            env.project_override.as_deref(),
-            env.project_strategy,
-        );
-        state.project_cache.lock().await.remove(&key);
-        let refreshed = resolve_project_ids_inner(
-            state,
-            env.cwd.as_deref(),
-            env.workspace_override.as_deref(),
-            env.project_override.as_deref(),
-            env.project_strategy,
-            &actor_key,
-            env.recall_default_global_requested,
-        )
-        .await?;
-        ws = refreshed.0;
-        proj = refreshed.1;
-        state
-            .writer
-            .begin_session(NewSession {
-                id: session_id,
-                workspace_id: ws,
-                project_id: proj,
-                agent_kind: env.agent,
-                cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
-                actor_user: owner_stamp.clone(),
-            })
+    // A keyed event claims its project-scoped key in the same transaction as
+    // the observation. A pending replay resumes the downstream wiki/handoff
+    // effects without duplicating the observation; only a delivery whose
+    // effects were marked complete is skipped.
+    let ingest_key = env.ingest_key.clone();
+    let owner_filter = if env.all_owners_requested {
+        if !matches!(env.event, HookEvent::SessionEnd) {
+            return Err(StoreError::SessionCollision.into());
+        }
+        let distinguishes = state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
             .await?;
-    }
+        if level
+            .authorize(ai_memory_core::Capability::Admin, distinguishes)
+            .is_err()
+        {
+            return Err(StoreError::SessionCollision.into());
+        }
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        actor
+            .as_ref()
+            .map_or(ai_memory_core::OwnerFilter::Unattributed, |id| {
+                ai_memory_core::OwnerFilter::User(id.storage_key())
+            })
+    };
+    let cwd_norm = env
+        .cwd
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(normalize_project_path_key);
+    let cache_key = cache_key_for(
+        cwd_norm.as_deref(),
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_strategy,
+    );
+    let mut attempts = 0;
+    // Keep the successful keyed-ingest gate until every downstream effect has
+    // completed. A replay that observes `ResumePending` must not race the first
+    // delivery's page, handoff, consolidation, or key-completion tail.
+    let (admission, log_title, _ingest_guard) = loop {
+        // Rebuild both records on retry: the store validates and persists this
+        // exact scope pair atomically with the keyed observation claim.
+        let new_session = NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: env.agent,
+            cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
+            actor_user: owner_stamp.clone(),
+        };
+        let kind = env.event.to_observation_kind();
+        let raw_obs = NewObservation {
+            session_id,
+            workspace_id: ws,
+            project_id: proj,
+            kind,
+            extension: env.extension.clone(),
+            source_event: env.source_event.clone(),
+            title: env
+                .title_hint
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_string()),
+            body: env.body_excerpt.clone().unwrap_or_default(),
+            importance: importance_for(env.event),
+        };
+        let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
+        let log_title = sanitized.inner().title.clone();
+        let ingest_guard = if let Some(key) = ingest_key.as_deref() {
+            Some(state.ingest_gates.lock(proj, key).await)
+        } else {
+            None
+        };
+        let result = state
+            .writer
+            .admit_hook_session_event(
+                new_session,
+                sanitized,
+                owner_filter.clone(),
+                ingest_key.clone(),
+            )
+            .await;
+        match result {
+            Ok(admission) => break (admission, log_title, ingest_guard),
+            Err(error) if attempts == 0 && error.is_stale_session_scope_reference() => {
+                // Do not hold an old-project gate while resolving and acquiring
+                // the refreshed scope's gate; that would permit nested gates.
+                drop(ingest_guard);
+                attempts += 1;
+                warn!(error = %error, "hook admission used a stale project cache entry; evicting and retrying once");
+                state.project_cache.lock().await.remove(&cache_key);
+                (ws, proj) = resolve_project_ids_inner(
+                    state,
+                    env.cwd.as_deref(),
+                    env.workspace_override.as_deref(),
+                    env.project_override.as_deref(),
+                    env.project_strategy,
+                )
+                .await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    // Admission is the first mutation/effect after scope resolution.
 
     // `AI_MEMORY_RUN_ID` is invocation-scoped. A valid active run links the
     // native session and switches only this hook invocation to managed
@@ -2322,6 +2495,56 @@ async fn process(
             })
             .ok()
     });
+    let (admitted, ingest) = match admission {
+        HookSessionAdmission::InvalidMissingEnd => {
+            info!(session = %session_id, "ignoring missing SessionEnd");
+            return Ok(());
+        }
+        HookSessionAdmission::InvalidScopedEnd => {
+            info!(
+                session = %session_id,
+                agent = %env.agent.as_str(),
+                "ignoring SessionEnd naming a different scope than its session"
+            );
+            return Ok(());
+        }
+        HookSessionAdmission::AlreadyEnded { session } => {
+            let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
+            match state.wiki.commit_all(&commit_msg) {
+                Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                Ok(None) => debug!("wiki clean during SessionEnd recovery"),
+                Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
+            }
+            let observations = state.reader.observations_for_session(session_id).await?;
+            if !is_lifecycle_only_session(&observations) {
+                enqueue_session_end_consolidation(
+                    state,
+                    session_id,
+                    session.workspace_id(),
+                    session.project_id(),
+                )
+                .await?;
+            }
+            if let Some(key) = ingest_key {
+                let _ = state
+                    .writer
+                    .complete_observation_ingest_if_claimed(session.project_id(), key)
+                    .await?;
+            }
+            return Ok(());
+        }
+        HookSessionAdmission::Observation { session, ingest }
+        | HookSessionAdmission::EndOpen { session, ingest }
+        | HookSessionAdmission::ReEnd { session, ingest } => (session, ingest),
+    };
+    if ingest == IngestObservationOutcome::AlreadyComplete {
+        return Ok(());
+    }
+    if ingest == IngestObservationOutcome::ResumePending {
+        debug!("resuming incomplete keyed hook event");
+    }
+    ws = admitted.workspace_id();
+    proj = admitted.project_id();
     if let Some(run_id) = managed_run
         && let Some(native_session_id) = env
             .session_id
@@ -2333,57 +2556,15 @@ async fn process(
             .link_managed_run_session(run_id, env.agent, native_session_id)
             .await?;
     }
-
-    // Persist the observation row.
-    let kind = env.event.to_observation_kind();
-    let title = env
-        .title_hint
-        .clone()
-        .unwrap_or_else(|| kind.as_str().to_string());
-    let body = env.body_excerpt.clone().unwrap_or_default();
-    let raw_obs = NewObservation {
-        session_id,
-        workspace_id: ws,
-        project_id: proj,
-        kind,
-        extension: env.extension.clone(),
-        source_event: env.source_event.clone(),
-        title,
-        body,
-        importance: importance_for(env.event),
-    };
-    // The store boundary takes `Sanitized<NewObservation>` directly — no
-    // unwrap-and-clone; the type proves the scrub happened. The log line
-    // below wants the scrubbed title, so keep a copy before the move.
-    let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
-    let log_title = sanitized.inner().title.clone();
-    // A keyed event claims its project-scoped key in the same transaction as
-    // the observation. A pending replay resumes the downstream wiki/handoff
-    // effects without duplicating the observation; only a delivery whose
-    // effects were marked complete is skipped.
-    let ingest_key = env.ingest_key.clone();
-    let _ingest_guard = if let Some(key) = ingest_key.as_deref() {
-        Some(state.ingest_gates.lock(proj, key).await)
-    } else {
-        None
-    };
-    if let Some(key) = ingest_key.as_ref() {
-        match state
-            .writer
-            .insert_observation_ingest(sanitized, key.clone())
-            .await?
-        {
-            IngestObservationOutcome::Inserted(_) => {}
-            IngestObservationOutcome::ResumePending => {
-                debug!(key, "resuming incomplete keyed hook event");
-            }
-            IngestObservationOutcome::AlreadyComplete => {
-                debug!(key, "completed ingest_key replay; skipping event");
-                return Ok(());
-            }
-        }
-    } else {
-        let _ = state.writer.insert_observation(sanitized).await?;
+    if publishable_scope {
+        publish_active_project_for_event(
+            state,
+            env.event,
+            &actor_key,
+            ws,
+            proj,
+            env.recall_default_global_requested,
+        );
     }
 
     // Append the log line to the per-project log.md.
@@ -2420,7 +2601,7 @@ async fn process(
     // and current actorless sessions use the same value; attributing either to
     // whoever delivers SessionEnd would silently rebucket shared context. A
     // store failure aborts this event rather than guessing an owner.
-    let session_owner = parse_session_owner(state.reader.session_actor_user(session_id).await?)?;
+    let session_owner = parse_session_owner(admitted.owner().map(str::to_owned))?;
     let session_actor = session_owner
         .as_ref()
         .map(IdentityKey::to_actor_context)
@@ -2439,10 +2620,48 @@ async fn process(
         warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
     }
 
-    // On SessionEnd, synthesize the summary page, end the session, and
-    // auto-create a handoff so the next agent can pick up.
+    // On SessionEnd, close boundary-only sessions without generated artifacts.
+    // Substantive sessions synthesize the summary page and auto-handoff below.
     if matches!(env.event, HookEvent::SessionEnd) {
-        let observations = state.reader.observations_for_session(session_id).await?;
+        let mut observations = state.reader.observations_for_session(session_id).await?;
+        if is_lifecycle_only_session(&observations) {
+            let outcome = state
+                .writer
+                .end_admitted_lifecycle_only_session(admitted.clone())
+                .await?;
+            match outcome {
+                ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
+                    let commit_msg = format!(
+                        "lifecycle-only session {}",
+                        short_id(&session_id.to_string()),
+                    );
+                    match state.wiki.commit_all(&commit_msg) {
+                        Ok(Some(oid)) => debug!(commit = %oid, "lifecycle-only log auto-commit"),
+                        Ok(None) => debug!("wiki clean after lifecycle-only SessionEnd"),
+                        Err(e) => warn!(error = %e, "lifecycle-only log auto-commit failed"),
+                    }
+                    info!(
+                        session = %session_id,
+                        reopened_handoff = ?reopened_handoff,
+                        "lifecycle-only session ended without summary, handoff, or consolidation",
+                    );
+                    if let Some(key) = ingest_key {
+                        state.writer.complete_observation_ingest(proj, key).await?;
+                    }
+                    return Ok(());
+                }
+                ai_memory_store::LifecycleOnlyEndOutcome::Substantive => {
+                    observations = state.reader.observations_for_session(session_id).await?;
+                    debug!(
+                        session = %session_id,
+                        "substantive work raced lifecycle-only SessionEnd; using normal end path",
+                    );
+                    // The writer observed substantive work, so the refreshed
+                    // set cannot still satisfy the lifecycle-only predicate.
+                    debug_assert!(!is_lifecycle_only_session(&observations));
+                }
+            }
+        }
         let new_page = synthesize_session_page(ws, proj, session_id, &observations);
         let page_id = state
             .wiki
@@ -2535,11 +2754,14 @@ async fn process(
             Some(handoff) => Some(
                 state
                     .writer
-                    .end_session_with_handoff(session_id, Some(page_id), handoff)
+                    .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
                     .await?,
             ),
             None => {
-                state.writer.end_session(session_id, Some(page_id)).await?;
+                state
+                    .writer
+                    .end_admitted_session(admitted.clone(), Some(page_id))
+                    .await?;
                 None
             }
         };
@@ -2611,19 +2833,29 @@ fn parse_session_owner(owner: Option<String>) -> anyhow::Result<Option<IdentityK
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     if let Some(raw) = &env.session_id {
-        // Accept either a UUID (canonical) or any string, hashing the
-        // latter to a deterministic UUID v5 so each agent's session id
-        // maps cleanly into our schema.
-        if let Ok(id) = SessionId::from_str(raw) {
-            return Ok(id);
-        }
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes());
-        return Ok(SessionId(uuid));
+        return Ok(resolve_native_session_id(raw));
     }
     if matches!(env.event, HookEvent::SessionStart) {
         return Ok(SessionId::new());
     }
     anyhow::bail!("hook payload missing session_id and event is not session-start")
+}
+
+fn resolve_native_session_id(raw: &str) -> SessionId {
+    // Accept either a UUID (canonical) or any string, hashing the latter to a
+    // deterministic UUID v5 so hook POSTs and startup GETs share one key.
+    SessionId::from_str(raw)
+        .unwrap_or_else(|_| SessionId(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+}
+
+fn is_lifecycle_only_session(observations: &[ai_memory_core::Observation]) -> bool {
+    !observations.is_empty()
+        && observations.iter().all(|observation| {
+            matches!(
+                observation.kind,
+                ObservationKind::SessionStart | ObservationKind::SessionEnd
+            )
+        })
 }
 
 fn build_auto_handoff(
@@ -2963,6 +3195,7 @@ mod tests {
             )),
             ingest_gates: IngestGates::default(),
             per_user_slots: false,
+            mid_session_routing: MidSessionRouting::default(),
         }
     }
 
@@ -3455,6 +3688,125 @@ mod tests {
         ));
     }
 
+    // Out-of-tree stickiness is scoped to `repo-root` and keeps the
+    // broad-anchor guards (issue #394).
+    #[test]
+    fn sticky_out_of_tree_gates_on_strategy_and_anchor() {
+        // repo-root + meaningful anchor: sticks regardless of the tree.
+        assert!(sticky_out_of_tree_under_repo_root(
+            Some("/a/b"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        // Default basename strategy: "no override" carries no
+        // fell-through signal there, so never.
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/a/b"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+        ));
+        // Broad anchors still refuse: filesystem root, $HOME, missing.
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/home/user"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        assert!(!sticky_out_of_tree_under_repo_root(
+            None,
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+    }
+
+    // The override gate for `[routing] mid_session` (#394). The invariant
+    // under test: a marker-declared project is a deliberate rescope and wins
+    // in BOTH modes; only a host-derived repo-root name may yield, and only
+    // under `sticky`.
+    #[test]
+    fn override_gate_distinguishes_marker_from_derived_project() {
+        use MidSessionRouting::{FollowCwd, Sticky};
+        use ProjectSource::{Marker, RepoRoot, Unspecified};
+
+        // (workspace, project, source, routing, expected)
+        let cases = [
+            // No override at all: both modes may stick (pre-#394 behavior).
+            (None, None, Unspecified, FollowCwd, true),
+            (None, None, Unspecified, Sticky, true),
+            // Marker-declared project: never yields, in either mode.
+            (None, Some("acme"), Marker, FollowCwd, false),
+            (None, Some("acme"), Marker, Sticky, false),
+            // Host-derived repo-root name: yields only under `sticky`. This
+            // is the cross-repo `cd` case the knob exists for.
+            (None, Some("acme"), RepoRoot, FollowCwd, false),
+            (None, Some("acme"), RepoRoot, Sticky, true),
+            // An untagged override from an older client stays authoritative,
+            // so `sticky` degrades safely instead of capturing a rescope.
+            (None, Some("acme"), Unspecified, Sticky, false),
+            // A marker workspace is itself a deliberate scope declaration.
+            (Some("oss"), None, Unspecified, Sticky, false),
+            (Some("oss"), Some("acme"), RepoRoot, Sticky, false),
+        ];
+        for (ws, project, source, routing, expected) in cases {
+            assert_eq!(
+                overrides_permit_sticky(ws, project, source, routing),
+                expected,
+                "ws={ws:?} project={project:?} source={} routing={}",
+                source.as_str(),
+                routing.as_str(),
+            );
+        }
+    }
+
+    // `sticky` extends out-of-tree inheritance to every strategy, but must
+    // NOT relax the broad-anchor guard that keeps a stray `$HOME` session
+    // from becoming a catch-all (#103).
+    #[test]
+    fn sticky_mode_extends_out_of_tree_but_keeps_broad_anchor_guard() {
+        use MidSessionRouting::{FollowCwd, Sticky};
+
+        // Basename strategy, cwd outside the session tree: only `sticky`.
+        assert!(!sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/elsewhere"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            FollowCwd,
+        ));
+        assert!(sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/elsewhere"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            Sticky,
+        ));
+        // Broad anchors refuse in `sticky` too — the guard is not relaxed.
+        for anchor in [Some("/"), Some("/home/user"), None] {
+            assert!(
+                !sticky_cwd_admits(
+                    anchor,
+                    Some("/elsewhere"),
+                    Some("/home/user"),
+                    ProjectStrategy::Basename,
+                    Sticky,
+                ),
+                "broad anchor {anchor:?} must never stick"
+            );
+        }
+        // In-tree stickiness is unchanged by the mode.
+        assert!(sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/a/b/c"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            FollowCwd,
+        ));
+    }
+
     // Session-sticky attribution: a mid-session `cd subdir/` inside a
     // NON-GIT project must keep observations in the session's project.
     // This is the exact production failure behind the fragment cleanup:
@@ -3558,6 +3910,410 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "marker-file overrides must still rescope"
+        );
+    }
+
+    // Out-of-tree stickiness under `repo-root` (issue #394): agent
+    // harnesses give each session a scratch directory OUTSIDE the
+    // project tree (Claude Code:
+    // `/private/tmp/claude-<uid>/<project>/<session>/scratchpad`).
+    // Under `repo-root` the host-side hook resolves the repository
+    // root and sends `project=`; when it sends none, the cwd is
+    // outside any git repo and any marker, so per-event derivation
+    // would mint a phantom `scratchpad` project. The session must
+    // stick instead.
+    #[tokio::test]
+    async fn mid_session_out_of_tree_cwd_sticks_under_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "55555555-5555-5555-5555-555555555555";
+        let parent = tmp.path().join("my_project");
+        let scratch = tmp.path().join("agent-scratch").join("scratchpad");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fire = |event: &str, cwd: std::path::PathBuf| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", parent.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", scratch.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let parent_proj = state
+            .reader
+            .find_project(state.workspace_id, "my_project".to_string())
+            .await
+            .unwrap()
+            .expect("parent project exists");
+        assert_eq!(
+            state
+                .reader
+                .find_project(state.workspace_id, "scratchpad".to_string())
+                .await
+                .unwrap(),
+            None,
+            "the out-of-tree event must not mint a phantom project"
+        );
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations.iter().all(|o| o.project_id == parent_proj),
+            "every observation must carry the session's project"
+        );
+    }
+
+    // v1-semantics guard for the same fixture: under the default
+    // `basename` strategy the client never sends a derived project, so
+    // "no override" carries no fell-through signal — an out-of-tree
+    // cwd still resolves per event exactly as before.
+    #[tokio::test]
+    async fn mid_session_out_of_tree_cwd_still_resolves_per_event_under_basename() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "66666666-6666-6666-6666-666666666666";
+        let parent = tmp.path().join("my_project");
+        let scratch = tmp.path().join("agent-scratch").join("scratchpad");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fire = |event: &str, cwd: std::path::PathBuf| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", parent.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", scratch.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "scratchpad".to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "basename strategy keeps v1 per-event resolution"
+        );
+    }
+
+    /// Fire a mid-session `cd` from one checkout into a sibling one, with the
+    /// host hook tagging each `project` override by provenance, and report
+    /// where the second observation landed. The shared fixture behind the
+    /// cross-repo cases below (#394).
+    async fn cross_repo_cd(
+        state: &HookState,
+        sid: &str,
+        source: &str,
+    ) -> (ProjectId, Option<ProjectId>) {
+        let fire = |event: &str, cwd: &str, project: &str, project_src: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    project: Some(project.to_string()),
+                    project_src: project_src.map(str::to_owned),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+        process(
+            state,
+            fire("session-start", "/checkouts/repo-a", "repo-a", Some(source)),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            state,
+            fire("post-tool-use", "/checkouts/repo-b", "repo-b", Some(source)),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let landed = observations.last().unwrap().project_id;
+        let repo_b = state
+            .reader
+            .find_project(state.workspace_id, "repo-b".to_string())
+            .await
+            .unwrap();
+        (landed, repo_b)
+    }
+
+    // The cross-repo `cd` case #394 left open. Under `sticky`, a mid-session
+    // hop into a sibling checkout keeps the session's project: the override
+    // is host-derived (`project_src=repo-root`), so it carries no operator
+    // intent and yields to the session.
+    #[tokio::test]
+    async fn sticky_routing_keeps_the_session_project_across_a_sibling_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "77777777-7777-4777-8777-777777777777";
+
+        let repo_a = state
+            .reader
+            .find_project(state.workspace_id, "repo-a".to_string())
+            .await
+            .unwrap();
+        assert_eq!(repo_a, None, "fixture starts clean");
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let repo_a = state
+            .reader
+            .find_project(state.workspace_id, "repo-a".to_string())
+            .await
+            .unwrap()
+            .expect("session project exists");
+        assert_eq!(
+            landed, repo_a,
+            "a mid-session hop into a sibling checkout must stay in the session's project"
+        );
+        assert_eq!(
+            repo_b, None,
+            "sticky routing must not split the session's record into a second project"
+        );
+    }
+
+    // The same fixture under the DEFAULT mode must behave exactly as it does
+    // today: the sibling checkout's project is minted and takes the event.
+    // This is the guard that `sticky` is genuinely opt-in.
+    #[tokio::test]
+    async fn follow_cwd_routing_still_splits_across_a_sibling_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert_eq!(
+            state.mid_session_routing,
+            MidSessionRouting::FollowCwd,
+            "follow-cwd must remain the default"
+        );
+        let sid = "88888888-8888-4888-8888-888888888888";
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let repo_b = repo_b.expect("follow-cwd mints the visited checkout's project");
+        assert_eq!(
+            landed, repo_b,
+            "follow-cwd must keep resolving every event from its own cwd"
+        );
+    }
+
+    // Even under `sticky`, a `.ai-memory.toml` naming the project is a
+    // deliberate rescope and must still win — the invariant the provenance
+    // parameter exists to protect.
+    #[tokio::test]
+    async fn sticky_routing_still_yields_to_a_marker_declared_project() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "99999999-9999-4999-8999-999999999999";
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker").await;
+        let repo_b = repo_b.expect("a marker-declared project must still be created");
+        assert_eq!(
+            landed, repo_b,
+            "a marker override is a deliberate rescope and outranks stickiness"
+        );
+    }
+
+    // A client too old to tag its override reports no provenance. `sticky`
+    // must treat that as authoritative rather than assume it was derived,
+    // so a mixed-version fleet cannot silently capture deliberate rescopes.
+    #[tokio::test]
+    async fn sticky_routing_does_not_capture_untagged_overrides_from_old_clients() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "abababab-abab-4bab-8bab-abababababab";
+        let fire = |event: &str, cwd: &str, project: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    project: Some(project.to_string()),
+                    // No `project_src`: the pre-#394 wire format.
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+        process(
+            &state,
+            fire("session-start", "/checkouts/legacy-a", "legacy-a"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", "/checkouts/legacy-b", "legacy-b"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "legacy-b".to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "an untagged override must stay authoritative under sticky"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_hook_tail_does_not_steal_active_project_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let project_a = tmp.path().join("project-a");
+        let project_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        let session_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let session_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let fire = |event: &str, session_id: &str, cwd: &std::path::Path| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "prompt": "continue",
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let active_b = state.active_project.get().expect("B published its scope");
+
+        process(
+            &state,
+            fire("user-prompt-submit", session_a, &project_a),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let active_a = state.active_project.get().expect("A published its scope");
+        assert_ne!(active_a, active_b, "the fixture must resolve two projects");
+
+        process(
+            &state,
+            fire("post-tool-use", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.active_project.get(),
+            Some(active_a),
+            "a delayed completion tail from B must not redirect unscoped reads away from A"
+        );
+
+        process(
+            &state,
+            fire("pre-tool-use", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.active_project.get(),
+            Some(active_b),
+            "a new foreground action in B must still advance the fallback"
         );
     }
 
@@ -4483,7 +5239,6 @@ mod tests {
     async fn drop_subagent_tracking_is_scoped_by_project() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        let actor = ai_memory_core::ActorKey::default();
 
         let marked_project_a = HookEnvelope::from_query_and_body(
             HookQuery {
@@ -4497,7 +5252,11 @@ mod tests {
                 "sessionId": "shared-session", "subagentType": "general-purpose"
             }),
         );
-        assert!(should_drop_subagent(&state, &marked_project_a, &actor).await);
+        assert!(should_drop_subagent(&state, &marked_project_a).await);
+        assert!(
+            state.active_project.get().is_none(),
+            "drop preflight may resolve scope but must not publish it as active"
+        );
 
         let unmarked_project_b = HookEnvelope::from_query_and_body(
             HookQuery {
@@ -4510,7 +5269,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &unmarked_project_b, &actor).await,
+            !should_drop_subagent(&state, &unmarked_project_b).await,
             "a subagent session tracked in project-a must not drop same-id events in project-b"
         );
 
@@ -4525,7 +5284,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_project_a, &actor).await,
+            should_drop_subagent(&state, &unmarked_project_a).await,
             "the originally tracked project's unmarked tail still drops"
         );
     }
@@ -4534,7 +5293,6 @@ mod tests {
     async fn subagent_stop_keeps_session_tracked_until_session_end_tail_drops() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        let actor = ai_memory_core::ActorKey::default();
 
         let query = |event: &str| HookQuery {
             event: event.into(),
@@ -4548,20 +5306,20 @@ mod tests {
             query("subagent-start"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &start, &actor).await);
+        assert!(should_drop_subagent(&state, &start).await);
 
         let subagent_stop = HookEnvelope::from_query_and_body(
             query("subagent-stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &subagent_stop, &actor).await);
+        assert!(should_drop_subagent(&state, &subagent_stop).await);
 
         let unmarked_stop_tail = HookEnvelope::from_query_and_body(
             query("stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_stop_tail, &actor).await,
+            should_drop_subagent(&state, &unmarked_stop_tail).await,
             "SubagentStop must not clear tracking before the unmarked stop tail"
         );
 
@@ -4570,7 +5328,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &session_end_tail, &actor).await,
+            should_drop_subagent(&state, &session_end_tail).await,
             "SessionEnd tail is dropped and then clears tracking"
         );
 
@@ -4579,7 +5337,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &after_session_end, &actor).await,
+            !should_drop_subagent(&state, &after_session_end).await,
             "SessionEnd clears tracking for that scoped session"
         );
     }
@@ -5770,6 +6528,625 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_collision_does_not_evict_or_retry_project_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let cwd = "/home/user/collision-project";
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+
+        let mut alice_event = session_envelope("user-prompt-submit", "collision-session", cwd);
+        alice_event.ingest_key = Some("alice-event".into());
+        process(&state, alice_event, alice, Vec::new())
+            .await
+            .unwrap();
+
+        let (cached_ws, cached_proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            Some("default"),
+            Some("scratch"),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let session_id = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "collision-session",
+            cwd,
+        ))
+        .unwrap();
+        let observations_before = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+
+        let mut bob_event = session_envelope("user-prompt-submit", "collision-session", cwd);
+        bob_event.ingest_key = Some("bob-event".into());
+        let error = process_authorized(
+            &state,
+            bob_event,
+            bob,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        let cache_key = cache_key_for(
+            Some(&normalize_project_path_key(cwd)),
+            Some("default"),
+            Some("scratch"),
+            ProjectStrategy::Basename,
+        );
+        let mut cache = state.project_cache.lock().await;
+        assert_eq!(cache.get(&cache_key), Some((cached_ws, cached_proj)));
+        drop(cache);
+        assert_eq!(
+            state.reader.find_session_scope(session_id).await.unwrap(),
+            Some((cached_ws, cached_proj, Some(cwd.into()))),
+            "the existing session must not be replaced or moved"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            observations_before.len(),
+            "the rejected delivery must not insert an observation or ingest key"
+        );
+    }
+
+    /// A rejected foreign delivery must stop at the store admission boundary:
+    /// it cannot create any router-side artifact or claim its key.
+    #[tokio::test]
+    async fn foreign_prompt_is_a_terminal_collision_without_router_side_effects() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        let mut first = session_envelope("user-prompt-submit", "owned-prompt", "/tmp/scratch");
+        first.ingest_key = Some("alice-prompt".into());
+        process(&state, first, alice, Vec::new()).await.unwrap();
+        let session_id = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "owned-prompt",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let pages = session_pages(&state).await;
+        let active = state.active_project.get();
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "collision-repo".into(),
+                worktree_fingerprint: "collision-worktree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "test:collision".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut foreign = session_envelope("user-prompt-submit", "owned-prompt", "/tmp/scratch");
+        foreign.ingest_key = Some("bob-must-not-claim".into());
+        foreign.managed_run = Some(run.run_id.to_string());
+        let error = process_authorized(
+            &state,
+            foreign,
+            bob,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert!(
+            !error.to_string().contains("alice"),
+            "collision must not disclose the owner"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            observations.len()
+        );
+        assert_eq!(session_pages(&state).await, pages);
+        assert_eq!(state.active_project.get(), active);
+        assert!(!open_handoff_exists(&state).await);
+        assert!(
+            state
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none(),
+            "rejected delivery linked Alice's native session to Bob's run"
+        );
+        assert!(
+            matches!(
+                state
+                    .writer
+                    .insert_observation_ingest(
+                        Sanitized::new(
+                            NewObservation {
+                                session_id,
+                                workspace_id: state.workspace_id,
+                                project_id: state.project_id,
+                                kind: ObservationKind::UserPrompt,
+                                extension: None,
+                                source_event: None,
+                                title: "probe".into(),
+                                body: String::new(),
+                                importance: 1,
+                            },
+                            &state.sanitizer
+                        ),
+                        "bob-must-not-claim".into(),
+                    )
+                    .await
+                    .unwrap(),
+                IngestObservationOutcome::Inserted(_)
+            ),
+            "foreign delivery must not claim its ingest key"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_session_end_and_reend_are_terminal_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "owned-end", "/tmp/scratch"),
+            alice.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let sid = resolve_session_id(&session_envelope(
+            "session-end",
+            "owned-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let before = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let err = process_authorized(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            bob.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+        assert!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        process(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            alice.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "owned-end", "/tmp/scratch"),
+            alice,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let resumed_count = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let handoff_count = state
+            .reader
+            .briefing_for_project(
+                state.workspace_id,
+                state.project_id,
+                1,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .pending_handoff_count;
+        let page_path = ai_memory_core::PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page_before = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|page| page.path == page_path)
+            .expect("Alice's first end wrote a session page");
+        let body_before = state
+            .wiki
+            .read_page(state.workspace_id, state.project_id, &page_path)
+            .unwrap()
+            .body;
+        let err = process_authorized(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            bob,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            resumed_count
+        );
+        assert_eq!(
+            state
+                .reader
+                .briefing_for_project(
+                    state.workspace_id,
+                    state.project_id,
+                    1,
+                    ai_memory_core::OwnerFilter::Any
+                )
+                .await
+                .unwrap()
+                .pending_handoff_count,
+            handoff_count
+        );
+        let page_after = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|page| page.path == page_path)
+            .expect("foreign re-end must not remove Alice's page");
+        assert_eq!(page_after.id, page_before.id);
+        assert_eq!(
+            state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &page_path)
+                .unwrap()
+                .body,
+            body_before,
+            "foreign re-end rewrote Alice's session summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_owners_recovery_is_root_session_end_only() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "recover-owned", "/tmp/scratch"),
+            alice,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut end = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        end.all_owners_requested = true;
+        process_authorized(
+            &state,
+            end,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let handoff = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handoff.owner_user.as_deref(), Some("user:alice"));
+
+        let no_flag = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        let error = process_authorized(
+            &state,
+            no_flag,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        let mut forbidden = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        forbidden.all_owners_requested = true;
+        let error = process_authorized(
+            &state,
+            forbidden,
+            Some(IdentityKey::User("bob".into())),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        let mut non_end = session_envelope("user-prompt-submit", "recover-owned", "/tmp/scratch");
+        non_end.all_owners_requested = true;
+        let error = process_authorized(
+            &state,
+            non_end,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_acknowledges_foreign_collision_then_commits_next_item() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "batch-owned", "/tmp/scratch"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let owned = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "batch-owned",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let owned_before = state
+            .reader
+            .observations_for_session(owned)
+            .await
+            .unwrap()
+            .len();
+        let state = Arc::new(state);
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-owned", "prompt":"foreign"}),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-valid", "prompt":"valid"}),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            Some(axum::Extension(
+                IdentityKey::User("bob".into()).to_actor_context(),
+            )),
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
+        assert!(ack.get("accepted_indices").is_none() || ack["accepted_indices"].is_null());
+        assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(owned)
+                .await
+                .unwrap()
+                .len(),
+            owned_before,
+            "the acknowledged collision must not mutate batch-owned"
+        );
+        let valid = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "batch-valid",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(valid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_end_is_a_no_op_and_single_hook_acknowledges_foreign_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let missing = resolve_session_id(&session_envelope(
+            "session-end",
+            "missing-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        process_authorized(
+            &state,
+            session_envelope("session-end", "missing-end", "/tmp/scratch"),
+            None,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(missing)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "async-owned", "/tmp/scratch"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let sid = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "async-owned",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let before = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let state = Arc::new(state);
+        let response = handle_hook(
+            State(state.clone()),
+            Query(HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/tmp/scratch".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                ..Default::default()
+            }),
+            Some(axum::Extension(
+                IdentityKey::User("bob".into()).to_actor_context(),
+            )),
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            HeaderMap::new(),
+            Json(serde_json::json!({"session_id":"async-owned", "prompt":"foreign"})),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // The background worker holds one ingress permit through processing.
+        // Acquiring the entire pool is therefore a bounded, deterministic join
+        // point without instrumenting production collision handling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let _all_permits = loop {
+            if let Ok(permits) = state
+                .ingest_semaphore
+                .clone()
+                .try_acquire_many_owned(DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT as u32)
+            {
+                break permits;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "asynchronous hook worker did not finish"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "foreign asynchronous hook inserted an observation"
+        );
+    }
+
+    #[tokio::test]
     async fn process_self_heal_evicts_project_strategy_cache_slot() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
@@ -5875,11 +7252,8 @@ mod tests {
         );
     }
 
-    /// SessionEnd must always write the heuristic `sessions/<id>.md` page,
-    /// even with `consolidate_on_session_end` enabled but no LLM provider:
-    /// the opt-in LLM pass is additive and guarded by a present
-    /// `consolidator`, so flag-on + no-provider degrades to today's
-    /// deterministic behavior (issue #40 — no regression).
+    /// A substantive SessionEnd must write the heuristic `sessions/<id>.md`
+    /// page even with `consolidate_on_session_end` enabled but no LLM provider.
     #[tokio::test]
     async fn session_end_writes_heuristic_page_even_with_consolidate_flag_on() {
         let tmp = TempDir::new().unwrap();
@@ -5887,7 +7261,7 @@ mod tests {
         state.consolidate_on_session_end = true; // flag on; consolidator stays None
 
         let sid = "11111111-1111-1111-1111-111111111111";
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt-submit", "session-end"] {
             let env = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -5910,6 +7284,154 @@ mod tests {
                 .any(|p| p.path.as_str().starts_with("sessions/")),
             "SessionEnd must write a heuristic sessions/<id>.md page regardless of the flag; got {:?}",
             pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_session_ends_without_page_handoff_or_consolidation() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "12121212-1212-1212-1212-121212121212";
+        let fire = |event: &str, key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid }),
+            )
+        };
+
+        process(&state, fire("session-start", None), None, Vec::new())
+            .await
+            .unwrap();
+        process(
+            &state,
+            fire("session-end", Some("boundary-end")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("session-end", Some("boundary-end")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .all(|page| !page.path.as_str().starts_with("sessions/"))
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(sid.parse().unwrap())
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "lifecycle-only sessions must not enter provider recovery"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid.parse().unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the completed keyed replay must not append another boundary event"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_bearing_session_without_prompt_still_writes_page_and_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "13131313-1313-1313-1313-131313131313";
+        for event in ["session-start", "pre-tool-use", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "README.md"}
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.path.as_str().starts_with("sessions/"))
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "tool activity is substantive even without a user prompt"
         );
     }
 
@@ -6135,7 +7657,7 @@ mod tests {
         let state = make_state(&tmp).await;
         let run_id = ManagedRunId::new().to_string();
         let managed_session = SessionId::new();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             let envelope = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -6169,7 +7691,7 @@ mod tests {
         );
 
         let direct_session = SessionId::new();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             let envelope = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -6427,6 +7949,123 @@ mod tests {
         state
     }
 
+    #[tokio::test]
+    async fn keyed_session_end_replay_waits_for_the_first_delivery_tail() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_hook = entered.clone();
+        let release_hook = release.clone();
+        let app = axum::Router::new().route(
+            "/admission",
+            axum::routing::post(move || {
+                let entered = entered_hook.clone();
+                let release = release_hook.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(
+            make_state_with_admission(
+                &tmp,
+                ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+                    name: "pause-tail".into(),
+                    url: format!("http://{addr}/admission"),
+                    timeout_ms: 5_000,
+                    failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+                    events: vec![ai_memory_wiki::AdmissionOp::HandoffBegin],
+                    blocking: true,
+                }])
+                .unwrap(),
+            )
+            .await,
+        );
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "gated-end", "/tmp/scratch"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut end = session_envelope("session-end", "gated-end", "/tmp/scratch");
+        end.ingest_key = Some("same-end".into());
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            process_authorized(
+                &first_state,
+                end,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first SessionEnd reached the paused tail");
+
+        let mut retry_end = session_envelope("session-end", "gated-end", "/tmp/scratch");
+        retry_end.ingest_key = Some("same-end".into());
+        let retry_state = state.clone();
+        let mut retry = tokio::spawn(async move {
+            process_authorized(
+                &retry_state,
+                retry_end,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut retry)
+                .await
+                .is_err(),
+            "same keyed replay passed the gate before the first tail completed"
+        );
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        retry.await.unwrap().unwrap();
+
+        let session_id = resolve_session_id(&session_envelope(
+            "session-end",
+            "gated-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.kind == ObservationKind::SessionEnd)
+                .count(),
+            1,
+            "same keyed replay duplicated SessionEnd"
+        );
+        assert_eq!(
+            state.reader.reindex_target_status().await.unwrap().handoffs,
+            1,
+            "same keyed replay created a second automatic handoff, including expired rows"
+        );
+        assert_eq!(
+            state.reader.status_counts().await.unwrap().pages_all,
+            1,
+            "same keyed replay rewrote the summary page"
+        );
+    }
+
     fn session_envelope(event: &str, session: &str, cwd: &str) -> HookEnvelope {
         HookEnvelope::from_query_and_body(
             HookQuery {
@@ -6494,7 +8133,7 @@ mod tests {
         .await;
         let cwd = tmp.path().to_string_lossy().into_owned();
         let session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &state,
                 session_envelope(event, &session, &cwd),
@@ -6528,7 +8167,7 @@ mod tests {
         let default_state = make_state(&default_tmp).await;
         let default_cwd = default_tmp.path().to_string_lossy().into_owned();
         let default_session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &default_state,
                 session_envelope(event, &default_session, &default_cwd),
@@ -6573,7 +8212,7 @@ mod tests {
         );
         let cwd = tmp.path().to_string_lossy().into_owned();
         let session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &state,
                 session_envelope(event, &session, &cwd),
@@ -6617,7 +8256,7 @@ mod tests {
             .await;
             let cwd = tmp.path().to_string_lossy().into_owned();
             let session = SessionId::new().to_string();
-            let items = ["session-start", "session-end"]
+            let items = ["session-start", "user-prompt", "session-end"]
                 .into_iter()
                 .map(|event| HookBatchItem {
                     url: format!(
@@ -7332,6 +8971,16 @@ mod tests {
             briefing.pending_handoff_count, 1,
             "recovery must preserve exactly one automatic handoff"
         );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "already-ended recovery repairs only the tail, never duplicates SessionEnd"
+        );
         assert!(
             state
                 .wiki
@@ -7773,6 +9422,89 @@ mod tests {
                 .state,
             ai_memory_core::HandoffState::Accepted
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_receiver_returns_its_startup_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let handoff_id = state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "REAL-WORK-MARKER".into(),
+                open_questions: vec!["what remains?".into()],
+                next_steps: vec!["continue the real work".into()],
+                files_touched: vec!["src/main.rs".into()],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let query = |session_id: &str| HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd.clone()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: None,
+            session_id: Some(session_id.into()),
+        };
+        let empty_sid = "empty-native-session";
+        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rendered.contains("REAL-WORK-MARKER"));
+        let accepted = state
+            .reader
+            .handoff_by_id(handoff_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.accepted_by_session,
+            Some(resolve_native_session_id(empty_sid))
+        );
+
+        for event in ["session-start", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    cwd: Some(cwd.clone()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": empty_sid, "cwd": cwd }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let reopened = state
+            .reader
+            .handoff_by_id(handoff_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.state, ai_memory_core::HandoffState::Open);
+        assert!(reopened.accepted_by.is_none());
+        assert!(reopened.accepted_at.is_none());
+        assert!(reopened.accepted_by_session.is_none());
+        let next =
+            fetch_and_accept_handoff(&state, query("next-substantive-session"), None, Vec::new())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(next.contains("REAL-WORK-MARKER"));
     }
 
     #[tokio::test]

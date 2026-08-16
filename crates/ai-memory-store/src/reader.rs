@@ -2509,6 +2509,47 @@ impl ReaderPool {
         .await
     }
 
+    /// Return decay tombstones old enough for permanent cleanup.
+    ///
+    /// `superseded_at` is written only by the forget-sweep eviction path, so
+    /// it is the tombstone discriminator regardless of whether a rewritten
+    /// page head also has a `supersedes` ancestor. The caller still routes
+    /// each result through the wiki layer before deleting its version chain.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn decay_tombstones_before(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+    ) -> StoreResult<Vec<DecayTombstone>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, path FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND is_latest = 0 \
+                   AND superseded_at IS NOT NULL \
+                   AND superseded_at <= ?3 \
+                 ORDER BY superseded_at, id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                out.push(DecayTombstone {
+                    id: PageId::from_slice(&id)?,
+                    path: PagePath::new(path)?,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return the number of DISTINCT operators that reinforced each
     /// `is_latest = 1` page of a project, for the sweep's breadth term.
     ///
@@ -5850,9 +5891,17 @@ impl ReaderPool {
 
             Ok(DerivedIndexStatus {
                 pages_rows: count(conn, "SELECT COUNT(*) FROM pages")?,
-                pages_fts_rows: count(conn, "SELECT COUNT(*) FROM pages_fts")?,
+                // `pages_fts` is an external-content FTS5 table, so
+                // `COUNT(*)` on it is answered from `pages` and can never
+                // diverge. The `_docsize` shadow table holds one row per
+                // indexed document, which is what makes this pair a drift
+                // check rather than a tautology. Same for `observations_fts`.
+                pages_fts_rows: count(conn, "SELECT COUNT(*) FROM pages_fts_docsize")?,
                 observations_rows: count(conn, "SELECT COUNT(*) FROM observations")?,
-                observations_fts_rows: count(conn, "SELECT COUNT(*) FROM observations_fts")?,
+                observations_fts_rows: count(
+                    conn,
+                    "SELECT COUNT(*) FROM observations_fts_docsize",
+                )?,
                 latest_pages_missing_embeddings: count(
                     conn,
                     "SELECT COUNT(*) \
@@ -6329,6 +6378,15 @@ pub struct DecayCandidate {
     /// Per-page salience once explicit feedback has moved it (V37);
     /// `None` means "use `DecayParams::salience_default`".
     pub salience: Option<f64>,
+}
+
+/// One forget-sweep tombstone eligible for permanent cleanup.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecayTombstone {
+    /// Evicted head whose ancestry chain is awaiting deletion.
+    pub id: PageId,
+    /// Relative wiki path associated with the evicted chain.
+    pub path: PagePath,
 }
 
 fn row_to_decay_candidate(

@@ -219,12 +219,17 @@ ai_memory_marker_qs() {
     pr=""
     st=""
     ds=""
+    # Provenance of `pr`, forwarded as `project_src` so the server can tell a
+    # deliberate marker rescope from a host-derived repo-root name. Only the
+    # latter may yield to session-sticky attribution (#394).
+    ps=""
     marker=$(ai_memory_find_marker "$cwd")
     if [ -n "$marker" ]; then
         ws=$(ai_memory_parse_toml_key "$marker" workspace)
         pr=$(ai_memory_parse_toml_key "$marker" project)
         st=$(ai_memory_parse_toml_key "$marker" project_strategy)
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
+        [ -n "$pr" ] && ps="marker"
     fi
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
@@ -240,11 +245,15 @@ ai_memory_marker_qs() {
     # keep their existing resolution path.
     if [ -z "$pr" ]; then
         case "$st" in
-            repo-root | repo_root) pr=$(ai_memory_repo_root_project "$cwd") ;;
+            repo-root | repo_root)
+                pr=$(ai_memory_repo_root_project "$cwd")
+                [ -n "$pr" ] && ps="repo-root"
+                ;;
         esac
     fi
     [ -n "$ws" ] && qs="${qs}&workspace=$(ai_memory_url_encode "$ws")"
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
+    [ -n "$ps" ] && qs="${qs}&project_src=$(ai_memory_url_encode "$ps")"
     [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.

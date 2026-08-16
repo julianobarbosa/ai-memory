@@ -258,17 +258,25 @@ fn marker_query_suffix_impl(
         briefing = parse_toml_flag(&marker, "inject_on_session_start");
         briefing_budget = parse_toml_flag(&marker, "max_chars");
     }
+    // Provenance of `project`, forwarded as `project_src` so the server can
+    // tell a deliberate marker rescope from a host-derived repo-root name.
+    // Only the latter may yield to session-sticky attribution (#394).
+    let mut project_src = project.as_ref().map(|_| "marker");
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
     }
     if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
         project = repo_root_project(cwd);
+        project_src = project.as_ref().map(|_| "repo-root");
     }
     if let Some(val) = workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
     }
     if let Some(val) = project {
         qs.push_str(&format!("&project={}", url_encode(&val)));
+    }
+    if let Some(val) = project_src {
+        qs.push_str(&format!("&project_src={val}"));
     }
     if let Some(val) = strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
@@ -943,6 +951,37 @@ drop_subagent_captures = "true"
         let qs = marker_query_suffix(sub.to_str().unwrap(), Some("repo-root"));
         assert!(qs.contains("&project=contentcreator"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+        // Host-derived, so the server may let a session overrule it (#394).
+        assert!(qs.contains("&project_src=repo-root"), "{qs}");
+    }
+
+    // `project_src` must faithfully separate the two ways a `project` override
+    // is produced — that distinction is the whole basis for `[routing]
+    // mid_session = "sticky"` honoring markers while overruling derivation.
+    #[test]
+    fn marker_query_suffix_tags_project_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("workdir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No override at all: nothing to describe.
+        let qs = marker_query_suffix(dir.to_str().unwrap(), None);
+        assert!(!qs.contains("&project="), "{qs}");
+        assert!(!qs.contains("&project_src="), "{qs}");
+
+        // Marker-declared project: a deliberate rescope.
+        std::fs::write(dir.join(".ai-memory.toml"), "project = \"pinned\"\n").unwrap();
+        let qs = marker_query_suffix(dir.to_str().unwrap(), None);
+        assert!(qs.contains("&project=pinned"), "{qs}");
+        assert!(qs.contains("&project_src=marker"), "{qs}");
+
+        // A marker project wins over the baked repo-root default, and keeps
+        // reporting `marker` — the provenance must follow the value that
+        // actually shipped, not the strategy that was configured.
+        let qs = marker_query_suffix(dir.to_str().unwrap(), Some("repo-root"));
+        assert!(qs.contains("&project=pinned"), "{qs}");
+        assert!(qs.contains("&project_src=marker"), "{qs}");
+        assert!(!qs.contains("project_src=repo-root"), "{qs}");
     }
 
     #[test]

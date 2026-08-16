@@ -96,7 +96,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 
 **LLM for consolidation passes:**
 - **Off by default**, behaves like agentmemory after #138's fix. Without a provider, the system still works: synthetic compression (rule-based), no LLM-generated summaries, no `memory_consolidate` page-rewrite.
-- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). SessionEnd provider work is persisted by observation generation and consumed outside the hook request by one bounded retrying worker, so client drain cancellation cannot lose it. The automatic handoff and completed-end watermark commit in one SQLite transaction; an already-ended keyed replay converges the remaining wiki commit, provider enqueue, and ingest-key completion. The completed end also stores the observation count it covered; a resumed session re-enters the end path only after that count advances, avoiding non-convergent wall-clock comparisons. Optional 6h maintenance timer.
+- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default). A substantive session end always writes a rule-based summary page + handoff regardless; a session containing only `SessionStart` / `SessionEnd` boundaries closes without either artifact or provider work and releases any startup handoff bound to that receiver. SessionEnd provider work is persisted by observation generation and consumed outside the hook request by one bounded retrying worker, so client drain cancellation cannot lose it. The automatic handoff and completed-end watermark commit in one SQLite transaction; an already-ended keyed replay converges the remaining wiki commit, provider enqueue, and ingest-key completion. The completed end also stores the observation count it covered; a resumed session re-enters the end path only after that count advances, avoiding non-convergent wall-clock comparisons. Optional 6h maintenance timer.
 - Providers implement `LlmProvider { complete(...); complete_structured(...) }`. The current provider and authentication matrix lives in [`ARCHITECTURE.md`](ARCHITECTURE.md); this design boundary also covers OpenAI-compatible endpoints such as Ollama, vLLM, and LM Studio.
 - **Native HTTP per provider** - no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider's typed JSON, errors on unknown fields. Hand-coded but correct.
 - **Structured output via JSON schema, not XML, not Instructor-style wrapping.** Use each provider's native JSON-mode where available; for Anthropic, request a tool-use response with a typed schema. Validate with `serde_json` + `schemars`-derived schemas.
@@ -159,7 +159,7 @@ Three scheduled MCP operations:
 - **`memory_query`** (called by agent on demand): project-scoped FTS + lexical entity + graph retrieval, with optional vectors, RRF-fused before bounded authority and optional LLM reranking. Agentmemory's earlier triple-stream result motivated the fusion shape.
 - **`memory_lint`** (scheduled hourly + on session-end): scans for contradictions, orphan pages, broken links, stale claims, low-confidence + zero-reinforcement entries. Pure LLM with strict JSON output.
 
-Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; soft-deletes via `is_latest=false` + `superseded_at`; hard-deletes only after 180 days *and* zero accesses. Never silently destroys anything user-pinned.
+Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; removes the Markdown source while tombstoning via `is_latest=false` + `superseded_at`; then hard-deletes the tombstone's full version ancestry after the configured grace period. Lifetime access counters influence the retention score before eviction but do not block cleanup afterward. Never silently destroys anything user-pinned, and never path-deletes a newer recreation.
 
 Auto-improvement work stays separate from normal session consolidation. The
 reviewer notes and staged design are in
@@ -221,7 +221,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
 | `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
-| `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
+| `memory_forget_sweep` | Retention sweep (M8); wiki-backed eviction below cold threshold; `dry_run=true` previews | destructive |
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical slim CLAUDE.md / AGENTS.md routing block, managed Agent Skill payloads, target hints, and overwrite guidance | read-only |
 
@@ -300,9 +300,9 @@ Top-line rules carved into the codebase:
 ## 15. Managed workstreams use a portable ledger, not native format conversion
 
 Managed cross-harness continuity is explicitly opt-in through `ai-memory run`.
-Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI, OMP, Grok
-Build CLI, and Antigravity CLI launches retain the existing hook and single-use
-handoff behavior. There is
+Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
+CLI, OMP, Grok Build CLI, and Antigravity CLI launches retain the existing hook
+and single-use handoff behavior. There is
 no process-global mode or manual harness switch: the wrapper selects the
 current repository/worktree workstream and each adapter applies that harness's
 native create/resume syntax.

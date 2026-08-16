@@ -315,7 +315,7 @@ These items previously drifted from the code. Their current status is:
 | raw archive status | Fixed: docs distinguish reserved `raw/` files from implemented observation-FTS fallback. |
 | scheduled maintenance | Fixed: docs describe default scheduled lint/sweep, opt-in embedding backfill, and the independent hollow-project cleanup. |
 | procedural tier | Fixed: consolidation can classify procedural memory, auto-improvement can create or patch bounded `procedures/` pages, and retention preserves semantic/procedural tiers. |
-| SessionEnd consolidation | Fixed: SessionEnd always writes a deterministic page and handoff; opt-in LLM work uses a durable retry queue, while PreCompact/manual consolidation remain available. |
+| SessionEnd consolidation | Fixed: substantive SessionEnd processing writes a deterministic page and handoff; lifecycle-only sessions close without generated artifacts or LLM work and release their session-bound startup handoff. Opt-in LLM work uses a durable retry queue, while PreCompact/manual consolidation remain available. |
 | batch embeddings | Fixed: code comments and status diagnostics now describe batch vector completeness as backfill-owned. |
 
 ## Implemented Roadmap Slice

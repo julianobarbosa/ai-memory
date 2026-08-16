@@ -8,6 +8,8 @@
 //! Reader-side APIs land in milestone M1-B; the writer + migrations are
 //! sufficient for M1-A's "drop a page in, see it persisted" demo.
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
@@ -43,13 +45,13 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary, PurgeSummary,
-    ReorgSummary,
+    AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
     BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
-    ContaminationSummary, DecayCandidate, DerivedIndexStatus, EmbeddingTripleCount,
+    ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
     FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, OpenSession, PageAuthor,
     PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
@@ -102,8 +104,9 @@ impl Store {
     /// cannot be applied, or the writer thread fails to start.
     pub fn open(data_dir: &Path) -> StoreResult<Self> {
         let db_dir = data_dir.join("db");
-        std::fs::create_dir_all(&db_dir)?;
+        create_private_dir_all(&db_dir)?;
         let db_path = db_dir.join(DB_FILENAME);
+        create_private_file_if_missing(&db_path)?;
 
         let mut conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -133,6 +136,30 @@ impl Store {
     }
 }
 
+/// Create missing database-directory components with owner-only access while
+/// leaving an existing installation's permissions untouched.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+/// Reserve a new SQLite file with restrictive permissions before SQLite writes
+/// its first page. Existing databases retain their current permissions.
+fn create_private_file_if_missing(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +172,33 @@ mod tests {
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_private_database_directory_and_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        let store = Store::open(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(root.join("db"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(store.db_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
         NewPage {
@@ -5020,7 +5074,11 @@ mod tests {
         let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let accepted = store
             .writer
-            .accept_startup_context(Some(acceptance(first_handoff, None)), Some(run.run_id))
+            .accept_startup_context(
+                Some(acceptance(first_handoff, None)),
+                Some(run.run_id),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5042,7 +5100,11 @@ mod tests {
         let second_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let rejected = store
             .writer
-            .accept_startup_context(Some(acceptance(second_handoff, None)), Some(run.run_id))
+            .accept_startup_context(
+                Some(acceptance(second_handoff, None)),
+                Some(run.run_id),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5107,6 +5169,7 @@ mod tests {
             .accept_startup_context(
                 Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
                 Some(run.run_id),
+                None,
             )
             .await
             .unwrap();

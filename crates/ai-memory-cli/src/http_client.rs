@@ -12,6 +12,8 @@
 
 use std::fmt;
 use std::io::{BufWriter, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -398,7 +400,7 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         let body = resp.text().await.unwrap_or_default();
         return Err(server_response_error(status, body));
     }
-    let file = std::fs::File::create(dest)
+    let file = private_output_file(dest)
         .with_context(|| format!("creating output file {}", dest.display()))?;
     let mut writer = BufWriter::new(file);
     let mut written = 0_u64;
@@ -418,9 +420,34 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     Ok(written)
 }
 
+/// Open a downloaded backup output file with private permissions before the
+/// first response bytes are written. Existing user-selected output files keep
+/// their existing permissions when overwritten.
+fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_backup_output_is_private_when_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        private_output_file(&output).unwrap();
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     // ----------------------------------------------------------------
     // ServerEndpoint::from_pair

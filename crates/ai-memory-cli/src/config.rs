@@ -55,9 +55,9 @@ pub struct DecaySettings {
     pub mu: f64,
     /// Default page salience.
     pub salience_default: f64,
-    /// Soft-delete threshold.
+    /// Wiki-backed eviction threshold.
     pub cold_threshold: f64,
-    /// Delay before hard-deleting an untouched soft-deleted page.
+    /// Grace period before permanently deleting an evicted version chain.
     pub hard_delete_after_days: i64,
     /// Optional weight for the number of distinct authenticated readers.
     pub breadth_weight: f64,
@@ -175,8 +175,8 @@ pub struct Config {
     pub embedding_base_url: Option<String>,
     /// M8 retention-sweep parameters. The defaults give an ~80-day
     /// "survival floor" for unused episodic content (above the cold
-    /// threshold), followed by ~180 days of soft-delete buffer before
-    /// hard-deletion. Tune `decay.lambda` down to slow decay or
+    /// threshold), followed by ~180 days of tombstone grace before permanent
+    /// version-chain deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
@@ -207,6 +207,10 @@ pub struct Config {
     /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
+    /// `[routing]` — how mid-session events whose cwd moved are attributed.
+    /// Default `follow-cwd` preserves the historical per-event resolution;
+    /// `sticky` keeps the session's project. See [`RoutingSettings`].
+    pub routing: RoutingSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -399,13 +403,17 @@ where
 }
 
 /// `[auth]` section of `config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// Shared bearer token. When set, all HTTP routes require
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Mark the browser session cookie `Secure`. Enable this only when a
+    /// trusted reverse proxy terminates HTTPS for `/web`; direct HTTP browsers
+    /// deliberately will not send a Secure cookie.
+    pub secure_cookie: bool,
     /// Username attributed to writes authenticated by the bearer
     /// token (rung 1: "identified single-user"). When set, the
     /// auth middleware injects an
@@ -450,6 +458,31 @@ pub struct AuthSettings {
     pub actor_proxy_bearer_token: Option<String>,
 }
 
+impl std::fmt::Debug for AuthSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSettings")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secure_cookie", &self.secure_cookie)
+            .field("root_username", &self.root_username)
+            .field("root_issuer", &self.root_issuer)
+            .field("root_subject", &self.root_subject)
+            .field("root_email", &self.root_email)
+            .field("root_name", &self.root_name)
+            .field(
+                "token_pepper",
+                &self.token_pepper.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "actor_proxy_bearer_token",
+                &self.actor_proxy_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// `[auto_scope]` — controls how the hook-published "currently active
 /// project" pointer is shared across concurrent callers. The legacy default
 /// is `single` (process-wide slot, last-write-wins). Opt-in modes isolate
@@ -483,6 +516,18 @@ impl Default for AutoScopeSettings {
     }
 }
 
+/// `[routing]` section of `config.toml`.
+///
+/// Set under `[routing]` in `config.toml` or via the
+/// `AI_MEMORY_ROUTING__MID_SESSION` env var.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingSettings {
+    /// `follow-cwd` (default) or `sticky`. See
+    /// [`ai_memory_core::MidSessionRouting`] for full semantics.
+    pub mid_session: ai_memory_core::MidSessionRouting,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -511,6 +556,7 @@ impl Default for Config {
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
+            routing: RoutingSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -1212,12 +1258,40 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn auth_settings_debug_redacts_secrets_in_auth_and_config() {
+        let auth = AuthSettings {
+            bearer_token: Some("bearer-secret-sentinel".into()),
+            root_username: Some("operator".into()),
+            token_pepper: Some("pepper-secret-sentinel".into()),
+            actor_proxy_bearer_token: Some("proxy-secret-sentinel".into()),
+            ..AuthSettings::default()
+        };
+        let config = Config {
+            auth: auth.clone(),
+            ..Config::default()
+        };
+
+        for rendered in [format!("{auth:?}"), format!("{config:?}")] {
+            assert!(rendered.contains("root_username: Some(\"operator\")"));
+            assert!(rendered.contains("<redacted>"));
+            for secret in [
+                "bearer-secret-sentinel",
+                "pepper-secret-sentinel",
+                "proxy-secret-sentinel",
+            ] {
+                assert!(!rendered.contains(secret), "Debug output exposed {secret}");
+            }
+        }
+    }
+
+    #[test]
     fn defaults_have_canonical_endings() {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
+        assert!(!cfg.auth.secure_cookie);
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
@@ -1440,6 +1514,9 @@ mod tests {
             hook_rate_per_sec = 7.5
             hook_rate_burst = 12.0
 
+            [auth]
+            secure_cookie = true
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -1491,6 +1568,7 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.hook_rate_per_sec, 7.5);
         assert_eq!(cfg.hook_rate_burst, 12.0);
+        assert!(cfg.auth.secure_cookie);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);

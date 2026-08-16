@@ -17,11 +17,8 @@
 //! `user.username` into the actor key would split the per-actor map
 //! across rungs, which is exactly what this test pins.
 
-use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorContext, NewUser, Tier};
-use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, SubagentSessionSet,
-    hook_router,
-};
+use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorContext, NewUser, SessionId, Tier};
+use ai_memory_hooks::{HookState, ProjectCacheStore, SubagentSessionSet, hook_router};
 use ai_memory_mcp::AiMemoryServer;
 use ai_memory_store::{Store, TokenPepper, generate_token, hash_token};
 use ai_memory_wiki::Wiki;
@@ -48,9 +45,12 @@ struct SeededUser {
 
 struct MultiUserHarness {
     router: Router,
-    _store: Store,
+    store: Store,
     _tmp: TempDir,
     users: Vec<SeededUser>,
+    /// A hook owns its permit from the 202 response until all downstream
+    /// processing, including active-pointer publication, has completed.
+    ingest_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl MultiUserHarness {
@@ -146,6 +146,9 @@ impl MultiUserHarness {
 
         let project_cache: ai_memory_hooks::ProjectCache =
             Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default()));
+        // One permit makes the test harness's completion barrier exact: after
+        // a 202, zero permits means the spawned hook task still owns it.
+        let ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         let hooks = hook_router(HookState {
             workspace_id: ws,
             project_id: baked,
@@ -156,14 +159,13 @@ impl MultiUserHarness {
             sanitizer: ai_memory_core::Sanitizer::default(),
             project_cache,
             active_project: active_project.clone(),
-            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
-            )),
+            ingest_semaphore: ingest_semaphore.clone(),
             ingest_gates: ai_memory_hooks::IngestGates::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
             per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
@@ -190,9 +192,10 @@ impl MultiUserHarness {
 
         MultiUserHarness {
             router,
-            _store: store,
+            store,
             _tmp: tmp,
             users,
+            ingest_semaphore,
         }
     }
 }
@@ -318,51 +321,56 @@ fn tool_text(body: &str) -> String {
         .join("\n")
 }
 
-async fn fire_hook_and_settle(router: &Router, token: &str, session_id: &str, proj: &str) {
-    let resp = router
+async fn fire_hook_and_settle(h: &MultiUserHarness, token: &str, session_id: &str, proj: &str) {
+    let resp = h
+        .router
         .clone()
         .oneshot(hook_request(token, session_id, proj))
         .await
         .expect("hook oneshot");
     assert_eq!(resp.status(), StatusCode::ACCEPTED, "hook must accept");
     let _ = response_text(resp).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    // The handler acquires this permit before it returns 202 and the spawned
+    // task releases it only after `process_envelope` finishes. Polling the
+    // semaphore therefore waits for completion rather than guessing a sleep.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.ingest_semaphore.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hook processing must release its harness permit");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Each user, authenticated by their real Bearer token, hooks their own
 // project; concurrent reads must resolve into their OWN slot, never any
-// sibling user's, even though they all share the same `session_id` value.
+// sibling user's, provided each native agent run has its own `session_id`.
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn per_actor_isolates_real_bearer_users() {
+async fn per_actor_isolates_real_bearer_users_with_distinct_native_sessions() {
     let h = MultiUserHarness::build(3).await;
 
-    // Intentionally shared session id across all users: the per_actor map
-    // must key by `(user, session)`, so even with collisions on the
-    // session-id half, the user-half from the auth middleware partitions
-    // them correctly. If a regression dropped `user` from the actor key,
-    // ALL three users would collapse into one slot and the assertion
-    // below would fail.
-    let shared_sess = "shared-session-across-users";
+    let sessions: Vec<String> = (0..h.users.len())
+        .map(|_| SessionId::new().to_string())
+        .collect();
     for u in &h.users {
         let proj = format!("user{}-proj", u.project_index);
-        fire_hook_and_settle(&h.router, &u.token, shared_sess, &proj).await;
+        let session_id = &sessions[u.project_index - 1];
+        fire_hook_and_settle(&h, &u.token, session_id, &proj).await;
     }
 
-    // Concurrent reads, one per user, with the shared session id.
+    // Concurrent reads, each with the matching native session id.
     let mut handles = Vec::new();
     for u in &h.users {
         let router = h.router.clone();
         let token = u.token.clone();
         let i = u.project_index;
+        let session_id = sessions[i - 1].clone();
         handles.push(tokio::spawn(async move {
             let resp = router
-                .oneshot(mcp_query_request(&token, shared_sess))
+                .oneshot(mcp_query_request(&token, &session_id))
                 .await
                 .expect("mcp oneshot");
             assert_eq!(resp.status(), StatusCode::OK, "user{i} read status");
@@ -391,6 +399,99 @@ async fn per_actor_isolates_real_bearer_users() {
     }
 }
 
+// A native SessionId is durable and global, not namespaced by the per-actor
+// active-pointer key. A second owner cannot claim it in another project or
+// publish a pointer under the colliding actor/session pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_owner_same_session_collision_is_dropped_before_pointer_publication() {
+    let h = MultiUserHarness::build(2).await;
+    let alice = &h.users[0];
+    let bob = &h.users[1];
+    let session = SessionId::new();
+    let session_id = session.to_string();
+
+    fire_hook_and_settle(&h, &alice.token, &session_id, "user1-proj").await;
+    let owner_before = h
+        .store
+        .reader
+        .session_actor_user(session)
+        .await
+        .expect("alice session owner");
+    let observations_before = h
+        .store
+        .reader
+        .observations_for_session(session)
+        .await
+        .expect("alice observations")
+        .len();
+    let alice_before = tool_text(
+        &response_text(
+            h.router
+                .clone()
+                .oneshot(mcp_query_request(&alice.token, &session_id))
+                .await
+                .expect("alice pointer lookup"),
+        )
+        .await,
+    );
+    assert_eq!(owner_before.as_deref(), Some("user:user1"));
+    assert_eq!(observations_before, 1);
+    assert!(alice_before.contains(number_word(1)));
+
+    fire_hook_and_settle(&h, &bob.token, &session_id, "user2-proj").await;
+
+    assert_eq!(
+        h.store
+            .reader
+            .session_actor_user(session)
+            .await
+            .expect("session owner after collision"),
+        owner_before,
+        "foreign hook must not take ownership"
+    );
+    assert_eq!(
+        h.store
+            .reader
+            .observations_for_session(session)
+            .await
+            .expect("observations after collision")
+            .len(),
+        observations_before,
+        "foreign hook must not append an observation"
+    );
+
+    let alice_after = tool_text(
+        &response_text(
+            h.router
+                .clone()
+                .oneshot(mcp_query_request(&alice.token, &session_id))
+                .await
+                .expect("alice pointer after collision"),
+        )
+        .await,
+    );
+    assert!(alice_after.contains(number_word(1)));
+
+    let bob_same_id = tool_text(
+        &response_text(
+            h.router
+                .clone()
+                .oneshot(mcp_query_request(&bob.token, &session_id))
+                .await
+                .expect("bob colliding pointer lookup"),
+        )
+        .await,
+    );
+    assert!(
+        !bob_same_id.contains(number_word(2)),
+        "Bob's colliding hook published user2's pointer:\n{bob_same_id}"
+    );
+    assert!(
+        !bob_same_id.contains(number_word(1)),
+        "Bob's colliding lookup resolved Alice's pointer instead of the baked default:\n{bob_same_id}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // A request without a Bearer token authenticates as anonymous → no
 // `user` in the actor key. If it still carries a session id, PerActor
@@ -408,7 +509,7 @@ async fn anonymous_request_does_not_inherit_user_slot() {
     let user1 = &h.users[0]; // owns user1-proj (alphaone marker)
 
     // user1 publishes their per_actor slot.
-    fire_hook_and_settle(&h.router, &user1.token, sess, "user1-proj").await;
+    fire_hook_and_settle(&h, &user1.token, sess, "user1-proj").await;
 
     // Anonymous read with the SAME session id. Because `user` differs
     // (`None` vs `Some("user1")`), the per_actor slot is a different
@@ -464,7 +565,7 @@ async fn unknown_bearer_does_not_match_any_user_slot() {
     let sess = "unknown-bearer-probe";
     let user1 = &h.users[0];
 
-    fire_hook_and_settle(&h.router, &user1.token, sess, "user1-proj").await;
+    fire_hook_and_settle(&h, &user1.token, sess, "user1-proj").await;
 
     // Forged Bearer of the right shape but unknown to the users table.
     let forged = "deadbeef".repeat(8);

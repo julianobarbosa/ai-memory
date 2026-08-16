@@ -2,10 +2,13 @@
 
 `ai-memory serve` publishes a process-shared "currently active project"
 pointer that MCP read tools consult when the caller omits `workspace` /
-`project`. The pointer is fed by the lifecycle hooks: every `/hook`
-event that resolves a `cwd` to a real project updates the pointer so
-read tools answer for the project the agent is actually in, not the
-server's static `--project` default.
+`project`. The pointer is fed by foreground lifecycle hooks: session start,
+user prompt, and pre-tool events that resolve a `cwd` to a real project update
+the pointer so read tools answer for the project the agent is actually in, not
+the server's static `--project` default. Completion and shutdown events still
+land in their resolved project, but do not advance shared fallback slots: a
+delayed post-tool, stop, or session-end tail from an older process must not
+redirect a newer session's unscoped reads.
 
 By default that pointer is a single process-wide slot — right for one
 operator running one project at a time, but it collapses parallel
@@ -25,12 +28,13 @@ separated.
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
 | `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | Shared engine fielding multiple authenticated users or trusted-proxy identities. Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
 
-Both opt-in modes still publish to the single slot in parallel, so a
-caller with no actor identity (anonymous probe, legacy code path) sees
-the most recent project rather than an empty pointer. That preserves
-legacy behavior, but it is not per-session isolation; use explicit
-`workspace` + `project` arguments when a client cannot send actor
-identity and concurrent runs matter.
+Both opt-in modes still publish foreground activity to the single slot in
+parallel, so a caller with no actor identity (anonymous probe, legacy code
+path) sees the most recently active project rather than an empty pointer.
+Non-foreground events refresh only their exact keyed entry when one exists.
+That preserves legacy behavior without letting a delayed tail take over, but
+it is not per-session isolation; use explicit `workspace` + `project`
+arguments when a client cannot send actor identity and concurrent runs matter.
 
 Explicit scope arguments fail closed. A `project` argument is resolved
 inside the active workspace first, then inside the server's default
@@ -100,6 +104,19 @@ process-wide single slot. A request that does carry a session id must
 match a hook-published keyed entry; if it does not, ai-memory falls back
 to the server's baked default rather than another session's latest
 project.
+
+The composite `(identity, session_id)` key namespaces only these active-project
+pointers. The durable `SessionId` stored for hook observations remains global:
+if another owner reuses an already-owned id, ai-memory drops that hook before it
+can append observations or publish a pointer for the foreign actor.
+
+Owner and agent are what identify a session; scope is not. The same operator's
+session legitimately produces events in another project when its cwd moves, so
+a differing `(workspace, project)` is recorded rather than rejected — see
+[`[routing] mid_session`](marker-file.md#mid-session-navigation-routing-mid_session)
+for how those events are attributed. The one exception is a terminal event: a
+`SessionEnd` naming a different scope than its session is not that session's
+end, so it is dropped rather than ending someone else's session.
 
 ## Client requirements
 

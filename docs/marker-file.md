@@ -334,6 +334,54 @@ ai-memory's hooks; pass `--project-strategy basename` explicitly to remove it.
 Precedence is unchanged: a marker's explicit `project_strategy` or `project`
 still wins over the install default.
 
+## Mid-session navigation: `[routing] mid_session`
+
+Everything above decides where a session *starts*. A long session also moves:
+an agent runs `cd` into a scratch directory, or into a sibling checkout to
+grep a reference. `[routing] mid_session` in `config.toml` decides how those
+mid-session events are attributed. It is server-side runtime config, not a
+marker key.
+
+```toml
+[routing]
+mid_session = "follow-cwd"   # default
+# mid_session = "sticky"
+```
+
+- **`follow-cwd`** (default, historical behavior) re-resolves every
+  mid-session event from its own cwd. A `cd` into a sibling checkout records
+  those observations in that checkout's project, so one session's raw record
+  is split across two projects while its session row and compiled page stay
+  in the first.
+- **`sticky`** keeps the session's project wherever the agent wanders. This
+  matches the model the rest of the system already uses: `sessions.project_id`
+  holds exactly one value, and consolidation reads by `session_id` and writes
+  one page in the session's project. Choose it when one agent session means
+  one project.
+
+Two guarantees hold in **both** modes:
+
+- **A marker still wins.** A `.ai-memory.toml` naming a project is a
+  deliberate rescope, not drift, so it is never overruled. The hook tells the
+  server which kind of override it sent (`project_src=marker` vs
+  `project_src=repo-root`), which is what lets `sticky` overrule a derived
+  name while honoring a declared one. A client older than v1.27 sends no
+  provenance, and its overrides stay authoritative.
+- **Broad anchors never stick.** A session rooted at `/` or at `$HOME` is not
+  a meaningful anchor, so it never captures events beneath it — otherwise one
+  stray session started in `$HOME` would fold every project into a single
+  bucket.
+
+Session-creating events are unaffected in both modes: opening a session in a
+plain non-git folder still names the project after that folder.
+
+Independently of this setting, under `project_strategy = "repo-root"` a
+mid-session event whose cwd is outside any git repo *and* any marker (agent
+scratch directories, `/tmp`, data folders) already inherits the session's
+project rather than minting a phantom project named `scratchpad` or `data`.
+The host hook resolves repo-root itself, so a missing override already proves
+the cwd resolved to nothing.
+
 ## Who reads the marker
 
 Both entry points, as of v1.20:

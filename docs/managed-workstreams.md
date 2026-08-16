@@ -1,8 +1,8 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP,
-Grok Build CLI, and Antigravity CLI. Direct agent launches
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
+CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -17,8 +17,11 @@ ai-memory run codex --yolo
 ai-memory run claude --model opus
 # Kimi Code installs `kimi`; `kimi-cli` is accepted as a launcher alias
 ai-memory run kimi-cli
-# Kiro's explicit managed adapter covers its default v2 engine
+# Command Code uses `command-code` on Unix and `cmdc` on native Windows
+ai-memory run command-code
+# Kiro defaults to v2; select its incompatible v3 engine explicitly once
 ai-memory run kiro
+ai-memory run kiro --v3
 # or omit the harness and continue the newest usable session automatically
 ai-memory run
 ```
@@ -39,7 +42,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|kiro|grok|antigravity]
+              [claude|codex|opencode|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
 
@@ -120,15 +123,15 @@ directory, including automatic harness selection. `continue` therefore accepts
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
-Claude Code, Codex, OpenCode, Pi, Crush, and Kimi Code. For an empty workstream
-it resumes
+Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, and both Kiro
+CLI engines. For an empty workstream it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
-another harness merely because that file has a later timestamp. Kiro, OMP,
-Grok, and Antigravity remain available explicitly but are not in the automatic
-pool. Kiro joins only after a logged-in current-format acceptance run validates
-its checkout-local discovery and import behavior.
+another harness merely because that file has a later timestamp. Kiro's v2 and
+v3 candidates share one server agent identity, but the selected native engine
+flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
+but are not in the automatic pool.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -229,10 +232,25 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
-| Kiro CLI | native default creation | `--resume-id <id>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
+| Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
+| Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
+| Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
+
+Command Code v3 transcripts are self-describing and append-only. The adapter
+requires the UUID filename, header id, and canonical header `cwd` to agree
+before discovery or resume. Its 1.14.1 allowlist was checked against both the
+integrity-matched published package and a sanitized live fixture. It imports
+visible messages, compactions, and branch summaries, retains `parentId` as
+branch provenance, and excludes hidden thinking, images, harness-injected
+messages, provider/model metadata, custom/Mod records, and every sidecar. An
+unknown transcript version fails closed until audited.
+The default executable is `command-code` on Unix and `cmdc` on native Windows;
+`commandcode`, `cmdc`, and `cmd` are accepted launcher aliases. Exact user
+`--session`, `--resume`, `--continue`, and fork choices remain authoritative.
+The experimental unsandboxed Mod API is not used.
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
@@ -256,10 +274,13 @@ chooser.
 the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-skip-permissions`, Codex
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
-Crush `--yolo`, Kimi Code `--yolo`, Kiro CLI v2 `--trust-all-tools`, Grok Build
-CLI `--yolo` (equivalent to its `--always-approve` option), and Antigravity CLI
-`--dangerously-skip-permissions`. OMP currently needs no added flag. ai-memory
-does not add a duplicate when the translated native flag is already present.
+Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
+`--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
+`--always-approve` option), and Antigravity CLI
+`--dangerously-skip-permissions`. Kiro v3 replaced the trust-all flag with
+`permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
+OMP currently needs no added flag. ai-memory does not add a duplicate when the
+translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
 Gemini CLI, Devin CLI, Cursor, and other agents may
@@ -294,7 +315,9 @@ Known Kimi Code adapter limitations: subagent transcripts
 (`agents/<id>/wire.jsonl` other than `main`) are not imported in v1 and are
 recorded as an extraction-loss annotation; the session bucket directory name
 is a one-way hash of the working directory, so discovery always reads
-`state.json`'s `workDir` and never parses the bucket name. Event ids derive
+`state.json`'s current `cwd` field or legacy `workDir` alias and never parses
+the bucket name. Conflicting aliases or a persisted id that disagrees with the
+session directory are rejected. Event ids derive
 from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines —
 only possible with identical content in the same millisecond, because Kimi
 Code stamps each record with `time` — collapse into a single ledger event.
@@ -306,28 +329,40 @@ workstream.
 Legacy sessions that keep `wire.jsonl` directly in the session directory
 (the pre-`agents/` layout the kimi session-store still reads through its
 stat fallback) are neither discovered nor imported in v1. The native
-contract was verified against Kimi Code v0.29.0. The managed launcher accepts
+contract was reverified against Kimi Code v0.34.0. The managed launcher accepts
 `kimi`, `kimi-code`, and `kimi-cli`; all three resolve the installed `kimi`
 executable.
 
-Kiro's explicit adapter covers only the default v2 engine. The audited 2.16.0
-binary and v2 fixtures expose UUID session IDs, checkout scoping, `--resume-id`,
-`$KIRO_HOME`, and the flat `$KIRO_HOME/sessions/cli/<uuid>.json` plus
-`<uuid>.jsonl` store with v1 `Prompt`, `AssistantMessage`, and `ToolResults`
-events. Current official Kiro session documentation instead describes
-per-directory database persistence without publishing a filename, schema, or
-read-only transcript contract; its v3 guide confirms that v3 sessions are not
-backward-compatible or resumable in v2. Authentication prevented producing a
-new isolated live transcript during this audit. The parser therefore accepts
-only the known v1 flat-store envelope, records unsupported versions as
-extraction loss, imports visible text and completed tool records only, and stays
-outside automatic selection until a logged-in current-format acceptance run is
-recorded. Exact lookups require a UUID, matching sibling `session_id`, and an
-exact canonical `cwd`; a linked ID cannot select another checkout's flat-store
-transcript. `--v3`, `--mode`, and a non-v2 `--agent-engine` select incompatible
-engines and pass through unchanged. The v2 `--yolo` translation is
-`--trust-all-tools`; an explicit narrower `--trust-tools` choice is never
-widened. See Kiro's current
+Kiro's version-aware adapter was live-tested with authenticated Kiro CLI
+2.16.2 in both engines. V2 uses UUID session IDs and the flat
+`$KIRO_HOME/sessions/cli/<uuid>.json` plus `<uuid>.jsonl` store with v1
+`Prompt`, `AssistantMessage`, and `ToolResults` events. V3 uses incompatible
+`sess_<uuid>` IDs and nested
+`$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/session.json` plus
+`messages.jsonl`; accepted metadata is limited to `schemaVersion = 1.0.0`,
+`dataModelVersion = 1`, an exact directory/id match, and a `workspacePaths`
+entry resolving to the current checkout. The v3 visible-event allowlist is
+user text, assistant `Say` output, tool calls, and tool results. Session
+bookkeeping, hook records, usage summaries, turn boundaries, private assistant
+operations, malformed records, and unknown schema versions are not imported.
+
+The engines can never cross-resume: exact store metadata is checked before a
+linked `--resume-id` is injected, and the incompatible engine flavor is also
+stored in the opaque incremental cursor. Explicit `--v3`, v3-only `--mode`,
+or `--agent-engine v3` selects v3; explicit `--agent-engine v2` selects v2; an
+unknown engine value remains passthrough instead of being guessed. Once a v3
+session is linked, a later plain `ai-memory run kiro` recovers that engine
+transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
+`~/.kiro/sessions` even when `KIRO_HOME` redirected other state, so ai-memory
+checks the configured v3 root first and that default root as a compatibility
+fallback. If a linked session exists only in the fallback, ai-memory removes
+`KIRO_HOME` for that one resume so Kiro can find the session; Kiro consequently
+uses its default-home v3 settings/hooks for that process. Fresh launches and
+versions that store the session below the configured root keep `KIRO_HOME`
+unchanged. Every candidate still needs exact id, schema, and checkout metadata.
+The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
+`--trust-tools` choice is never widened. V3 documents no equivalent CLI flag.
+See Kiro's current
 [session management](https://kiro.dev/docs/cli/chat/session-management/) and
 [v3 compatibility](https://kiro.dev/docs/cli/v3/) references.
 
@@ -423,8 +458,8 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 ## Privacy and storage boundaries
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, Kiro, OMP, Grok, or Antigravity private stores. The launched harness
-retains normal ownership of its own session writes. Adapters read only
+Kimi Code, Command Code, Kiro, OMP, Grok, or Antigravity private stores. The
+launched harness retains normal ownership of its own session writes. Adapters read only
 documented or observed local session formats. Provider credentials, encrypted
 content, system/developer prompt records, and hidden reasoning are not copied. The
 server sanitizer runs before both the SQLite FTS ledger and immutable files under
@@ -440,7 +475,9 @@ belong in wiki pages through consolidation or explicit durable writes.
 project name. Wiki paths are UUID-keyed, so it moves no server directory, source
 checkout, or native harness session. If the source checkout path itself is
 renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
-Pi, Kimi Code (`state.json`'s `workDir`), Kiro (`<uuid>.json`'s `cwd`), OMP, and
+Pi, Kimi Code (`state.json`'s `cwd` or legacy `workDir`), Command Code (v3
+header `cwd`), Kiro v2
+(`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP, and
 Antigravity may still reference the old path; Crush's project-local `.crush`
 database moves with the checkout.
 
@@ -457,8 +494,8 @@ checkout to match exactly.
 ## Manual acceptance
 
 The opt-in acceptance runner exercises launcher edge cases and then orchestrates
-the locally installed Claude, Codex, OpenCode, Pi, Crush, OMP, Kimi, Grok, and
-Antigravity CLIs through one real workstream:
+the locally installed Claude, Codex, OpenCode, Pi, Crush, OMP, Kimi, Command
+Code, Grok, and Antigravity CLIs through one real workstream:
 
 ```bash
 scripts/managed-workstream-acceptance.sh
@@ -471,13 +508,16 @@ OpenCode receive only copied authentication material; OMP receives a temporary
 agent directory with read-consistent credential/model database backups and
 copied settings. Crush uses its existing global provider configuration and an
 isolated project database. Kimi Code runs with an isolated `$KIMI_CODE_HOME`
-seeded with the operator's provider configuration. Antigravity runs with an
-isolated `HOME` seeded only with the operator's OAuth and settings files. The
+seeded with the operator's provider configuration. Command Code runs with an
+isolated `HOME` seeded only with `auth.json` and `config.json`. Antigravity runs
+with an isolated `HOME` seeded only with the operator's OAuth and settings files. The
 deterministic phase also covers first-run adoption, bare-mode selection and
 empty-directory failure, wrapper `--yolo`, lease exclusion, Crush context
-cleanup, a fake-mode Kimi store/resume/import round trip, an Antigravity
-hook/link/resume round trip, a fake-mode Kiro v2 store/resume/import round trip,
-Kiro v3 passthrough, private-trajectory exclusion, and the
+cleanup, fake-mode Kimi and Command Code store/resume/import round trips, an
+Antigravity hook/link/resume round trip, a fake-mode Kiro v2
+store/resume/import round trip,
+the equivalent Kiro v3 nested-store round trip with transparent engine recovery,
+private-trajectory exclusion, and the
 established-workstream guard against obsolete sessions. The fake Kimi round
 trip also deletes the linked native session and verifies automatic
 fresh-session recovery and repointing.
@@ -486,15 +526,16 @@ returning resume paths are all exercised. Docker wrapper host execution and
 remote URL preservation are covered separately by the `ai-memory-cli`
 packaging tests.
 
-Kiro is intentionally skipped in the scripted real-harness phase. Its
-`--no-interactive` mode writes a different v1 SQLite store, while the managed v2
-adapter reads the interactive flat JSON/JSONL store. A logged-in Kiro acceptance
-therefore remains interactive: run `ai-memory run --new kiro-accept kiro`, enter
-a unique prompt, quit normally, then run `ai-memory run --workstream
-kiro-accept kiro-cli` and verify that Kiro resumes the same native conversation.
-Repeat with `--v3` and confirm ai-memory prints no managed resume selector or
-import result for that invocation. Record the Kiro version and sanitize the
-paired metadata/event files before converting any new shape into a fixture.
+Kiro is intentionally skipped in the scripted real-model loop. Its
+`--no-interactive` mode writes a different v1 SQLite store, while both managed
+adapters read the interactive v2/v3 journals. Logged-in Kiro acceptance
+therefore remains interactive. For v2, run `ai-memory run --new kiro-v2-accept
+kiro`, enter a unique prompt, quit normally, then run `ai-memory run
+--workstream kiro-v2-accept kiro-cli` and verify the same UUID resumes. For v3,
+repeat with a fresh workstream and `kiro --v3`; the second plain `kiro` launch
+must transparently add `--v3 --resume-id <sess_uuid>`. Search both workstream
+ledgers for the unique visible assistant replies. Record the Kiro version and
+sanitize metadata/event files before changing either fixture schema.
 
 The real-harness phase treats the model as the system under transport, not as
 the test oracle. For each leg it records the prior ledger sequence, then
@@ -512,6 +553,8 @@ Grok and Antigravity cross-harness fixtures exercise the same assertion helper
 without credentials or model calls.
 
 Set
+`AI_MEMORY_ACCEPTANCE_HARNESSES="command-code codex"` to select a
+Command-Code-to-Codex-to-Command-Code round trip, or
 `AI_MEMORY_ACCEPTANCE_HARNESSES="antigravity codex"` to select an
 Antigravity-to-Codex-to-Antigravity round trip (`agy` and `antigravity-cli` are
 accepted aliases), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model

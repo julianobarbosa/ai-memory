@@ -171,12 +171,17 @@ function Get-AiMemoryMarkerQuery {
     $proj = $null
     $strategy = $null
     $dropSubagent = $null
+    # Provenance of $proj, forwarded as `project_src` so the server can tell a
+    # deliberate marker rescope from a host-derived repo-root name. Only the
+    # latter may yield to session-sticky attribution (#394).
+    $projSrc = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
         $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
         $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
+        if ($proj) { $projSrc = "marker" }
     }
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
@@ -188,9 +193,11 @@ function Get-AiMemoryMarkerQuery {
     # only when no explicit project is pinned. Explicit project always wins.
     if (-not $proj -and ($strategy -eq "repo-root" -or $strategy -eq "repo_root")) {
         $proj = Get-AiMemoryRepoRootProject -Cwd $Cwd
+        if ($proj) { $projSrc = "repo-root" }
     }
     if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
     if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
+    if ($projSrc) { $qs += "&project_src=$([uri]::EscapeDataString($projSrc))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.

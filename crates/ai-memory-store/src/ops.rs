@@ -35,6 +35,87 @@ pub enum IngestObservationOutcome {
     AlreadyComplete,
 }
 
+/// Unforgeable writer-issued session capability for hook follow-up mutations.
+#[derive(Clone, Debug)]
+pub struct AdmittedSession {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    agent_kind: AgentKind,
+    owner: Option<String>,
+}
+impl AdmittedSession {
+    /// Persisted session identifier authorized by this guard.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    /// Persisted workspace identifier authorized by this guard.
+    pub fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+    /// Persisted project identifier authorized by this guard.
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+    /// Persisted agent kind authorized by this guard.
+    pub fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+    /// Persisted owner storage key, or `None` for a shared session.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+}
+
+/// Result of atomic hook admission.
+#[derive(Clone, Debug)]
+pub enum HookSessionAdmission {
+    /// An ordinary observation was admitted for this persisted session.
+    Observation {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was admitted for a session that was still open.
+    EndOpen {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was admitted after new observations followed an end.
+    ReEnd {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was already fully represented by this persisted session.
+    AlreadyEnded {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+    },
+    /// A terminal event named no persisted session and created nothing.
+    InvalidMissingEnd,
+    /// A terminal event named a persisted session in a different scope, so it
+    /// is not that session's end. Mirrors the pre-guard
+    /// `SessionEndDisposition::DropInvalid` arm.
+    InvalidScopedEnd,
+}
+/// Result of conditionally ending a session whose persisted observations are
+/// all lifecycle boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleOnlyEndOutcome {
+    /// The session was still boundary-only inside the writer transaction.
+    Ended {
+        /// Startup handoff returned to the open pool, when one was claimed.
+        reopened_handoff: Option<HandoffId>,
+    },
+    /// Substantive work arrived before the atomic end check.
+    Substantive,
+}
+
 /// Summary returned by [`purge_project`] and exposed via
 /// [`crate::writer::WriterHandle::purge_project`].
 #[derive(Debug, Default, Clone)]
@@ -852,6 +933,38 @@ fn refresh_incoming_links_for_path(
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.
 /// Idempotent: a second call with the same id leaves the row untouched.
 pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
+    begin_session_row(conn, session)
+}
+
+pub(crate) fn begin_session_in_transaction(
+    tx: &Transaction<'_>,
+    session: &NewSession,
+) -> StoreResult<()> {
+    begin_session_row(tx, session)?;
+    let matches_receiver: bool = tx.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM sessions \
+             WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND agent_kind = ?4 AND actor_user IS ?5 \
+         )",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes(),
+            session.agent_kind.as_str(),
+            session.actor_user.as_deref(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !matches_receiver {
+        return Err(StoreError::InvalidState(
+            "startup receiver id belongs to a different scope, agent, or operator".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()> {
     validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
     let now = Timestamp::now().as_microsecond();
     let agent = session.agent_kind.as_str();
@@ -885,6 +998,76 @@ pub fn end_session(
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
     end_session_row(conn, session_id, summary_page_id)
+}
+
+/// Atomically end a lifecycle-only session and return its startup handoff to
+/// the open pool.
+///
+/// Only a handoff claimed by this exact receiver session is reopened. The
+/// compare-and-set protects a baton that has moved to any other state, while
+/// clearing all acceptance metadata makes a later claim indistinguishable
+/// from the original open row.
+pub fn end_lifecycle_only_session(
+    conn: &mut Connection,
+    session_id: &SessionId,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
+    let tx = conn.transaction()?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, session_id)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+fn end_lifecycle_only_session_in_tx(
+    tx: &Transaction<'_>,
+    session_id: &SessionId,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
+    let has_substantive_observation: bool = tx.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM observations \
+             WHERE session_id = ?1 AND kind NOT IN ('session-start', 'session-end') \
+         )",
+        params![session_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if has_substantive_observation {
+        return Ok(LifecycleOnlyEndOutcome::Substantive);
+    }
+    end_session_row(tx, session_id, None)?;
+    let reopened: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = tx
+        .query_row(
+            "UPDATE handoffs \
+             SET state = 'open', accepted_by = NULL, accepted_at = NULL, \
+                 accepted_by_session = NULL, accepted_by_user = NULL \
+             WHERE id = ( \
+                 SELECT id FROM handoffs \
+                 WHERE state = 'accepted' AND accepted_by_session = ?1 \
+                 ORDER BY accepted_at DESC, created_at DESC LIMIT 1 \
+             ) AND state = 'accepted' AND accepted_by_session = ?1 \
+             RETURNING id, workspace_id, project_id",
+            params![session_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let reopened = reopened
+        .map(|(id, workspace_id, project_id)| -> StoreResult<HandoffId> {
+            let handoff_id = HandoffId::from_slice(&id)?;
+            let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+            let project_id = ProjectId::from_slice(&project_id)?;
+            audit(
+                tx,
+                "release_lifecycle_only_handoff",
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                None,
+                Timestamp::now().as_microsecond(),
+            )?;
+            Ok(handoff_id)
+        })
+        .transpose()?;
+    Ok(LifecycleOnlyEndOutcome::Ended {
+        reopened_handoff: reopened,
+    })
 }
 
 fn end_session_row(
@@ -966,6 +1149,210 @@ pub fn insert_observation_keyed(
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
     Ok(IngestObservationOutcome::Inserted(id))
+}
+
+/// Find or create the hook session, validate its immutable tuple and owner,
+/// optionally claim an ingest key, and append the observation in one writer
+/// transaction. Validation always precedes key mutation.
+pub fn admit_hook_session_event(
+    conn: &mut Connection,
+    session: &NewSession,
+    obs: &NewObservation,
+    owner_filter: &OwnerFilter,
+    ingest_key: Option<&str>,
+) -> StoreResult<HookSessionAdmission> {
+    if obs.session_id != session.id
+        || obs.workspace_id != session.workspace_id
+        || obs.project_id != session.project_id
+    {
+        return Err(StoreError::InvalidState(
+            "hook observation does not match its session tuple".into(),
+        ));
+    }
+    let session_end = obs.kind == ObservationKind::SessionEnd;
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    type Row = (Vec<u8>, Vec<u8>, String, Option<String>, Option<i64>, u64);
+    let existing: Option<Row> = tx.query_row(
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count FROM sessions WHERE id = ?1",
+        params![session.id.as_bytes()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).optional()?;
+    let (owner, ended_at, ended_count) = match existing {
+        Some((ws, project, agent, owner, ended_at, ended_count)) => {
+            // Corrupt owners fail closed, including for Any recovery. Owner
+            // and agent identify WHO the session belongs to, so a mismatch
+            // there is a genuine UUID collision and is terminal.
+            if owner
+                .as_deref()
+                .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
+                || agent != session.agent_kind.as_str()
+                || !owner_filter.admits(owner.as_deref())
+            {
+                return Err(StoreError::SessionCollision);
+            }
+            // Scope is NOT identity. Under the default `follow-cwd` routing a
+            // mid-session `cd` into another project legitimately resolves this
+            // event to a different (workspace, project) than the session row,
+            // and the observation belongs in the project it names — that is
+            // exactly the record-splitting `[routing] mid_session = "sticky"`
+            // exists to opt out of. Treating the difference as a collision
+            // silently DROPPED those events instead of recording them.
+            //
+            // A terminal event is the one exception: an end naming a different
+            // scope is not this session's end, so it is dropped rather than
+            // ending someone else's session (the pre-guard
+            // `SessionEndDisposition::DropInvalid` arm).
+            let scoped_to_session = ws.as_slice() == session.workspace_id.as_bytes()
+                && project.as_slice() == session.project_id.as_bytes();
+            if session_end && !scoped_to_session {
+                tx.commit()?;
+                return Ok(HookSessionAdmission::InvalidScopedEnd);
+            }
+            (owner, ended_at, ended_count)
+        }
+        None if session_end => {
+            tx.commit()?;
+            return Ok(HookSessionAdmission::InvalidMissingEnd);
+        }
+        None => {
+            validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
+            if !owner_filter.admits(session.actor_user.as_deref()) {
+                return Err(StoreError::SessionCollision);
+            }
+            tx.execute(
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), now, session.actor_user.as_deref()],
+            )?;
+            (session.actor_user.clone(), None, 0)
+        }
+    };
+    let guard = AdmittedSession {
+        session_id: session.id,
+        workspace_id: session.workspace_id,
+        project_id: session.project_id,
+        agent_kind: session.agent_kind,
+        owner,
+    };
+    if session_end && ended_at.is_some() {
+        let count: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            params![session.id.as_bytes()],
+            |r| r.get(0),
+        )?;
+        if count <= ended_count {
+            tx.commit()?;
+            return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
+        }
+    }
+    let ingest = if let Some(key) = ingest_key {
+        tx.execute(
+            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            params![now - INGEST_KEY_TTL_MICROS],
+        )?;
+        let old: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                params![obs.project_id.as_bytes(), key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match old {
+            Some(done) => {
+                if done.is_some() {
+                    IngestObservationOutcome::AlreadyComplete
+                } else {
+                    IngestObservationOutcome::ResumePending
+                }
+            }
+            None => {
+                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
+            }
+        }
+    } else {
+        IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
+    };
+    tx.commit()?;
+    if !session_end {
+        Ok(HookSessionAdmission::Observation {
+            session: guard,
+            ingest,
+        })
+    } else if ended_at.is_some() {
+        Ok(HookSessionAdmission::ReEnd {
+            session: guard,
+            ingest,
+        })
+    } else {
+        Ok(HookSessionAdmission::EndOpen {
+            session: guard,
+            ingest,
+        })
+    }
+}
+
+fn validate_admitted_session(tx: &Transaction<'_>, admitted: &AdmittedSession) -> StoreResult<()> {
+    let owner: Option<String> = tx.query_row(
+        "SELECT actor_user FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND agent_kind = ?4",
+        params![admitted.session_id.as_bytes(), admitted.workspace_id.as_bytes(), admitted.project_id.as_bytes(), admitted.agent_kind.as_str()],
+        |r| r.get(0),
+    ).optional()?.ok_or(StoreError::SessionCollision)?;
+    if owner != admitted.owner
+        || owner
+            .as_deref()
+            .is_some_and(|v| IdentityKey::from_storage_key(v).is_none())
+    {
+        return Err(StoreError::SessionCollision);
+    }
+    Ok(())
+}
+
+/// Guarded hook equivalent of [`end_session`].
+pub fn end_admitted_session(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+    page: Option<&PageId>,
+) -> StoreResult<()> {
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    end_session_row(&tx, &admitted.session_id, page)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Guarded hook lifecycle-only end.
+pub fn end_admitted_lifecycle_only_session(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, &admitted.session_id)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Guarded hook end plus automatic handoff in one transaction.
+pub fn end_admitted_session_with_handoff(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+    page: Option<&PageId>,
+    handoff: &NewHandoff,
+) -> StoreResult<HandoffId> {
+    if handoff.from_session_id != Some(admitted.session_id)
+        || handoff.workspace_id != admitted.workspace_id
+        || handoff.project_id != admitted.project_id
+        || handoff.owner_user != admitted.owner
+    {
+        return Err(StoreError::SessionCollision);
+    }
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    end_session_row(&tx, &admitted.session_id, page)?;
+    let id = insert_handoff_row(&tx, handoff)?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Mark a keyed hook event complete after its downstream effects finish.
@@ -1335,38 +1722,52 @@ pub fn record_page_feedback(
     Ok(Some((page_id, next_salience)))
 }
 
-/// Mark a set of `is_latest=1` pages as soft-deleted by the forget
-/// sweep. Distinguished from M7 supersession by `supersedes IS NULL`.
-pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> StoreResult<usize> {
-    if page_ids.is_empty() {
-        return Ok(0);
-    }
+/// Mark the expected latest page as evicted by the forget sweep.
+///
+/// The full identity and latest-id check share one transaction so a stale
+/// sweep candidate cannot evict a page that was rewritten after selection.
+/// `superseded_at` is the decay-tombstone marker; unlike `supersedes`, it is
+/// never populated by ordinary page versioning.
+pub fn soft_delete_for_decay_if_latest(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    expected_latest_id: PageId,
+) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
-    let mut affected = 0usize;
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE pages \
-             SET is_latest = 0, superseded_at = ?1 \
-             WHERE id = ?2 AND is_latest = 1",
-        )?;
-        for id in page_ids {
-            affected += stmt.execute(params![now, id.as_bytes()])?;
-        }
-    }
-    audit(
-        &tx,
-        "soft_delete_for_decay",
-        None,
-        None,
-        None,
-        // Decay sweep is a system op (scheduled / admin-triggered) — no
-        // user-attributable actor at the row level.
-        None,
-        Timestamp::now().as_microsecond(),
+    let affected = tx.execute(
+        "UPDATE pages \
+         SET is_latest = 0, superseded_at = ?1 \
+         WHERE id = ?2 \
+           AND workspace_id = ?3 \
+           AND project_id = ?4 \
+           AND path = ?5 \
+           AND is_latest = 1",
+        params![
+            now,
+            expected_latest_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str(),
+        ],
     )?;
+    if affected != 0 {
+        audit(
+            &tx,
+            "soft_delete_for_decay",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            Some(expected_latest_id.as_bytes()),
+            // Decay is a scheduled/admin system operation rather than a
+            // user-attributable page edit.
+            None,
+            now,
+        )?;
+    }
     tx.commit()?;
-    Ok(affected)
+    Ok(affected != 0)
 }
 
 /// Delete every version of a page (by path) from the index. Used when the
@@ -1471,29 +1872,67 @@ fn delete_page_inner(
     Ok(rows > 0)
 }
 
-/// Hard-delete rows in one workspace/project that were soft-deleted by an
-/// earlier sweep at least `hard_delete_after_days` ago AND received zero
-/// subsequent accesses. Safe: M7 supersedes-chain pages have a non-null
-/// `supersedes` so they never match. Orphaned entity-index rows from those
-/// page deletions are removed in the same transaction.
-pub fn hard_delete_decayed_pages(
+/// Permanently delete one eligible decay tombstone and its ancestry chain.
+///
+/// The tombstone id, full path identity, cutoff, and current latest-page state
+/// are all rechecked in the transaction. This lets the wiki layer remove the
+/// authoritative file only when the path has no newer live page, while still
+/// allowing an old chain to be cleaned after that path was deliberately
+/// recreated. Ordinary supersession rows have `superseded_at IS NULL` and
+/// cannot become roots of this deletion.
+pub fn hard_delete_decayed_page_chain(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    hard_delete_after_days: i64,
+    path: &PagePath,
+    tombstone_id: PageId,
+    expected_latest_id: Option<PageId>,
+    cutoff_us: i64,
 ) -> StoreResult<usize> {
-    let cutoff = Timestamp::now().as_microsecond() - hard_delete_after_days * 86_400_000_000;
     let tx = conn.transaction()?;
+    let current_latest: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                path.as_str()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected_latest = expected_latest_id.map(|id| id.as_bytes().to_vec());
+    if current_latest != expected_latest {
+        return Ok(0);
+    }
     let n = tx.execute(
-        "DELETE FROM pages \
-         WHERE workspace_id = ?1 \
-           AND project_id = ?2 \
-           AND is_latest = 0 \
-           AND supersedes IS NULL \
-           AND superseded_at IS NOT NULL \
-           AND superseded_at < ?3 \
-           AND access_count = 0",
-        params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff],
+        "WITH RECURSIVE decay_chain(id) AS ( \
+             SELECT id FROM pages \
+             WHERE id = ?1 \
+               AND workspace_id = ?2 \
+               AND project_id = ?3 \
+               AND path = ?4 \
+               AND is_latest = 0 \
+               AND superseded_at IS NOT NULL \
+               AND superseded_at <= ?5 \
+             UNION \
+             SELECT parent.id \
+             FROM decay_chain c \
+             JOIN pages child ON child.id = c.id \
+             JOIN pages parent ON parent.id = child.supersedes \
+             WHERE parent.workspace_id = ?2 \
+               AND parent.project_id = ?3 \
+               AND parent.path = ?4 \
+         ) \
+         DELETE FROM pages WHERE id IN (SELECT id FROM decay_chain)",
+        params![
+            tombstone_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str(),
+            cutoff_us,
+        ],
     )?;
     if n > 0 {
         tx.execute(
@@ -1503,6 +1942,15 @@ pub fn hard_delete_decayed_pages(
                    SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
                )",
             params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+        audit(
+            &tx,
+            "hard_delete_decayed",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            Some(tombstone_id.as_bytes()),
+            None,
+            Timestamp::now().as_microsecond(),
         )?;
     }
     tx.commit()?;
@@ -1712,6 +2160,51 @@ pub(crate) fn accept_handoff_in_transaction(
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.as_ref().map(|s| &s.as_bytes()[..]);
+    if let Some(accepting_session) = accepting_session {
+        let receiver: Option<(bool, bool)> = tx
+            .query_row(
+                "SELECT workspace_id = ?2 AND project_id = ?3 AND agent_kind = ?4, \
+                        ended_at IS NULL \
+                 FROM sessions WHERE id = ?1",
+                params![
+                    accepting_session.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    accepting_agent.as_str(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((matching_scope_and_agent, open)) = receiver else {
+            return Err(StoreError::InvalidState(
+                "handoff receiver session does not exist".into(),
+            ));
+        };
+        if !matching_scope_and_agent {
+            return Err(StoreError::InvalidState(
+                "handoff receiver session does not match the accepting scope and agent".into(),
+            ));
+        }
+        if !open {
+            return Err(StoreError::InvalidState(
+                "an ended session cannot accept a handoff".into(),
+            ));
+        }
+        let already_claimed: bool = tx.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM handoffs \
+                 WHERE state = 'accepted' AND accepted_by_session = ?1 \
+             )",
+            params![accepting_session.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if already_claimed {
+            // SessionStart can be retried. One receiver must never consume a
+            // second baton, or an empty end could return only one and strand
+            // the first accepted row.
+            return Ok(false);
+        }
+    }
     let metadata = tx
         .query_row(
             "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user \
@@ -2942,6 +3435,67 @@ pub(crate) mod tests {
         (tmp, conn, ws, proj)
     }
 
+    fn hook_session(
+        id: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: Option<&str>,
+    ) -> NewSession {
+        NewSession {
+            id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: owner.map(str::to_owned),
+        }
+    }
+
+    fn hook_observation(session: &NewSession) -> NewObservation {
+        NewObservation {
+            session_id: session.id,
+            workspace_id: session.workspace_id,
+            project_id: session.project_id,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "hook".into(),
+            body: "observation".into(),
+            importance: 5,
+        }
+    }
+
+    fn session_end_observation(session: &NewSession) -> NewObservation {
+        let mut observation = hook_observation(session);
+        observation.kind = ObservationKind::SessionEnd;
+        observation
+    }
+
+    fn seed_ingest_key(conn: &Connection, project_id: ProjectId, key: &str, completed: bool) {
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project_id.as_bytes(),
+                key,
+                Timestamp::now().as_microsecond(),
+                completed.then_some(Timestamp::now().as_microsecond()),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn admitted_session(admission: HookSessionAdmission) -> AdmittedSession {
+        match admission {
+            HookSessionAdmission::Observation { session, .. }
+            | HookSessionAdmission::EndOpen { session, .. }
+            | HookSessionAdmission::ReEnd { session, .. }
+            | HookSessionAdmission::AlreadyEnded { session } => session,
+            HookSessionAdmission::InvalidMissingEnd | HookSessionAdmission::InvalidScopedEnd => {
+                panic!("expected admitted session")
+            }
+        }
+    }
+
     fn page(
         ws: ai_memory_core::WorkspaceId,
         proj: ai_memory_core::ProjectId,
@@ -3514,6 +4068,179 @@ pub(crate) mod tests {
         // guard.)
         let second = accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj));
         assert!(second.is_ok(), "double-accept must not error");
+    }
+
+    #[test]
+    fn lifecycle_only_receiver_releases_its_handoff_and_cannot_reclaim_after_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let new_handoff = || NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: Some("/repo".into()),
+            summary: "real pending work".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let handoff_id = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut claim = handoff_acceptance(handoff_id, ws, proj);
+        claim.accepting_session = Some(receiver);
+        assert!(accept_handoff(&mut conn, &claim).unwrap());
+        let second_handoff = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut duplicate_start = handoff_acceptance(second_handoff, ws, proj);
+        duplicate_start.accepting_session = Some(receiver);
+        assert!(
+            !accept_handoff(&mut conn, &duplicate_start).unwrap(),
+            "a repeated SessionStart must not consume a second handoff"
+        );
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: Some(handoff_id)
+            }
+        );
+        let (state, accepted_by, accepted_at, accepted_session): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ) = conn
+            .query_row(
+                "SELECT state, accepted_by, accepted_at, accepted_by_session \
+                 FROM handoffs WHERE id = ?1",
+                params![handoff_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+        assert!(accepted_by.is_none());
+        assert!(accepted_at.is_none());
+        assert!(accepted_session.is_none());
+        let (ended_at, summary_page): (Option<i64>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT ended_at, summary_page_id FROM sessions WHERE id = ?1",
+                params![receiver.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(ended_at.is_some());
+        assert!(summary_page.is_none());
+        assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
+        let second_state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![second_handoff.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_state, "open");
+
+        let next_handoff = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut stale_claim = handoff_acceptance(next_handoff, ws, proj);
+        stale_claim.accepting_session = Some(receiver);
+        let error = accept_handoff(&mut conn, &stale_claim)
+            .expect_err("an out-of-order startup fetch must not bind to an ended session");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![next_handoff.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+    }
+
+    #[test]
+    fn lifecycle_only_end_compare_and_set_yields_to_substantive_observation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let handoff_id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "continue".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut claim = handoff_acceptance(handoff_id, ws, proj);
+        claim.accepting_session = Some(receiver);
+        assert!(accept_handoff(&mut conn, &claim).unwrap());
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::PreToolUse,
+                extension: None,
+                source_event: None,
+                title: "Read".into(),
+                body: "README.md".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Substantive
+        );
+        let ended_at: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![receiver.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended_at.is_none());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![handoff_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted");
     }
 
     #[test]
@@ -5695,5 +6422,542 @@ pub(crate) mod tests {
             Some(normalize_repo_path_key(&gone_path)),
             "path absent on this host must be preserved (multi-user/unmounted safety)"
         );
+    }
+
+    #[test]
+    fn hook_admission_rejects_cross_owner_fresh_key_without_claiming_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let alice = "user:alice";
+        let bob = "user:bob";
+        let session = hook_session(SessionId::new(), ws, proj, Some(alice));
+        begin_session(&mut conn, &session).unwrap();
+        let bob_event = hook_observation(&session);
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &bob_event,
+                &OwnerFilter::User(bob.into()),
+                Some("fresh-key"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        let keys: u64 = conn
+            .query_row("SELECT COUNT(*) FROM ingest_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((observations, keys), (0, 0));
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &bob_event,
+                &OwnerFilter::User(alice.into()),
+                Some("fresh-key"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::Inserted(_),
+                ..
+            }
+        ));
+    }
+
+    // A mid-session `cd` into another project resolves the event to a
+    // different (workspace, project) than the session row. Under the default
+    // `follow-cwd` routing that is legitimate — the observation belongs in the
+    // project it names — so scope difference must NOT be treated as a UUID
+    // collision. Guarding it as one silently dropped every cross-project
+    // mid-session event (#394 / #396 composition).
+    #[test]
+    fn cross_project_mid_session_observation_is_admitted_not_dropped() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+
+        // Same session and operator, event resolved into a sibling project.
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let observation = hook_observation(&moved);
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::Inserted(_),
+                ..
+            }
+        ));
+
+        // It lands in the project it named, and the session row is untouched.
+        let landed: Vec<u8> = conn
+            .query_row("SELECT project_id FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(landed.as_slice(), visited.as_bytes());
+        let session_project: Vec<u8> = conn
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_project.as_slice(), proj.as_bytes());
+    }
+
+    // Identity is still identity: a different operator or a different agent
+    // reusing the UUID stays terminal, in the same scope-moved shape as above.
+    #[test]
+    fn cross_project_events_still_reject_foreign_owner_and_agent() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let observation = hook_observation(&moved);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &observation,
+                &OwnerFilter::User("user:bob".into()),
+                None,
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let mut other_agent = moved.clone();
+        other_agent.agent_kind = AgentKind::ClaudeCode;
+        let observation = hook_observation(&other_agent);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &other_agent,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 0, "neither rejection may leave a row");
+    }
+
+    // A terminal event naming a different scope is not this session's end, so
+    // it is dropped rather than ending someone else's session — preserving the
+    // pre-guard `SessionEndDisposition::DropInvalid` arm.
+    #[test]
+    fn cross_project_session_end_is_dropped_without_ending_the_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let end = session_end_observation(&moved);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &end,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+            HookSessionAdmission::InvalidScopedEnd
+        ));
+
+        let ended: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended, None, "a foreign-scope end must not end the session");
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 0);
+    }
+
+    #[test]
+    fn concurrent_alice_and_bob_events_only_admit_alice_observation() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        drop(conn);
+        let path = tmp.path().join("test.sqlite");
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let run = |owner: &'static str, key: &'static str, gate: Arc<std::sync::Barrier>| {
+            let path = path.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let mut conn = Connection::open(path).unwrap();
+                conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+                gate.wait();
+                admit_hook_session_event(
+                    &mut conn,
+                    &session,
+                    &hook_observation(&session),
+                    &OwnerFilter::User(owner.into()),
+                    Some(key),
+                )
+            })
+        };
+        let alice = run("user:alice", "alice-key", Arc::clone(&gate));
+        let bob = run("user:bob", "bob-key", gate);
+        assert!(matches!(
+            alice.join().unwrap(),
+            Ok(HookSessionAdmission::Observation { .. })
+        ));
+        assert!(matches!(
+            bob.join().unwrap(),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let conn = Connection::open(path).unwrap();
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 1);
+    }
+
+    #[test]
+    fn hook_admission_rejects_tuple_mismatches_before_mutation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let mut observation = hook_observation(&session);
+        observation.project_id = other;
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                Some("tuple-key"),
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+
+        let alice_session = hook_session(session.id, ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &alice_session).unwrap();
+        let mut agent_mismatch = alice_session.clone();
+        agent_mismatch.agent_kind = AgentKind::ClaudeCode;
+        let observation = hook_observation(&alice_session);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &agent_mismatch,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                Some("agent-key"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let counts: (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn hook_admission_rejects_unadmitted_new_owner_and_accepts_shared_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let owned = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &owned,
+                &hook_observation(&owned),
+                &OwnerFilter::User("user:bob".into()),
+                Some("denied-owner"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+
+        let shared = hook_session(SessionId::new(), ws, proj, None);
+        let admission = admit_hook_session_event(
+            &mut conn,
+            &shared,
+            &hook_observation(&shared),
+            &OwnerFilter::User("user:alice".into()),
+            None,
+        )
+        .unwrap();
+        assert!(admitted_session(admission).owner().is_none());
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT actor_user FROM sessions WHERE id = ?1",
+                params![shared.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owner.is_none());
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &shared,
+                &hook_observation(&shared),
+                &OwnerFilter::User("user:bob".into()),
+                Some("shared-bob"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation { .. }
+        ));
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT actor_user FROM sessions WHERE id = ?1",
+                params![shared.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn open_session_end_admissions_preserve_all_ingest_outcomes() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for (key, completed, expected_complete) in [
+            ("open-inserted", None, false),
+            ("open-pending", Some(false), false),
+            ("open-complete", Some(true), true),
+        ] {
+            let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            begin_session(&mut conn, &session).unwrap();
+            if let Some(completed) = completed {
+                seed_ingest_key(&conn, proj, key, completed);
+            }
+            let admission = admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+            )
+            .unwrap();
+            match admission {
+                HookSessionAdmission::EndOpen { ingest, .. } if key == "open-inserted" => {
+                    assert!(matches!(ingest, IngestObservationOutcome::Inserted(_)));
+                }
+                HookSessionAdmission::EndOpen { ingest, .. } if key == "open-pending" => {
+                    assert_eq!(ingest, IngestObservationOutcome::ResumePending);
+                }
+                HookSessionAdmission::EndOpen { ingest, .. } if expected_complete => {
+                    assert_eq!(ingest, IngestObservationOutcome::AlreadyComplete);
+                }
+                other => panic!("unexpected open SessionEnd admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reend_session_end_admissions_preserve_all_ingest_outcomes() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for (key, completed, expected_complete) in [
+            ("reend-inserted", None, false),
+            ("reend-pending", Some(false), false),
+            ("reend-complete", Some(true), true),
+        ] {
+            let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            begin_session(&mut conn, &session).unwrap();
+            end_session(&mut conn, &session.id, None).unwrap();
+            insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+            if let Some(completed) = completed {
+                seed_ingest_key(&conn, proj, key, completed);
+            }
+            let admission = admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+            )
+            .unwrap();
+            match admission {
+                HookSessionAdmission::ReEnd { ingest, .. } if key == "reend-inserted" => {
+                    assert!(matches!(ingest, IngestObservationOutcome::Inserted(_)));
+                }
+                HookSessionAdmission::ReEnd { ingest, .. } if key == "reend-pending" => {
+                    assert_eq!(ingest, IngestObservationOutcome::ResumePending);
+                }
+                HookSessionAdmission::ReEnd { ingest, .. } if expected_complete => {
+                    assert_eq!(ingest, IngestObservationOutcome::AlreadyComplete);
+                }
+                other => panic!("unexpected re-end SessionEnd admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_session_end_creates_no_session_key_or_observation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some("missing-end"),
+            )
+            .unwrap(),
+            HookSessionAdmission::InvalidMissingEnd
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+    }
+
+    #[test]
+    fn ordinary_observation_already_complete_remains_observation_admission() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        seed_ingest_key(&conn, proj, "ordinary-complete", true);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &hook_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some("ordinary-complete"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::AlreadyComplete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn admitted_guard_revalidates_and_lifecycle_preserves_handoff_release_audit() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let guard = admitted_session(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &hook_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+        );
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![session.id.as_bytes()],
+        )
+        .unwrap();
+        assert!(matches!(
+            end_admitted_session(&mut conn, &guard, None),
+            Err(StoreError::SessionCollision)
+        ));
+        begin_session(&mut conn, &session).unwrap();
+        conn.execute(
+            "UPDATE sessions SET actor_user = 'user:bob' WHERE id = ?1",
+            params![session.id.as_bytes()],
+        )
+        .unwrap();
+        assert!(matches!(
+            end_admitted_lifecycle_only_session(&mut conn, &guard),
+            Err(StoreError::SessionCollision)
+        ));
+        let handoff = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: Some(session.id),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: None,
+            summary: "x".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: Some("user:alice".into()),
+        };
+        assert!(matches!(
+            end_admitted_session_with_handoff(&mut conn, &guard, None, &handoff),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let receiver = hook_session(SessionId::new(), ws, proj, None);
+        let mut lifecycle_observation = hook_observation(&receiver);
+        lifecycle_observation.kind = ObservationKind::SessionStart;
+        let receiver_guard = admitted_session(
+            admit_hook_session_event(
+                &mut conn,
+                &receiver,
+                &lifecycle_observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+        );
+        let handoff = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "x".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let handoff_id = insert_handoff(&mut conn, &handoff).unwrap();
+        let mut acceptance = handoff_acceptance(handoff_id, ws, proj);
+        acceptance.accepting_session = Some(receiver.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+        assert_eq!(
+            end_admitted_lifecycle_only_session(&mut conn, &receiver_guard).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: Some(handoff_id)
+            }
+        );
+        assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
     }
 }

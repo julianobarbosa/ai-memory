@@ -1,6 +1,8 @@
 //! Authenticated HTTP ingress for optional managed workstreams.
 
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
@@ -136,6 +138,7 @@ async fn prepare_run(
             | AgentKind::Crush
             | AgentKind::Omp
             | AgentKind::KimiCode
+            | AgentKind::CommandCode
             | AgentKind::KiroCli
             | AgentKind::Grok
             | AgentKind::AntigravityCli
@@ -145,13 +148,15 @@ async fn prepare_run(
             "managed run requires a supported command-line harness",
         );
     }
-    const AUTO_AGENTS: [AgentKind; 6] = [
+    const AUTO_AGENTS: [AgentKind; 8] = [
         AgentKind::ClaudeCode,
         AgentKind::Codex,
         AgentKind::OpenCode,
         AgentKind::Pi,
         AgentKind::Crush,
         AgentKind::KimiCode,
+        AgentKind::CommandCode,
+        AgentKind::KiroCli,
     ];
     if request.automatic_harness
         && (!AUTO_AGENTS.contains(&request.agent)
@@ -687,17 +692,18 @@ fn write_segment(
     let parent = target
         .parent()
         .ok_or_else(|| std::io::Error::other("managed segment has no parent"))?;
-    std::fs::create_dir_all(parent)?;
+    create_private_dir_all(parent)?;
     if target.exists() {
         return Ok(relative.to_string_lossy().replace('\\', "/"));
     }
     let temp = parent.join(format!(".{run_id}-{}.tmp", ManagedRunId::new()));
     {
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
@@ -709,6 +715,14 @@ fn write_segment(
         }
     }
     Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
 }
 
 fn truncate_owned(value: &mut String, max: usize) {
@@ -898,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+    async fn kiro_is_accepted_as_an_explicit_and_automatic_harness() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let state = test_state(&store, temp.path());
@@ -925,6 +939,19 @@ mod tests {
         let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
         let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(prepared.resolved_agent, Some(AgentKind::KiroCli));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
 
         let automatic = prepare_run(
             State(state),
@@ -944,7 +971,70 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(automatic.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(automatic.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn command_code_is_accepted_as_an_explicit_and_automatic_harness() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+
+        let explicit = prepare_run(
+            State(state.clone()),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::CommandCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "explicit".into(),
+            }),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prepared.resolved_agent, Some(AgentKind::CommandCode));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("2cce5126-f57d-4ddd-8f66-e5bb409f60db".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let automatic = prepare_run(
+            State(state),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::CommandCode,
+                automatic_harness: true,
+                available_agents: vec![AgentKind::CommandCode, AgentKind::ClaudeCode],
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "automatic".into(),
+            }),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1237,5 +1327,57 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let packet: ManagedRunContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(packet.context.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segment_files_and_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let workstream_id = WorkstreamId::new();
+        let run_id = ManagedRunId::new();
+        let relative = write_segment(
+            temp.path(),
+            workstream_id,
+            run_id,
+            &[NewWorkstreamEvent {
+                event_id: "event-1".into(),
+                agent: AgentKind::Codex,
+                native_session_id: "session-1".into(),
+                source_record_id: None,
+                kind: WorkstreamEventKind::Message,
+                role: None,
+                content: "sensitive transcript".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(workstream_id.to_string())
+            .join("segments");
+        for path in [
+            temp.path().join("raw"),
+            temp.path().join("raw/workstreams"),
+            segment_dir.clone(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(temp.path().join("raw").join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

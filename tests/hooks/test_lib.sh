@@ -156,7 +156,7 @@ assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&work
 
 printf 'workspace = "ws1"\nproject = "p1"\nproject_strategy = "repo-root"\n' >"$TMP/a/b/.ai-memory.toml"
 QS2=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_strategy=repo-root" "$QS2"
+assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_src=marker&project_strategy=repo-root" "$QS2"
 
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
@@ -180,7 +180,7 @@ if command -v git >/dev/null 2>&1; then
     printf 'workspace = "oss"\nproject_strategy = "repo-root"\n' >"$REPO/.ai-memory.toml"
     QSR=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "repo-root: subdir resolves to repo basename" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
         "$QSR"
 
     rm -f "$REPO/.ai-memory.toml"
@@ -188,14 +188,14 @@ if command -v git >/dev/null 2>&1; then
     export AI_MEMORY_PROJECT_STRATEGY
     QSE=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "repo-root env: no marker resolves to repo basename" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&project=acme-api&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
         "$QSE"
 
     printf 'workspace = "oss"\nproject = "pinned"\nproject_strategy = "basename"\n' \
         >"$REPO/.ai-memory.toml"
     QSO=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "marker project strategy overrides env default" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_strategy=basename" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=basename" \
         "$QSO"
     unset AI_MEMORY_PROJECT_STRATEGY
 
@@ -212,7 +212,7 @@ if command -v git >/dev/null 2>&1; then
     if git -C "$REPO" worktree add -q "$WT" >/dev/null 2>&1; then
         QSW=$(ai_memory_marker_qs "$WT")
         assert_eq "repo-root: out-of-tree worktree collapses to main repo" \
-            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_strategy=repo-root" \
+            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
             "$QSW"
     fi
 
@@ -221,7 +221,7 @@ if command -v git >/dev/null 2>&1; then
         >"$REPO/.ai-memory.toml"
     QSP=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "explicit project pin beats repo-root" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=repo-root" \
         "$QSP"
 
     PSH=""

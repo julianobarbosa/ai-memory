@@ -83,6 +83,12 @@ pub struct HookQuery {
     /// clients; older servers ignore it — both directions keep today's
     /// behavior.
     pub ingest_key: Option<String>,
+    /// Explicit root-only recovery propagation from `finalize-session --all-owners`.
+    pub all_owners: Option<String>,
+    /// Provenance of the `project` override: `marker` when a
+    /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
+    /// from the enclosing checkout. Absent on older clients (#394).
+    pub project_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -108,6 +114,9 @@ pub struct HookEnvelope {
     pub project_override: Option<String>,
     /// Project derivation strategy declared by the hook marker.
     pub project_strategy: ProjectStrategy,
+    /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
+    /// when there is no override, so the two can never disagree (#394).
+    pub project_source: ProjectSource,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -118,6 +127,8 @@ pub struct HookEnvelope {
     /// router publishes it on the actor's `ActiveProject` so default-scoped
     /// read tools broaden to a global search.
     pub recall_default_global_requested: bool,
+    /// Explicit cross-owner recovery request (never honored for ordinary hooks).
+    pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
     /// Optional third-party extension namespace.
@@ -238,6 +249,66 @@ impl ProjectStrategy {
             Self::Basename => "basename",
             Self::RepoRoot => "repo-root",
         }
+    }
+}
+
+/// Where a `project` override on the wire came from.
+///
+/// The host-side hook sends `project=` for two very different reasons: a
+/// `.ai-memory.toml` marker naming the project outright, and `repo-root`
+/// derivation of the enclosing checkout's name (which must run host-side —
+/// a containerized server cannot see the client's checkout). Both arrive as
+/// the same query parameter, so before #394's `sticky` knob the router could
+/// not honor one while overriding the other. This discriminator is that
+/// missing signal: a marker is a deliberate rescope and always wins, while a
+/// repo-root derivation is just "where the cwd happens to be" and may yield
+/// to the session under `[routing] mid_session = "sticky"`.
+///
+/// Older clients omit the parameter entirely and parse as [`Self::Unspecified`],
+/// which keeps their overrides authoritative — the pre-#394 behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectSource {
+    /// No provenance declared: either no override at all, or a client too
+    /// old to tag one. Treated as authoritative, never as fell-through.
+    #[default]
+    Unspecified,
+    /// A `.ai-memory.toml` marker named this project explicitly.
+    Marker,
+    /// The host hook derived it from the enclosing git repo root under the
+    /// `repo-root` strategy.
+    RepoRoot,
+}
+
+impl ProjectSource {
+    /// Parse the `project_src` query value. Unknown values fall back to
+    /// [`Self::Unspecified`] so a typo can never downgrade an override into
+    /// something the session is allowed to overrule.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("marker") => Self::Marker,
+            Some("repo-root" | "repo_root") => Self::RepoRoot,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Stable wire/log representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Marker => "marker",
+            Self::RepoRoot => "repo-root",
+        }
+    }
+
+    /// Whether an override from this source may yield to session-sticky
+    /// attribution. Only host-side repo-root derivation may: it carries no
+    /// operator intent, just the cwd's enclosing checkout.
+    #[must_use]
+    pub const fn yields_to_session(self) -> bool {
+        matches!(self, Self::RepoRoot)
     }
 }
 
@@ -393,8 +464,17 @@ impl HookEnvelope {
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
+        // Provenance describes an override, so it is meaningless without one.
+        // Pinning it to `Unspecified` here keeps every downstream check from
+        // having to re-test `project_override.is_some()` alongside it.
+        let project_source = if project_override.is_some() {
+            ProjectSource::parse(query.project_src.as_deref())
+        } else {
+            ProjectSource::Unspecified
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
+        let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -452,8 +532,10 @@ impl HookEnvelope {
             workspace_override,
             project_override,
             project_strategy,
+            project_source,
             drop_subagent_requested,
             recall_default_global_requested,
+            all_owners_requested,
             managed_run,
             capture_assistant_requested,
             ingest_key,
@@ -512,6 +594,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode
+            | AgentKind::CommandCode
             | AgentKind::OpenCode
             | AgentKind::Pi
             | AgentKind::AntigravityCli
@@ -909,6 +992,68 @@ fn normalize_token(value: &str, max_len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_source_parses_both_spellings_and_defaults_closed() {
+        assert_eq!(ProjectSource::parse(Some("marker")), ProjectSource::Marker);
+        assert_eq!(
+            ProjectSource::parse(Some("repo-root")),
+            ProjectSource::RepoRoot
+        );
+        assert_eq!(
+            ProjectSource::parse(Some("repo_root")),
+            ProjectSource::RepoRoot
+        );
+        // Absent (older client) and unknown values both stay authoritative,
+        // so a typo can never downgrade an override into something the
+        // session is allowed to overrule.
+        assert_eq!(ProjectSource::parse(None), ProjectSource::Unspecified);
+        assert_eq!(
+            ProjectSource::parse(Some("REPO-ROOT")),
+            ProjectSource::Unspecified
+        );
+        assert_eq!(
+            ProjectSource::parse(Some("nonsense")),
+            ProjectSource::Unspecified
+        );
+        // Only a host-derived name may yield to the session.
+        assert!(ProjectSource::RepoRoot.yields_to_session());
+        assert!(!ProjectSource::Marker.yields_to_session());
+        assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn project_source_is_pinned_unspecified_without_an_override() {
+        // Provenance describes an override; a `project_src` arriving without
+        // one is meaningless and must not read as a fell-through signal.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/checkouts/repo-a".into()),
+                project_src: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.project_override, None);
+        assert_eq!(env.project_source, ProjectSource::Unspecified);
+
+        // With an override it is carried through verbatim.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/checkouts/repo-a".into()),
+                project: Some("repo-a".into()),
+                project_src: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.project_override.as_deref(), Some("repo-a"));
+        assert_eq!(env.project_source, ProjectSource::RepoRoot);
+    }
 
     #[test]
     fn body_is_subagent_detects_harness_markers() {

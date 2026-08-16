@@ -24,6 +24,7 @@
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Local supported profiles default to host-native hook commands; Claude Code may use its Windows exec form, while other agents use native single command strings matching their hook schema. PowerShell/Git Bash scripts are compatibility fallbacks. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. `install-mcp --session-aware` optionally enables per-session auto-scope isolation through a local stdio bridge. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
 | Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
+| Command Code | Supported | MCP config (`~/.commandcode/mcp.json`) + its four stable lifecycle-hook events (`~/.commandcode/settings.json`); native commands enforce capture exclusions and `SessionStart` injects handoffs. `Stop` is only a turn boundary, so use `ai-memory finalize-session --agent command-code` after the final turn. `ai-memory run command-code` adds exact v3 native-session resume and visible-event import; experimental unsandboxed Mods remain excluded. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
 | Cursor | Supported | MCP config + lifecycle hooks. |
@@ -31,14 +32,15 @@
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
 | Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Crush | Managed-only | `ai-memory run crush` resumes its project-local session database and supplies portable context through a temporary supported global-context file; no lifecycle-hook installer is provided. |
-| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP, Grok Build CLI, and Antigravity CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
+| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, both incompatible Kiro CLI engines, OMP, Grok Build CLI, and Antigravity CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). Only `PreInvocation` with `invocationNum = 0` maps to SessionStart; later model calls cannot consume a next-session handoff. No automatic true session-end hook, so run `ai-memory finalize-session --agent antigravity-cli` after the final turn when you need a summary, handoff, and opt-in SessionEnd consolidation. `ai-memory run antigravity` (aliases `antigravity-cli`, `agy`) adds managed workstream resume via `--conversation`; conversation text is not decoded, so the ledger for this harness comes from hook capture. |
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
+| Swival CLI | MCP-only | `install-mcp --client swival --apply` merges a native HTTP entry into the project-root `.swival/mcp.json`, preserving sibling servers. Lifecycle and managed-workstream support are not claimed because Swival's callback contract does not expose a stable session identifier. |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
-| Kiro CLI | Supported (v2) | MCP config uses `install-mcp --client kiro-cli` (alias `kiro`) and Kiro's Bedrock-compatible schema flavor. `install-hooks --agent kiro-cli` merges verified v2 hooks into existing agent configs, honors `$KIRO_HOME`, preserves unrelated entries, and injects pending handoffs through `agentSpawn` stdout. Kiro v2 has no true SessionEnd hook; use `ai-memory finalize-session --agent kiro-cli`, with `--session-id <uuid>` when concurrent sessions share a scope. Explicit `ai-memory run kiro` adds v2 managed resume; it is not in bare automatic selection pending a logged-in current-format acceptance run. Kiro v3 hooks and managed sessions remain unsupported. |
+| Kiro CLI | Supported | MCP config uses `install-mcp --client kiro-cli` (alias `kiro`) and Kiro's Bedrock-compatible schema flavor. `install-hooks --agent kiro-cli` merges v2 hooks into existing agent configs; the explicit `--agent kiro-cli-v3` target writes the incompatible standalone v3 registration. Both preserve unrelated entries, honor `$KIRO_HOME`, enforce capture exclusions, and inject pending handoffs at session start. Kiro has no true SessionEnd hook; use `ai-memory finalize-session --agent kiro-cli`, with `--session-id <uuid>` for concurrent sessions. `ai-memory run kiro` manages v2; add `--v3`, `--mode`, or `--agent-engine v3` for version-safe v3 resume. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
 | Hermes Agent | Community | Core hook ingestion recognizes `agent=hermes` and Hermes' documented shell-hook `tool_name` / `tool_input` payload for concrete session attribution, tool-family titles, and capture exclusions. A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available, but no first-party installer is shipped; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. Hermes ignores session-start hook stdout, so recover handoffs through MCP. |
@@ -69,20 +71,24 @@ priors are at the [bottom](#influences-and-prior-art).
   notifications and tool excerpts retain up to 2 KB, with a 16 KiB durable
   backstop for every observation body.
 - **Opt-in managed workstreams.** `ai-memory run claude`, then `ai-memory run
-  codex --yolo`, then `ai-memory run kimi`, transparently resumes one logical
-  workstream with native per-harness sessions, a portable visible-event ledger,
-  and full-ledger search. Delivered packets are origin-marked; Claude transcript
-  import rejects a packet that Claude persisted and read back through a tool.
+  codex --yolo`, then `ai-memory run command-code`, transparently resumes one
+  logical workstream with native per-harness sessions, a portable visible-event
+  ledger, and full-ledger search. Delivered packets are origin-marked; Claude
+  transcript import rejects a packet that Claude persisted and read back through a tool.
   `ai-memory run` with no harness continues the newest usable Claude Code,
-  Codex, OpenCode, Pi, Crush, or Kimi Code session for this checkout.
+  Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, or Kiro CLI v2/v3
+  session for this checkout.
   On first
   explicit use, an interactive launcher can adopt a previous session from the
   same checkout; later switches cannot select unrelated native history. Native
   arguments pass through unchanged except the wrapper-owned `--yolo` and
   `--fresh`; direct
   commands are unaffected. `kimi-code` and `kimi-cli` are accepted aliases for
-  the installed `kimi` command, and `kiro-cli` for the installed `kiro-cli`
-  command (`ai-memory run kiro`, default v2 engine only).
+  the installed `kimi` command; `commandcode`, `cmdc`, and `cmd` select the
+  cross-platform `command-code` executable (`cmdc` on native Windows); and
+  `kiro-cli` selects the installed `kiro-cli` command. Kiro defaults to v2;
+  `ai-memory run kiro --v3` selects v3, while a
+  returning linked v3 workstream selects its engine transparently.
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
@@ -154,7 +160,7 @@ priors are at the [bottom](#influences-and-prior-art).
   volume; shared deployments keep the endpoint root-only. See
   [MCP client activity](docs/users.md#mcp-client-activity).
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
-  Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
+  Code, Codex, Command Code, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
   / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
   GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), Kiro CLI
@@ -197,11 +203,17 @@ priors are at the [bottom](#influences-and-prior-art).
   # Quit Claude Code, then continue the same workstream in Codex.
   ai-memory run codex --yolo
 
+  # Continue in Command Code, preserving its own exact native session.
+  ai-memory run command-code
+
   # Later, omit the name to resume the newest usable managed session here.
   ai-memory run
 
   # Start a new Codex session in the same workstream, keeping portable history.
   ai-memory run --fresh codex
+
+  # Kiro defaults to v2; select its incompatible v3 engine explicitly once.
+  ai-memory run kiro --v3
   ```
 
 - **"Pick the project instead of remembering where it lives."** Start from a
@@ -246,8 +258,8 @@ priors are at the [bottom](#influences-and-prior-art).
   the workstream immediately. If a linked native transcript was deleted,
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
-  Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP, Grok Build CLI, and
-  Antigravity CLI; direct harness launches remain unchanged. See
+  Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
+  Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to
   type and no list to read:
@@ -460,7 +472,7 @@ docker run -d --name ai-memory \
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
-#    `--agent codex`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
+#    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
 #    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
@@ -473,7 +485,11 @@ ai-memory install-hooks --agent  claude-code --apply
 # Kiro CLI v2 example (requires an existing Kiro agent config):
 # ai-memory install-mcp   --client kiro-cli --apply
 # ai-memory install-hooks --agent  kiro-cli --apply
-# Kiro CLI v3 hook capture is not yet supported; see docs/install.md.
+# Kiro CLI v3 example (standalone hook registration):
+# ai-memory install-hooks --agent  kiro-cli-v3 --apply
+# Command Code stable MCP + lifecycle example:
+# ai-memory install-mcp   --client command-code --apply
+# ai-memory install-hooks --agent  command-code --apply
 ```
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
@@ -557,10 +573,14 @@ one matching entry.
 
 ### Install Notes
 
-- **SELinux:** on enforcing Linux hosts, the Docker wrapper automatically adds
-  `--security-opt label=disable` only to short-lived helper commands that write
+- **SELinux:** on enforcing Linux hosts, the wrapper automatically adds
+  `--security-opt label=disable` only to short-lived helper commands that touch
   bind-mounted host files. It does not alter the long-lived server container
-  or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. See
+  or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. Rootless
+  engines also get `-u 0:0` for those commands. Docker and podman report
+  rootless mode and SELinux support under different `info` keys; both are
+  read. The same treatment applies whenever `AI_MEMORY_DATA_DIR` selects a
+  host directory or an explicit `--config` reads a host file. See
   [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
   from PowerShell/cmd. Local supported profiles default to host-native commands:
@@ -619,6 +639,14 @@ Loopback-only (`127.0.0.1:49374`) with no auth is the default because
 it is safe for a single-user laptop: no process outside the machine can
 reach the server.
 
+Unauthenticated non-loopback HTTP now fails closed. Set
+`AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
+intentional, dangerous exception for plain HTTP only. Authentication does not
+encrypt bearer tokens: for LAN or remote access, use the ready
+[Caddy](docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
+the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
+
 Enable bearer auth when the server is exposed beyond loopback, when
 untrusted local processes share the machine, or when the data dir holds
 sensitive project history:
@@ -642,7 +670,9 @@ ai-memory install-hooks --agent  claude-code --apply \
 
 Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/admin/*`, and
 `/web/*`. Browser access to `/web` uses HTTP Basic auth with the token
-as the password. Non-loopback binds should also set
+as the password. When `/web` is exposed through an HTTPS reverse proxy, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true`; it makes the browser cookie HTTPS-only.
+Close or redirect direct HTTP access to that hostname. Non-loopback binds should also set
 `AI_MEMORY_ALLOWED_HOSTS` to guard against DNS rebinding.
 
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
@@ -829,7 +859,11 @@ rule-based output. Add an LLM provider
 when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
-Session end always writes a rule-based summary page + handoff either way.
+Substantive session ends always write a rule-based summary page + handoff either
+way. A session containing only `SessionStart` / `SessionEnd` boundaries is
+closed without a page, handoff, or provider job. When that empty session had
+accepted startup context, its session-bound handoff is returned to the open
+pool for the next receiver instead of being lost.
 When the session-end opt-in is enabled, provider work is durably queued after
 those deterministic writes and handled by one bounded server worker, so hook
 drain latency does not cancel it. Failed jobs retry with backoff and survive a
@@ -876,7 +910,17 @@ lands in the same `ai-memory-data` volume as the server.
 authenticates with an OAuth bearer token instead of an API key. Run
 `claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
 `ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
-setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed.
+setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
+wrappers forward either token by name to short-lived helper commands such as
+`llm-test`; configure the long-lived server container separately as shown in the
+installation guide.
+
+For both Anthropic providers, ai-memory omits `temperature` for Claude
+4.7 and later models and Claude Mythos Preview because those models reject
+non-default sampling parameters. `llm-test` sends the same representative 0.2
+value as the normal pipeline before the provider applies that compatibility
+rule.
+
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
 [the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
@@ -976,7 +1020,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |

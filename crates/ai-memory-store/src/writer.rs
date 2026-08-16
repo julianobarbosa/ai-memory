@@ -25,8 +25,8 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
-    PurgeSummary, ReorgSummary,
+    self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -111,6 +111,10 @@ pub(crate) enum WriteCmd {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
+    EndLifecycleOnlySession {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
+    },
     SweepHollowProjects {
         min_age_days: u32,
         reply: oneshot::Sender<StoreResult<Vec<String>>>,
@@ -123,6 +127,28 @@ pub(crate) enum WriteCmd {
         obs: NewObservation,
         ingest_key: String,
         reply: oneshot::Sender<StoreResult<IngestObservationOutcome>>,
+    },
+    AdmitHookSessionEvent {
+        session: NewSession,
+        obs: NewObservation,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
+    },
+    EndAdmittedSession {
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    EndAdmittedSessionWithHandoff {
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    EndAdmittedLifecycleOnlySession {
+        admitted: AdmittedSession,
+        reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
     CompleteObservationIngest {
         project_id: ProjectId,
@@ -203,14 +229,20 @@ pub(crate) enum WriteCmd {
         params: crate::decay::DecayParams,
         reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
     },
-    SoftDeleteForDecay {
-        page_ids: Vec<PageId>,
-        reply: oneshot::Sender<StoreResult<usize>>,
-    },
-    HardDeleteDecayed {
+    SoftDeleteForDecayIfLatest {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        hard_delete_after_days: i64,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    HardDeleteDecayedPageChain {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        tombstone_id: PageId,
+        expected_latest_id: Option<PageId>,
+        cutoff_us: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
     HealCatchAllRepoPaths {
@@ -378,6 +410,7 @@ pub(crate) enum WriteCmd {
     AcceptStartupContext {
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_session: Option<NewSession>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -574,6 +607,24 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically end a lifecycle-only session and reopen the handoff claimed
+    /// by that exact receiver, if one exists.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_lifecycle_only_session(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<LifecycleOnlyEndOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndLifecycleOnlySession {
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Delete hollow project rows (no data of any kind) older than
     /// `min_age_days`; returns the deleted names. See
     /// [`ops::sweep_hollow_projects`].
@@ -630,6 +681,74 @@ impl WriterHandle {
         self.send(WriteCmd::InsertObservationIngest {
             obs,
             ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically validate/admit a hook session and insert its observation.
+    pub async fn admit_hook_session_event(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+    ) -> StoreResult<HookSessionAdmission> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AdmitHookSessionEvent {
+            session,
+            obs: obs.into_inner(),
+            owner_filter,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook end.
+    pub async fn end_admitted_session(
+        &self,
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedSession {
+            admitted,
+            summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook end plus automatic handoff.
+    pub async fn end_admitted_session_with_handoff(
+        &self,
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+    ) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedSessionWithHandoff {
+            admitted,
+            summary_page_id,
+            handoff,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook lifecycle-only end.
+    pub async fn end_admitted_lifecycle_only_session(
+        &self,
+        admitted: AdmittedSession,
+    ) -> StoreResult<LifecycleOnlyEndOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedLifecycleOnlySession {
+            admitted,
             reply: tx,
         })
         .await?;
@@ -950,36 +1069,53 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Soft-delete pages identified by the M8 forget sweep.
+    /// Tombstone the expected latest page identified by the forget sweep.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn soft_delete_for_decay(&self, page_ids: Vec<PageId>) -> StoreResult<usize> {
+    pub async fn soft_delete_for_decay_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::SoftDeleteForDecay {
-            page_ids,
+        self.send(WriteCmd::SoftDeleteForDecayIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Hard-delete pages in one workspace/project that were soft-deleted by
-    /// the sweep more than `hard_delete_after_days` ago.
+    /// Permanently delete one eligible decay tombstone and its ancestry chain.
+    /// The expected latest-page state is checked in the same transaction so a
+    /// page recreated at the same path cannot be removed accidentally.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn hard_delete_decayed(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hard_delete_decayed_page_chain(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        hard_delete_after_days: i64,
+        path: PagePath,
+        tombstone_id: PageId,
+        expected_latest_id: Option<PageId>,
+        cutoff_us: i64,
     ) -> StoreResult<usize> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::HardDeleteDecayed {
+        self.send(WriteCmd::HardDeleteDecayedPageChain {
             workspace_id,
             project_id,
-            hard_delete_after_days,
+            path,
+            tombstone_id,
+            expected_latest_id,
+            cutoff_us,
             reply: tx,
         })
         .await?;
@@ -1510,11 +1646,13 @@ impl WriterHandle {
         &self,
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_session: Option<NewSession>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff,
             managed_run_id,
+            receiving_session,
             reply: tx,
         })
         .await?;
@@ -1677,6 +1815,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "end_session_with_handoff");
             }
+            WriteCmd::EndLifecycleOnlySession { session_id, reply } => {
+                let result = ops::end_lifecycle_only_session(&mut conn, &session_id);
+                send_or_warn(reply, result, "end_lifecycle_only_session");
+            }
             WriteCmd::SweepHollowProjects {
                 min_age_days,
                 reply,
@@ -1695,6 +1837,49 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::insert_observation_keyed(&mut conn, &obs, &ingest_key);
                 send_or_warn(reply, result, "insert_observation_ingest");
+            }
+            WriteCmd::AdmitHookSessionEvent {
+                session,
+                obs,
+                owner_filter,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::admit_hook_session_event(
+                    &mut conn,
+                    &session,
+                    &obs,
+                    &owner_filter,
+                    ingest_key.as_deref(),
+                );
+                send_or_warn(reply, result, "admit_hook_session_event");
+            }
+            WriteCmd::EndAdmittedSession {
+                admitted,
+                summary_page_id,
+                reply,
+            } => {
+                let result =
+                    ops::end_admitted_session(&mut conn, &admitted, summary_page_id.as_ref());
+                send_or_warn(reply, result, "end_admitted_session");
+            }
+            WriteCmd::EndAdmittedSessionWithHandoff {
+                admitted,
+                summary_page_id,
+                handoff,
+                reply,
+            } => {
+                let result = ops::end_admitted_session_with_handoff(
+                    &mut conn,
+                    &admitted,
+                    summary_page_id.as_ref(),
+                    &handoff,
+                );
+                send_or_warn(reply, result, "end_admitted_session_with_handoff");
+            }
+            WriteCmd::EndAdmittedLifecycleOnlySession { admitted, reply } => {
+                let result = ops::end_admitted_lifecycle_only_session(&mut conn, &admitted);
+                send_or_warn(reply, result, "end_admitted_lifecycle_only_session");
             }
             WriteCmd::CompleteObservationIngest {
                 project_id,
@@ -1822,23 +2007,41 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::bump_client_activity(&mut conn, &entries);
                 send_or_warn(reply, result, "bump_client_activity");
             }
-            WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
-                let result = ops::soft_delete_for_decay(&mut conn, &page_ids);
-                send_or_warn(reply, result, "soft_delete_for_decay");
-            }
-            WriteCmd::HardDeleteDecayed {
+            WriteCmd::SoftDeleteForDecayIfLatest {
                 workspace_id,
                 project_id,
-                hard_delete_after_days,
+                path,
+                expected_latest_id,
                 reply,
             } => {
-                let result = ops::hard_delete_decayed_pages(
+                let result = ops::soft_delete_for_decay_if_latest(
                     &mut conn,
                     workspace_id,
                     project_id,
-                    hard_delete_after_days,
+                    &path,
+                    expected_latest_id,
                 );
-                send_or_warn(reply, result, "hard_delete_decayed_pages");
+                send_or_warn(reply, result, "soft_delete_for_decay_if_latest");
+            }
+            WriteCmd::HardDeleteDecayedPageChain {
+                workspace_id,
+                project_id,
+                path,
+                tombstone_id,
+                expected_latest_id,
+                cutoff_us,
+                reply,
+            } => {
+                let result = ops::hard_delete_decayed_page_chain(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    tombstone_id,
+                    expected_latest_id,
+                    cutoff_us,
+                );
+                send_or_warn(reply, result, "hard_delete_decayed_page_chain");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {
                 let result = ops::heal_catch_all_repo_paths(&mut conn, home.as_deref());
@@ -2074,10 +2277,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::AcceptStartupContext {
                 handoff,
                 managed_run_id,
+                receiving_session,
                 reply,
             } => {
                 let result = (|| {
                     let tx = conn.transaction()?;
+                    if let Some(session) = &receiving_session {
+                        let matching_acceptance = handoff.as_ref().is_some_and(|acceptance| {
+                            acceptance.accepting_session == Some(session.id)
+                                && acceptance.workspace_id == session.workspace_id
+                                && acceptance.project_id == session.project_id
+                                && acceptance.accepting_agent == session.agent_kind
+                        });
+                        if !matching_acceptance {
+                            return Err(StoreError::InvalidState(
+                                "startup receiver session does not match its handoff claim".into(),
+                            ));
+                        }
+                        ops::begin_session_in_transaction(&tx, session)?;
+                    }
                     let managed_context_accepted = match managed_run_id {
                         Some(run_id) => {
                             crate::workstream::claim_context_in_transaction(&tx, run_id)?

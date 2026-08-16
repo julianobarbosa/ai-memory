@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -31,7 +33,6 @@ fn render_default_auth_block(pepper: &str) -> String {
 # the first user is added** — rotating invalidates every existing
 # token. Only used when multi-user is enabled (at least one row in
 # the `users` table); single-user / bearer-only setups don't read it.
-[auth]
 token_pepper = \"{pepper}\"
 
 # Multi-user attribution (all optional).
@@ -70,11 +71,12 @@ token_pepper = \"{pepper}\"
 /// cannot be written.
 pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Result<()> {
     let root = &config.data_dir;
-    fs::create_dir_all(root).with_context(|| format!("creating data root {}", root.display()))?;
+    create_private_dir_all(root)
+        .with_context(|| format!("creating data root {}", root.display()))?;
 
     for sub in SUBDIRS {
         let path = root.join(sub);
-        fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        create_private_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         tracing::info!(path = %path.display(), "ensured directory");
     }
 
@@ -86,7 +88,7 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         );
     } else {
         if let Some(parent) = cfg_path.parent() {
-            fs::create_dir_all(parent)
+            create_private_dir_all(parent)
                 .with_context(|| format!("creating config dir {}", parent.display()))?;
         }
         // Pepper is generated NOW (not at first server start) so it's
@@ -100,7 +102,7 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
             DEFAULT_CONFIG_TOML,
             render_default_auth_block(&pepper)
         );
-        let mut f = fs::File::create(&cfg_path)
+        let mut f = private_config_file(&cfg_path, args.force)
             .with_context(|| format!("creating {}", cfg_path.display()))?;
         f.write_all(body.as_bytes())
             .with_context(|| format!("writing {}", cfg_path.display()))?;
@@ -109,6 +111,29 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
 
     tracing::info!("init complete");
     Ok(())
+}
+
+/// Create missing directory components with owner-only access without changing
+/// the permissions of an existing installation.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+/// Open a config file so a newly created file is private before its secret
+/// token pepper is written. Forced rewrites preserve existing permissions.
+fn private_config_file(path: &Path, force: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).truncate(true).create(true);
+    if !force {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 fn init_config_path(data_dir: &Path, explicit: Option<&Path>) -> PathBuf {
@@ -210,6 +235,10 @@ mod tests {
             .expect("rendered config must round-trip via figment (full Config extract)");
 
         assert!(
+            !loaded.auth.secure_cookie,
+            "generated config must preserve direct loopback HTTP browser compatibility"
+        );
+        assert!(
             loaded
                 .auth
                 .token_pepper
@@ -217,8 +246,28 @@ mod tests {
                 .is_some_and(|p| p.len() == 64),
             "parsed token_pepper must round-trip from the rendered template"
         );
+        // `[auth]` must stay the LAST section of config.default.toml: the
+        // block appended here emits bare keys, so any section added below it
+        // silently swallows them into the wrong table. Assert the structural
+        // rule directly rather than leaving it to whichever `[auth]` key
+        // happens to be checked above.
+        let rendered = std::fs::read_to_string(&cfg_path).unwrap();
+        let last_section = rendered
+            .lines()
+            .rfind(|line| line.trim_start().starts_with('['))
+            .expect("rendered config declares sections");
+        assert_eq!(
+            last_section.trim(),
+            "[auth]",
+            "[auth] must remain the last section; init appends bare keys after it"
+        );
         assert!(loaded.auth.bearer_token.is_none());
         assert!(!loaded.slots.per_user);
+        assert_eq!(
+            loaded.routing.mid_session,
+            ai_memory_core::MidSessionRouting::FollowCwd,
+            "generated config must preserve historical per-event attribution"
+        );
         assert_eq!(
             loaded.consolidation.max_input_tokens,
             ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS
@@ -276,6 +325,33 @@ mod tests {
         assert!(
             !data_dir.join("config.toml").exists(),
             "explicit --config must not also write data-dir config"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_creates_private_directories_and_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        run(&cfg_in(&root), InitArgs { force: false }, None).unwrap();
+
+        for path in std::iter::once(root.clone()).chain(SUBDIRS.iter().map(|sub| root.join(sub))) {
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            fs::metadata(root.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }

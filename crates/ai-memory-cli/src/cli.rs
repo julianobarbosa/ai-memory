@@ -234,6 +234,14 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// Command Code CLI.
+    #[value(
+        name = "command-code",
+        alias = "commandcode",
+        alias = "cmdc",
+        alias = "cmd"
+    )]
+    CommandCode,
     /// Amazon Kiro CLI (v2 engine).
     #[value(name = "kiro", alias = "kiro-cli")]
     Kiro,
@@ -1015,11 +1023,17 @@ pub enum AgentChoice {
     #[value(alias = "kimi")]
     KimiCode,
     /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
-    /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
-    /// schema is documented but lacks accepted live lifecycle and built-in
-    /// tool payload fixtures.
+    /// in agent configs under `~/.kiro/agents/*.json`.
     #[value(alias = "kiro")]
     KiroCli,
+    /// Kiro CLI (AWS), v3 agent engine — PascalCase lifecycle hooks in the
+    /// standalone `$KIRO_HOME/hooks/ai-memory.json` registration file.
+    #[value(alias = "kiro-v3")]
+    KiroCliV3,
+    /// Command Code CLI — stable JSON-config shell hooks in
+    /// `~/.commandcode/settings.json`.
+    #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
+    CommandCode,
 }
 
 impl AgentChoice {
@@ -1045,7 +1059,8 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
-            Self::KiroCli => AgentKind::KiroCli,
+            Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
+            Self::CommandCode => AgentKind::CommandCode,
         }
     }
 
@@ -1153,6 +1168,13 @@ pub enum McpClient {
     /// `install-hooks --agent kiro-cli` for verified v2 lifecycle capture.
     #[value(alias = "kiro")]
     KiroCli,
+    /// Command Code CLI — `~/.commandcode/mcp.json`.
+    #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
+    CommandCode,
+    /// Swival CLI — project-scoped `.swival/mcp.json` using native HTTP.
+    /// This integration is MCP-only; Swival's lifecycle callback does not
+    /// expose a stable session identifier for reliable capture correlation.
+    Swival,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -1622,6 +1644,12 @@ pub struct ServeArgs {
     /// Bind address for `--transport http` (default: from config).
     #[arg(long)]
     pub bind: Option<String>,
+    /// DANGEROUS: allow unauthenticated plain HTTP on a non-loopback bind.
+    ///
+    /// HTTP-only. Unnecessary for loopback binds; prefer AI_MEMORY_AUTH_TOKEN
+    /// or a loopback bind instead.
+    #[arg(long)]
+    pub allow_insecure_no_auth: bool,
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
@@ -1723,6 +1751,22 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn serve_parses_insecure_no_auth_override() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--allow-insecure-no-auth",
+        ])
+        .expect("serve override parses");
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.allow_insecure_no_auth);
+    }
 
     #[test]
     fn finalize_session_parses_typed_id_and_rejects_ambiguous_selection() {
@@ -2209,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_v2_hook_aliases_parse_and_v3_is_not_advertised() {
+    fn kiro_hook_engine_aliases_parse_explicitly() {
         for alias in ["kiro-cli", "kiro"] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
@@ -2225,21 +2269,72 @@ mod tests {
             };
             assert_eq!(args.agent, AgentChoice::KiroCli);
         }
-        for unsupported in ["kiro-cli-v3", "kiro-v3"] {
-            let error = Cli::try_parse_from([
+        for alias in ["kiro-cli-v3", "kiro-v3"] {
+            let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-hooks",
                 "--agent",
-                unsupported,
+                alias,
                 "--server-url",
                 "http://127.0.0.1:49374",
             ])
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("invalid value"),
-                "v3 must remain unsupported until its live payload fixtures are verified: {error}"
-            );
+            .unwrap_or_else(|error| panic!("failed to parse Kiro v3 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Kiro v3 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::KiroCliV3);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::KiroCli);
         }
+    }
+
+    #[test]
+    fn command_code_mcp_and_hook_aliases_parse() {
+        for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
+            let mcp = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://memory.example:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse MCP alias {alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp for {alias}");
+            };
+            assert_eq!(args.client, McpClient::CommandCode);
+
+            let hooks = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://memory.example:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse hook alias {alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks for {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::CommandCode);
+        }
+    }
+
+    #[test]
+    fn swival_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "swival",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse MCP client swival: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for swival");
+        };
+        assert_eq!(args.client, McpClient::Swival);
     }
 
     #[test]

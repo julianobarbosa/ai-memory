@@ -224,6 +224,9 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const briefingBudget = tomlFlag(body, "max_chars");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
+    // `project_src` tells the server a marker rescope from a host-derived
+    // repo-root name; only the latter yields to sticky routing (#394).
+    if (project) url.searchParams.set("project_src", "marker");
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
     if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
@@ -231,7 +234,10 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
-      if (repoProject) url.searchParams.set("project", repoProject);
+      if (repoProject) {
+        url.searchParams.set("project", repoProject);
+        url.searchParams.set("project_src", "repo-root");
+      }
     }
   } catch (_e) {
   }
@@ -262,13 +268,20 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     } catch (_e) {
     }
   }
+  // `project_src` tells the server a marker rescope from a host-derived
+  // repo-root name; only the latter yields to sticky routing (#394).
+  let projectSrc: string | undefined = project ? "marker" : undefined;
   if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
   if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
     const repoProject = repoRootProject(cwd);
-    if (repoProject) project = repoProject;
+    if (repoProject) {
+      project = repoProject;
+      projectSrc = "repo-root";
+    }
   }
   if (workspace) url.searchParams.set("workspace", workspace);
   if (project) url.searchParams.set("project", project);
+  if (projectSrc) url.searchParams.set("project_src", projectSrc);
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
   if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);

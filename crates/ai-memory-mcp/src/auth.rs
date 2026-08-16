@@ -88,6 +88,9 @@ pub struct AuthState {
     /// Bearer token that authenticates as **root**. `None` means
     /// "auth disabled at the wire level" — rung 0.
     expected: Option<String>,
+    /// Whether browser session cookies must be marked `Secure`. This is an
+    /// explicit operator setting: proxy headers are untrusted input.
+    secure_cookie: bool,
     /// Actor template stamped onto requests that authenticate with the
     /// `expected` token. Populated from `[auth].root_username` /
     /// `root_email` / `root_name`. When all three are unset the root
@@ -115,6 +118,13 @@ impl AuthState {
             expected: expected.filter(|token| !token.trim().is_empty()),
             ..Self::default()
         }
+    }
+
+    /// Require HTTPS for browser session cookies.
+    #[must_use]
+    pub fn with_secure_cookie(mut self, secure_cookie: bool) -> Self {
+        self.secure_cookie = secure_cookie;
+        self
     }
 
     /// Attach the root actor template — see [`Self::root_actor`]. The
@@ -327,7 +337,7 @@ pub async fn require_bearer(
         // browser session. Subsequent navigations ride the cookie alone.
         if from_basic.is_some() && from_cookie.is_none() {
             let mut resp = next.run(req).await;
-            if let Ok(cookie) = build_session_cookie(provided).parse() {
+            if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse() {
                 resp.headers_mut().insert(header::SET_COOKIE, cookie);
             }
             return resp;
@@ -398,7 +408,8 @@ pub async fn require_bearer(
 
                 if from_basic.is_some() && from_cookie.is_none() {
                     let mut resp = next.run(req).await;
-                    if let Ok(cookie) = build_session_cookie(provided).parse() {
+                    if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse()
+                    {
                         resp.headers_mut().insert(header::SET_COOKIE, cookie);
                     }
                     return resp;
@@ -463,14 +474,13 @@ fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
     None
 }
 
-fn build_session_cookie(token: &str) -> String {
+fn build_session_cookie(token: &str, secure_cookie: bool) -> String {
     // 30-day Max-Age — long enough that re-entering the credential
-    // every month is rare. HttpOnly hides it from any inline JS;
-    // SameSite=Lax keeps cross-site POSTs from riding it.
-    // No Secure attribute: homelab deployments are often plain HTTP
-    // on a LAN. A TLS-terminating reverse proxy is the right place to
-    // add Secure if the service is exposed publicly.
-    format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
+    // every month is rare. HttpOnly hides it from inline JS and Strict keeps
+    // cross-site requests from riding it. `Secure` remains opt-in so direct
+    // loopback/plain-HTTP browser use works; never infer it from proxy headers.
+    let secure = if secure_cookie { "; Secure" } else { "" };
+    format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}")
 }
 
 /// The proxy's identity headers contradict themselves. Not a 401 — the
@@ -551,7 +561,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn router_with_auth(token: Option<&str>) -> Router {
-        let state = Arc::new(AuthState::new(token.map(str::to_string)));
+        router_with_auth_secure_cookie(token, false)
+    }
+
+    fn router_with_auth_secure_cookie(token: Option<&str>, secure_cookie: bool) -> Router {
+        let state =
+            Arc::new(AuthState::new(token.map(str::to_string)).with_secure_cookie(secure_cookie));
         Router::new()
             .route("/probe", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(state, require_bearer))
@@ -740,7 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_with_right_token_passes_get_and_sets_cookie() {
+    async fn basic_auth_with_right_token_passes_get_and_sets_non_secure_cookie() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
@@ -761,10 +776,34 @@ mod tests {
             .expect("set-cookie on first Basic-auth success")
             .to_str()
             .unwrap();
-        assert!(cookie.contains("ai_memory_auth=right-token"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Path=/"));
+        assert_eq!(
+            cookie,
+            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_auth_sets_secure_cookie_only_when_explicitly_enabled() {
+        let r = router_with_auth_secure_cookie(Some("right-token"), true);
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", basic_auth("right-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::SET_COOKIE)
+                .expect("set-cookie on first Basic-auth success")
+                .to_str()
+                .unwrap(),
+            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure"
+        );
     }
 
     #[tokio::test]

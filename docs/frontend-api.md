@@ -71,7 +71,7 @@ with one of these statuses:
 | `401 Unauthorized` | bearer missing or wrong. |
 | `403 Forbidden` | Host header not in allowlist; or a non-root caller requests `all_owners=true`. |
 | `404 Not Found` | workspace, project, or page doesn't exist; or page file missing on disk. |
-| `500 Internal Server Error` | reader pool / SQLite failure. Body is `{"error":"<context>"}` with the source error chain. |
+| `500 Internal Server Error` | reader pool / SQLite failure. Body is always the fixed `{"error":"internal server error"}`; the underlying cause is logged server-side rather than returned, so it cannot leak paths or configuration to a browser. |
 
 ## 4. Endpoint reference
 

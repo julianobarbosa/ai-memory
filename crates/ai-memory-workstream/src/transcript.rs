@@ -49,6 +49,11 @@ pub struct ExportedTranscript {
 struct FileCursor {
     path: String,
     offset: u64,
+    /// Identifies incompatible native stores that share one wire-level agent.
+    /// Older cursors omit this field and remain readable after exact path and
+    /// metadata validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flavor: Option<FileFlavor>,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
     /// on rewind); Kiro's append-only behavior is not documented. Those
@@ -58,12 +63,38 @@ struct FileCursor {
     prefix_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FileFlavor {
+    KiroV2,
+    KiroV3,
+}
+
+/// Recover Kiro's incompatible engine flavor from an opaque transcript cursor.
+/// The result is advisory only: callers must still validate the exact native
+/// session against that engine's store before injecting a resume selector.
+#[must_use]
+pub fn kiro_harness_from_source_cursor(raw: &str) -> Option<ManagedHarness> {
+    match serde_json::from_str::<FileCursor>(raw).ok()?.flavor? {
+        FileFlavor::KiroV2 => Some(ManagedHarness::Kiro),
+        FileFlavor::KiroV3 => Some(ManagedHarness::KiroV3),
+    }
+}
+
+const fn file_flavor(harness: ManagedHarness) -> Option<FileFlavor> {
+    match harness {
+        ManagedHarness::Kiro => Some(FileFlavor::KiroV2),
+        ManagedHarness::KiroV3 => Some(FileFlavor::KiroV3),
+        _ => None,
+    }
+}
+
 /// Harnesses whose JSONL journal can be rewritten in place, requiring
 /// prefix-validated cursors and content-hash record ids.
 const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
     matches!(
         harness,
-        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::Grok
+        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::KiroV3 | ManagedHarness::Grok
     )
 }
 
@@ -119,15 +150,17 @@ pub async fn discover_native_session(
     if harness == ManagedHarness::Crush {
         return discover_crush(cwd, session_dir, started_at);
     }
-    let root = session_root(harness, home, session_dir);
-    let mut candidates = collect_files(&root, |path| transcript_file(harness, path))?;
-    candidates.sort_by_key(|path| modified(path));
-    candidates.reverse();
+    let mut candidates = collect_session_files(harness, home, session_dir)?;
+    candidates.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     for path in candidates.into_iter().take(512) {
         if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
             break;
         }
-        if let Some((id, record_cwd)) = session_header(harness, &path)?
+        if let Some((id, record_cwd)) = session_header_for_cwd(harness, &path, cwd)?
             && same_path(&record_cwd, cwd)
         {
             return Ok(Some(id));
@@ -156,17 +189,21 @@ pub async fn list_native_sessions(
         return list_crush_sessions(cwd, session_dir, limit);
     }
 
-    let root = session_root(harness, home, session_dir);
-    let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
-    files.sort_by_key(|path| modified(path));
-    files.reverse();
+    let mut files = collect_session_files(harness, home, session_dir)?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     let mut seen = HashSet::new();
     let mut sessions = Vec::new();
     for path in files.into_iter().take(2_000) {
         let Some(updated_at) = modified(&path) else {
             continue;
         };
-        let Ok(Some((native_session_id, recorded_cwd))) = session_header(harness, &path) else {
+        let Ok(Some((native_session_id, recorded_cwd))) =
+            session_header_for_cwd(harness, &path, cwd)
+        else {
             continue;
         };
         if !same_path(&recorded_cwd, cwd)
@@ -204,6 +241,36 @@ pub fn native_session_exists(
         return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
     }
     Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
+}
+
+/// Whether a linked Kiro v3 session was found only in the default home rather
+/// than the configured `KIRO_HOME` session root.
+///
+/// Kiro CLI 2.16.2 writes v3 sessions to the default root while a custom
+/// `KIRO_HOME` is active, then searches only the custom root on resume. The
+/// launcher uses this proof to remove `KIRO_HOME` for that one native process.
+pub fn kiro_v3_resume_uses_default_store(
+    home: &Path,
+    cwd: &Path,
+    configured_root: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    let Some(configured_root) = configured_root else {
+        return Ok(false);
+    };
+    let default_root = home.join(".kiro/sessions");
+    if configured_root == default_root {
+        return Ok(false);
+    }
+    let found = locate_session_file(
+        ManagedHarness::KiroV3,
+        home,
+        cwd,
+        Some(configured_root),
+        native_session_id,
+    )?;
+    Ok(found
+        .is_some_and(|path| path.starts_with(&default_root) && !path.starts_with(configured_root)))
 }
 
 /// Wait briefly for buffered transcript writers to settle before importing.
@@ -244,9 +311,12 @@ fn export_jsonl(
     native_session_id: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    let flavor = file_flavor(harness);
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
-        .filter(|cursor| Path::new(&cursor.path) == path);
+        .filter(|cursor| {
+            Path::new(&cursor.path) == path && (cursor.flavor.is_none() || cursor.flavor == flavor)
+        });
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -342,7 +412,21 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::CommandCode => parse_command_code(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::Kiro => parse_kiro(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
+            ManagedHarness::KiroV3 => parse_kiro_v3(
                 &value,
                 native_session_id,
                 &record_id,
@@ -372,6 +456,7 @@ fn export_jsonl(
         source_cursor: Some(serde_json::to_string(&FileCursor {
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
+            flavor,
             prefix_sha256: journal_rewrites_in_place(harness)
                 .then(|| format!("{:x}", prefix_hasher.finalize())),
         })?),
@@ -871,6 +956,234 @@ fn parse_kimi(
     }
 }
 
+/// Command Code v3 session record. The stable documentation guarantees an
+/// append-only tree; the record-level allowlist was checked against the
+/// integrity-matched published 1.14.1 bundle and a sanitized live fixture.
+/// Parent ids are retained so a consumer can distinguish branch changes
+/// without importing hidden reasoning or provider metadata.
+fn parse_command_code(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value.get("type").and_then(Value::as_str);
+    let parent_id = match value.get("parentId") {
+        Some(Value::String(parent)) => Some(parent.as_str()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            losses.push("Command Code malformed parent ids were intentionally excluded".into());
+            return;
+        }
+    };
+    if matches!(record_type, Some("compaction") | Some("branch_summary")) {
+        let Some(summary) = value.get("summary").and_then(Value::as_str) else {
+            losses.push("Command Code malformed summaries were intentionally excluded".into());
+            return;
+        };
+        let (kind, summary_type) = if record_type == Some("compaction") {
+            (WorkstreamEventKind::Compaction, "compaction")
+        } else {
+            (WorkstreamEventKind::Message, "branch-summary")
+        };
+        push_event(
+            events,
+            AgentKind::CommandCode,
+            session,
+            record_id,
+            0,
+            kind,
+            Some("assistant"),
+            summary,
+            timestamp(value),
+            json!({"parent_id": parent_id, "summary_type": summary_type}),
+        );
+        return;
+    }
+    if record_type != Some("message") {
+        return;
+    }
+    let Some(message) = value.get("message").and_then(Value::as_object) else {
+        losses.push("Command Code malformed message records were intentionally excluded".into());
+        return;
+    };
+    let Some(role) = message.get("role").and_then(Value::as_str) else {
+        losses.push("Command Code messages without a role were intentionally excluded".into());
+        return;
+    };
+    let source = message
+        .get("meta")
+        .and_then(|meta| meta.get("source"))
+        .and_then(Value::as_str);
+    if message
+        .get("meta")
+        .and_then(|meta| meta.get("isMeta"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        losses.push("Command Code synthetic/meta messages were intentionally excluded".into());
+        return;
+    }
+    if !matches!(
+        (role, source),
+        ("user", Some("user")) | ("assistant", Some("model"))
+    ) {
+        losses
+            .push("Command Code non-user/model message records were intentionally excluded".into());
+        return;
+    }
+    let Some(parts) = message.get("content").and_then(Value::as_array) else {
+        losses.push(
+            "Command Code messages without content blocks were intentionally excluded".into(),
+        );
+        return;
+    };
+    let occurred_at = timestamp(value);
+    for (index, part) in parts.iter().enumerate() {
+        match (role, part.get("type").and_then(Value::as_str)) {
+            ("user", Some("text")) => {
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    losses.push(
+                        "Command Code malformed text blocks were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    text,
+                    occurred_at.clone(),
+                    json!({"parent_id": parent_id}),
+                );
+            }
+            ("assistant", Some("text")) => {
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    losses.push(
+                        "Command Code malformed text blocks were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    text,
+                    occurred_at.clone(),
+                    json!({"parent_id": parent_id}),
+                );
+            }
+            ("assistant", Some("thinking")) => {
+                losses.push("Command Code hidden reasoning was intentionally excluded".into());
+            }
+            ("assistant", Some("tool_use")) => {
+                let (Some(tool_id), Some(name), Some(input)) = (
+                    part.get("id").and_then(Value::as_str),
+                    part.get("name").and_then(Value::as_str),
+                    part.get("input").filter(|value| value.is_object()),
+                ) else {
+                    losses.push(
+                        "Command Code malformed tool calls were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {}", compact_json(input)),
+                    occurred_at.clone(),
+                    json!({"tool": name, "tool_use_id": tool_id, "parent_id": parent_id}),
+                );
+            }
+            ("user", Some("tool_result")) => {
+                parse_command_code_tool_result(
+                    part,
+                    session,
+                    record_id,
+                    index,
+                    parent_id,
+                    occurred_at.clone(),
+                    events,
+                    losses,
+                );
+            }
+            (_, Some(_)) | (_, None) => losses
+                .push("Command Code unsupported content blocks were intentionally excluded".into()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_command_code_tool_result(
+    part: &Value,
+    session: &str,
+    record_id: &str,
+    block: usize,
+    parent_id: Option<&str>,
+    occurred_at: Option<String>,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let Some(tool_use_id) = part.get("tool_use_id").and_then(Value::as_str) else {
+        losses.push("Command Code malformed tool results were intentionally excluded".into());
+        return;
+    };
+    let Some(parts) = part.get("content").and_then(Value::as_array) else {
+        losses.push("Command Code malformed tool results were intentionally excluded".into());
+        return;
+    };
+    let mut texts = Vec::new();
+    for item in parts {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    texts.push(text);
+                } else {
+                    losses.push(
+                        "Command Code malformed tool-result text was intentionally excluded".into(),
+                    );
+                }
+            }
+            Some("image") => {
+                losses.push("Command Code image tool results were intentionally excluded".into());
+            }
+            _ => losses.push(
+                "Command Code unsupported tool-result content was intentionally excluded".into(),
+            ),
+        }
+    }
+    push_event(
+        events,
+        AgentKind::CommandCode,
+        session,
+        record_id,
+        block,
+        WorkstreamEventKind::ToolResult,
+        Some("tool"),
+        &texts.join("\n"),
+        occurred_at,
+        json!({
+            "tool_use_id": tool_use_id,
+            "parent_id": parent_id,
+            "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+        }),
+    );
+}
+
 /// One event per text part of a kimi message; `think` reasoning and media
 /// parts become loss annotations. Returns the number of content parts seen so
 /// callers can index sibling events (tool calls) without collisions.
@@ -1102,6 +1415,117 @@ fn parse_kiro(
                     }),
                 );
             }
+        }
+        _ => {}
+    }
+}
+
+/// Import the visible allowlist from Kiro v3's `messages.jsonl` journal.
+/// Session bookkeeping, lifecycle-hook records, usage summaries, turn
+/// boundaries, and assistant operations other than visible `Say` output are
+/// deliberately excluded.
+fn parse_kiro_v3(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let occurred_at = timestamp(value);
+    match payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "user" => {
+            if let Some(content) = payload.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    content,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "assistant" => {
+            if payload.get("operationType").and_then(Value::as_str) != Some("Say") {
+                losses.push(
+                    "Kiro v3 non-visible assistant operations were intentionally excluded".into(),
+                );
+                return;
+            }
+            if let Some(content) = payload.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    content,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "tool_call" => {
+            let name = payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let arguments = payload.get("args").map(compact_json).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::KiroCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolCall,
+                Some("assistant"),
+                &format!("{name}: {arguments}"),
+                occurred_at,
+                json!({
+                    "tool": name,
+                    "tool_call_id": payload.get("toolCallId").and_then(Value::as_str)
+                }),
+            );
+        }
+        "tool_result" => {
+            let Some(content) = payload.get("content").and_then(Value::as_str) else {
+                return;
+            };
+            push_event(
+                events,
+                AgentKind::KiroCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                content,
+                occurred_at,
+                json!({
+                    "tool_call_id": payload.get("toolCallId").and_then(Value::as_str),
+                    "is_error": payload.get("success").and_then(Value::as_bool).map(|success| !success)
+                }),
+            );
+        }
+        "ContextualHookInvoked"
+        | "session_metadata"
+        | "usage_summary"
+        | "turn_start"
+        | "turn_end"
+        | "session_start"
+        | "session_event" => {
+            losses.push("Kiro v3 private session records were intentionally excluded".into());
         }
         _ => {}
     }
@@ -1765,7 +2189,8 @@ fn locate_session_file(
     session_dir: Option<&Path>,
     id: &str,
 ) -> Result<Option<PathBuf>> {
-    let root = session_root(harness, home, session_dir);
+    let roots = session_roots(harness, home, session_dir);
+    let root = &roots[0];
     if !valid_native_session_id(id) {
         return Ok(None);
     }
@@ -1788,7 +2213,7 @@ fn locate_session_file(
         // Bucket names are one-way cwd hashes, so only the bucket level can
         // be enumerated — but the session id below it is a plain directory
         // name, giving an exact fast path per bucket.
-        if let Ok(buckets) = fs::read_dir(&root) {
+        if let Ok(buckets) = fs::read_dir(root) {
             for bucket in buckets.flatten() {
                 let candidate = bucket.path().join(id).join("agents/main/wire.jsonl");
                 if session_path_matches(harness, &candidate, id, cwd)? {
@@ -1796,6 +2221,27 @@ fn locate_session_file(
                 }
             }
         }
+    }
+    if harness == ManagedHarness::CommandCode {
+        // The project bucket is a one-way cwd slug. Enumerate only that level,
+        // then probe the exact UUID filename and validate its self-describing
+        // header before returning it.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        if let Ok(buckets) = fs::read_dir(root) {
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let candidate = bucket.path().join(format!("{id}.jsonl"));
+                if session_path_matches(harness, &candidate, id, cwd)? {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+        return Ok(None);
     }
     if harness == ManagedHarness::Kiro {
         // The store is flat and shared by every checkout. Require both the
@@ -1811,7 +2257,31 @@ fn locate_session_file(
         }
         return Ok(None);
     }
-    let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
+    if harness == ManagedHarness::KiroV3 {
+        let Some(uuid) = id.strip_prefix("sess_") else {
+            return Ok(None);
+        };
+        if Uuid::parse_str(uuid).is_err() {
+            return Ok(None);
+        }
+        for root in roots {
+            let Ok(buckets) = fs::read_dir(&root) else {
+                continue;
+            };
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let exact = bucket.path().join(id).join("messages.jsonl");
+                if session_path_matches(harness, &exact, id, cwd)? {
+                    return Ok(Some(exact));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    let mut files = collect_session_files(harness, home, session_dir)?;
     files.sort_by_key(|path| temporary_transcript(path));
     for path in files.into_iter().take(2_000) {
         if session_path_matches(harness, &path, id, cwd)? {
@@ -1830,7 +2300,7 @@ fn session_path_matches(
     if !path.is_file() {
         return Ok(false);
     }
-    Ok(session_header(harness, path)?
+    Ok(session_header_for_cwd(harness, path, cwd)?
         .is_some_and(|(found, recorded_cwd)| found == id && same_path(&recorded_cwd, cwd)))
 }
 
@@ -1858,6 +2328,24 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
     }
+    if harness == ManagedHarness::CommandCode {
+        // Sidecars such as `<id>.checkpoints.jsonl` do not have a UUID file
+        // stem and are excluded from discovery and import.
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
+    }
+    if harness == ManagedHarness::KiroV3 {
+        return path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl")
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("sess_"))
+                .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok());
+    }
     if harness == ManagedHarness::Antigravity {
         // One SQLite database per conversation, named by its id.
         return path.extension().is_some_and(|ext| ext == "db");
@@ -1877,6 +2365,9 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::CommandCode {
+        return command_code_session_header(path);
     }
     if harness == ManagedHarness::Kiro {
         return kiro_session_header(path);
@@ -1916,7 +2407,9 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             ManagedHarness::OpenCode
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
+            | ManagedHarness::CommandCode
             | ManagedHarness::Kiro
+            | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Antigravity => (None, None),
         };
@@ -1927,12 +2420,69 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
     Ok(None)
 }
 
+/// Command Code v3 transcripts are self-describing on their first line. Fail
+/// closed on an unknown version, malformed UUID/timestamp/path, or a header id
+/// that disagrees with the transcript filename.
+fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(stem).is_err() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    let read =
+        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
+    if read == 0 || read > MAX_EVENT_BYTES {
+        return Ok(None);
+    }
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session")
+        || header.get("version").and_then(Value::as_u64) != Some(3)
+    {
+        return Ok(None);
+    }
+    let (Some(id), Some(timestamp), Some(cwd)) = (
+        header.get("id").and_then(Value::as_str),
+        header.get("timestamp").and_then(Value::as_str),
+        header.get("cwd").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let cwd = PathBuf::from(cwd);
+    if id != stem
+        || Uuid::parse_str(id).is_err()
+        || timestamp.parse::<jiff::Timestamp>().is_err()
+        || !cwd.is_absolute()
+    {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd)))
+}
+
+fn session_header_for_cwd(
+    harness: ManagedHarness,
+    path: &Path,
+    cwd: &Path,
+) -> Result<Option<(String, PathBuf)>> {
+    if harness == ManagedHarness::KiroV3 {
+        kiro_v3_session_header(path, cwd)
+    } else {
+        session_header(harness, path)
+    }
+}
+
 /// Kimi sessions are self-describing in `<session-dir>/state.json` — the wire
 /// journal itself carries no session id or cwd, and the bucket directory name
 /// is a one-way hash of the cwd, so neither can be inferred from the layout.
-/// The journal path is `<session-dir>/agents/main/wire.jsonl`, making the
-/// session directory the third ancestor. Missing/invalid state means the
-/// session is unusable for checkout matching, not an error.
+/// Kimi 0.29 used `workDir`; 0.34 uses `cwd`. Conflicting aliases and an
+/// optional id that disagrees with the directory fail closed. The journal path
+/// is `<session-dir>/agents/main/wire.jsonl`, making the session directory the
+/// third ancestor. Missing/invalid state means the session is unusable for
+/// checkout matching, not an error.
 fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.ancestors().nth(3) else {
         return Ok(None);
@@ -1943,11 +2493,32 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Ok(state) = serde_json::from_str::<Value>(&raw) else {
         return Ok(None);
     };
-    let Some(cwd) = state.get("workDir").and_then(Value::as_str) else {
-        return Ok(None);
-    };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
+    };
+    match state.get("id") {
+        Some(Value::String(recorded)) if recorded == id => {}
+        Some(_) => return Ok(None),
+        None => {}
+    }
+    let legacy = match state.get("workDir") {
+        Some(Value::String(cwd)) => Some(cwd.as_str()),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+    let current = match state.get("cwd") {
+        Some(Value::String(cwd)) => Some(cwd.as_str()),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+    let cwd = match (legacy, current) {
+        (Some(legacy), Some(current))
+            if legacy == current || same_path(Path::new(legacy), Path::new(current)) =>
+        {
+            current
+        }
+        (Some(_), Some(_)) | (None, None) => return Ok(None),
+        (Some(cwd), None) | (None, Some(cwd)) => cwd,
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
 }
@@ -1978,6 +2549,48 @@ fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Kiro v3 stores one self-describing directory per `sess_<uuid>` session.
+/// Only the observed schema/data-model pair is accepted, and at least one
+/// recorded workspace must resolve to the current checkout.
+fn kiro_v3_session_header(path: &Path, cwd: &Path) -> Result<Option<(String, PathBuf)>> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("messages.jsonl") {
+        return Ok(None);
+    }
+    let Some(session_dir) = path.parent() else {
+        return Ok(None);
+    };
+    let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(uuid) = id.strip_prefix("sess_") else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(uuid).is_err() {
+        return Ok(None);
+    }
+    let Ok(raw) = fs::read_to_string(session_dir.join("session.json")) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    if metadata.get("schemaVersion").and_then(Value::as_str) != Some("1.0.0")
+        || metadata.get("dataModelVersion").and_then(Value::as_u64) != Some(1)
+        || metadata.get("id").and_then(Value::as_str) != Some(id)
+    {
+        return Ok(None);
+    }
+    let Some(workspaces) = metadata.get("workspacePaths").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let matching = workspaces
+        .iter()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .find(|workspace| same_path(workspace, cwd));
+    Ok(matching.map(|workspace| (id.to_string(), workspace)))
 }
 
 /// Grok sessions are self-describing in `<session-dir>/summary.json`
@@ -2315,10 +2928,49 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::CommandCode => home.join(".commandcode/projects"),
         ManagedHarness::Kiro => home.join(".kiro/sessions/cli"),
+        ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
     }
+}
+
+/// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
+/// to the default home during acceptance. Scan the configured root first and
+/// the default root as a compatibility fallback; every result still passes
+/// strict metadata and checkout validation.
+fn session_roots(
+    harness: ManagedHarness,
+    home: &Path,
+    override_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let primary = session_root(harness, home, override_dir);
+    let mut roots = vec![primary.clone()];
+    if harness == ManagedHarness::KiroV3 {
+        let fallback = home.join(".kiro/sessions");
+        if fallback != primary {
+            roots.push(fallback);
+        }
+    }
+    roots
+}
+
+fn collect_session_files(
+    harness: ManagedHarness,
+    home: &Path,
+    override_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for root in session_roots(harness, home, override_dir) {
+        for path in collect_files(&root, |path| transcript_file(harness, path))? {
+            if seen.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn collect_files(root: &Path, predicate: impl Fn(&Path) -> bool + Copy) -> Result<Vec<PathBuf>> {
@@ -2501,7 +3153,9 @@ mod tests {
                     ManagedHarness::OpenCode
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
+                    | ManagedHarness::CommandCode
                     | ManagedHarness::Kiro
+                    | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
                     | ManagedHarness::Antigravity => {
                         unreachable!()
@@ -2528,6 +3182,203 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn command_code_v3_discovery_requires_exact_uuid_header_and_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let root = temp.path().join("command-code-projects");
+        let bucket = root.join("opaque-project-slug");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&bucket).unwrap();
+
+        let matching = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let wrong_checkout = "2cce5126-f57d-4ddd-8f66-e5bb409f60db";
+        let future_schema = "bb40bd9b-d60a-4a87-91c6-57d12c3d3002";
+        fs::write(
+            bucket.join(format!("{matching}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":matching,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{wrong_checkout}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":wrong_checkout,"timestamp":"2026-08-07T17:00:00Z","cwd":other})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{future_schema}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":4,"id":future_schema,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{matching}.checkpoints.jsonl")),
+            "{\"prompt\":\"private checkpoint\"}\n",
+        )
+        .unwrap();
+
+        let sessions = list_native_sessions(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, matching);
+        assert!(
+            native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                matching,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                wrong_checkout,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                future_schema,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn command_code_v3_exports_only_visible_allowlisted_blocks_incrementally() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let path = temp.path().join(format!("{session}.jsonl"));
+        let records = [
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd}),
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-07T17:00:01Z","message":{"role":"user","content":[{"type":"text","text":"visible user"}],"meta":{"source":"user"}}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-07T17:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"private signature"},{"type":"text","text":"visible assistant"},{"type":"tool_use","id":"tool-1","name":"read_directory","input":{"path":"src"}}],"meta":{"source":"model"}},"model":"private model","usage":{"costUsd":99}}),
+            json!({"type":"message","id":"t1","parentId":"a1","timestamp":"2026-08-07T17:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":[{"type":"text","text":"visible result"},{"type":"image","source":{"type":"base64","data":"private image"}}]}],"meta":{"source":"user"}}}),
+            json!({"type":"compaction","id":"c1","parentId":"t1","timestamp":"2026-08-07T17:00:04Z","summary":"visible compacted context","firstKeptEntryId":"u1","tokensBefore":1000,"details":"private details"}),
+            json!({"type":"branch_summary","id":"b1","parentId":"u1","timestamp":"2026-08-07T17:00:05Z","fromId":"c1","summary":"visible abandoned-branch summary","details":"private details"}),
+            json!({"type":"message","id":"injected","parentId":"b1","timestamp":"2026-08-07T17:00:06Z","message":{"role":"user","content":[{"type":"text","text":"harness context"}],"meta":{"source":"hook"}}}),
+        ];
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let first = export_jsonl(ManagedHarness::CommandCode, &path, session, None).unwrap();
+        assert_eq!(first.events.len(), 6);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| (event.kind, event.role.as_deref(), event.content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (WorkstreamEventKind::Message, Some("user"), "visible user"),
+                (
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    "visible assistant",
+                ),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    "read_directory: {\"path\":\"src\"}",
+                ),
+                (
+                    WorkstreamEventKind::ToolResult,
+                    Some("tool"),
+                    "visible result",
+                ),
+                (
+                    WorkstreamEventKind::Compaction,
+                    Some("assistant"),
+                    "visible compacted context",
+                ),
+                (
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    "visible abandoned-branch summary",
+                ),
+            ]
+        );
+        assert_eq!(first.events[1].metadata["parent_id"], "u1");
+        assert_eq!(first.events[2].metadata["tool_use_id"], "tool-1");
+        assert_eq!(first.events[3].metadata["parent_id"], "a1");
+        assert_eq!(first.events[3].metadata["is_error"], true);
+        assert_eq!(first.events[4].metadata["summary_type"], "compaction");
+        assert_eq!(first.events[5].metadata["summary_type"], "branch-summary");
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("hidden reasoning"))
+        );
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("image tool results"))
+        );
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("non-user/model"))
+        );
+        assert!(first.events.iter().all(|event| {
+            !event.content.contains("private") && !event.content.contains("harness context")
+        }));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"a2","parentId":"u1","timestamp":"2026-08-07T17:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"visible alternate branch"}],"meta":{"source":"model"}}})
+        )
+        .unwrap();
+        let second = export_jsonl(
+            ManagedHarness::CommandCode,
+            &path,
+            session,
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "visible alternate branch");
+        assert_eq!(second.events[0].metadata["parent_id"], "u1");
     }
 
     #[tokio::test]
@@ -2961,15 +3812,18 @@ mod tests {
     /// `session_b` at `other`. Returns `(root, wire_a)`.
     fn kimi_store_fixture(cwd: &Path, other: &Path) -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
-        for (bucket, id, work_dir) in [
-            ("wd_repo_a1b2c3d4e5f6", "session_aaa", cwd),
-            ("wd_other_f6e5d4c3b2a1", "session_bbb", other),
+        for (bucket, id, locator_key, work_dir) in [
+            ("wd_repo_a1b2c3d4e5f6", "session_aaa", "workDir", cwd),
+            ("wd_other_f6e5d4c3b2a1", "session_bbb", "cwd", other),
         ] {
             let session_dir = root.path().join(bucket).join(id);
             fs::create_dir_all(session_dir.join("agents/main")).unwrap();
+            let mut state = serde_json::Map::new();
+            state.insert("id".into(), Value::String(id.into()));
+            state.insert(locator_key.into(), json!(work_dir));
             fs::write(
                 session_dir.join("state.json"),
-                json!({"workDir": work_dir}).to_string(),
+                Value::Object(state).to_string(),
             )
             .unwrap();
         }
@@ -2997,7 +3851,7 @@ mod tests {
             .join("wd_other_f6e5d4c3b2a1/session_bbb/agents/main/wire.jsonl");
         fs::write(&wire_b, "").unwrap();
         // The "other" bucket is alphabetically first and its session newer,
-        // so only an exact workDir match can pick the right session.
+        // so only an exact state locator match can pick the right session.
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&wire_b, "{\"type\":\"metadata\"}\n").unwrap();
 
@@ -3062,6 +3916,50 @@ mod tests {
                 "missing"
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn kimi_state_rejects_conflicting_locators_and_mismatched_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let session_dir = temp.path().join("session_expected");
+        let wire = session_dir.join("agents/main/wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(&wire, "").unwrap();
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","workDir":cwd,"cwd":other}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_other","cwd":cwd}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","cwd":[cwd]}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","workDir":cwd,"cwd":cwd}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            kimi_session_header(&wire).unwrap(),
+            Some(("session_expected".into(), cwd))
         );
     }
 
@@ -3691,6 +4589,7 @@ mod tests {
 
     const KIRO_SESSION_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
     const KIRO_SESSION_B: &str = "3f6d1c2a-0000-4000-8000-000000000bbb";
+    const KIRO_V3_SESSION: &str = "sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e";
 
     fn write_kiro_session(root: &Path, id: &str, cwd: &Path, lines: &[Value]) {
         fs::write(
@@ -3711,6 +4610,27 @@ mod tests {
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         fs::write(root.join(format!("{id}.jsonl")), transcript).unwrap();
+    }
+
+    fn write_kiro_v3_session(root: &Path, id: &str, workspaces: &[&Path], messages: &str) {
+        let session_dir = root.join("checkout-fixture").join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            json!({
+                "schemaVersion": "1.0.0",
+                "dataModelVersion": 1,
+                "id": id,
+                "workspacePaths": workspaces,
+                "createdAt": "2026-08-06T10:00:00Z",
+                "lastModifiedAt": "2026-08-06T10:05:00Z",
+                "agentMode": "vibe",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(session_dir.join("messages.jsonl"), messages).unwrap();
     }
 
     #[tokio::test]
@@ -3800,42 +4720,151 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kiro_v3_discovery_is_checkout_scoped_and_never_cross_resumes_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let v2_root = temp.path().join("v2");
+        let v3_root = temp.path().join("v3");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&v2_root).unwrap();
+        write_kiro_session(&v2_root, KIRO_SESSION_A, &cwd, &[]);
+        write_kiro_v3_session(
+            &v3_root,
+            KIRO_V3_SESSION,
+            &[&other, &cwd],
+            include_str!("../tests/fixtures/kiro-v3-messages.jsonl"),
+        );
+
+        let sessions =
+            list_native_sessions(ManagedHarness::KiroV3, temp.path(), &cwd, Some(&v3_root), 8)
+                .await
+                .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, KIRO_V3_SESSION);
+        assert!(
+            native_session_exists(
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+                Some(&v3_root),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&v2_root),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+                Some(&v3_root),
+                KIRO_SESSION_A,
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_v3_rejects_unknown_schema_and_history_only_mirrors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(root.join("cli")).unwrap();
+        fs::write(root.join("cli/fixture.history"), "sanitized prompt\n").unwrap();
+        write_kiro_v3_session(&root, KIRO_V3_SESSION, &[&cwd], "{}\n");
+        let metadata = root
+            .join("checkout-fixture")
+            .join(KIRO_V3_SESSION)
+            .join("session.json");
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(&metadata).unwrap()).unwrap();
+        value["schemaVersion"] = Value::String("2.0.0".into());
+        fs::write(&metadata, value.to_string()).unwrap();
+
+        assert!(
+            list_native_sessions(ManagedHarness::KiroV3, temp.path(), &cwd, Some(&root), 8,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_native_sessions(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root.join("cli")),
+                8,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn kiro_v3_detects_the_custom_home_resume_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let configured = temp.path().join("custom-kiro/sessions");
+        let default = temp.path().join(".kiro/sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&configured).unwrap();
+        write_kiro_v3_session(&default, KIRO_V3_SESSION, &[&cwd], "{}\n");
+
+        assert!(
+            kiro_v3_resume_uses_default_store(
+                temp.path(),
+                &cwd,
+                Some(&configured),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !kiro_v3_resume_uses_default_store(temp.path(), &cwd, Some(&default), KIRO_V3_SESSION,)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn kiro_export_maps_only_visible_v1_records() {
         let temp = tempfile::tempdir().unwrap();
         let stream = temp.path().join(format!("{KIRO_SESSION_A}.jsonl"));
-        let records = [
-            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"hello kiro"}],"meta":{"timestamp":1_700_000_000_000_i64}}}),
-            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[
-                {"kind":"text","data":"visible answer"},
-                {"kind":"toolUse","data":{"name":"fs_read","tool_use_id":"call_1","input":{"path":"README.md"}}}
-            ]}}),
-            json!({"version":"v1","kind":"ToolResults","data":{"message_id":"m3","content":[
-                {"kind":"toolResult","data":{"tool_use_id":"call_1","content":[{"kind":"text","data":"result ok"}],"is_error":false}}
-            ]}}),
-            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m4","content":[{"kind":"image","data":{"format":"png"}}]}}),
-            json!({"version":"v2","kind":"Prompt","data":{"message_id":"m5","content":[{"kind":"text","data":"future"}]}}),
-        ];
         fs::write(
             &stream,
-            records
-                .iter()
-                .map(|record| format!("{record}\n"))
-                .collect::<String>(),
+            format!(
+                "{}{}\n{}\n",
+                include_str!("../tests/fixtures/kiro-v2-messages.jsonl"),
+                json!({"version":"v1","kind":"Prompt","data":{"message_id":"m4","content":[{"kind":"image","data":{"format":"png"}}]}}),
+                json!({"version":"v2","kind":"Prompt","data":{"message_id":"m5","content":[{"kind":"text","data":"future"}]}}),
+            ),
         )
         .unwrap();
 
         let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_SESSION_A, None).unwrap();
         assert_eq!(export.events.len(), 4);
-        assert_eq!(export.events[0].content, "hello kiro");
+        assert_eq!(export.events[0].content, "sanitized v2 prompt");
         assert_eq!(export.events[0].role.as_deref(), Some("user"));
         assert_eq!(
             export.events[0].occurred_at.as_deref(),
             Some("2023-11-14T22:13:20Z")
         );
-        assert_eq!(export.events[1].content, "visible answer");
+        assert_eq!(export.events[1].content, "sanitized v2 reply");
         assert_eq!(export.events[2].kind, WorkstreamEventKind::ToolCall);
-        assert_eq!(export.events[3].content, "result ok");
+        assert_eq!(export.events[3].content, "sanitized v2 result");
         assert!(
             export
                 .losses
@@ -3847,6 +4876,42 @@ mod tests {
                 .losses
                 .iter()
                 .any(|loss| loss.contains("unsupported envelope version v2"))
+        );
+    }
+
+    #[test]
+    fn kiro_v3_export_maps_only_visible_records_and_persists_flavor() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join("messages.jsonl");
+        fs::write(
+            &stream,
+            include_str!("../tests/fixtures/kiro-v3-messages.jsonl"),
+        )
+        .unwrap();
+
+        let export = export_jsonl(ManagedHarness::KiroV3, &stream, KIRO_V3_SESSION, None).unwrap();
+        assert_eq!(export.events.len(), 4);
+        assert_eq!(export.events[0].content, "sanitized v3 prompt");
+        assert_eq!(export.events[0].role.as_deref(), Some("user"));
+        assert_eq!(export.events[1].content, "sanitized v3 reply");
+        assert_eq!(export.events[2].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(export.events[3].content, "sanitized v3 result");
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("private session"))
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("non-visible assistant"))
+        );
+        let cursor: Value = serde_json::from_str(export.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.get("flavor").and_then(Value::as_str),
+            Some("kiro-v3")
         );
     }
 

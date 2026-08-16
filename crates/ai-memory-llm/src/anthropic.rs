@@ -163,26 +163,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        let messages: Vec<AnthropicMsg<'_>> = request
-            .messages
-            .iter()
-            .map(|m| AnthropicMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: &m.content,
-            })
-            .collect();
-        let body = AnthropicRequest {
-            model: &self.model,
-            max_tokens: request.max_tokens,
-            system: request.system.as_deref(),
-            messages,
-            temperature: request.temperature,
-            tools: None,
-            tool_choice: None,
-        };
+        let body = self.build_request(&request, None);
         let response: AnthropicResponse = self.post(&body).await?;
         let text = response
             .content
@@ -208,33 +189,7 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        let tool = AnthropicTool {
-            name: "result".into(),
-            description: "Emit the structured result.".into(),
-            input_schema: schema,
-        };
-        let messages: Vec<AnthropicMsg<'_>> = request
-            .messages
-            .iter()
-            .map(|m| AnthropicMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: &m.content,
-            })
-            .collect();
-        let body = AnthropicRequest {
-            model: &self.model,
-            max_tokens: request.max_tokens,
-            system: request.system.as_deref(),
-            messages,
-            temperature: request.temperature,
-            tools: Some(vec![tool]),
-            tool_choice: Some(AnthropicToolChoice::Tool {
-                name: "result".into(),
-            }),
-        };
+        let body = self.build_request(&request, Some(schema));
         let response: AnthropicResponse = self.post(&body).await?;
         for c in response.content {
             if let AnthropicContent::ToolUse { input, .. } = c {
@@ -248,6 +203,57 @@ impl LlmProvider for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Build the `/v1/messages` body shared by `complete` and
+    /// `complete_structured_raw`. Passing a schema turns the call into the
+    /// forced-tool structured-output shape. Both paths go through here so the
+    /// temperature rule below can't apply to one and silently miss the other.
+    fn build_request<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        schema: Option<serde_json::Value>,
+    ) -> AnthropicRequest<'a> {
+        let messages: Vec<AnthropicMsg<'a>> = request
+            .messages
+            .iter()
+            .map(|m| AnthropicMsg {
+                role: match m.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                },
+                content: &m.content,
+            })
+            .collect();
+        let (tools, tool_choice) = match schema {
+            Some(input_schema) => (
+                Some(vec![AnthropicTool {
+                    name: "result".into(),
+                    description: "Emit the structured result.".into(),
+                    input_schema,
+                }]),
+                Some(AnthropicToolChoice::Tool {
+                    name: "result".into(),
+                }),
+            ),
+            None => (None, None),
+        };
+        // Newer models reject ai-memory's non-default `temperature` with a
+        // 400; omit the field so the API applies its own default.
+        let temperature = if model_rejects_temperature(&self.model) {
+            None
+        } else {
+            request.temperature
+        };
+        AnthropicRequest {
+            model: &self.model,
+            max_tokens: request.max_tokens,
+            system: request.system.as_deref(),
+            messages,
+            temperature,
+            tools,
+            tool_choice,
+        }
+    }
+
     async fn post<B: Serialize, R: DeserializeOwned>(&self, body: &B) -> LlmResult<R> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         debug!(url, "POST anthropic");
@@ -289,9 +295,85 @@ impl AnthropicProvider {
     }
 }
 
+/// Models that reject ai-memory's non-default `temperature`.
+///
+/// Anthropic deprecated sampling parameters on the newer models: sending
+/// `temperature` to Claude 4.7+ or to Claude Mythos Preview returns a
+/// 400 with `` `temperature` is deprecated for this model. `` Every structured
+/// call site — bootstrap, consolidation, lint, auto-improve — passes 0.1-0.2,
+/// so without this the whole LLM pipeline is unusable on those models.
+/// Omitting the field lets the API apply its own default, the same escape
+/// hatch `openai.rs::model_requires_default_temperature` uses for gpt-5 /
+/// o-series.
+///
+/// Anything we can't parse as a modern `claude-<family>-<major>[-<minor>]` id
+/// keeps the caller's value: the legacy `claude-3-5-sonnet-…` ordering and the
+/// whole Claude 4.0-4.6 line still accept sampling parameters, and a gateway
+/// proxying a non-Claude model behind this wire format must not be silently
+/// stripped either.
+fn model_rejects_temperature(model: &str) -> bool {
+    if is_mythos_preview(model) {
+        return true;
+    }
+    match claude_family_version(model) {
+        Some((major, minor)) => major >= 5 || (major == 4 && minor >= 7),
+        None => false,
+    }
+}
+
+/// Match the dateless preview id, including vendor-prefixed variants.
+fn is_mythos_preview(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let Some(rest) = lower
+        .find("claude-")
+        .map(|start| &lower[start + "claude-".len()..])
+    else {
+        return false;
+    };
+    let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("mythos"), Some("preview"))
+    )
+}
+
+/// Parse the `<major>[-<minor>]` version following the family name of a modern
+/// Claude id (`claude-opus-5`, `claude-sonnet-4-6`, `claude-opus-5@20260115`,
+/// `anthropic.claude-opus-5-v1:0`). Returns `None` for the legacy
+/// family-last ordering (`claude-3-5-sonnet-20241022`) and for ids that carry
+/// no numeric version (`claude-opus-latest`).
+fn claude_family_version(model: &str) -> Option<(u32, u32)> {
+    let lower = model.to_ascii_lowercase();
+    // Bedrock/Vertex ids carry a vendor prefix and a snapshot suffix around
+    // the same `claude-<family>-<version>` core.
+    let rest = &lower[lower.find("claude-")? + "claude-".len()..];
+    let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
+    if !matches!(
+        parts.next()?,
+        "opus" | "sonnet" | "haiku" | "fable" | "mythos"
+    ) {
+        return None;
+    }
+    let major = version_segment(parts.next()?)?;
+    let minor = parts.next().and_then(version_segment).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// A version segment is one or two digits; a longer digit run is a date
+/// snapshot (`claude-opus-4-20250514`), not a minor version.
+fn version_segment(segment: &str) -> Option<u32> {
+    if segment.is_empty() || segment.len() > 2 || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    segment.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
+    use serde_json::json;
+
+    use crate::types::ChatMessage;
 
     use super::*;
 
@@ -352,6 +434,86 @@ mod tests {
             beta_val.contains("oauth-2025-04-20"),
             "anthropic-beta must contain oauth-2025-04-20"
         );
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 256,
+            temperature: Some(0.2),
+        }
+    }
+
+    /// Serialized `/v1/messages` body for `model`, with the caller's
+    /// temperature set to 0.2 — what bootstrap / consolidation actually send.
+    fn body_for(model: &str, schema: Option<serde_json::Value>) -> serde_json::Value {
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model).unwrap();
+        let request = chat_request();
+        serde_json::to_value(provider.build_request(&request, schema)).unwrap()
+    }
+
+    #[test]
+    fn build_request_omits_temperature_for_models_that_deprecated_it() {
+        // The structured path is the one that actually broke in the field:
+        // bootstrap sends temperature 0.2 and Anthropic answers 400
+        // "`temperature` is deprecated for this model".
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "anthropic.claude-mythos-preview-v1:0",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "anthropic.claude-opus-5-v1:0",
+        ] {
+            let body = body_for(model, Some(json!({})));
+            assert!(
+                body.get("temperature").is_none(),
+                "temperature must be omitted for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_keeps_temperature_for_models_that_still_accept_it() {
+        // Determinism matters for consolidation output, so the models that
+        // still honour sampling params must keep the caller's 0.2.
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-20250514",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            let body = body_for(model, None);
+            let temp = body["temperature"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("temperature must be forwarded for {model}, got {body}"));
+            assert!((temp - 0.2).abs() < 1e-6, "{model}: got {temp}");
+        }
+    }
+
+    #[test]
+    fn build_request_keeps_the_structured_tool_shape() {
+        // The temperature rule must not disturb the forced-tool wiring the
+        // structured path depends on.
+        let body = body_for("claude-opus-5", Some(json!({"type": "object"})));
+        assert_eq!(body["tools"][0]["name"], json!("result"));
+        assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "tool", "name": "result"})
+        );
+
+        let plain = body_for("claude-opus-5", None);
+        assert!(plain.get("tools").is_none());
+        assert!(plain.get("tool_choice").is_none());
     }
 
     #[test]

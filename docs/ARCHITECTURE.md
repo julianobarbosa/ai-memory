@@ -137,11 +137,13 @@ from hook paths.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
-   pages with `retention < cold_threshold` are soft-deleted;
-   soft-deletions older than `hard_delete_after_days` with no subsequent
-   access get purged only within that sweep's resolved workspace/project,
-   together with entity-index rows orphaned by the purge. Semantic / pinned /
-   freshly-touched pages survive.
+   pages with `retention < cold_threshold` are evicted through the wiki layer,
+   which removes the authoritative file and leaves a decay tombstone;
+   tombstones older than `hard_delete_after_days` are purged with their full
+   version ancestry only within that sweep's resolved workspace/project,
+   together with entity-index rows orphaned by the purge. A newer page recreated
+   at the same path is preserved. Semantic / pinned / freshly-touched pages
+   survive.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
@@ -255,7 +257,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Table | What |
 |---|---|
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
-| `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
+| `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for opt-in SessionEnd LLM consolidation. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. |
@@ -362,7 +364,7 @@ invariants below.
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
-| `memory_forget_sweep` | destructive | Retention pass: soft-delete cold pages, purge aged tombstones, and hard-delete TTL-expired pages through the wiki layer. `dry_run=true` for preview. |
+| `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
@@ -492,7 +494,7 @@ log_level = "info"
 lambda = 0.02                      # ↓ to forget less aggressively
 sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
-cold_threshold = 0.20              # below this → soft-delete
+cold_threshold = 0.20              # below this → remove file + retain tombstone
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 

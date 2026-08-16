@@ -2,10 +2,11 @@
 //!
 //! Walks the `is_latest = 1` pages for a project, computes the retention score
 //! for each via [`ai_memory_store::retention_score_with_breadth`],
-//! and soft-deletes those below threshold. Semantic / procedural /
-//! working tiers are skipped (M8 policy: semantic compounds, only
-//! episodic decays). Pinned pages (schema flag OR `pinned: true` in
-//! frontmatter) are exempt regardless of tier.
+//! and evicts those below threshold through the wiki layer: the authoritative
+//! Markdown file is removed and the exact latest row becomes a decay
+//! tombstone. Semantic / procedural / working tiers are skipped (M8 policy:
+//! semantic compounds, only episodic decays). Pinned pages (schema flag OR
+//! `pinned: true` in frontmatter) are exempt regardless of tier.
 //!
 //! TTL pass: pages whose frontmatter `expires_at:` is in the past are
 //! hard-deleted through the wiki layer (file + rows), regardless of
@@ -13,10 +14,10 @@
 //! than a pin. `memory_lint` warns about pinned+expiring combos so the
 //! contradiction is visible before the delete lands.
 //!
-//! Hard-delete pass cleans up rows soft-deleted more than
-//! `hard_delete_after_days` ago that received zero subsequent access.
-//! M7 supersession rows are safe: they have `supersedes IS NOT NULL`
-//! and therefore never match the hard-delete predicate.
+//! Hard-delete pass cleans up tombstones older than
+//! `hard_delete_after_days` and their supersession ancestry. A page recreated
+//! at the same path is a separate live chain and is preserved. Ordinary
+//! supersession rows are safe because only decay writes `superseded_at`.
 
 use std::collections::HashMap;
 
@@ -32,7 +33,7 @@ use thiserror::Error;
 /// One evicted page surfaced in the [`SweepReport`].
 #[derive(Debug, Clone, Serialize)]
 pub struct EvictedPage {
-    /// Identifier of the soft-deleted page.
+    /// Identifier of the page selected for eviction.
     pub id: PageId,
     /// Relative wiki path.
     pub path: String,
@@ -42,6 +43,9 @@ pub struct EvictedPage {
     pub age_days: f64,
     /// Total access count.
     pub access_count: u32,
+    /// `true` when the Markdown removal and tombstone write landed. Always
+    /// `false` on `dry_run`; failures are retried by the next sweep.
+    pub deleted: bool,
 }
 
 /// One TTL-expired page surfaced in the [`SweepReport`].
@@ -67,13 +71,13 @@ pub struct SweepReport {
     pub dry_run: bool,
     /// Total candidates evaluated (all tiers, before filtering).
     pub candidates_evaluated: usize,
-    /// Pages that fell below the cold threshold (soft-deleted unless
-    /// `dry_run`).
+    /// Pages that fell below the cold threshold (evicted through the wiki
+    /// layer unless `dry_run`).
     pub evicted: Vec<EvictedPage>,
     /// Pages past their frontmatter `expires_at:` TTL (hard-deleted
     /// through the wiki layer unless `dry_run`).
     pub expired: Vec<ExpiredPage>,
-    /// Number of older soft-deleted rows hard-deleted on this pass.
+    /// Number of page-version rows permanently deleted on this pass.
     pub hard_deleted: usize,
 }
 
@@ -90,21 +94,21 @@ pub enum SweepError {
 }
 
 const US_PER_DAY: f64 = 86_400_000_000.0;
+const US_PER_DAY_I64: i64 = 86_400_000_000;
 
 /// Run a sweep against the given workspace/project.
 ///
-/// `wiki` routes TTL deletions through the wiki layer so the markdown
-/// file is removed together with the rows (deleting only store rows
-/// would let the watcher re-index the file). Callers without a wiki
-/// handle (bare-store tests) pass `None`; expired pages are then reported
-/// but left intact. A store-only delete would leave the authoritative file
-/// behind for the watcher to re-index.
+/// `wiki` routes decay and TTL deletions through the wiki layer so the
+/// Markdown source of truth is removed with the index mutation. Callers
+/// without a wiki handle (bare-store tests) pass `None`; affected pages are
+/// reported but left intact. A store-only mutation would let reconciliation
+/// re-index the authoritative file.
 ///
 /// # Errors
 /// Propagates any store error encountered while reading candidates or
-/// writing soft-deletions. Per-page TTL delete failures (rejecting
-/// admission webhook, IO error) are reported in the
-/// [`SweepReport::expired`] entries instead of aborting the sweep.
+/// writing tombstones. Per-page Wiki failures (rejecting admission
+/// webhook, IO error) are reported in the corresponding entry instead of
+/// aborting the sweep.
 pub async fn run_sweep(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -135,7 +139,7 @@ pub async fn run_sweep(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sweep_with_breadth(
     reader: &ReaderPool,
-    writer: &WriterHandle,
+    _writer: &WriterHandle,
     wiki: Option<&Wiki>,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -152,7 +156,6 @@ pub async fn run_sweep_with_breadth(
     let now_us = Timestamp::now().as_microsecond();
 
     let mut evicted = Vec::new();
-    let mut to_evict_ids: Vec<PageId> = Vec::new();
     let mut expired: Vec<ExpiredPage> = Vec::new();
 
     for c in &candidates {
@@ -190,8 +193,8 @@ pub async fn run_sweep_with_breadth(
                 retention: score,
                 age_days,
                 access_count: c.access_count,
+                deleted: false,
             });
-            to_evict_ids.push(c.id);
         }
     }
 
@@ -227,12 +230,60 @@ pub async fn run_sweep_with_breadth(
                 }
             }
         }
-        if !to_evict_ids.is_empty() {
-            writer.soft_delete_for_decay(to_evict_ids).await?;
+        for page in &mut evicted {
+            let path = match ai_memory_core::PagePath::new(page.path.clone()) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let result = match wiki {
+                Some(wiki) => wiki
+                    .evict_page_if_latest(workspace_id, project_id, &path, page.id, None)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("wiki unavailable; refusing store-only decay eviction".to_string()),
+            };
+            match result {
+                Ok(true) => page.deleted = true,
+                Ok(false) => tracing::debug!(
+                    path = %page.path,
+                    "forget sweep: page changed after decay selection; skipping stale eviction"
+                ),
+                Err(error) => tracing::warn!(
+                    path = %page.path,
+                    error,
+                    "forget sweep: decay eviction failed; retrying on next sweep"
+                ),
+            }
         }
-        hard_deleted = writer
-            .hard_delete_decayed(workspace_id, project_id, params.hard_delete_after_days)
-            .await?;
+
+        if let Some(wiki) = wiki {
+            let grace_days = params.hard_delete_after_days.max(0);
+            let cutoff_us = Timestamp::now()
+                .as_microsecond()
+                .saturating_sub(grace_days.saturating_mul(US_PER_DAY_I64));
+            let tombstones = reader
+                .decay_tombstones_before(workspace_id, project_id, cutoff_us)
+                .await?;
+            for tombstone in tombstones {
+                match wiki
+                    .hard_delete_decay_tombstone(
+                        workspace_id,
+                        project_id,
+                        &tombstone.path,
+                        tombstone.id,
+                        cutoff_us,
+                    )
+                    .await
+                {
+                    Ok(deleted) => hard_deleted += deleted,
+                    Err(error) => tracing::warn!(
+                        path = %tombstone.path,
+                        %error,
+                        "forget sweep: decay tombstone cleanup failed; retrying on next sweep"
+                    ),
+                }
+            }
+        }
     }
 
     Ok(SweepReport {

@@ -374,7 +374,7 @@ fn write_success_response<W: std::io::Write>(
 ) -> std::io::Result<()> {
     if agent == AgentKind::KiroCli {
         // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
-        // context, and v2 Stop parses stdout for a block decision. Capture-only
+        // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
     } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
@@ -618,11 +618,10 @@ where
         if agent_kind.session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let native_session_qs = canonical_session_id
-                .as_deref()
-                .map_or_else(String::new, |session_id| {
-                    format!("&session_id={}", url_encode(session_id))
-                });
+            let native_session_qs = canonical_session_id.as_deref().map_or_else(
+                || session_qs.clone(),
+                |session_id| format!("&session_id={}", url_encode(session_id)),
+            );
             let handoff_url = format!(
                 "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
                 args.agent
@@ -631,7 +630,7 @@ where
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
                 if agent_kind == AgentKind::KiroCli {
-                    // Kiro v2 consumes agentSpawn stdout verbatim and defines
+                    // Kiro v2/v3 consume SessionStart stdout verbatim and define
                     // no wrapper envelope.
                     writeln!(stdout, "{handoff}")?;
                 } else {
@@ -922,11 +921,40 @@ mod tests {
             ),
             (AgentKind::KiroCli, HookEvent::PreToolUse, b"".as_slice()),
             (AgentKind::KiroCli, HookEvent::SessionStart, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::UserPrompt, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::PostToolUse, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::Stop, b"".as_slice()),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
             assert_eq!(output, expected, "{agent:?} {event:?}");
         }
+    }
+
+    #[test]
+    fn kiro_v3_live_lifecycle_fixtures_share_native_context() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/kiro-v3-hook-payloads.json"
+        ))
+        .unwrap();
+        let events = fixture["events"].as_array().unwrap();
+        assert_eq!(events.len(), 5);
+        for event in events {
+            let payload = &event["payload"];
+            let (cwd, session_id) = hook_context("kiro-cli", payload);
+            assert_eq!(cwd.as_deref(), Some("/workspace/project"));
+            assert_eq!(session_id.as_deref(), Some("kiro-v3-session"));
+        }
+        assert_eq!(events[0]["payload"]["hook_event_name"], "SessionStart");
+        assert_eq!(events[1]["payload"]["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(events[2]["payload"]["hook_event_name"], "PreToolUse");
+        assert_eq!(events[3]["payload"]["hook_event_name"], "PostToolUse");
+        assert_eq!(events[4]["payload"]["hook_event_name"], "Stop");
+        assert_eq!(events[2]["payload"]["tool_name"], "read_file");
+        assert_eq!(
+            events[2]["payload"]["tool_input"]["path"],
+            "/workspace/project/sample.txt"
+        );
     }
 
     #[tokio::test]
@@ -1110,6 +1138,57 @@ mod tests {
             query_param(&entries[0].url, "cwd").is_some(),
             "{}",
             entries[0].url
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_generated_session_id_reaches_startup_handoff_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "DEVIN-HANDOFF").await;
+        let mut args = devin_hook_args("session-start");
+        args.server_url = base;
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.starts_with("POST /hook")),
+            "session start must be posted: {recorded:?}"
+        );
+        let get = recorded
+            .iter()
+            .find(|request| request.starts_with("GET /handoff?"))
+            .expect("startup handoff must be fetched");
+        let request_param = |request: &str| {
+            request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|target| query_param(target, "session_id"))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            request_param(get).as_deref(),
+            stored_session_id(&data_dir, AgentKind::Devin).as_deref(),
+            "the destructive startup claim must use the generated receiver id: {recorded:?}"
         );
     }
 

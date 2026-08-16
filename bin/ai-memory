@@ -22,6 +22,10 @@
 #                           the wrapper reaches the host loopback server
 #                           started by the README quick start.
 #   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
+#   ANTHROPIC_OAUTH_TOKEN   Claude subscription token forwarded to helper
+#                           commands
+#   CLAUDE_CODE_OAUTH_TOKEN fallback Claude subscription token forwarded
+#                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
 #   AI_MEMORY_NATIVE_BIN    native binary used for `run`/`show`/`continue` (optional)
@@ -365,6 +369,8 @@ for var in \
   CLAUDE_CONFIG_DIR \
   CLAUDE_CODE_SESSION_ID \
   ANTHROPIC_API_KEY \
+  ANTHROPIC_OAUTH_TOKEN \
+  CLAUDE_CODE_OAUTH_TOKEN \
   OPENAI_API_KEY \
   COPILOT_GITHUB_TOKEN \
   GITHUB_COPILOT_API_TOKEN \
@@ -400,15 +406,24 @@ USER_ARGS=(-u "$(id -u):$(id -g)")
 # (issue #107)
 RENDERS_HOST_CONFIG=0
 WRAPPER_SUBCOMMAND=""
+EXPLICIT_HOST_CONFIG=0
 WRAPPER_ARGS=("$@")
 idx=0
 while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
   arg="${WRAPPER_ARGS[$idx]}"
   case "${arg}" in
-    --data-dir | --config)
+    --config)
+      EXPLICIT_HOST_CONFIG=1
       idx=$((idx + 2))
       ;;
-    --data-dir=* | --config=*)
+    --config=*)
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 1))
+      ;;
+    --data-dir)
+      idx=$((idx + 2))
+      ;;
+    --data-dir=*)
       idx=$((idx + 1))
       ;;
     --*)
@@ -434,6 +449,34 @@ case "${WRAPPER_SUBCOMMAND}" in
       WRITES_HOST_FILES=1
       ;;
 esac
+# bootstrap only *reads* host files — the repo bind-mounted at /work and the
+# `.ai-memory.toml` markers under $HOME — but an unmapped UID and a confined
+# SELinux label block reads exactly as hard as writes. The failure is
+# two-stage and misleading: bootstrap first degrades silently to
+# "no .git found at /work; bootstrapping from README/docs/rules only", then
+# dies with "Permission denied (os error 13)" when it reaches a file it
+# cannot skip. So readers need the same treatment as writers.
+READS_HOST_FILES=0
+case "${WRAPPER_SUBCOMMAND}" in
+    bootstrap | restore)
+      READS_HOST_FILES=1
+      ;;
+esac
+if [ "${EXPLICIT_HOST_CONFIG}" -eq 1 ]; then
+  READS_HOST_FILES=1
+fi
+# A custom data directory is a host bind at /data, so every command that opens
+# the store touches host files even when it would otherwise be a thin client.
+HOST_DATA_BIND=0
+if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+  HOST_DATA_BIND=1
+fi
+TOUCHES_HOST_FILES=0
+if [ "${WRITES_HOST_FILES}" -eq 1 ] \
+  || [ "${READS_HOST_FILES}" -eq 1 ] \
+  || [ "${HOST_DATA_BIND}" -eq 1 ]; then
+  TOUCHES_HOST_FILES=1
+fi
 
 # Rootless Docker runs the whole daemon inside its own user namespace, where
 # container UID 0 maps back to the invoking host user, but any *non-zero*
@@ -445,15 +488,35 @@ esac
 # staging dir, $PWD/CLAUDE.md, skill directories, …) fails with
 # EACCES/ENOENT. Running as UID 0 instead hits rootlesskit's primary
 # mapping and lands as the real host user. Only do this for commands that
-# write to a host bind mount: other commands only touch the /data named
+# touch a host bind mount: other commands only touch the /data named
 # volume, which isn't host-visible and doesn't have this problem, so leave
 # their UID mapping alone.
 DOCKER_SECURITY_OPTIONS=$("${DOCKER}" info --format '{{.SecurityOptions}}' 2>/dev/null || true)
 ROOTLESS_DOCKER=0
+CONTAINER_SELINUX=0
 if printf '%s\n' "${DOCKER_SECURITY_OPTIONS}" | grep -q 'name=rootless'; then
   ROOTLESS_DOCKER=1
 fi
-if [ "${WRITES_HOST_FILES}" -eq 1 ] && [ "${ROOTLESS_DOCKER}" -eq 1 ]; then
+if printf '%s\n' "${DOCKER_SECURITY_OPTIONS}" | grep -q 'name=selinux'; then
+  CONTAINER_SELINUX=1
+fi
+# `.SecurityOptions` is a Docker-only field. Podman — including through the
+# podman-docker `docker` shim — fails the template with "can't evaluate field
+# SecurityOptions in type system.infoReport" and exits 125, which the `|| true`
+# above swallows into an empty string. Both gates then read as "not rootless,
+# no SELinux" and rootless podman runs the helper as an unmapped subordinate
+# UID under a confined label, so every host-file access dies with
+# "Permission denied (os error 13)". Podman exposes the same two facts under
+# different keys, so ask it directly when the Docker probe came back empty.
+if [ -z "${DOCKER_SECURITY_OPTIONS}" ]; then
+  if [ "$("${DOCKER}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)" = "true" ]; then
+    ROOTLESS_DOCKER=1
+  fi
+  if [ "$("${DOCKER}" info --format '{{.Host.Security.SELinuxEnabled}}' 2>/dev/null || true)" = "true" ]; then
+    CONTAINER_SELINUX=1
+  fi
+fi
+if [ "${TOUCHES_HOST_FILES}" -eq 1 ] && [ "${ROOTLESS_DOCKER}" -eq 1 ]; then
   USER_ARGS=(-u 0:0)
 fi
 
@@ -466,14 +529,14 @@ case "$(uname -s 2>/dev/null || true)" in
     # SELinux blocks the helper's container label from writing normal home
     # labels even when its uid/gid match the host user. Relabeling the entire
     # $HOME bind with :z/:Z is unsafe, so relax label confinement only for the
-    # short-lived, trusted helper commands that actually write host files.
+    # short-lived, trusted helper commands that actually touch host files.
     SELINUX_MODE=$(getenforce 2>/dev/null || true)
     if [ -z "${SELINUX_MODE}" ] && [ -r /sys/fs/selinux/enforce ]; then
       SELINUX_MODE=$(cat /sys/fs/selinux/enforce 2>/dev/null || true)
     fi
-    if [ "${WRITES_HOST_FILES}" -eq 1 ] \
+    if [ "${TOUCHES_HOST_FILES}" -eq 1 ] \
       && { [ "${SELINUX_MODE}" = "Enforcing" ] || [ "${SELINUX_MODE}" = "enforcing" ] || [ "${SELINUX_MODE}" = "1" ]; } \
-      && printf '%s\n' "${DOCKER_SECURITY_OPTIONS}" | grep -q 'name=selinux'; then
+      && [ "${CONTAINER_SELINUX}" -eq 1 ]; then
       SELINUX_ARGS=(--security-opt label=disable)
     fi
     ;;
@@ -498,10 +561,10 @@ case "$(uname -s 2>/dev/null || true)" in
     # "Permission denied" in the rolling file appender.
     # Omitting -u lets the container run as its default (uid 1000)
     # which matches the volume owner. Keep the earlier rootless-Docker
-    # exception for commands that write host config: under rootless Docker,
+    # exception for commands that touch host binds: under rootless Docker,
     # UID 0 maps back to the invoking host user and is the only mapping that
-    # can write bind-mounted agent config reliably.
-    if ! { [ "${ROOTLESS_DOCKER}" -eq 1 ] && [ "${WRITES_HOST_FILES}" -eq 1 ]; }; then
+    # can access bind-mounted host files reliably.
+    if ! { [ "${ROOTLESS_DOCKER}" -eq 1 ] && [ "${TOUCHES_HOST_FILES}" -eq 1 ]; }; then
       USER_ARGS=()
     fi
     ;;
@@ -512,7 +575,7 @@ esac
 # same content the server sees. Bind-mount a host path if the user
 # overrode AI_MEMORY_DATA_DIR; otherwise use the named volume.
 DATA_ARGS=(-e "AI_MEMORY_DATA_DIR=/data")
-if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+if [ "${HOST_DATA_BIND}" -eq 1 ]; then
   DATA_ARGS+=(-v "${AI_MEMORY_DATA_DIR}:/data")
 else
   DATA_ARGS+=(-v "${DATA_VOLUME}:/data")

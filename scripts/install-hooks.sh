@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,10 +46,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
 
@@ -114,6 +115,17 @@ if [[ "$AGENT" == "kiro-cli" ]]; then
     SCRIPTS=(
         "session-start"
         "user-prompt-submit"
+        "pre-tool-use"
+        "post-tool-use"
+        "stop"
+    )
+fi
+
+# Command Code's stable hook API exposes exactly these four events. Additional
+# lifecycle boundaries belong to its experimental Mod API and are not shipped.
+if [[ "$AGENT" == "command-code" ]]; then
+    SCRIPTS=(
+        "session-start"
         "pre-tool-use"
         "post-tool-use"
         "stop"

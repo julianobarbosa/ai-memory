@@ -76,6 +76,8 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
+        McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
     };
@@ -210,6 +212,12 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
             .join("settings")
             .join("mcp.json"),
+        McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        McpClient::Swival => {
+            let cwd = std::env::current_dir()
+                .context("could not resolve current dir for .swival/mcp.json default")?;
+            swival_project_root(&cwd).join(".swival").join("mcp.json")
+        }
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -228,6 +236,22 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             zed_config_path_in(&config_dir, std::env::consts::OS)
         }
     })
+}
+
+/// Match Swival's own base-dir discovery: the nearest ancestor containing
+/// `.git` or `swival.toml`, falling back to the invocation directory.
+fn swival_project_root(start: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let mut current = resolved.as_path();
+    loop {
+        if current.join(".git").exists() || current.join("swival.toml").exists() {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            return resolved;
+        };
+        current = parent;
+    }
 }
 
 /// Resolve Zed's user settings from the platform config root. The root is
@@ -461,7 +485,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::AntigravityCli
         | McpClient::Devin
         | McpClient::KimiCode
-        | McpClient::KiroCli => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::KiroCli
+        | McpClient::CommandCode
+        | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -676,6 +702,23 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         }
         McpClient::KiroCli => {
             entry.insert("url".into(), json!(bedrock_flavored_mcp_url(server_url)));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::CommandCode => {
+            entry.insert("transport".into(), json!("http"));
+            entry.insert("enabled".into(), json!(true));
+            entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::Swival => {
+            // Swival .swival/mcp.json entry: `type: "http"` + `url` +
+            // optional headers (documented format).
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1145,11 +1188,34 @@ fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
          # Kiro accepts HTTPS remote endpoints and plain HTTP only on\n\
          # localhost. `?flavor=bedrock` removes unsupported root-level\n\
          # schema combinators while handler validation remains unchanged.\n\
-         # Lifecycle capture for the documented v2 engine is installed\n\
-         # separately with `install-hooks --agent kiro-cli`. Kiro v3 hook\n\
-         # capture remains unsupported pending fixture-verified lifecycle\n\
-         # and built-in tool payloads for its standalone schema.\n\
+         # Lifecycle capture is installed separately: use\n\
+         # `install-hooks --agent kiro-cli` for v2 or the explicit\n\
+         # `install-hooks --agent kiro-cli-v3` target for v3.\n\
          # Managed workstreams are not installed by this command.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Command Code — merge into ~/.commandcode/mcp.json:\n\
+         #\n\
+         # The equivalent CLI registration is:\n\
+         #   cmd mcp add --transport http --scope user {name} {url}\n\
+         # (`cmdc` is the native Windows executable name.)\n\
+         {snippet}\n",
+        name = args.name,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_swival(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Swival CLI — merge into .swival/mcp.json in the project root
+         # (Swival's documented default lookup; project-scoped by design), or
+         # re-run with --apply to merge it in place preserving other servers.
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -1309,6 +1375,32 @@ mod tests {
                 .unwrap()
                 .contains("MCP-only")
         );
+    }
+
+    #[test]
+    fn command_code_renderer_uses_documented_user_scope_http_schema() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::CommandCode)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "transport": "http",
+                        "enabled": true,
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        }
+                    }
+                }
+            })
+        );
+        let rendered = render_command_code(&args_for(McpClient::CommandCode)).unwrap();
+        assert!(rendered.contains("~/.commandcode/mcp.json"));
+        assert!(rendered.contains("cmd mcp add --transport http --scope user"));
+        assert!(rendered.contains("`cmdc` is the native Windows executable"));
     }
 
     #[test]
@@ -1561,6 +1653,8 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
+            McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1585,6 +1679,8 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
+            McpClient::CommandCode,
+            McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1623,6 +1719,8 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
+            McpClient::CommandCode,
+            McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1654,6 +1752,8 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
+            McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1813,7 +1913,7 @@ mod tests {
         assert!(kiro.contains("http://127.0.0.1:49374/mcp?flavor=bedrock"));
         assert!(!kiro.contains("\"transport\""));
         assert!(kiro.contains("install-hooks --agent kiro-cli"));
-        assert!(kiro.contains("Kiro v3 hook"));
+        assert!(kiro.contains("install-hooks --agent kiro-cli-v3"));
         let kiro_with_token = render_with_token(McpClient::KiroCli);
         assert!(kiro_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the
@@ -2246,6 +2346,70 @@ mod tests {
         assert_eq!(
             first_content, second_content,
             "second apply must produce identical bytes"
+        );
+    }
+
+    #[test]
+    fn swival_entry_and_apply_match_upstream_json_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join(".swival").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let mut args = args_with_token(McpClient::Swival);
+        args.config_file = Some(config_path.clone());
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second, "Swival MCP apply must be idempotent");
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["mcpServers"]["ai-memory"]["type"], "http");
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["url"],
+            "http://127.0.0.1:49374/mcp"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(
+            value["mcpServers"]["other"]["command"], "other-mcp",
+            "apply must preserve sibling servers"
+        );
+    }
+
+    #[test]
+    fn swival_project_root_matches_git_toml_and_fallback_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_root = tmp.path().join("git-project");
+        let git_nested = git_root.join("a").join("b");
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        fs::create_dir_all(&git_nested).unwrap();
+        assert_eq!(
+            swival_project_root(&git_nested),
+            fs::canonicalize(&git_root).unwrap()
+        );
+
+        let toml_root = tmp.path().join("toml-project");
+        let toml_nested = toml_root.join("src");
+        fs::create_dir_all(&toml_nested).unwrap();
+        fs::write(toml_root.join("swival.toml"), "").unwrap();
+        assert_eq!(
+            swival_project_root(&toml_nested),
+            fs::canonicalize(&toml_root).unwrap()
+        );
+
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            swival_project_root(&plain),
+            fs::canonicalize(&plain).unwrap()
         );
     }
 

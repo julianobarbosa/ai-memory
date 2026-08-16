@@ -5,15 +5,17 @@
 //! The MCP protocol carries no working-directory context: a `memory_query`
 //! call arrives with its arguments and nothing else, so a tool handler has
 //! no way to know which project the agent is sitting in. The lifecycle hooks
-//! *do* know — every `/hook` event carries the agent's `cwd`, and the hook
+//! *do* know — lifecycle `/hook` events carry the agent's `cwd`, and the hook
 //! router resolves it to the correct per-cwd `(workspace_id, project_id)`.
 //!
 //! In HTTP mode the `/hook` ingress and the `/mcp` endpoint live in the same
 //! process, so the hook router can publish "the project the user is currently
-//! active in" to this shared pointer, and the MCP tools can read it as their
-//! default instead of falling back to the server's static `--project` (which
-//! defaults to `scratch` and made the read tools return empty memory even
-//! when the hooks were correctly populating a real project).
+//! active in" to this shared pointer when work starts or advances, and the MCP
+//! tools can read it as their default instead of falling back to the server's
+//! static `--project` (which defaults to `scratch` and made the read tools
+//! return empty memory even when the hooks were correctly populating a real
+//! project). Completion events refresh exact actor-scoped entries only; a
+//! delayed tail from an older session must not redirect a shared fallback.
 //!
 //! ## Isolation modes
 //!
@@ -91,7 +93,59 @@ pub enum ActiveProjectMode {
     PerActor,
 }
 
+/// Selects how the hook router attributes MID-SESSION events whose cwd has
+/// moved since the session started. Set under `[routing] mid_session`.
+///
+/// Distinct from [`ActiveProjectMode`], which namespaces the in-process
+/// "current project" pointer: this decides the DURABLE project written on
+/// observations, and it never affects session-CREATING events — opening a
+/// session always resolves from its own cwd.
+///
+/// `FollowCwd` is the default and preserves the historical behavior exactly:
+/// every mid-session event re-resolves from its own cwd, so `cd`-ing into a
+/// sibling checkout routes those observations to that checkout's project.
+///
+/// `Sticky` treats mid-session navigation as navigation: the session's project
+/// stays the source of truth wherever the agent wanders. This matches the
+/// product's own model — `sessions.project_id` holds exactly one value, and
+/// consolidation writes one page in the session's project — so following the
+/// cwd splits a session's raw record across projects while its page lands in
+/// only one. A `.ai-memory.toml` marker still wins in both modes: naming a
+/// project is a deliberate rescope, not drift (#394).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MidSessionRouting {
+    /// Re-resolve every mid-session event from its own cwd. Historical
+    /// behavior, and the default.
+    #[default]
+    #[serde(alias = "follow_cwd")]
+    FollowCwd,
+    /// Inherit the session's project for every mid-session event, overruling
+    /// a host-derived repo-root override but never a marker-declared one.
+    Sticky,
+}
+
+impl MidSessionRouting {
+    /// Whether this mode lets an established session overrule a
+    /// non-deliberate (host-derived) project override.
+    #[must_use]
+    pub const fn overrules_derived_override(self) -> bool {
+        matches!(self, Self::Sticky)
+    }
+
+    /// Stable config/log representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowCwd => "follow-cwd",
+            Self::Sticky => "sticky",
+        }
+    }
+}
+
 /// Composite identity used to key per-actor entries.
+/// This cache key namespaces active-project pointers only; it does not
+/// namespace durable hook `SessionId` records.
 ///
 /// - `PerSession` mode populates only `session_id`.
 /// - `PerActor` mode populates both (`user` holds the qualified identity key:
@@ -353,6 +407,38 @@ impl ActiveProject {
                 Instant::now(),
             );
         }
+        guard.insert(
+            scoped,
+            workspace_id,
+            project_id,
+            default_global,
+            Instant::now(),
+        );
+    }
+
+    /// Refresh only the exact actor-scoped entry without advancing either
+    /// fallback slot.
+    ///
+    /// Hook completion events use this path so an exact `per_session` or
+    /// `per_actor` caller keeps a fresh mapping, while a delayed tail from an
+    /// older session cannot redirect the process-wide single slot or the
+    /// identity-only fallback used by a caller with no session coordinate.
+    /// `Single` mode and actors without a usable coordinate are no-ops.
+    pub fn set_scoped_for(
+        &self,
+        actor: &ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        default_global: bool,
+    ) {
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return;
+        }
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return;
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
         guard.insert(
             scoped,
             workspace_id,
@@ -731,6 +817,48 @@ mod tests {
         ap.set_for(&sess_b, ws, p_b, false);
         assert_eq!(ap.get_for(&sess_a), Some((ws, p_a)));
         assert_eq!(ap.get_for(&sess_b), Some((ws, p_b)));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_single_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerSession);
+        let ws = WorkspaceId::new();
+        let foreground = key_session("foreground");
+        let stale = key_session("stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&foreground), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&foreground));
+        assert!(!ap.default_global_for(&stale));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_per_actor_identity_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let ws = WorkspaceId::new();
+        let foreground = key_actor("alice", "foreground");
+        let stale = key_actor("alice", "stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        let identity_only = ActorKey {
+            user: Some("alice".to_string()),
+            session_id: None,
+        };
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&identity_only), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&identity_only));
+        assert!(!ap.default_global_for(&stale));
     }
 
     #[test]

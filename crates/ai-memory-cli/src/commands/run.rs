@@ -16,9 +16,10 @@ use ai_memory_core::{
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
     allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, has_native_session_selector, inspect_repository,
-    kiro_selects_non_default_engine, list_native_sessions, native_session_exists,
-    wait_for_transcript_flush,
+    export_transcript, has_native_session_selector, inspect_repository, kiro_explicit_session_id,
+    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
+    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
+    native_session_exists, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -37,13 +38,16 @@ const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
-const AUTO_HARNESSES: [ManagedHarness; 6] = [
+const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
     ManagedHarness::OpenCode,
     ManagedHarness::Pi,
     ManagedHarness::Crush,
     ManagedHarness::Kimi,
+    ManagedHarness::CommandCode,
+    ManagedHarness::Kiro,
+    ManagedHarness::KiroV3,
 ];
 
 #[derive(Debug, Clone)]
@@ -106,7 +110,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         Vec::new()
     };
     let provisional_harness = match args.harness {
-        Some(choice) => managed_harness(choice),
+        Some(choice) => managed_harness_for_args(choice, &native_args),
         None => auto_candidates
             .first()
             .map(|candidate| candidate.harness)
@@ -130,10 +134,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         worktree_fingerprint: repository.worktree_fingerprint,
         agent: provisional_harness.agent_kind(),
         automatic_harness,
-        available_agents: auto_candidates
-            .iter()
-            .map(|candidate| candidate.harness.agent_kind())
-            .collect(),
+        available_agents: unique_auto_agents(&auto_candidates),
         workstream: args.workstream,
         new_workstream: args.new_workstream,
         lease_owner: lease_owner(),
@@ -179,21 +180,38 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             "managed run interrupted before the agent started"
         )));
     }
-    let harness = if automatic_harness {
+    let resolved_harness = if automatic_harness {
         let resolved = prepared.resolved_agent.unwrap_or_else(|| {
             eprintln!(
                 "ai-memory: the server does not support managed harness precedence; using the newest checkout-local session. Upgrade the server for established-workstream selection"
             );
             provisional_harness.agent_kind()
         });
-        acquired_try!(managed_harness_from_agent(resolved).ok_or_else(|| {
+        let selected = acquired_try!(managed_harness_from_agent(resolved).ok_or_else(|| {
             anyhow!(
                 "the server selected unsupported automatic harness '{}'",
                 resolved.as_str()
             )
-        }))
+        }));
+        automatic_harness_flavor(
+            selected,
+            provisional_harness,
+            prepared.native_session_id.as_deref(),
+        )
     } else {
         provisional_harness
+    };
+    let harness = if resolved_harness.agent_kind() == AgentKind::KiroCli {
+        acquired_try!(resolve_kiro_harness(
+            &native_args,
+            prepared.native_session_id.as_deref(),
+            prepared.source_cursor.as_deref(),
+            resolved_harness,
+            &home,
+            &repository.cwd,
+        ))
+    } else {
+        resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
     let native_grok_rules = user_supplied_grok_rules(&native_args);
@@ -298,13 +316,32 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         // (`--trust-all-tools`); the v3 engine replaced it with
         // permissions.yaml and documents no CLI equivalent, so the wrapper
         // maps nothing there and says so instead of failing silently.
-        if harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args) {
+        if harness == ManagedHarness::KiroV3
+            || harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
+        {
             eprintln!(
                 "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
                  (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
             );
         }
         apply_yolo(harness, &mut plan.args);
+    }
+    let remove_kiro_home = if harness == ManagedHarness::KiroV3
+        && let Some(native_session_id) = plan.expected_session_id.as_deref()
+    {
+        acquired_try!(kiro_v3_resume_uses_default_store(
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            native_session_id,
+        ))
+    } else {
+        false
+    };
+    if remove_kiro_home {
+        eprintln!(
+            "ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"
+        );
     }
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
@@ -371,6 +408,9 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if remove_kiro_home {
+        command.env_remove("KIRO_HOME");
+    }
     if let Some(context) = &crush_context {
         command.env("CRUSH_GLOBAL_CONFIG", context.path());
     }
@@ -613,6 +653,32 @@ async fn list_auto_sessions(home: &Path, cwd: &Path) -> Result<Vec<AutoSessionCa
     Ok(found)
 }
 
+fn unique_auto_agents(candidates: &[AutoSessionCandidate]) -> Vec<AgentKind> {
+    let mut agents = Vec::new();
+    for candidate in candidates {
+        let agent = candidate.harness.agent_kind();
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    agents
+}
+
+fn automatic_harness_flavor(
+    selected: ManagedHarness,
+    provisional: ManagedHarness,
+    linked_session_id: Option<&str>,
+) -> ManagedHarness {
+    if selected == ManagedHarness::Kiro
+        && provisional.agent_kind() == AgentKind::KiroCli
+        && linked_session_id.is_none()
+    {
+        provisional
+    } else {
+        selected
+    }
+}
+
 fn filter_usable_auto_sessions(
     candidates: Vec<AutoSessionCandidate>,
     available: impl Fn(ManagedHarness) -> bool,
@@ -642,8 +708,61 @@ fn filter_usable_auto_sessions(
 
 fn no_auto_session_error() -> anyhow::Error {
     anyhow!(
-        "no Claude Code, Codex, OpenCode, Pi, Crush, or Kimi Code session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, or `ai-memory run kimi`"
+        "no Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, or Kiro CLI session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, `ai-memory run kimi`, `ai-memory run command-code`, or `ai-memory run kiro`"
     )
+}
+
+fn resolve_kiro_harness(
+    native_args: &[OsString],
+    linked_session_id: Option<&str>,
+    source_cursor: Option<&str>,
+    fallback: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+) -> Result<ManagedHarness> {
+    if kiro_selects_v3_engine(native_args) {
+        return Ok(ManagedHarness::KiroV3);
+    }
+    if kiro_selects_v2_engine(native_args) {
+        return Ok(ManagedHarness::Kiro);
+    }
+    if kiro_selects_non_default_engine(native_args) {
+        return Ok(ManagedHarness::Kiro);
+    }
+
+    let explicit_session_id = kiro_explicit_session_id(native_args);
+    if let Some(session_id) = explicit_session_id.as_deref().or(linked_session_id) {
+        let mut found = Vec::new();
+        for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+            let probe = build_launch_plan(harness, None, Vec::new(), None)?;
+            if native_session_exists(harness, home, cwd, probe.session_dir.as_deref(), session_id)?
+            {
+                found.push(harness);
+            }
+        }
+        match found.as_slice() {
+            [harness] => return Ok(*harness),
+            [_, _] => {
+                return Err(anyhow!(
+                    "Kiro session {} exists in both incompatible engine stores; use --fresh with an explicit --agent-engine v2 or --v3",
+                    display_session_id(session_id)
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // An exact user selector wins over the workstream's prior cursor. If its
+    // store is unavailable, keep Kiro's documented v2 default unless the user
+    // also selected v3 explicitly above.
+    if explicit_session_id.is_some() {
+        return Ok(ManagedHarness::Kiro);
+    }
+
+    if let Some(harness) = source_cursor.and_then(kiro_harness_from_source_cursor) {
+        return Ok(harness);
+    }
+    Ok(fallback)
 }
 
 fn remove_wrapper_yolo(args: &mut Vec<OsString>) -> bool {
@@ -1232,9 +1351,19 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::CommandCode => ManagedHarness::CommandCode,
         RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
+    }
+}
+
+fn managed_harness_for_args(choice: RunHarnessChoice, native_args: &[OsString]) -> ManagedHarness {
+    let harness = managed_harness(choice);
+    if harness == ManagedHarness::Kiro && kiro_selects_v3_engine(native_args) {
+        ManagedHarness::KiroV3
+    } else {
+        harness
     }
 }
 
@@ -1246,6 +1375,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::CommandCode => Some(ManagedHarness::CommandCode),
         AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
@@ -1662,6 +1792,34 @@ mod tests {
     }
 
     #[test]
+    fn command_code_aliases_select_the_managed_adapter() {
+        for name in ["command-code", "commandcode", "cmdc", "cmd"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--print"),
+                OsStr::new("continue here"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert!(
+                matches!(
+                    args.harness,
+                    Some(crate::cli::RunHarnessChoice::CommandCode)
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                args.native_args,
+                ["--print", "continue here"].map(OsString::from).to_vec()
+            );
+        }
+    }
+
+    #[test]
     fn kiro_cli_alias_selects_the_kiro_adapter() {
         for name in ["kiro", "kiro-cli"] {
             let cli = Cli::try_parse_from([
@@ -1685,6 +1843,118 @@ mod tests {
             );
             assert_eq!(managed_harness(args.harness.unwrap()), ManagedHarness::Kiro);
         }
+    }
+
+    #[test]
+    fn kiro_engine_resolution_prefers_explicit_args_then_persisted_flavor() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let v3_cursor = serde_json::json!({
+            "path": "/sanitized/messages.jsonl",
+            "offset": 42,
+            "flavor": "kiro-v3",
+            "prefix_sha256": "fixture"
+        })
+        .to_string();
+
+        assert_eq!(
+            managed_harness_for_args(RunHarnessChoice::Kiro, &[OsString::from("--v3")]),
+            ManagedHarness::KiroV3
+        );
+        assert_eq!(
+            resolve_kiro_harness(
+                &[],
+                Some("missing-session"),
+                Some(&v3_cursor),
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+            )
+            .unwrap(),
+            ManagedHarness::KiroV3
+        );
+        assert_eq!(
+            resolve_kiro_harness(
+                &[OsString::from("--agent-engine=v2")],
+                Some("sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e"),
+                Some(&v3_cursor),
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+            )
+            .unwrap(),
+            ManagedHarness::Kiro
+        );
+        assert_eq!(
+            resolve_kiro_harness(
+                &[
+                    OsString::from("--resume-id"),
+                    OsString::from("missing-explicit-session"),
+                ],
+                Some("sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e"),
+                Some(&v3_cursor),
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+            )
+            .unwrap(),
+            ManagedHarness::Kiro
+        );
+    }
+
+    #[test]
+    fn automatic_kiro_flavors_share_one_server_agent_identity() {
+        let candidates = vec![
+            AutoSessionCandidate {
+                harness: ManagedHarness::KiroV3,
+                session: NativeSessionCandidate {
+                    native_session_id: "v3".into(),
+                    updated_at: SystemTime::UNIX_EPOCH,
+                },
+            },
+            AutoSessionCandidate {
+                harness: ManagedHarness::Kiro,
+                session: NativeSessionCandidate {
+                    native_session_id: "v2".into(),
+                    updated_at: SystemTime::UNIX_EPOCH,
+                },
+            },
+        ];
+
+        assert_eq!(unique_auto_agents(&candidates), [AgentKind::KiroCli]);
+        assert_eq!(
+            automatic_harness_flavor(ManagedHarness::Kiro, ManagedHarness::KiroV3, None),
+            ManagedHarness::KiroV3
+        );
+        assert_eq!(
+            automatic_harness_flavor(ManagedHarness::Kiro, ManagedHarness::KiroV3, Some("linked"),),
+            ManagedHarness::Kiro
+        );
+    }
+
+    #[test]
+    fn incompatible_link_starts_fresh_in_the_explicit_kiro_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let (fresh, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::KiroV3,
+            None,
+            vec![OsString::from("--v3")],
+            Some("3f6d1c2a-0000-4000-8000-000000000aaa"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            orphaned.as_deref(),
+            Some("3f6d1c2a-0000-4000-8000-000000000aaa")
+        );
+        assert_eq!(fresh.expected_session_id, None);
+        assert_eq!(fresh.args, [OsString::from("--v3")]);
     }
 
     #[test]

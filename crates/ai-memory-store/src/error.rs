@@ -53,6 +53,11 @@ pub enum StoreError {
     #[error("writer actor is no longer running")]
     WriterClosed,
 
+    /// A hook tried to reuse a session id that belongs to another immutable
+    /// session tuple or operator. Deliberately carries no row details.
+    #[error("session collision")]
+    SessionCollision,
+
     /// A `spawn_blocking` task panicked or was cancelled.
     #[error("reader pool task did not complete: {0}")]
     PoolPanic(String),
@@ -135,4 +140,58 @@ pub enum StoreError {
     /// A live `ai-memory run` lease already owns the selected workstream.
     #[error("workstream is already active: {0}")]
     WorkstreamBusy(String),
+}
+
+impl StoreError {
+    /// Whether a hook admission failed because its cached scope was deleted or
+    /// moved after resolution.
+    #[must_use]
+    pub fn is_stale_session_scope_reference(&self) -> bool {
+        let Self::Sqlite(rusqlite::Error::SqliteFailure(error, message)) = self else {
+            return false;
+        };
+
+        error.code == rusqlite::ErrorCode::ConstraintViolation
+            && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+                || (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                    && message.as_deref()
+                        == Some("sessions.workspace_id does not match the project's workspace")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreError;
+
+    #[test]
+    fn stale_session_scope_reference_only_matches_fk_or_exact_pairing_trigger() {
+        let foreign_key = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            },
+            Some("FOREIGN KEY constraint failed".into()),
+        ));
+        assert!(foreign_key.is_stale_session_scope_reference());
+
+        let pairing_trigger = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+            },
+            Some("sessions.workspace_id does not match the project's workspace".into()),
+        ));
+        assert!(pairing_trigger.is_stale_session_scope_reference());
+
+        let other_trigger = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+            },
+            Some("other trigger".into()),
+        ));
+        assert!(!other_trigger.is_stale_session_scope_reference());
+        assert!(!StoreError::SessionCollision.is_stale_session_scope_reference());
+        assert!(!StoreError::InvalidState("invalid".into()).is_stale_session_scope_reference());
+    }
 }

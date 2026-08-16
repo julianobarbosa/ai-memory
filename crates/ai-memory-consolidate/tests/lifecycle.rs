@@ -262,10 +262,36 @@ async fn m8_retention_lifecycle_end_to_end() {
     assert_eq!(counts_before.pages_latest as usize, FIXTURES.len());
     assert_eq!(counts_before.pages_all as usize, FIXTURES.len());
 
-    let real = run_sweep(
+    // Destructive decay without the authoritative Wiki handle must fail
+    // closed. Mutating only SQLite would leave the files for reconciliation
+    // to recreate as live pages.
+    let no_wiki = run_sweep(
         &store.reader,
         &store.writer,
         None,
+        ws,
+        proj,
+        &params,
+        /* dry_run */ false,
+    )
+    .await
+    .expect("store-only sweep");
+    assert!(no_wiki.evicted.iter().all(|page| !page.deleted));
+    let counts_after_refusal = store
+        .reader
+        .status_counts()
+        .await
+        .expect("counts after refusal");
+    assert_eq!(
+        counts_after_refusal.pages_latest,
+        counts_before.pages_latest
+    );
+    assert_eq!(counts_after_refusal.pages_all, counts_before.pages_all);
+
+    let real = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
         ws,
         proj,
         &params,
@@ -276,6 +302,11 @@ async fn m8_retention_lifecycle_end_to_end() {
     assert!(!real.dry_run);
     let expected_evicted_count = FIXTURES.iter().filter(|f| f.expected_evicted).count();
     assert_eq!(real.evicted.len(), expected_evicted_count);
+    assert!(
+        real.evicted.iter().all(|page| page.deleted),
+        "every selected page should complete its wiki-backed eviction: {:?}",
+        real.evicted,
+    );
 
     let counts_after = store.reader.status_counts().await.expect("counts after");
     assert_eq!(
@@ -286,8 +317,17 @@ async fn m8_retention_lifecycle_end_to_end() {
     assert_eq!(
         counts_after.pages_all as usize,
         FIXTURES.len(),
-        "soft-delete preserves the row (kept for 180d hard-delete window)",
+        "eviction preserves a tombstone for the hard-delete grace period",
     );
+    let project_root = wiki.project_root(ws, proj);
+    for fixture in FIXTURES {
+        assert_eq!(
+            project_root.join(fixture.path).exists(),
+            !fixture.expected_evicted,
+            "the Markdown source must be removed exactly for evicted pages: {}",
+            fixture.path,
+        );
+    }
 
     // ── Phase 6 — FTS5 invariants ───────────────────────────────
     // Keywords unique to evicted pages should disappear from search.
@@ -690,7 +730,9 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
         .get_or_create_project(other_ws, "target", None)
         .await
         .expect("other workspace project");
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
 
     for (workspace_id, project_id, path, entity) in [
         (ws, target, "sessions/target.md", "target-entity"),
@@ -724,11 +766,13 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
     let conn = rusqlite::Connection::open(store.db_path()).expect("open aux conn");
     conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
     conn.execute(
-        "UPDATE pages SET is_latest = 0, superseded_at = 1, access_count = 0",
+        "UPDATE pages SET is_latest = 0, superseded_at = 1, access_count = 7",
         [],
     )
     .expect("age tombstone fixtures");
     drop(conn);
+    std::fs::remove_file(wiki.abs_path(ws, target, &PagePath::new("sessions/target.md").unwrap()))
+        .expect("simulate wiki-backed target eviction");
 
     let params = DecayParams {
         hard_delete_after_days: 0,
@@ -737,7 +781,7 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
     let report = run_sweep(
         &store.reader,
         &store.writer,
-        None,
+        Some(&wiki),
         ws,
         target,
         &params,
@@ -788,6 +832,245 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
         remaining_entities(other_ws, other_project),
         1,
         "other workspace entity index is preserved"
+    );
+}
+
+#[tokio::test]
+async fn rewritten_decay_eviction_removes_the_file_and_entire_version_chain() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("workspace");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "rewritten", None)
+        .await
+        .expect("project");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
+    let path = PagePath::new("sessions/rewritten.md").unwrap();
+
+    let write = |body: &str, entity: &str| WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: path.clone(),
+        frontmatter: serde_json::json!({"entities": [entity]}),
+        body: body.to_string(),
+        tier: Tier::Episodic,
+        pinned: false,
+        title: Some("Rewritten".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    };
+    let first = wiki
+        .write_page(write("# Rewritten\nfirst-version-marker", "first-entity"))
+        .await
+        .unwrap();
+    let second = wiki
+        .write_page(write("# Rewritten\nsecond-version-marker", "second-entity"))
+        .await
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = 1, access_count = 7 WHERE id = ?1",
+        params![second.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &DecayParams {
+            hard_delete_after_days: 0,
+            ..DecayParams::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.evicted.len(), 1);
+    assert!(report.evicted[0].deleted);
+    assert_eq!(
+        report.hard_deleted, 2,
+        "the evicted head and its superseded ancestor are both purged"
+    );
+    assert!(!wiki.abs_path(ws, proj, &path).exists());
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pages WHERE id IN (?1, ?2)",
+            params![first.as_bytes(), second.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let entities: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM entities WHERE workspace_id = ?1 AND project_id = ?2",
+            params![ws.as_bytes(), proj.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        entities, 0,
+        "orphaned entity rows are cleaned with the chain"
+    );
+    assert!(
+        store
+            .reader
+            .search_pages_for_project(ws, proj, "second-version-marker".into(), 5, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the deleted chain must leave no searchable FTS entry"
+    );
+}
+
+#[tokio::test]
+async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("workspace");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "recreated", None)
+        .await
+        .expect("project");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
+    let path = PagePath::new("sessions/recreated.md").unwrap();
+
+    let write = |body: &str| WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: path.clone(),
+        frontmatter: serde_json::json!({}),
+        body: body.to_string(),
+        tier: Tier::Episodic,
+        pinned: false,
+        title: Some("Recreated".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    };
+    let first = wiki
+        .write_page(write("# Recreated\nold one"))
+        .await
+        .unwrap();
+    let second = wiki
+        .write_page(write("# Recreated\nold two"))
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = 1 WHERE id = ?1",
+        params![second.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let grace = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &DecayParams {
+            hard_delete_after_days: 30,
+            ..DecayParams::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(grace.evicted[0].deleted);
+    assert_eq!(grace.hard_deleted, 0);
+    assert!(!wiki.abs_path(ws, proj, &path).exists());
+
+    // Simulate an external editor recreating the authoritative file before
+    // the watcher gets a chance to index it. Cleanup must notice and reindex
+    // this file rather than treating the absent latest row as permission to
+    // delete it.
+    std::fs::write(
+        wiki.abs_path(ws, proj, &path),
+        "# Recreated\nnew-live-marker",
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET superseded_at = 1 WHERE id = ?1",
+        params![second.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let cleanup = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &DecayParams {
+            cold_threshold: 0.0,
+            hard_delete_after_days: 0,
+            ..DecayParams::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(cleanup.evicted.is_empty());
+    assert_eq!(cleanup.hard_deleted, 2);
+    assert!(wiki.abs_path(ws, proj, &path).exists());
+    let recreated = store
+        .reader
+        .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+        .await
+        .unwrap()
+        .expect("the external recreation is indexed before cleanup");
+    assert_eq!(
+        store
+            .reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+            .await
+            .unwrap(),
+        Some(recreated),
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pages WHERE id IN (?1, ?2)",
+            params![first.as_bytes(), second.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_rows, 0);
+    assert!(
+        store
+            .reader
+            .search_pages_for_project(ws, proj, "new-live-marker".into(), 5, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|hit| hit.id == recreated),
+        "the recreated page and its FTS entry must survive old-chain cleanup"
     );
 }
 
