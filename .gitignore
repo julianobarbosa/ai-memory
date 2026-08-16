@@ -31,7 +31,11 @@ perf.data*
 # Sandbox marker (not project content).
 .ai-jail
 .claude/
+.codex/
+.gemini/
+.github/
 .slim/deepwork/
+_bmad-output/
 evals/runs/
 
 # ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
@@ -46,3 +50,4 @@ evals/runs/
 .bmad-loop/runs/
 .bmad-loop/cache/
 .bmad-loop/policy.toml
+_bmad/render/
