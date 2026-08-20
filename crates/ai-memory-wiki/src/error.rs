@@ -42,6 +42,12 @@ pub enum WikiError {
     /// already exists.
     #[error("destination dir already exists: {0}")]
     DestinationExists(String),
+
+    /// A move-session refused to overwrite an existing page file at the
+    /// destination (`<wiki_root>/<ws>/<proj>/sessions/<id>.md`). Surfaced as
+    /// `409 Conflict` at the admin layer.
+    #[error("destination page file already exists: {0}")]
+    DestinationPageExists(String),
 }
 
 impl From<serde_yaml::Error> for WikiError {

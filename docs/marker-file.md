@@ -392,7 +392,7 @@ Both entry points, as of v1.20:
   calling the server — `run`, `bootstrap`, `search`, `read-page`,
   `write-page`, `lint`, `curator`, `embed`, `pending-writes`,
   `forget-sweep`, `auto-improve`, `purge-project`, `rename-project`,
-  `move-project` (source side), and friends.
+  `move-project` and `move-session --from-project` (source side), and friends.
 
 Before v1.20 only the hooks read it. A checkout declaring
 `workspace = "acme"` therefore had its captures land in `acme` while every

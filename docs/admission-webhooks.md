@@ -72,6 +72,12 @@ Webhooks fire on these `op` values today (extensible enum):
   `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
   fired before the directory rename + DB re-stamp so a mirror can rename or
   reject the project move.
+- `move_session` — one session (its rows and its `sessions/<id>.md` page)
+  is moved to another project (`/admin/move-session`). Carries the source
+  project in `ctx.workspace` / `ctx.project`, destination names in
+  `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
+  fired before the page file moves and the DB re-stamps so a mirror can move
+  or reject it.
 - `handoff_begin` / `handoff_accept` / `handoff_cancel` — a handoff is created,
   consumed, or discarded. Carries the workspace / project and the acting
   operator, no page path (handoffs live in their own table, not the wiki tree).
@@ -121,7 +127,7 @@ within 750 ms is treated as a refusal and the baton remains open. Configure
 smaller per-webhook values when you need logs to identify which decider timed
 out rather than the aggregate deadline firing first.
 
-`delete` / `purge_project` / `purge_workspace` / `move_project` are notifications — there is no
+`delete` / `purge_project` / `purge_workspace` / `move_project` / `move_session` are notifications — there is no
 body to mutate; a `Reject`-policy webhook still aborts the operation
 (admission fires BEFORE the SQL destruction in both the `/admin/purge-project`
 and `/admin/delete-workspace` paths, and before source teardown in
@@ -184,10 +190,10 @@ terminal `purge_project` notification is unchanged.
 POST <webhook.url>
 Content-Type: application/json
 X-Memory-Op: write_page | consolidate | delete | purge_project | purge_workspace | move_project
-             | handoff_begin | handoff_accept | handoff_cancel
+             | move_session | handoff_begin | handoff_accept | handoff_cancel
 ```
 
-(The header is one of those nine values; the second line is a continuation of
+(The header is one of those ten values; the second line is a continuation of
 the list, not a second header.)
 
 ```jsonc
@@ -200,8 +206,8 @@ the list, not a second header.)
   "ctx": {
     "workspace": "default",                  // resolved name (see §5)
     "project": "ai-memory-ops",              // resolved name
-    "destination_workspace": "archive",       // move_project only; omitted otherwise
-    "destination_project": "ai-memory-ops",   // move_project only; omitted otherwise
+    "destination_workspace": "archive",       // move_project / move_session only; omitted otherwise
+    "destination_project": "ai-memory-ops",   // move_project / move_session only; omitted otherwise
     "actor": {                               // request-layer identity
       "agent": "claude-code",                // claude-code | codex | opencode | hook | cli | …
       "user": "djalmajr",                    // null when unauthenticated
@@ -209,7 +215,7 @@ the list, not a second header.)
       "client": "72836f52-...",              // DCR client UUID
       "session_id": "019e6d-..."
     },
-    "op": "write_page",                      // write_page | consolidate | delete | purge_project | purge_workspace | move_project
+    "op": "write_page",                      // write_page | consolidate | delete | purge_project | purge_workspace | move_project | move_session
     "partial_failure": true                  // purge_project/purge_workspace only, and ONLY when set
                                              //   (skipped on the wire when false).
                                              //   true → the DB rows were purged but

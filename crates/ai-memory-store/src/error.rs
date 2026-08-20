@@ -112,6 +112,16 @@ pub enum StoreError {
     #[error("workspace name '{0}' is already taken")]
     WorkspaceNameTaken(String),
 
+    /// A session move was rejected because the destination scope already has
+    /// a latest page at the session page path (`idx_pages_latest_path`), so
+    /// re-stamping the source versions would collide. The caller retries with
+    /// the regenerate mode or resolves the destination page first.
+    #[error("page path '{path}' already has a latest version in the destination scope")]
+    PagePathTaken {
+        /// The colliding wiki-relative page path.
+        path: String,
+    },
+
     /// The supplied workspace name failed validation (empty, slash, etc.).
     #[error("invalid workspace name: {0}")]
     InvalidWorkspaceName(String),

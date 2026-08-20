@@ -63,7 +63,7 @@ pub use curator::{
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
-pub use lint::{LintError, LintFinding, LintReport, run_lint};
+pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep, run_sweep_with_breadth};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,

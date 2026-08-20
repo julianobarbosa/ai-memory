@@ -342,7 +342,7 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     let home = tempfile::tempdir().unwrap();
     let extensions = home.path().join(".omp/agent/extensions");
     std::fs::create_dir_all(&extensions).unwrap();
-    let extension = extensions.join("ai-memory.ts");
+    let extension = extensions.join("ai-memory-omp.ts");
     let user_content = "// user-owned extension that happens to use this filename\n";
     std::fs::write(&extension, user_content).unwrap();
 
@@ -373,7 +373,7 @@ fn uninstall_pi_extension_deletes_only_generated_bridge_file() {
     let home = tempfile::tempdir().unwrap();
     let extensions = home.path().join(".pi/agent/extensions");
     std::fs::create_dir_all(&extensions).unwrap();
-    let extension = extensions.join("ai-memory.ts");
+    let extension = extensions.join("ai-memory-pi.ts");
     let user_content = "// user-owned Pi extension\n";
     std::fs::write(&extension, user_content).unwrap();
 

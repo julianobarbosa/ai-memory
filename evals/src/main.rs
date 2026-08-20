@@ -371,6 +371,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // Match the product default so provider comparisons exercise the
             // same schema-constrained path operators receive.
             compat_strict: true,
+            request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 }

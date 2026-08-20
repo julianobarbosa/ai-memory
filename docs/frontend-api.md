@@ -11,7 +11,7 @@
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
 | `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
@@ -67,10 +67,10 @@ with one of these statuses:
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`. |
+| `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`, malformed session id, unknown observation `kinds` or `order`. |
 | `401 Unauthorized` | bearer missing or wrong. |
 | `403 Forbidden` | Host header not in allowlist; or a non-root caller requests `all_owners=true`. |
-| `404 Not Found` | workspace, project, or page doesn't exist; or page file missing on disk. |
+| `404 Not Found` | workspace, project, or page doesn't exist; page file missing on disk; or a session id that is not visible in that project for the caller. |
 | `500 Internal Server Error` | reader pool / SQLite failure. Body is always the fixed `{"error":"internal server error"}`; the underlying cause is logged server-side rather than returned, so it cannot leak paths or configuration to a browser. |
 
 ## 4. Endpoint reference
@@ -443,18 +443,113 @@ fresh tab gets the icon without an HTTP Basic prompt, and the
 embedded PNG is the same one any visitor to `/web` already sees, so
 the info-leak surface is nil.
 
+### 4.11 Sessions
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/sessions?limit=20&offset=0&include_open=false
+```
+
+Sessions that touched the project, newest first: a session is listed when its
+row is anchored in the project OR at least one of its observations landed
+there, so a session that changed repositories mid-flight shows up in both.
+`observation_count` counts only this project's rows. `limit` clamped
+`1..=100`, default `20`; `offset` default `0`; `include_open` default
+`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+caller the server can name sees their own sessions plus unattributed ones;
+an unnamed caller sees unattributed ones only. Never cached (`no-store`).
+
+**Response:** `{ "sessions": [SessionSummary, ...] }`
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+      "cwd": "/home/me/src/app",
+      "agent_kind": "claude-code",
+      "started_at": "2026-08-16T09:12:03.412Z",
+      "ended_at": "2026-08-16T10:47:55.001Z",
+      "observation_count": 143,
+      "actor_user": null
+    }
+  ]
+}
+```
+
+### 4.12 Session observations
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/sessions/{session_id}/observations?limit=50&offset=0&order=asc&kinds=user-prompt,stop&q=migration&body_max_chars=4000
+```
+
+One session's raw hook observations (prompts, tool calls, stops) as stored,
+paged. Only rows that landed in `{workspace}/{project}` are returned;
+`elided_other_scope` counts rows the same session left in another project.
+The session must be visible under the same predicate as 4.11 (row or
+observation in the project, owner filter passes), otherwise `404`. `limit`
+clamped `1..=200`, default `50`; `offset` default `0`; `order` is `asc`
+(capture order, default) or `desc`; `kinds` is a comma-separated list of
+`session-start`, `user-prompt`, `pre-tool-use`, `post-tool-use`,
+`pre-compact`, `post-compaction`, `notification`, `stop`, `session-end`,
+`other`; `q` is an FTS5 query restricted to the session; `body_max_chars`
+clamped `200..=16384`, default `4000`, and a longer body ends with a visible
+`[body truncated; N chars omitted]` marker. `total` counts the in-scope
+rows matching `kinds` and `q`, so paginate on `offset` without a second
+call. Bodies were sanitized and bounded on ingest; treat them as untrusted
+historical text. Never cached (`no-store`). Same payload as the MCP tool
+`memory_read_session_observations`.
+
+**Response:** `{ "session": SessionSummary, "observations": [ObservationRecord, ...], "total", "offset", "limit", "order", "elided_other_scope", "body_max_chars" }`
+
+```json
+{
+  "session": {
+    "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+    "cwd": "/home/me/src/app",
+    "agent_kind": "claude-code",
+    "started_at": "2026-08-16T09:12:03.412Z",
+    "ended_at": "2026-08-16T10:47:55.001Z",
+    "observation_count": 143,
+    "actor_user": null
+  },
+  "observations": [
+    {
+      "id": "0198f0a2-4d5e-7f60-9a0b-1c2d3e4f5a6b",
+      "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+      "kind": "user-prompt",
+      "title": "User prompt",
+      "body": "Add a migration for the sessions table ...",
+      "importance": 5,
+      "created_at": "2026-08-16T09:12:10.020Z",
+      "extension": null,
+      "source_event": null
+    }
+  ],
+  "total": 12,
+  "offset": 0,
+  "limit": 50,
+  "order": "asc",
+  "elided_other_scope": 0,
+  "body_max_chars": 4000
+}
+```
+
 ## 5. Limits and pagination
 
-- Most `limit` query params clamp to `1..=100`; handoff history clamps to
-  `1..=200`.
+- Most `limit` query params clamp to `1..=100`; handoff history and
+  session observations clamp to `1..=200`. Session listing and session
+  observations take an `offset`; observations also report `total`.
+- Session observation bodies are capped per row by `body_max_chars`
+  (`200..=16384`, default `4000`) with a visible truncation marker.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
 - **Cache-Control + ETag.** Identity-independent read endpoints use
   `Cache-Control: private, max-age=N` with an endpoint-specific TTL; page reads
   also carry a SHA-256 `ETag`, and a matching `If-None-Match` receives `304 Not
-  Modified`. Briefing, overview and handoff-list responses depend on the
-  authenticated actor and therefore use `Cache-Control: private, no-store`, so
+  Modified`. Briefing, overview, handoff-list, session-list and session
+  observation responses depend on the authenticated actor and therefore use
+  `Cache-Control: private, no-store`, so
   a browser cannot reuse Alice's prompt-derived response after credentials at
   the same URL switch to Bob. Search responses are not cacheable because the
   request body affects the result.
@@ -588,7 +683,8 @@ Read these:
 | | Location |
 |---|---|
 | Route registration + handler bodies | `crates/ai-memory-web/src/routes/api.rs` |
-| Response structs (`PageHit`, `WorkspaceSummary`, `BriefingSnapshot`, `HealthPage`, …) | `crates/ai-memory-store/src/reader.rs` |
+| Response structs (`PageHit`, `WorkspaceSummary`, `BriefingSnapshot`, `HealthPage`, `SessionSummary`, `ObservationRecord`, …) | `crates/ai-memory-store/src/reader.rs` |
+| Session listing + per-session observation readers (`sessions_for_scope`, `session_summary_scoped`, `session_observations_scoped`) | `crates/ai-memory-store/src/reader.rs` |
 | 27 integration tests covering every endpoint (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/routes.rs` |
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |

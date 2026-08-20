@@ -221,9 +221,17 @@ cargo deny check                                          # dependency policy (i
   `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
-  listed in `ci.yml`), differential gitleaks scanning, and a non-gating
-  Windows test job. `.github/workflows/secret-scan.yml` runs the separate
-  weekly/manual full-history gitleaks scan.
+  listed in `ci.yml`), and differential gitleaks scanning.
+  `.github/workflows/secret-scan.yml` runs the separate weekly/manual
+  full-history gitleaks scan.
+- **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
+  every push to `main`, nightly, on demand, and on any PR labelled
+  `windows`. It is the only place `#[cfg(windows)]` tests compile, and it
+  is ~4x slower than the same tests on Linux — keeping it out of `ci.yml`
+  is what holds PR feedback near the eight minutes the gating jobs take.
+  **Add the `windows` label** to a PR touching path handling, file
+  locking, or git plumbing, so the check runs before the merge rather
+  than after it.
 
 ## Code style guidelines
 
@@ -361,7 +369,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 17 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 18 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys); major = breaking (on-disk format
   without migration, removed subcommands, breaking MCP schema changes).

@@ -399,6 +399,23 @@ docker cp ai-memory:/data/wiki ./my-ai-memory-wiki
 docker exec ai-memory git -C /data/wiki log --oneline
 ```
 
+## Move a session to another project
+
+A session captured under the wrong project (a `cd` into a scratch
+directory, a subagent started elsewhere) can be reattached without a
+reorg of the whole store:
+
+```bash
+ai-memory move-session <session-id> --to my-project            # dry run
+ai-memory move-session <session-id> --to my-project --confirm  # apply
+ai-memory move-session --from-project tmp --to my-project --confirm
+```
+
+The session, its observations, handoffs, consolidation jobs and its
+`sessions/<id>.md` page move together; see
+[`docs/lifecycle-ops.md`](lifecycle-ops.md#move-session) for the page modes,
+guards, and what stays behind.
+
 ## Project consolidation preferences
 
 Create `_prompts/consolidation.md` in a project's wiki when its compiled pages

@@ -26,6 +26,16 @@
 //!   otherwise parse the first balanced `{…}` from the text body.
 //!   No tenacity-style 8-128s backoff (cognee #2840 lesson).
 
+/// Default per-request timeout applied by every chat provider.
+///
+/// 300s tolerates Ollama / llama-swap cold-loading a 30B+ model from disk
+/// on first request. Once `OLLAMA_KEEP_ALIVE` keeps it warm, subsequent
+/// requests return in seconds — but the first one after the model unloaded
+/// needs the headroom. Slow hosted gateways that stream long completions
+/// may need more; operators override it with `AI_MEMORY_LLM_TIMEOUT_SECS`
+/// (read once by `Config::load`, applied to every chat provider).
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;

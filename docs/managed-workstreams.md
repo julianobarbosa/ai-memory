@@ -560,3 +560,53 @@ Antigravity-to-Codex-to-Antigravity round trip (`agy` and `antigravity-cli` are
 accepted aliases), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
 calls, or
 `AI_MEMORY_ACCEPTANCE_KEEP=1` to retain all temporary logs and data.
+
+## Running inside Herdr
+
+[Herdr](https://herdr.dev/) is a terminal workspace manager that tracks which
+agent runs in each pane. It identifies the agent from the pane's foreground
+process, falling back to matching the agent's own screen output against
+per-agent manifests.
+
+`ai-memory run` sits awkwardly between the two. The foreground process is the
+wrapper and the agent is its child — one process group whose leader is
+`ai-memory` — so process detection does not find the agent. The pane resolves
+only once the harness paints a title Herdr recognizes, which can be well after
+launch and may never happen for a harness whose output matches no manifest.
+Until then Herdr's agents pane shows nothing for that pane.
+
+ai-memory does not try to fix this from the inside, deliberately. Herdr's hint
+for wrapper commands, `HERDR_AGENT`, is scoped to the pane's foreground
+process, and a process cannot amend its own environment after exec — so the
+wrapper has no way to describe itself to Herdr once it is already running.
+Setting the variable on the agent it spawns would put it somewhere Herdr does
+not look for it.
+
+Two things work today.
+
+**Name the agent on the command**, where Herdr does look:
+
+```bash
+HERDR_AGENT=codex ai-memory run codex
+```
+
+**Or install Herdr's own agent integration**, which is the better answer:
+
+```bash
+herdr integration install codex
+herdr integration install claude
+```
+
+An installed integration reports agent identity and lifecycle state over
+Herdr's socket and is authoritative regardless of process detection — so the
+wrapper stops mattering entirely. It also upgrades what Herdr can show: real
+`idle` / `working` / `blocked` signals instead of inferring from the screen,
+which cannot reliably see `blocked` at all.
+
+These are separate mechanisms writing to separate files: Herdr's integration
+installs its own hook script (`~/.claude/hooks/herdr-agent-state.sh` for Claude
+Code, `~/.codex/herdr-agent-state.sh` for Codex), while ai-memory's lifecycle
+hooks live in the agent's own config. ai-memory's installer preserves foreign
+entries rather than replacing them, so re-running `ai-memory install-hooks`
+will not remove Herdr's. Back up the agent's config and diff it after
+installing either one if you want to be sure the other survived.

@@ -14,8 +14,11 @@
 //! ## What we redact
 //!
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
-//! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_…, GitHub PATs,
-//! Google AIza…, Slack xoxb/xoxp…, AWS AKIA…), PEM-bracketed private
+//! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
+//! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
+//! github_pat_…, Google AIza… plus OAuth refresh tokens 1//…, Meta /
+//! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
+//! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
 //! anything matching the generic `*_(KEY|TOKEN|SECRET|PASSWORD|
 //! CREDENTIAL)=value` shape. Operators can extend the list via
@@ -50,12 +53,55 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#,
     // Vendor-prefixed API keys.
     r"sk-[A-Za-z0-9_\-]{16,}",
-    r"sk_live_[A-Za-z0-9_\-]{16,}",
-    r"ghp_[A-Za-z0-9]{20,}",
+    // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
+    // full-access, but the scope is operator-chosen and routinely includes
+    // charges/refunds — not meaningfully safer than `sk_live_`.
+    r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}",
+    // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
+    // what `gh auth login` stores on disk), `ghu_` (user-to-server),
+    // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
+    r"gh[pousr]_[A-Za-z0-9]{20,}",
     r"github_pat_[A-Za-z0-9_]{20,}",
-    r"AKIA[0-9A-Z]{12,}",
+    // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
+    //
+    // Anchored to the exact published format — a 4-character prefix plus
+    // sixteen more, twenty in total — rather than an open `{12,}` tail.
+    // `ASIA` is also an English word, and an open tail redacted ordinary
+    // uppercase text: `ASIAPACIFICREGION` and `ASIAEAST1CLUSTER` were both
+    // destroyed. That is worse than it sounds here, because the strip runs
+    // BEFORE storage and is irreversible: the observation loses the text with
+    // no error and no way to recover it. The word boundaries keep a real key
+    // from being missed when it sits inside punctuation.
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     // Naked Google / Gemini API keys.
     r"AIza[A-Za-z0-9_\-]{30,}",
+    // Google OAuth refresh tokens. Longer-lived than the AIza keys above:
+    // they mint fresh access tokens until explicitly revoked, so a leaked
+    // one outlives the session it came from.
+    r"1//[0-9A-Za-z_\-]{20,}",
+    // Meta / Facebook Graph API access tokens (ad accounts, pages,
+    // business management).
+    r"EAA[A-Za-z0-9]{20,}",
+    // Telegram bot tokens: <bot-id>:<secret>. Grants full control of the bot,
+    // including reading every message it can see. Two branches on purpose:
+    //  - `AA…` is the shape every issued token has taken, left open-ended so a
+    //    future length change cannot silently retire the rule.
+    //  - the second branch matches the shape Telegram's own docs publish
+    //    (`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` — 6-digit id, no `AA`),
+    //    length-anchored because without the `AA` anchor a bare `\d+:[\w-]+`
+    //    also matches timestamps, ratios, `host:port` maps, SRT cues and
+    //    `<short-sha>:<hex>` pairs.
+    // Thanks to @tahazarif10 for spotting that the documented example fell
+    // outside the original `\d{8,10}:AA…` form.
+    r"\b\d{6,10}:(?:AA[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-]{34,35})\b",
+    // GoHighLevel Private Integration Tokens. The `pit-` prefix is what the
+    // vendor documents (their MCP guide shows `Bearer pit-your-token`); the
+    // tail is NOT documented anywhere, and every token observed in the wild
+    // carries a UUID. Anchoring on the UUID shape rather than a permissive
+    // tail is deliberate: `pit-` is also an English fragment, so
+    // `pit-[A-Za-z0-9\-]{20,}` would redact "pit-stop-strategy-analysis".
+    // These tokens do not expire until manually revoked.
+    r"pit-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
     // Slack tokens (bot/user/admin/app-level/refresh).
     r"xox[abprs]-[A-Za-z0-9\-]{10,}",
     r"xapp-[A-Za-z0-9\-]{10,}",
@@ -254,14 +300,184 @@ mod tests {
 
     #[test]
     fn scrubs_naked_google_api_key() {
-        // Fixture is the AIzaSy… shape with random hex padding, NOT a
-        // real key. A previous iteration of this file used a live
-        // value as the fixture; do not do that — automated scanners
-        // (GitGuardian, Google's own) will pick it up and you'll
-        // spend an hour rotating credentials.
-        let out = s().scrub("the key AIzaSy0123456789abcdefghijklmnopqrstuvwx is leaked");
+        // Fixture is the AIzaSy… shape, NOT a real key. A previous
+        // iteration of this file used a live value as the fixture; do not
+        // do that — automated scanners (GitGuardian, Google's own) will
+        // pick it up and you'll spend an hour rotating credentials.
+        //
+        // Kept to 36 characters on purpose. At 40 it also matched the shape
+        // of an AWS *secret* access key (40 chars of the base64 alphabet),
+        // and GitHub push protection blocked pushes of any branch carrying
+        // this file. Google's rule only needs `AIza` plus 30, so the shorter
+        // fixture still exercises it.
+        let out = s().scrub("the key AIzaSyFAKEfake0123456789abcdefghijkl is leaked");
         assert!(out.contains("[REDACTED]"));
         assert!(!out.contains("AIzaSy"));
+    }
+
+    // Every fixture below is a SHAPE, never a live value — same rule as the
+    // AIzaSy… test above, and the same `FAKE` convention used by the
+    // `ghp_FAKE…` fixture in ai-memory-wiki. Keep them obviously synthetic
+    // so credential scanners do not flag this repository.
+
+    #[test]
+    fn scrubs_all_github_token_prefixes() {
+        // ghp_ was already covered; gho_/ghu_/ghs_/ghr_ were not, and gho_
+        // is the prefix `gh auth login` writes to disk.
+        for tok in [
+            "ghp_FAKEfakeFAKEfakeFAKEfake012345678",
+            "gho_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghu_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghs_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghr_FAKEfakeFAKEfakeFAKEfake012345678",
+        ] {
+            let out = s().scrub(&format!("token={tok}"));
+            assert!(out.contains("[REDACTED]"), "not redacted: {tok}");
+            assert!(!out.contains("FAKEfake"), "leaked: {tok}");
+        }
+    }
+
+    /// The strip runs before storage and cannot be undone, so a pattern that
+    /// over-matches destroys captured content silently. Every other test here
+    /// asserts that a secret IS redacted; these assert that ordinary text is
+    /// NOT — the direction that was missing when `ASIA` shipped with an open
+    /// tail and started eating uppercase identifiers.
+    #[test]
+    fn leaves_ordinary_text_untouched() {
+        let s = s();
+        for text in [
+            // `ASIA` is an English word. These are the exact shapes an open
+            // `(?:AKIA|ASIA)[0-9A-Z]{12,}` tail destroyed.
+            "ASIAPACIFICREGION",
+            "rollout to ASIAEAST1CLUSTER tonight",
+            "ASIAPAC revenue summary",
+            // `pit-` is an English fragment; the UUID anchor is what keeps
+            // this readable rather than a permissive `pit-[A-Za-z0-9-]{20,}`.
+            "pit-stop-strategy-analysis for the race",
+            // Bare prefixes with nothing key-shaped after them.
+            "the AKIA meeting notes",
+            "EAA is the airport code",
+            // Colon-separated pairs that are not Telegram tokens.
+            "timestamp 1234567:30 remaining",
+            "map 127.0.0.1:8080 to the proxy",
+        ] {
+            assert_eq!(
+                s.scrub(text),
+                text,
+                "ordinary text must survive the strip verbatim: {text}"
+            );
+        }
+    }
+
+    /// A real key is still caught at its published length, and inside
+    /// punctuation, so anchoring the format did not open a hole.
+    #[test]
+    fn still_scrubs_aws_keys_at_their_published_length() {
+        let s = s();
+        for text in [
+            "AKIAFAKEFAKEFAKEFAKE",
+            "aws_access_key_id=ASIAFAKEFAKEFAKEFAKE",
+            "(AKIAFAKEFAKEFAKEFAKE)",
+            "\"ASIAFAKEFAKEFAKEFAKE\",",
+        ] {
+            let out = s.scrub(text);
+            assert!(out.contains("[REDACTED]"), "not redacted: {text}");
+            assert!(!out.contains("FAKEFAKE"), "leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn scrubs_aws_temporary_session_key_id() {
+        // ASIA… is an STS short-lived key id; AKIA… was already covered.
+        let out = s().scrub("aws_access_key_id ASIAFAKEFAKEFAKEFAKE");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("ASIAFAKE"));
+    }
+
+    #[test]
+    fn scrubs_stripe_restricted_key() {
+        let out = s().scrub("stripe=rk_live_FAKEfakeFAKE1234");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfakeFAKE"));
+    }
+
+    #[test]
+    fn scrubs_meta_graph_access_token() {
+        let out = s().scrub("fb=EAAFAKEfakeFAKEfake0123456789");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+    }
+
+    #[test]
+    fn meta_pattern_does_not_eat_short_base64_runs() {
+        // Negative control. The OpenSSH fixture in
+        // `scrubs_pem_private_key_block` contains the substring "EAAAAA";
+        // the {20,} tail is what stops `EAA…` from matching every base64
+        // blob that happens to contain it.
+        let out = s().scrub("harmless b3BlbnNzaC1rZXktdjEAAAAA value");
+        assert!(!out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn scrubs_google_oauth_refresh_token() {
+        let out = s().scrub("refresh_token: 1//0gFAKEfakeFAKEfake0123456789");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+    }
+
+    #[test]
+    fn scrubs_telegram_bot_token() {
+        let out = s().scrub("TG 123456789:AAFAKEfakeFAKEfakeFAKEfake0123456789 done");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+        assert!(out.contains("done"), "should not swallow trailing context");
+    }
+
+    #[test]
+    fn scrubs_telegram_documented_example_shape() {
+        // Regression for #408: Telegram's own Bot API docs publish
+        // `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` — a 6-digit id and no
+        // `AA` prefix — which the original `\d{8,10}:AA…` form could not match.
+        // This is the vendor's placeholder, not a live token.
+        let out = s().scrub("token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 ok");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("ABC-DEF1234"));
+        assert!(out.contains("ok"), "should not swallow trailing context");
+    }
+
+    #[test]
+    fn telegram_pattern_does_not_eat_colon_separated_prose() {
+        // Negative control, and the reason the non-`AA` branch is
+        // length-anchored rather than open-ended: dropping the anchor entirely
+        // makes `\d+:[\w-]+` match all of these.
+        for benign in [
+            "built 2026:08 release notes",
+            "aspect ratio 16:9 widescreen",
+            "ports 8080:my-service-name-here",
+            "00:00:00,000 --> 00:00:04,120 caption",
+            "commit 12345678:deadbeefcafebabe0123456789abcdef",
+        ] {
+            let out = s().scrub(benign);
+            assert!(!out.contains("[REDACTED]"), "false positive on: {benign}");
+        }
+    }
+
+    #[test]
+    fn scrubs_gohighlevel_private_integration_token() {
+        // Uppercase hex on purpose: the vendor documents no case, so the
+        // pattern accepts both. DEADBEEF/CAFEBABE keeps the fixture
+        // unmistakably synthetic.
+        let out = s().scrub("ghl=pit-DEADBEEF-FACE-4B0B-BEEF-CAFEBABE1234");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("DEADBEEF"));
+    }
+
+    #[test]
+    fn ghl_pattern_does_not_eat_hyphenated_english() {
+        // Negative control, and the reason the tail is UUID-anchored rather
+        // than permissive: `pit-` is an ordinary English fragment.
+        let out = s().scrub("planning the pit-stop-strategy-analysis for turn 4");
+        assert!(!out.contains("[REDACTED]"));
     }
 
     #[test]

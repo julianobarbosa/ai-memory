@@ -294,11 +294,22 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let plugin = install_hooks::opencode_plugin_path()?;
         push_generated_delete(&mut plan, plugin, DeleteKind::OpenCodePlugin);
 
-        let omp = install_hooks::omp_extension_path()?;
-        push_generated_delete(&mut plan, omp, DeleteKind::OmpExtension);
+        let omp_profile = args.profile.as_deref();
+        let omp = install_hooks::omp_extension_path(omp_profile)?;
+        push_generated_delete(&mut plan, omp.clone(), DeleteKind::OmpExtension);
+
+        let legacy_omp = omp.with_file_name("ai-memory.ts");
+        if legacy_omp != omp {
+            push_generated_delete(&mut plan, legacy_omp, DeleteKind::OmpExtension);
+        }
 
         let pi = install_hooks::pi_extension_path()?;
-        push_generated_delete(&mut plan, pi, DeleteKind::PiExtension);
+        push_generated_delete(&mut plan, pi.clone(), DeleteKind::PiExtension);
+
+        let legacy_pi = pi.with_file_name("ai-memory.ts");
+        if legacy_pi != pi {
+            push_generated_delete(&mut plan, legacy_pi, DeleteKind::PiExtension);
+        }
 
         let openclaw_dir = openclaw_plugin::default_plugin_dir()?;
         push_generated_delete(

@@ -30,7 +30,7 @@
 | Cursor | Supported | MCP config + lifecycle hooks. |
 | Gemini CLI | Supported | MCP config + lifecycle hooks. |
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
-| Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
+| Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory-pi.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Crush | Managed-only | `ai-memory run crush` resumes its project-local session database and supplies portable context through a temporary supported global-context file; no lifecycle-hook installer is provided. |
 | Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, both incompatible Kiro CLI engines, OMP, Grok Build CLI, and Antigravity CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
@@ -172,6 +172,7 @@ priors are at the [bottom](#influences-and-prior-art).
   bridge via `install-mcp --session-aware`.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`,
+  `move-session`,
   `audit-contamination`, `lint`, `curator`, `auto-improve`,
   `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup`,
   `finalize-session` are
@@ -898,8 +899,8 @@ Recommended defaults:
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
-| `gemini` | `gemini-2.5-flash` | Google-hosted option with a generous free tier. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
@@ -965,6 +966,14 @@ automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
 validated minimums are 6,000 input and 1,000 output tokens.
 
+Every chat provider bounds each completion request at 300 seconds
+(`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in
+config.toml; the quick openai-oauth token refresh keeps the default ceiling).
+The default tolerates a local engine cold-loading a large model; slow hosted
+gateways whose long completions exceed the ceiling fail every request with
+`http: error sending request`, so raise the value there instead of watching
+consolidation exhaust its retries.
+
 Reranking is optional and off by default. With an LLM provider configured,
 `AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
 calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
@@ -988,7 +997,7 @@ bounded page-authority adjustment after candidate generation; embeddings
 improve relevance recall but do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
 [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
 for the empirical model comparison.
 

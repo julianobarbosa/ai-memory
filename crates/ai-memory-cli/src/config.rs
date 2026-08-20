@@ -140,6 +140,16 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// Per-request timeout (seconds) applied to every chat
+    /// completion request and to the Copilot token exchange; the
+    /// openai-oauth token refresh keeps the built-in default ceiling
+    /// (it is a quick grant exchange). Defaults to
+    /// `ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS` (300s), which
+    /// tolerates a local engine cold-loading a large model. Raise it
+    /// for slow hosted gateways whose long completions exceed the
+    /// ceiling (observed with free aggregator tiers). Set with
+    /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
+    pub llm_timeout_secs: u64,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -156,6 +166,17 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
+    /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
+    /// contract) on every `tools/list`, regardless of client or `?flavor=`
+    /// marker. Moonshot and Bedrock reject root combinators with a 400, and
+    /// generic MCP clients (OpenCode, Cursor) never send the flavor marker —
+    /// so operators routing through a strict upstream can opt in here.
+    /// Runtime "exactly one of" validation is unchanged and remains the
+    /// enforcement backstop (issue #412). Set with
+    /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true` or `strip_root_combinators = true`
+    /// in config.toml.
+    pub strip_root_combinators: bool,
     /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
     /// supported: LLM-as-judge over the configured LLM provider, so it
     /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
@@ -541,8 +562,10 @@ impl Default for Config {
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: true,
+            llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             consolidate_on_session_end: false,
             capture_assistant: false,
+            strip_root_combinators: false,
             reranker: None,
             embedding_provider: None,
             embedding_model: None,
@@ -907,6 +930,15 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
+        // Zero (or a sub-second remainder rounded down) would cut every
+        // provider request off before it is sent.
+        if config.llm_timeout_secs == 0 {
+            anyhow::bail!(
+                "llm_timeout_secs must be at least 1 second (got {}); \
+                 AI_MEMORY_LLM_TIMEOUT_SECS is read in seconds",
+                config.llm_timeout_secs
+            );
+        }
 
         Ok(config)
     }
@@ -948,7 +980,7 @@ impl Config {
                 ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
-                ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
+                ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
@@ -973,6 +1005,7 @@ impl Config {
                 .clone()
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
+            request_timeout_secs: self.llm_timeout_secs,
         }))
     }
 
@@ -1291,6 +1324,10 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
+        assert_eq!(
+            cfg.llm_timeout_secs,
+            ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS
+        );
         assert!(!cfg.auth.secure_cookie);
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
@@ -1425,6 +1462,32 @@ mod tests {
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
         assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+    }
+
+    /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
+    /// slow hosted gateways can outlive the 300s default; the accepted floor
+    /// mirrors that motivation — anything below one second severs every
+    /// provider request before it is sent.
+    #[test]
+    fn load_round_trips_a_custom_llm_request_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_timeout_secs = 900\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.llm_timeout_secs, 900);
+    }
+
+    #[test]
+    fn load_rejects_a_zero_llm_request_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_timeout_secs = 0\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a sub-second timeout must fail closed");
+        assert!(
+            error.to_string().contains("llm_timeout_secs"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

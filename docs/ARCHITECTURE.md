@@ -346,13 +346,14 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (17 tools)
+## MCP tool surface (18 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
 | `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
+| `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the latest completed visible session. |
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
@@ -369,7 +370,8 @@ invariants below.
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
-`memory_install_self_routing`, `memory_read_page`, `memory_delete_page`,
+`memory_install_self_routing`, `memory_read_page`,
+`memory_read_session_observations`, `memory_delete_page`,
 `memory_handoff_cancel`, `memory_auto_improve`, and `memory_feedback`
 post-date the original "narrow on purpose" cut (§10 of
 `design-decisions.md`): briefing/explore separate the structured vs.
@@ -380,7 +382,10 @@ must re-write its own routing rules into a project's `CLAUDE.md` /
 `AGENTS.md` and install the companion managed Agent Skills into
 `.claude/skills` or `.agents/skills`, `memory_read_page` complements
 `memory_query` for the "I need the full page, not a snippet" case
-(e.g. opening a decision page end-to-end), `memory_auto_improve` exposes a
+(e.g. opening a decision page end-to-end),
+`memory_read_session_observations` opens the raw evidence behind a compiled
+page or a raw hit (one session, in scope, paged and body-capped) so an agent
+can audit what the hooks actually captured, `memory_auto_improve` exposes a
 safe default-on learning review through the same approval/write path as
 pending writes, and `memory_delete_page` is the exact-path destructive pair
 needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
@@ -426,8 +431,8 @@ auto-improve         finalize-session     pending-writes
 embed                generate-auth-token  setup-agent
 bootstrap            install-instructions install-skills
 reorg                purge-project        rename-project
-move-project         uninstall            auth
-user                 completions
+move-project         move-session         uninstall
+auth                 user                 completions
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -544,6 +549,7 @@ AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
+AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token

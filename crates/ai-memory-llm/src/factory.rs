@@ -99,6 +99,10 @@ pub struct ProviderConfig {
     /// parser. Enabled by default and ignored by every other provider.
     /// Sourced once from `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
     pub compat_strict: bool,
+    /// Per-request timeout for every chat provider, in seconds.
+    /// Sourced once from `AI_MEMORY_LLM_TIMEOUT_SECS` by `Config::load`;
+    /// defaults to [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`].
+    pub request_timeout_secs: u64,
 }
 
 /// Embedding providers available to ai-memory.
@@ -227,18 +231,25 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
 /// Returns [`LlmError::NotConfigured`] if a required env value (API
 /// key, base URL) is missing.
 pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>> {
+    let timeout = config.request_timeout_secs;
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(AnthropicProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                AnthropicProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                OpenAiProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::Gemini => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(GeminiProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                GeminiProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config
@@ -246,16 +257,21 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
-                    .with_strict(config.compat_strict),
+                    .with_strict(config.compat_strict)
+                    .with_timeout_secs(timeout),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
             let path = config.auth.require_openai_oauth_token_file()?.to_path_buf();
-            Ok(Arc::new(OpenAiOAuthProvider::new(path, config.model)?))
+            Ok(Arc::new(
+                OpenAiOAuthProvider::new(path, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
-            Ok(Arc::new(CopilotProvider::new(auth, config.model)?))
+            Ok(Arc::new(
+                CopilotProvider::new(auth, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::AnthropicOAuth => {
             let token = config.auth.require_anthropic_oauth_token()?;
@@ -263,11 +279,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_timeout_secs(timeout)))
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenCodeProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                OpenCodeProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
     }
 }
@@ -324,6 +342,7 @@ mod tests {
             auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
             base_url: None,
             compat_strict: false,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
         };
 
         let err = match build_provider(cfg) {

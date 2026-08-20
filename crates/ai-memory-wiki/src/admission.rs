@@ -63,6 +63,12 @@ pub enum AdmissionOp {
     /// project id. Carries source names in `workspace`/`project` and
     /// destination names in `destination_workspace`/`destination_project`.
     MoveProject,
+    /// One session (its rows and its `sessions/<id>.md` page) is being moved
+    /// to another project. Carries the source names in `workspace`/`project`
+    /// and the destination names in `destination_workspace`/
+    /// `destination_project`; no page path. Lets a mirror move or drop the
+    /// session page file.
+    MoveSession,
     /// A handoff is being created. Carries the workspace/project; no page path,
     /// since handoffs live in their own table rather than the wiki tree.
     ///
@@ -88,6 +94,7 @@ impl AdmissionOp {
             AdmissionOp::PurgeProject => "purge_project",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
             AdmissionOp::MoveProject => "move_project",
+            AdmissionOp::MoveSession => "move_session",
             AdmissionOp::HandoffBegin => "handoff_begin",
             AdmissionOp::HandoffAccept => "handoff_accept",
             AdmissionOp::HandoffCancel => "handoff_cancel",
@@ -782,6 +789,7 @@ mod tests {
         assert_eq!(AdmissionOp::WritePage.as_header_value(), "write_page");
         assert_eq!(AdmissionOp::Consolidate.as_header_value(), "consolidate");
         assert_eq!(AdmissionOp::MoveProject.as_header_value(), "move_project");
+        assert_eq!(AdmissionOp::MoveSession.as_header_value(), "move_session");
     }
 
     #[tokio::test]

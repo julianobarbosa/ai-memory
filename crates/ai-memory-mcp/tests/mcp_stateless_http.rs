@@ -32,6 +32,15 @@ const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","param
 /// mode. Returns the `Store` too so the writer actor stays alive for the
 /// duration of the test.
 async fn make_router(tmp: &TempDir, stateful: bool) -> (Router, Store) {
+    make_router_with_strip(tmp, stateful, false).await
+}
+
+/// [`make_router`] with the `strip_root_combinators` server toggle exposed.
+async fn make_router_with_strip(
+    tmp: &TempDir,
+    stateful: bool,
+    strip_root_combinators: bool,
+) -> (Router, Store) {
     let store = Store::open(tmp.path()).unwrap();
     let ws = store
         .writer
@@ -43,7 +52,8 @@ async fn make_router(tmp: &TempDir, stateful: bool) -> (Router, Store) {
         .get_or_create_project(ws, "scratch".to_string(), None)
         .await
         .unwrap();
-    let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+    let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+        .with_strip_root_combinators(strip_root_combinators);
     let svc = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -235,6 +245,47 @@ async fn stateless_bedrock_flavor_strips_root_any_of() {
         );
     }
     assert!(schema.get("properties").is_some());
+}
+
+/// Generic clients (OpenCode, Cursor) never send the `?flavor=` marker, yet
+/// forward tool schemas verbatim to strict upstreams. The
+/// `strip_root_combinators` toggle must serve the restricted dialect to them
+/// anyway (issue #412) — same transport wiring, no flavor parameter.
+#[tokio::test]
+async fn stateless_config_strip_strips_root_any_of_without_flavor() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router_with_strip(&tmp, false, true).await;
+
+    let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "config strip must remove root `{key}` without a flavor marker: {schema}"
+        );
+    }
+    assert!(
+        schema.get("properties").is_some(),
+        "the flat schema must keep describing the args: {schema}"
+    );
+}
+
+/// The toggle is opt-in: with it off and no flavor marker, the upstream root
+/// `anyOf` stays, so schema-respecting clients keep their early refusal
+/// (issue #155).
+#[tokio::test]
+async fn stateless_config_without_strip_keeps_root_any_of_without_flavor() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    assert!(
+        schema.get("anyOf").is_some(),
+        "default config must keep the upstream root anyOf: {schema}"
+    );
 }
 
 /// Control: without the marker, tools/list keeps the upstream root `anyOf`.

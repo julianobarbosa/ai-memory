@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_core::{
-    ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier,
-    UserId, WorkspaceId,
+    ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer,
+    SessionId, Tier, UserId, WorkspaceId,
 };
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle, artifact_path_for,
-    f32_vec_to_bytes,
+    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, ReaderPool, WriterHandle,
+    artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -41,6 +41,31 @@ enum PageStoreRemoval {
     Decay {
         expected_latest_id: PageId,
     },
+}
+
+/// What [`Wiki::move_session_page`] did with the on-disk
+/// `sessions/<session_id>.md` file of the moved session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPageFile {
+    /// Renamed from the source project directory into the destination one
+    /// ([`PagesMode::Move`]).
+    Moved,
+    /// Removed from the source project directory ([`PagesMode::Regenerate`]),
+    /// so the watcher cannot re-index it as a live page after its rows were
+    /// retired; the next consolidation writes a fresh page in the destination.
+    Removed,
+    /// No file existed in the source project directory.
+    Absent,
+}
+
+/// Result of [`Wiki::move_session_page`]: the store summary plus what
+/// happened to the page file.
+#[derive(Debug, Clone)]
+pub struct MoveSessionOutcome {
+    /// Row counts and scopes as reported by the store re-stamp.
+    pub summary: MoveSessionSummary,
+    /// Disposition of the on-disk session page file.
+    pub file: SessionPageFile,
 }
 
 /// Wiki filesystem handle.
@@ -318,6 +343,123 @@ impl Wiki {
                             src.display()
                         ))));
                     }
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Move one session to another project: relocate its `sessions/<id>.md`
+    /// file on disk and re-stamp its store rows in one transaction
+    /// ([`WriterHandle::move_session`]).
+    ///
+    /// Same critical section and ordering as [`Self::move_project_workspace`]:
+    /// the exclusive mutation guard is held across the admission chain, the
+    /// file step and the store step; disk goes first and SQL last, so the DB
+    /// is never ahead of disk. Under [`PagesMode::Move`] the file is renamed
+    /// into the destination project directory (refused when a file already
+    /// sits there). Under [`PagesMode::Regenerate`] the file is first parked
+    /// under the watcher-ignored `.ai-memory-tmp.` prefix and deleted once the
+    /// rows are retired: left in place, the next reconciliation pass would
+    /// re-index it as a fresh latest page in the source scope. A store failure
+    /// puts the file back where it was in both modes. When `from == to` (a
+    /// re-home of a session already rooted in the destination) there is no
+    /// file to relocate: the file step is skipped and only the store sweep
+    /// runs.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::DestinationPageExists`] when the destination
+    /// already holds a page file at that path, [`WikiError::Store`] for store
+    /// refusals (`NotFound`, `PagePathTaken`), or an I/O error when the file
+    /// step or its rollback fails.
+    pub async fn move_session_page(
+        &self,
+        session_id: SessionId,
+        from: (WorkspaceId, ProjectId),
+        to: (WorkspaceId, ProjectId),
+        pages: PagesMode,
+        author_id: Option<UserId>,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<MoveSessionOutcome> {
+        let _guard = self.mutation_lock.write().await;
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::MoveSession;
+            self.resolve_admission_names(from.0, from.1, &mut ctx).await;
+            chain.notify(None, &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+
+        let file_name = format!("{session_id}.md");
+        let src = self
+            .project_root(from.0, from.1)
+            .join("sessions")
+            .join(&file_name);
+        let parked = if from != to && src.is_file() {
+            let target = match pages {
+                PagesMode::Move => {
+                    let dst = self
+                        .project_root(to.0, to.1)
+                        .join("sessions")
+                        .join(&file_name);
+                    if dst.exists() {
+                        return Err(WikiError::DestinationPageExists(dst.display().to_string()));
+                    }
+                    dst
+                }
+                // Same directory, watcher-ignored name: invisible to
+                // reindex/reconcile, trivially renamed back on failure.
+                PagesMode::Regenerate => {
+                    src.with_file_name(format!(".ai-memory-tmp.move-session.{file_name}"))
+                }
+            };
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&src, &target)?;
+            Some(target)
+        } else {
+            None
+        };
+
+        match self
+            .writer
+            .move_session(session_id, to.0, to.1, pages, author_id, true)
+            .await
+        {
+            Ok(summary) => {
+                let file = match (&parked, pages) {
+                    (None, _) => SessionPageFile::Absent,
+                    (Some(_), PagesMode::Move) => SessionPageFile::Moved,
+                    (Some(tmp), PagesMode::Regenerate) => {
+                        // The rows are retired; a leftover temp file is
+                        // ignored by the watcher, so this is best-effort.
+                        if let Err(e) = std::fs::remove_file(tmp) {
+                            tracing::warn!(
+                                error = %e,
+                                path = %tmp.display(),
+                                "move-session: could not remove parked session page file"
+                            );
+                        }
+                        SessionPageFile::Removed
+                    }
+                };
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+                }
+                Ok(MoveSessionOutcome { summary, file })
+            }
+            Err(e) => {
+                if let Some(target) = parked
+                    && let Err(rollback_err) = std::fs::rename(&target, &src)
+                {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({e}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
+                        target.display(),
+                        src.display()
+                    ))));
                 }
                 Err(e.into())
             }
@@ -4027,5 +4169,247 @@ mod tests {
         let err = parse_entities(&path, &serde_json::json!({"entities": "sqlite"}))
             .expect_err("a string instead of a list is a structural error");
         assert!(err.to_string().contains("non-array entities"), "{err}");
+    }
+
+    /// Two projects in one workspace, one ended session in the first with a
+    /// consolidated `sessions/<id>.md` page written through the wiki.
+    async fn session_with_page(
+        tmp: &TempDir,
+    ) -> (
+        Store,
+        Wiki,
+        WorkspaceId,
+        ProjectId,
+        ProjectId,
+        SessionId,
+        PagePath,
+    ) {
+        let (store, wiki, ws, src) = scoped(tmp).await;
+        let dst = store
+            .writer
+            .get_or_create_project(ws, "target", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: src,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: Some("/repo/src".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(sid, None).await.unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        wiki.write_page(req(
+            ws,
+            src,
+            path.as_str(),
+            "consolidated session body",
+            serde_json::json!({ "title": "Session" }),
+        ))
+        .await
+        .unwrap();
+        (store, wiki, ws, src, dst, sid, path)
+    }
+
+    fn leftover_tempfiles(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".ai-memory-tmp."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn move_session_page_moves_file_and_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Moved);
+        assert!(outcome.summary.session_moved);
+        assert_eq!(outcome.summary.page_versions_moved, 1);
+
+        assert!(
+            !wiki.abs_path(ws, src, &path).exists(),
+            "source file must be gone"
+        );
+        let moved = std::fs::read_to_string(wiki.abs_path(ws, dst, &path)).unwrap();
+        assert!(moved.contains("consolidated session body"));
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, dst, path.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "latest page row must now sit in the destination"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, src, path.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The moved file is byte-identical to what the store indexed, so the
+        // watcher's follow-up reindex in the destination is a no-op.
+        wiki.reindex_page(ws, dst, path.clone()).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, dst, path.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "consolidated session body"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_regenerate_removes_source_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Regenerate, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Removed);
+        assert_eq!(outcome.summary.pages_regenerated, 1);
+
+        let src_abs = wiki.abs_path(ws, src, &path);
+        assert!(!src_abs.exists(), "retired page file must not linger");
+        assert!(!wiki.abs_path(ws, dst, &path).exists());
+        assert!(
+            leftover_tempfiles(src_abs.parent().unwrap()).is_empty(),
+            "parked copy must be deleted after the store commit"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, src, path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "no latest version left in the source"
+        );
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_puts_file_back_when_store_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        // A latest page row at the same path in the destination, without a
+        // file, so the disk step succeeds and only the SQL step refuses.
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: dst,
+                path: path.clone(),
+                title: "taken".into(),
+                body: "already here".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+                expires_at: None,
+                entities: vec![],
+            })
+            .await
+            .unwrap();
+
+        let err = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WikiError::Store(ai_memory_store::StoreError::PagePathTaken { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            wiki.abs_path(ws, src, &path).exists(),
+            "source file must be back after the store refused"
+        );
+        assert!(!wiki.abs_path(ws, dst, &path).exists());
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, src))
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_refuses_existing_destination_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        wiki.write_page(req(
+            ws,
+            dst,
+            path.as_str(),
+            "destination already has this page",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        let err = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WikiError::DestinationPageExists(_)),
+            "unexpected error: {err}"
+        );
+        assert!(wiki.abs_path(ws, src, &path).exists());
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, src)),
+            "nothing may move when the destination file exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_without_file_reports_absent() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        std::fs::remove_file(wiki.abs_path(ws, src, &path)).unwrap();
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Absent);
+        // The rows still move even though the file was already gone.
+        assert_eq!(outcome.summary.page_versions_moved, 1);
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
     }
 }

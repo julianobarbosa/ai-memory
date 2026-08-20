@@ -103,6 +103,96 @@ pub fn spool_len(spool: &Path) -> usize {
     list_entries(spool).map_or(0, |f| f.len())
 }
 
+/// Snapshot of local hook-spool health for operator status reporting.
+///
+/// Deliberately content-free: counts, ages, and attempt sums only — never
+/// payload excerpts, URLs, or token material (the spool holds private capture
+/// until it drains).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SpoolHealth {
+    /// Events queued locally awaiting delivery.
+    pub pending: usize,
+    /// Age (ms) of the oldest queued event, or `None` when the spool is empty.
+    pub oldest_age_ms: Option<u64>,
+    /// Sum of failed-delivery attempts across all queued events.
+    pub retries_total: u64,
+}
+
+/// Snapshot local spool health: queued count and oldest-event age from the
+/// timestamp-embedded file names (no file reads), plus total retry attempts
+/// (one bounded read per queued entry — fine for an operator-invoked status
+/// command, never on the hook hot path).
+#[must_use]
+pub fn spool_health(spool: &Path) -> SpoolHealth {
+    let Some(files) = list_entries(spool) else {
+        return SpoolHealth::default();
+    };
+    if files.is_empty() {
+        return SpoolHealth::default();
+    }
+    // Keep only files whose *names* follow the spool convention. A stray
+    // `.json` that this queue did not write is not a pending hook event, and
+    // letting one drive the age is actively misleading: an unparseable name
+    // reads as `created_ms = 0`, so the oldest age becomes the whole Unix
+    // epoch — roughly 56 years of phantom backlog on a status screen whose
+    // entire job is telling an operator whether capture is keeping up.
+    //
+    // Not hypothetical on macOS: writing to a filesystem without extended
+    // attributes (FAT, SMB, some NFS) leaves AppleDouble sidecars named
+    // `._<original>`, which end in `.json` and sort before any digit.
+    let mut files: Vec<(u64, PathBuf)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let created = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(created_ms_from_name)?;
+            Some((created, path))
+        })
+        .collect();
+    if files.is_empty() {
+        return SpoolHealth::default();
+    }
+    files.sort();
+    let now = now_ms();
+    let oldest_created = files[0].0;
+    let mut health = SpoolHealth {
+        pending: files.len(),
+        oldest_age_ms: Some(now.saturating_sub(oldest_created)),
+        retries_total: 0,
+    };
+    for (_, path) in &files {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes)
+        {
+            health.retries_total += u64::from(entry.attempts);
+        }
+    }
+    health
+}
+
+/// Extract the enqueue timestamp embedded in a spool file name
+/// (`{created_ms:013}-{pid}-{seq:016x}.json`), `None` when the name does not
+/// follow that convention. Filenames are the only place `created_ms` is
+/// readable without opening the file, so oldest-age reporting never pays a
+/// read per queued event.
+///
+/// Returns `None` rather than `0` so a foreign file cannot be mistaken for an
+/// entry enqueued at the Unix epoch — see [`spool_health`].
+fn created_ms_from_name(file_name: &str) -> Option<u64> {
+    let (stamp, rest) = file_name.split_once('-')?;
+    // Require the full zero-padded width the writer emits, so a name that
+    // merely *starts* with digits is not accepted.
+    if stamp.len() != 13 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // And require the remainder to look like `{pid}-{seq}.json`.
+    if !rest.ends_with(".json") || !rest.contains('-') {
+        return None;
+    }
+    stamp.parse().ok()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2065,5 +2155,123 @@ mod tests {
             1,
             "the spool entry survives a failed rewrite"
         );
+    }
+
+    #[test]
+    fn spool_health_is_default_when_dir_missing_or_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-spool");
+        assert_eq!(spool_health(&missing), SpoolHealth::default());
+
+        let empty = spool_dir(tmp.path());
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(spool_health(&empty), SpoolHealth::default());
+    }
+
+    #[test]
+    fn spool_health_reports_pending_oldest_age_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        // Two events with distinct enqueue times; the second carries two failed
+        // attempts. Names embed `created_ms`, so oldest-age comes from the name.
+        let mut old = entry_for("https://x/hook?event=old".into(), "{}".into(), None, false);
+        old.created_ms = now_ms().saturating_sub(5 * 60 * 1000);
+        let mut new = entry_for("https://x/hook?event=new".into(), "{}".into(), None, false);
+        new.created_ms = now_ms().saturating_sub(60 * 1000);
+        new.attempts = 2;
+        enqueue(&spool, &old).unwrap();
+        enqueue(&spool, &new).unwrap();
+
+        let before = now_ms();
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 2);
+        assert_eq!(health.retries_total, 2);
+        let oldest = health
+            .oldest_age_ms
+            .expect("non-empty spool reports an age");
+        assert!(
+            (5 * 60 * 1000..=5 * 60 * 1000 + 1_000).contains(&oldest),
+            "oldest age ~5m, got {oldest}ms (measured at {before})"
+        );
+    }
+
+    #[test]
+    fn spool_health_ignores_unparseable_entries_for_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "0000000000042-1-0000000000000001.json",
+            "https://x/hook".into(),
+        );
+        std::fs::write(
+            spool.join("0000000000043-1-0000000000000002.json"),
+            b"not a spool entry",
+        )
+        .unwrap();
+
+        let before = now_ms();
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 2);
+        assert_eq!(health.retries_total, 0);
+        let oldest = health
+            .oldest_age_ms
+            .expect("non-empty spool reports an age");
+        assert!(
+            oldest >= before.saturating_sub(42),
+            "oldest name parses to 42ms, age {oldest}ms"
+        );
+    }
+
+    #[test]
+    fn created_ms_from_name_handles_malformed_names() {
+        assert_eq!(
+            created_ms_from_name("0000000000042-1-0000000000000001.json"),
+            Some(42)
+        );
+        assert_eq!(created_ms_from_name("garbage.json"), None);
+        // A macOS AppleDouble sidecar: ends in `.json`, sorts before any
+        // digit, and must never be read as an epoch-0 entry.
+        assert_eq!(created_ms_from_name("._0000000000042-1-0002.json"), None);
+        // Digits alone are not enough — the writer zero-pads to 13.
+        assert_eq!(created_ms_from_name("42-1-0002.json"), None);
+        assert_eq!(created_ms_from_name("0000000000042-1-0002.txt"), None);
+    }
+
+    /// Regression: a foreign `.json` in the spool directory must not be
+    /// counted as a pending event, and must never drive the oldest age.
+    /// Before this guard an AppleDouble sidecar parsed as `created_ms = 0`
+    /// and reported roughly 56 years of backlog that did not exist.
+    #[test]
+    fn spool_health_ignores_files_this_queue_did_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+
+        let mut real = entry_for("https://x/hook".into(), "{}".into(), None, false);
+        real.created_ms = now_ms().saturating_sub(1_000);
+        enqueue(&spool, &real).unwrap();
+
+        // Sorts before any digit and still ends in `.json`.
+        std::fs::write(spool.join("._sidecar.json"), b"\x00\x05").unwrap();
+        std::fs::write(spool.join("notes.json"), b"{}").unwrap();
+
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 1, "only the real entry is pending");
+        let age = health.oldest_age_ms.expect("one real entry");
+        assert!(
+            age < 60_000,
+            "age must come from the real entry (~1s), got {age}ms"
+        );
+    }
+
+    /// A directory holding only foreign files reports empty, not epoch-aged.
+    #[test]
+    fn spool_health_is_default_when_only_foreign_files_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(spool.join("._only.json"), b"x").unwrap();
+        assert_eq!(spool_health(&spool), SpoolHealth::default());
     }
 }

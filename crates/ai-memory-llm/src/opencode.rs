@@ -36,6 +36,15 @@ impl OpenCodeProvider {
         let inner = OpenAiCompatProvider::new(OPENCODE_ZEN_BASE_URL, Some(api_key), model.into())?;
         Ok(Self { inner })
     }
+
+    /// Override the per-request timeout on the wrapped
+    /// [`OpenAiCompatProvider`]. The factory calls this with
+    /// `ProviderConfig::request_timeout_secs`.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.inner = self.inner.with_timeout_secs(secs);
+        self
+    }
 }
 
 #[async_trait]

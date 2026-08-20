@@ -98,6 +98,15 @@ impl OpenAiCompatProvider {
         self.strict = strict;
         self
     }
+
+    /// Override the per-request timeout on the wrapped
+    /// [`OpenAiProvider`]. The factory calls this with
+    /// `ProviderConfig::request_timeout_secs`.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.inner = self.inner.with_timeout_secs(secs);
+        self
+    }
 }
 
 #[async_trait]
@@ -286,6 +295,17 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    #[test]
+    fn timeout_override_reaches_the_inner_provider() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
+            .expect("provider builds")
+            .with_timeout_secs(45);
+        assert_eq!(
+            p.inner.request_timeout(),
+            std::time::Duration::from_secs(45)
+        );
     }
 
     #[test]

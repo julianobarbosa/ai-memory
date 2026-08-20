@@ -1039,9 +1039,22 @@ ai-memory install-hooks --agent omp --apply
 # or: ai-memory install-hooks --agent oh-my-pi --apply
 ```
 
-This writes `~/.omp/agent/extensions/ai-memory.ts`, which OMP discovers
+This writes `~/.omp/agent/extensions/ai-memory-omp.ts`, which OMP discovers
 as a direct TypeScript extension on startup. Restart `omp` after
-installing or changing the file.
+installing or changing the file. When `PI_CODING_AGENT_DIR` is set
+(it relocates OMP's whole `~/.omp/agent` home), the extension is written
+to `$PI_CODING_AGENT_DIR/extensions/ai-memory-omp.ts` instead, and
+`--profile <name>` (or `OMP_PROFILE`) targets
+`~/.omp/profiles/<name>/agent/extensions/` — note `PI_CODING_AGENT_DIR`
+takes precedence over a profile, since it names the agent directory
+outright.
+
+Pi and OMP honour the *same* `PI_CODING_AGENT_DIR`, and each agent loads
+every direct `*.ts` in its extensions directory. Pointing both at one
+directory therefore makes each load both extensions and capture every
+event twice, once under each agent identity. `install-hooks` warns when it
+detects this; give the two agents separate homes, or scope OMP to a
+profile.
 
 **Gotchas:**
 - OMP extensions are TypeScript modules, not shell hooks; stdout is not
@@ -1053,7 +1066,9 @@ installing or changing the file.
 
 **Status:** ✅ MCP and lifecycle capture supported via generated bridge
 extension. Pi has no native `mcp.json`; use `install-hooks --agent pi --apply`
-to write `~/.pi/agent/extensions/ai-memory.ts`.
+to write `~/.pi/agent/extensions/ai-memory-pi.ts`. When `PI_CODING_AGENT_DIR`
+is set (it relocates Pi's whole `~/.pi/agent` home), the extension is
+written to `$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts` instead.
 
 ```bash
 ai-memory install-hooks --agent pi --apply
@@ -1084,7 +1099,8 @@ Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
      memory_consolidate, memory_auto_improve, memory_write_page,
-     memory_read_page, memory_delete_page, memory_feedback,
+     memory_read_page, memory_read_session_observations,
+     memory_delete_page, memory_feedback,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```

@@ -89,6 +89,7 @@ pub struct OpenAiProvider {
     base_url: String,
     model: String,
     dialect: RequestDialect,
+    timeout: Duration,
 }
 
 impl OpenAiProvider {
@@ -99,19 +100,14 @@ impl OpenAiProvider {
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        // 300s tolerates Ollama / llama-swap cold-loading a 30B+ model
-        // from disk on first request. Once OLLAMA_KEEP_ALIVE keeps it
-        // warm, subsequent requests return in seconds — but the first
-        // one after the model unloaded needs the headroom.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -121,6 +117,23 @@ impl OpenAiProvider {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Applied per request,
+    /// so the HTTP client itself stays connection-pool friendly.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Currently configured per-request timeout. Test-visible so
+    /// wrapper tests (`OpenAiCompatProvider`, `OpenCodeProvider`)
+    /// can assert the delegation without exposing the field.
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Switch request dialect. See [`RequestDialect`].
@@ -316,6 +329,7 @@ impl OpenAiProvider {
         let resp = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(body)
@@ -478,6 +492,17 @@ mod tests {
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
+    }
+
+    #[test]
+    fn request_timeout_defaults_and_is_overridable() {
+        let provider = provider_for("gpt-4o-mini");
+        assert_eq!(
+            provider.timeout,
+            std::time::Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+        let provider = provider.with_timeout_secs(900);
+        assert_eq!(provider.timeout, std::time::Duration::from_secs(900));
     }
 
     fn chat_request() -> ChatRequest {

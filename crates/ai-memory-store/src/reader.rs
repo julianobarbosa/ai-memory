@@ -19,7 +19,7 @@ use jiff::Timestamp;
 use parking_lot::Mutex;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 // `ai_memory_core::Tier` is referenced via fully-qualified path inside the
 // DecayCandidate struct definition above to avoid a top-level import
@@ -219,6 +219,26 @@ fn rerank_page_hits_with_meta(
     });
     hits.truncate(limit);
     hits
+}
+
+/// Rows keyed to one session (see [`ReaderPool::session_dependent_rows`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDependentRows {
+    /// `observations` rows of the session, in any scope.
+    pub observations: u64,
+    /// `handoffs` rows the session produced, in any scope.
+    pub handoffs: u64,
+    /// `session_consolidation_jobs` rows, in any scope.
+    pub consolidation_jobs: u64,
+    /// `auto_improve_runs` rows, in any scope.
+    pub auto_improve_runs: u64,
+    /// `auto_improve_scheduler_claims` rows, in any scope.
+    pub auto_improve_claims: u64,
+    /// Versions of `sessions/<id>.md` in the queried page scope.
+    pub page_versions: u64,
+    /// Latest versions of `sessions/<id>.md` in the queried page scope
+    /// (0 or 1).
+    pub page_latest: u64,
 }
 
 /// One page flagged by `stale`/`wrong` feedback on its current version,
@@ -430,6 +450,27 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
+/// and [`ReaderPool::session_summary_scoped`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionSummary {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+    /// `AgentKind` as stored (`claude-code`, `cursor`, ...).
+    pub agent_kind: String,
+    /// ISO-8601 session start timestamp.
+    pub started_at: String,
+    /// ISO-8601 session end timestamp; `None` while the session is open.
+    pub ended_at: Option<String>,
+    /// Observations of this session that landed in the queried scope. A
+    /// session that crossed repositories mid-flight has more rows elsewhere.
+    pub observation_count: u64,
+    /// Operator the session belongs to, as stored on the `sessions` row.
+    pub actor_user: Option<String>,
+}
+
 /// Aggregate MCP tool-call counts for one client, from
 /// `client_activity` — the MCP-only complement to
 /// [`AgentSessionCount`]: hook-less clients (VS Code Copilot, Claude
@@ -530,6 +571,74 @@ pub struct ObservationHit {
     pub rank: f64,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
+}
+
+/// One raw observation with its full stored body, as returned by
+/// [`ReaderPool::session_observations_scoped`]. Bodies were sanitized and
+/// bounded on the way in, so this is a read of what the store holds; callers
+/// that need a smaller payload cap the body themselves.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservationRecord {
+    /// Stable observation identifier.
+    pub id: ObservationId,
+    /// Owning session identifier.
+    pub session_id: SessionId,
+    /// Observation kind as stored on the lifecycle row.
+    pub kind: String,
+    /// Observation title.
+    pub title: String,
+    /// Full sanitized observation body.
+    pub body: String,
+    /// Importance in `1..=10`.
+    pub importance: u8,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+    /// Third-party extension namespace that supplied `source_event`, if any.
+    pub extension: Option<String>,
+    /// Source event name from an opt-in extension vocabulary, if any.
+    pub source_event: Option<String>,
+}
+
+/// Sort direction for [`ObservationPage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObservationOrder {
+    /// Oldest first (capture order).
+    #[default]
+    Asc,
+    /// Newest first.
+    Desc,
+}
+
+/// Paging and filtering for [`ReaderPool::session_observations_scoped`].
+/// The store applies `limit` and `offset` as given; callers clamp.
+#[derive(Debug, Clone)]
+pub struct ObservationPage {
+    /// Maximum rows to return. Zero returns no rows but still counts.
+    pub limit: usize,
+    /// Rows to skip before the first returned one.
+    pub offset: usize,
+    /// Sort direction over `created_at` (with the id as tiebreak).
+    pub order: ObservationOrder,
+    /// Keep only these kinds. `None` or an empty list keeps every kind.
+    pub kinds: Option<Vec<ObservationKind>>,
+    /// Optional full-text query over title and body. Ignored when it
+    /// normalizes to nothing searchable.
+    pub query: Option<String>,
+}
+
+/// One page of a session's observations plus the counts a caller needs to
+/// paginate and to notice that the session has rows outside the scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservationPageResult {
+    /// The requested page, in the requested order.
+    pub records: Vec<ObservationRecord>,
+    /// Rows in scope matching the kind and query filters, across all pages.
+    pub total: u64,
+    /// Rows of the same session that landed in a different
+    /// `(workspace, project)`, unfiltered. Non-zero means the session crossed
+    /// repositories and this scope holds only part of it.
+    pub elided_other_scope: u64,
 }
 
 /// Aggregate counts surfaced by [`ReaderPool::status_counts`] and consumed
@@ -1646,6 +1755,126 @@ impl ReaderPool {
         .await
     }
 
+    /// Page through one session's raw observations as seen from one scope.
+    ///
+    /// Only the rows that landed in `(workspace_id, project_id)` are returned:
+    /// a session that crossed repositories mid-flight has observations in more
+    /// than one scope, and a caller resolved to one of them must not read the
+    /// other. `elided_other_scope` reports how many rows were left out so the
+    /// caller can tell a short session from a partially visible one. `total`
+    /// counts the in-scope rows matching the page's kind and query filters, so
+    /// paginating needs no second round-trip; a zero `limit` returns no rows
+    /// but still reports both counts.
+    ///
+    /// The query goes through the same FTS5 normalization as
+    /// [`Self::search_observations_for_project`] and is dropped when nothing
+    /// searchable remains, so a punctuation-only query lists the session
+    /// instead of matching nothing.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_observations_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        page: ObservationPage,
+    ) -> StoreResult<ObservationPageResult> {
+        let fts_query = page
+            .query
+            .as_deref()
+            .map(normalize_fts_query)
+            .filter(|q| !q.is_empty());
+        let kinds: Vec<&'static str> = page
+            .kinds
+            .iter()
+            .flatten()
+            .map(ObservationKind::as_str)
+            .collect();
+        let direction = match page.order {
+            ObservationOrder::Asc => "ASC",
+            ObservationOrder::Desc => "DESC",
+        };
+        let (limit, offset) = (page.limit, page.offset);
+        self.with_conn(move |conn| {
+            // `?` is positional-by-order: session, scope, then the optional
+            // MATCH term and kind list, then LIMIT/OFFSET on the page query.
+            let mut sql_params: Vec<Value> = Vec::with_capacity(kinds.len() + 6);
+            sql_params.push(Value::Blob(session_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            let mut source = String::from("FROM observations");
+            let mut predicate = String::from(
+                " WHERE observations.session_id = ? \
+                   AND observations.workspace_id = ? \
+                   AND observations.project_id = ?",
+            );
+            if let Some(q) = fts_query {
+                source.push_str(
+                    " JOIN observations_fts ON observations_fts.rowid = observations.rowid",
+                );
+                predicate.push_str(" AND observations_fts MATCH ?");
+                sql_params.push(Value::Text(q));
+            }
+            if !kinds.is_empty() {
+                predicate.push_str(" AND observations.kind IN (");
+                for (idx, kind) in kinds.iter().enumerate() {
+                    if idx > 0 {
+                        predicate.push_str(", ");
+                    }
+                    predicate.push('?');
+                    sql_params.push(Value::Text((*kind).to_string()));
+                }
+                predicate.push(')');
+            }
+
+            let total: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) {source}{predicate}"),
+                params_from_iter(sql_params.iter()),
+                |row| row.get(0),
+            )?;
+            let elided: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations \
+                 WHERE session_id = ?1 AND NOT (workspace_id = ?2 AND project_id = ?3)",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get(0),
+            )?;
+
+            let mut records = Vec::new();
+            if limit > 0 {
+                sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+                sql_params.push(Value::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
+                let sql = format!(
+                    "SELECT observations.id, observations.session_id, observations.kind, \
+                            observations.title, observations.body, observations.importance, \
+                            observations.created_at, observations.extension, \
+                            observations.source_event \
+                     {source}{predicate} \
+                     ORDER BY observations.created_at {direction}, observations.id {direction} \
+                     LIMIT ? OFFSET ?"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params_from_iter(sql_params.iter()),
+                    row_to_observation_record,
+                )?;
+                for row in rows {
+                    records.push(row??);
+                }
+            }
+            Ok(ObservationPageResult {
+                records,
+                total: u64::try_from(total).unwrap_or(0),
+                elided_other_scope: u64::try_from(elided).unwrap_or(0),
+            })
+        })
+        .await
+    }
+
     /// Return the latest completed session for a project.
     ///
     /// Used by read-only review tools that need a natural default when the user
@@ -1978,6 +2207,175 @@ impl ReaderPool {
         .await
     }
 
+    /// List the sessions that touched one scope, newest first.
+    ///
+    /// A session is listed when its `sessions` row is anchored in the scope OR
+    /// at least one of its observations landed there. The second half matters
+    /// for a session that changed repositories mid-flight: its row stays
+    /// frozen on the starting scope (`begin_session` is `ON CONFLICT DO
+    /// NOTHING`), so listing by row alone would hide it from the very scope
+    /// that holds its work. `observation_count` counts only the rows in this
+    /// scope. `include_open == false` keeps sessions with `ended_at` set.
+    ///
+    /// The owner predicate follows the rest of the session surface: shared
+    /// (`actor_user IS NULL`) rows are visible to everyone, owned rows only to
+    /// their operator unless the caller passes [`OwnerFilter::Any`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn sessions_for_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        include_open: bool,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<SessionSummary>> {
+        self.sessions_for_scope_filtered(
+            workspace_id,
+            project_id,
+            owner_filter,
+            include_open,
+            limit,
+            offset,
+            None,
+        )
+        .await
+    }
+
+    /// Return one session as seen from one scope, or `None` when the session
+    /// has neither its row nor any observation there, or when the owner
+    /// filter rejects it. The id narrows the same predicates
+    /// [`Self::sessions_for_scope`] applies (open sessions included); it
+    /// never replaces them, so a known id cannot read across scopes or
+    /// operators.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_summary_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<SessionSummary>> {
+        let mut sessions = self
+            .sessions_for_scope_filtered(
+                workspace_id,
+                project_id,
+                owner_filter,
+                true,
+                1,
+                0,
+                Some(session_id),
+            )
+            .await?;
+        Ok(sessions.pop())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sessions_for_scope_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        include_open: bool,
+        limit: usize,
+        offset: usize,
+        exact_session_id: Option<SessionId>,
+    ) -> StoreResult<Vec<SessionSummary>> {
+        self.with_conn(move |conn| {
+            // The point lookup lets the primary key narrow first so the scope
+            // test is one indexed probe; the listing materializes the scope's
+            // session ids once instead of probing every session in the table.
+            let membership = if exact_session_id.is_some() {
+                " AND s.id = :sid \
+                  AND ((s.workspace_id = :ws AND s.project_id = :proj) \
+                       OR EXISTS (SELECT 1 FROM observations o \
+                                  WHERE o.session_id = s.id \
+                                    AND o.workspace_id = :ws AND o.project_id = :proj))"
+            } else {
+                " AND s.id IN (SELECT id FROM sessions \
+                               WHERE workspace_id = :ws AND project_id = :proj \
+                               UNION \
+                               SELECT session_id FROM observations \
+                               WHERE workspace_id = :ws AND project_id = :proj)"
+            };
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            let ended_clause = if include_open {
+                ""
+            } else {
+                " AND s.ended_at IS NOT NULL"
+            };
+            let sql = format!(
+                "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
+                        (SELECT COUNT(*) FROM observations o \
+                         WHERE o.session_id = s.id \
+                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n \
+                 FROM sessions s \
+                 WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
+                 ORDER BY s.started_at DESC, s.id DESC \
+                 LIMIT :limit OFFSET :offset"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+            let sid_bytes = exact_session_id.map(|sid| *sid.as_bytes());
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+                (":limit", &limit),
+                (":offset", &offset),
+            ];
+            if let Some(sid) = &sid_bytes {
+                named.push((":sid", sid));
+            }
+            if let OwnerFilter::User(user) = &owner_filter {
+                named.push((":actor", user));
+            }
+            let rows = stmt.query_map(named.as_slice(), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let cwd: Option<String> = row.get(1)?;
+                let agent_kind: String = row.get(2)?;
+                let started_us: i64 = row.get(3)?;
+                let ended_us: Option<i64> = row.get(4)?;
+                let actor_user: Option<String> = row.get(5)?;
+                let n: i64 = row.get(6)?;
+                Ok((
+                    id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n) = row?;
+                let started_at = jiff::Timestamp::from_microsecond(started_us)
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_default();
+                let ended_at = ended_us
+                    .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                    .map(|ts| ts.to_string());
+                out.push(SessionSummary {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    cwd,
+                    agent_kind,
+                    started_at,
+                    ended_at,
+                    observation_count: u64::try_from(n).unwrap_or(0),
+                    actor_user,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// The `(workspace_id, project_id, cwd)` a session was created under,
     /// or `None` when no such session exists. The hook router uses this for
     /// session-sticky attribution: mid-session events inherit the session's
@@ -2016,6 +2414,93 @@ impl ReaderPool {
                 ))),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    /// Ids of every session that touches `(workspace_id, project_id)`: a
+    /// `sessions` row in the scope OR at least one observation stamped into
+    /// it. The second leg catches the phantom projects that mid-session
+    /// routing before the sticky mode filled with observations of sessions
+    /// rooted elsewhere (no `sessions` row of their own), so a batch
+    /// `move-session` can empty such a bucket. Ordered by first touch (the
+    /// row's `started_at` or the earliest observation in the scope), then id.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_ids_touching_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM ( \
+                     SELECT id, started_at AS first_seen FROM sessions \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     UNION ALL \
+                     SELECT session_id AS id, MIN(created_at) AS first_seen FROM observations \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     GROUP BY session_id \
+                 ) \
+                 GROUP BY id \
+                 ORDER BY MIN(first_seen), id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(SessionId::from_slice(&r?)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Rows keyed to a session across every scope, plus its
+    /// `sessions/<id>.md` page rows in one scope: what a `move_session` into
+    /// a scope that holds nothing of the session yet would touch. Used for
+    /// the dry run of a move whose destination does not exist yet.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_dependent_rows(
+        &self,
+        session_id: SessionId,
+        page_scope: (WorkspaceId, ProjectId),
+    ) -> StoreResult<SessionDependentRows> {
+        self.with_conn(move |conn| {
+            let sid = session_id.as_bytes();
+            let count = |sql: &str| -> StoreResult<u64> {
+                Ok(conn.query_row(sql, [sid.as_slice()], |r| r.get::<_, i64>(0))? as u64)
+            };
+            let (page_versions, page_latest): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(is_latest), 0) FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+                params![
+                    page_scope.0.as_bytes(),
+                    page_scope.1.as_bytes(),
+                    format!("sessions/{session_id}.md"),
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(SessionDependentRows {
+                observations: count("SELECT COUNT(*) FROM observations WHERE session_id = ?1")?,
+                handoffs: count("SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1")?,
+                consolidation_jobs: count(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs WHERE session_id = ?1",
+                )?,
+                auto_improve_runs: count(
+                    "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+                )?,
+                auto_improve_claims: count(
+                    "SELECT COUNT(*) FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                )?,
+                page_versions: page_versions as u64,
+                page_latest: page_latest as u64,
+            })
         })
         .await
     }
@@ -6243,6 +6728,37 @@ fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<O
         importance,
         created_us,
     ))
+}
+
+fn row_to_observation_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoreResult<ObservationRecord>> {
+    let id_bytes: Vec<u8> = row.get(0)?;
+    let session_bytes: Vec<u8> = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let title: String = row.get(3)?;
+    let body: String = row.get(4)?;
+    let importance: i64 = row.get(5)?;
+    let created_us: i64 = row.get(6)?;
+    let extension: Option<String> = row.get(7)?;
+    let source_event: Option<String> = row.get(8)?;
+    let created_at = jiff::Timestamp::from_microsecond(created_us)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default();
+    let record = ObservationId::from_slice(&id_bytes).and_then(|id| {
+        SessionId::from_slice(&session_bytes).map(|session_id| ObservationRecord {
+            id,
+            session_id,
+            kind,
+            title,
+            body,
+            importance: u8::try_from(importance.clamp(1, 10)).unwrap_or(1),
+            created_at,
+            extension,
+            source_event,
+        })
+    });
+    Ok(record.map_err(StoreError::from))
 }
 
 #[allow(clippy::too_many_arguments)]

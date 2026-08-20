@@ -138,6 +138,7 @@ pub struct OpenAiOAuthProvider {
     model: String,
     token_path: PathBuf,
     token: Mutex<OpenAiOAuthToken>,
+    timeout: Duration,
 }
 
 impl OpenAiOAuthProvider {
@@ -152,16 +153,22 @@ impl OpenAiOAuthProvider {
                 token_path.display()
             ))
         })?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(LlmError::from)?;
+        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
         Ok(Self {
             client,
             model: model.into(),
             token_path,
             token: Mutex::new(token),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
     }
 
     async fn current_token(&self) -> LlmResult<OpenAiOAuthToken> {
@@ -184,6 +191,7 @@ impl OpenAiOAuthProvider {
         let mut request = self
             .client
             .post(CODEX_RESPONSES_URL)
+            .timeout(self.timeout)
             .bearer_auth(token.access.expose_secret())
             .header("content-type", "application/json")
             .header(

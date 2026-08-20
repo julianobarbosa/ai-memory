@@ -90,6 +90,7 @@ mod tests {
         ("memory_query", "ai-memory-retrieval"),
         ("memory_recent", "ai-memory-retrieval"),
         ("memory_read_page", "ai-memory-retrieval"),
+        ("memory_read_session_observations", "ai-memory-retrieval"),
         ("memory_status", "ai-memory-retrieval"),
         ("memory_briefing", "ai-memory-retrieval"),
         ("memory_explore", "ai-memory-retrieval"),

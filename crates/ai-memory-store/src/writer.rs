@@ -26,7 +26,8 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, PagesMode,
+    PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -306,6 +307,19 @@ pub(crate) enum WriteCmd {
         from_workspace: WorkspaceId,
         to_workspace: WorkspaceId,
         reply: oneshot::Sender<StoreResult<MoveSummary>>,
+    },
+    /// Re-stamp one session and its dependent rows (observations, handoffs,
+    /// consolidation jobs, auto-improve runs and claim, session page) into
+    /// another scope in one transaction. `commit = false` rolls back after
+    /// counting so the reply is an exact dry run.
+    MoveSession {
+        session_id: SessionId,
+        target_workspace: WorkspaceId,
+        target_project: ProjectId,
+        pages: PagesMode,
+        author_id: Option<UserId>,
+        commit: bool,
+        reply: oneshot::Sender<StoreResult<MoveSessionSummary>>,
     },
     /// Rename a project's `name` column without moving any files (the wiki
     /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
@@ -1239,6 +1253,46 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Re-stamp one session, its observations, the handoffs it produced, its
+    /// consolidation jobs, auto-improve runs and scheduler claim, and its
+    /// `sessions/<id>.md` page (per `pages`) into
+    /// `(target_workspace, target_project)` in one transaction. With
+    /// `commit = false` the transaction is rolled back after counting, so the
+    /// summary is an exact dry run. The target project must already exist;
+    /// the caller moves the on-disk page file afterwards. `author_id` is the
+    /// operator recorded on the audit row. A target equal to the session
+    /// row's own scope re-homes only the rows still lying elsewhere
+    /// (`session_moved = false`); see [`ops::move_session`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down,
+    /// [`StoreError::NotFound`] if the session or the target project is
+    /// absent, [`StoreError::PagePathTaken`] when [`PagesMode::Move`] would
+    /// collide with a latest page in the target scope, or propagates the SQL
+    /// error.
+    pub async fn move_session(
+        &self,
+        session_id: SessionId,
+        target_workspace: WorkspaceId,
+        target_project: ProjectId,
+        pages: PagesMode,
+        author_id: Option<UserId>,
+        commit: bool,
+    ) -> StoreResult<MoveSessionSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MoveSession {
+            session_id,
+            target_workspace,
+            target_project,
+            pages,
+            author_id,
+            commit,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Rename a project within its workspace (column-only; no file moves).
     ///
     /// # Errors
@@ -2135,6 +2189,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "move_project_workspace");
             }
+            WriteCmd::MoveSession {
+                session_id,
+                target_workspace,
+                target_project,
+                pages,
+                author_id,
+                commit,
+                reply,
+            } => {
+                let result = ops::move_session(
+                    &mut conn,
+                    session_id,
+                    target_workspace,
+                    target_project,
+                    pages,
+                    author_id,
+                    commit,
+                );
+                send_or_warn(reply, result, "move_session");
+            }
             WriteCmd::RenameProject {
                 workspace_id,
                 project_id,
@@ -2522,6 +2596,65 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "pending command must have committed");
         }
+    }
+
+    /// The dry run and the real move both go through the actor; only the
+    /// latter changes the session row a reader sees.
+    #[tokio::test]
+    async fn move_session_dry_run_then_commit_through_writer() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let src = store
+            .writer
+            .get_or_create_project(ws, "src", None)
+            .await
+            .unwrap();
+        let dst = store
+            .writer
+            .get_or_create_project(ws, "dst", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: src,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        let dry = store
+            .writer
+            .move_session(sid, ws, dst, PagesMode::Move, None, false)
+            .await
+            .unwrap();
+        assert!(dry.session_moved);
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, src)),
+            "dry run must roll back"
+        );
+
+        let moved = store
+            .writer
+            .move_session(sid, ws, dst, PagesMode::Move, None, true)
+            .await
+            .unwrap();
+        assert!(moved.session_moved);
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
     }
 
     /// Once the actor has stopped, calls fail fast with

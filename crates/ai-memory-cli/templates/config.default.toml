@@ -35,6 +35,14 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
+# tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
+# Generic MCP clients (OpenCode, Cursor) never send that marker yet forward
+# schemas verbatim to strict upstreams that reject root combinators with a
+# 400. Runtime "exactly one of" validation is unchanged. Env equivalent:
+# `AI_MEMORY_STRIP_ROOT_COMBINATORS=true`.
+# strip_root_combinators = false
+
 # Optional final LLM relevance pass for project/scopes memory_query calls.
 # Requires an LLM provider and adds at most one provider call per eligible
 # query. The bounded query, page titles, and search snippets are sent to that

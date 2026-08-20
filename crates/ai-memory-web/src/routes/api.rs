@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
+use ai_memory_core::{ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_store::{
-    BriefingSnapshot, HealthPage, PageHit, RelatedPage, ScopeName, ScopeResolutionError,
-    lookup_existing_scope, resolve_many_existing_scopes,
+    BriefingSnapshot, HealthPage, ObservationOrder, ObservationPage, ObservationRecord, PageHit,
+    RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope,
+    resolve_many_existing_scopes,
 };
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -60,6 +61,14 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route(
             "/workspaces/{workspace}/projects/{project}/handoffs",
             axum::routing::get(handoffs_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/sessions",
+            axum::routing::get(sessions_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/sessions/{session_id}/observations",
+            axum::routing::get(session_observations_handler),
         )
         .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
@@ -826,6 +835,161 @@ async fn project_overview_handler(
     ))
 }
 
+/// Bounds for the session routes. They mirror the MCP
+/// `memory_read_session_observations` tool so a frontend and an agent see
+/// the same page sizes and body caps.
+const SESSION_LIST_MAX_LIMIT: usize = 100;
+const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
+const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
+const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
+const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
+
+async fn sessions_handler(
+    State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<SessionListQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let sessions = state
+        .reader
+        .sessions_for_scope(
+            workspace_id,
+            project_id,
+            owner_filter_for(actor),
+            query.include_open,
+            query.limit.clamp(1, SESSION_LIST_MAX_LIMIT),
+            query.offset,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(with_no_store(
+        Json(ApiSessionList { sessions }).into_response(),
+    ))
+}
+
+async fn session_observations_handler(
+    State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Path((workspace, project, session_id)): Path<(String, String, String)>,
+    Query(query): Query<SessionObservationsQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let session_id = session_id.parse::<SessionId>().map_err(|_| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid session id: {session_id}"),
+        )
+    })?;
+    let limit = query.limit.clamp(1, SESSION_OBSERVATIONS_MAX_LIMIT);
+    let body_max_chars = query
+        .body_max_chars
+        .unwrap_or(SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS)
+        .clamp(
+            SESSION_OBSERVATIONS_MIN_BODY_CHARS,
+            SESSION_OBSERVATIONS_MAX_BODY_CHARS,
+        );
+    let order = match query.order.as_deref().map(str::trim) {
+        None | Some("") => ObservationOrder::Asc,
+        Some(raw) if raw.eq_ignore_ascii_case("asc") => ObservationOrder::Asc,
+        Some(raw) if raw.eq_ignore_ascii_case("desc") => ObservationOrder::Desc,
+        Some(raw) => {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown order: {raw} (expected asc or desc)"),
+            ));
+        }
+    };
+    let mut kinds = Vec::new();
+    for kind in query
+        .kinds
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        let Ok(parsed) = kind.parse::<ObservationKind>() else {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown observation kind: {kind}"),
+            ));
+        };
+        kinds.push(parsed);
+    }
+    let kinds = (!kinds.is_empty()).then_some(kinds);
+
+    // Same visibility predicate as the MCP tool: the session must have its
+    // row or at least one observation in this scope and pass the owner
+    // filter, otherwise the id reads as not found so a known uuid cannot
+    // probe another project or operator.
+    let session = state
+        .reader
+        .session_summary_scoped(
+            workspace_id,
+            project_id,
+            session_id,
+            owner_filter_for(actor),
+        )
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("session '{session_id}' not found")))?;
+    let page = state
+        .reader
+        .session_observations_scoped(
+            workspace_id,
+            project_id,
+            session_id,
+            ObservationPage {
+                limit,
+                offset: query.offset,
+                order,
+                kinds,
+                query: query.q.clone(),
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+    let observations = page
+        .records
+        .into_iter()
+        .map(|mut record| {
+            record.body = cap_body(&record.body, body_max_chars);
+            record
+        })
+        .collect();
+    Ok(with_no_store(
+        Json(ApiSessionObservations {
+            session,
+            observations,
+            total: page.total,
+            offset: query.offset,
+            limit,
+            order,
+            elided_other_scope: page.elided_other_scope,
+            body_max_chars,
+        })
+        .into_response(),
+    ))
+}
+
+/// Cap one observation body with a visible marker. Same shape as
+/// `ai_memory_consolidate::projection::cap_text_with_marker`, which the MCP
+/// tool uses; duplicated here because the web crate does not depend on the
+/// consolidation pipeline.
+fn cap_body(body: &str, max_chars: usize) -> String {
+    let total = body.chars().count();
+    if total <= max_chars {
+        return body.to_owned();
+    }
+    let mut out: String = body.chars().take(max_chars).collect();
+    out.push_str(&format!(
+        "\n[body truncated; {} chars omitted]",
+        total - max_chars
+    ));
+    out
+}
+
 async fn lookup_project(
     state: &WebState,
     workspace: &str,
@@ -1002,6 +1166,62 @@ enum SearchMode {
 struct LimitQuery {
     #[serde(default = "default_limit")]
     limit: usize,
+}
+
+fn default_session_list_limit() -> usize {
+    20
+}
+
+fn default_session_observations_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionListQuery {
+    #[serde(default = "default_session_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    /// Also list sessions that have not ended yet. Default false.
+    #[serde(default)]
+    include_open: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionObservationsQuery {
+    #[serde(default = "default_session_observations_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    /// `asc` (capture order, default) or `desc`.
+    #[serde(default)]
+    order: Option<String>,
+    /// Comma-separated observation kinds, e.g. `user-prompt,stop`.
+    #[serde(default)]
+    kinds: Option<String>,
+    /// Full-text query restricted to the session.
+    #[serde(default)]
+    q: Option<String>,
+    /// Per-body character cap; clamped to `200..=16384`, default `4000`.
+    #[serde(default)]
+    body_max_chars: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiSessionList {
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiSessionObservations {
+    session: SessionSummary,
+    observations: Vec<ObservationRecord>,
+    total: u64,
+    offset: usize,
+    limit: usize,
+    order: ObservationOrder,
+    elided_other_scope: u64,
+    body_max_chars: usize,
 }
 
 #[derive(Debug, Serialize)]

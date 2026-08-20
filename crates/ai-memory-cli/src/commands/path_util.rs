@@ -14,16 +14,30 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// Claude Code's relocated config root: `$CLAUDE_CONFIG_DIR` when set to a
-/// non-empty, non-whitespace value, else `None` (callers fall back to the
-/// `~/.claude*` defaults). The env value comes in as a parameter so tests
-/// can exercise both branches without mutating process env.
-pub(crate) fn claude_config_dir(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+/// An agent's relocated config root from its own home variable, when that
+/// variable is set to a non-empty, non-whitespace value; else `None`, and the
+/// caller falls back to the agent's `~/...` default.
+///
+/// Blank is treated as unset on purpose: an exported-but-empty variable is far
+/// more often an unset shell expansion than a deliberate request to install
+/// into the filesystem root.
+///
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env — which is not merely inconvenient here but
+/// forbidden: `std::env::set_var` is `unsafe` under edition 2024 and this
+/// workspace forbids `unsafe_code`.
+pub(crate) fn agent_config_home(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let value = env_override?;
     if value.to_str().is_some_and(|s| s.trim().is_empty()) {
         return None;
     }
     Some(PathBuf::from(value))
+}
+
+/// Claude Code's relocated config root: `$CLAUDE_CONFIG_DIR` when set, else
+/// `None`. Named alias kept so Claude call sites read for what they resolve.
+pub(crate) fn claude_config_dir(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    agent_config_home(env_override)
 }
 
 /// Candidate Claude Code paths for uninstall. The active relocated path comes

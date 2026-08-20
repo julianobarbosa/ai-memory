@@ -67,6 +67,7 @@ fn scripts_cover_subcommands_from_across_the_tree() {
             "serve",
             "write-page",
             "purge-project",
+            "move-session",
             "user",
             "rotate-token",
             "auth",

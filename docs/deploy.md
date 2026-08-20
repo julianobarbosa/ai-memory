@@ -162,7 +162,7 @@ alternatives:
 | openai | `gpt-5.4-mini` | ~$0.002 | Cheaper, faster alternative. Decent quality. |
 | openai-oauth | `gpt-5.5` | ChatGPT subscription | ChatGPT/Codex backend. Run `docker exec -it ai-memory ai-memory auth login openai-oauth` on the server host so `<data_dir>/auth.json` lands in the mounted data volume. |
 | copilot | `gpt-5.5` | GitHub Copilot subscription | GitHub Copilot Chat backend. Run `docker exec -it ai-memory ai-memory auth login copilot` on the server host or set `COPILOT_GITHUB_TOKEN`. |
-| gemini | `gemini-2.5-flash` | free tier covers personal use | Google hosted, native `responseSchema` structured output. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| gemini | `gemini-3.5-flash` | free tier covers personal use | Google hosted, native `responseSchema` structured output. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | openai-compat (Ollama) | `qwen3:32b` | $0 | Self-hosted. Set `AI_MEMORY_LLM_BASE_URL=http://host.docker.internal:11434/v1`. Quality depends on the model. |
 
 > **What we don't recommend:** reasoning-mode models (Kimi-K2.6 in reasoning mode,
@@ -179,6 +179,12 @@ gateway endpoints use the same schema-constrained request by default, with a
 tolerant fallback for explicit capability rejection or malformed output. Set
 `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint. If you switch
 to a niche local model, run a quick `ai-memory llm-test` before trusting it.
+
+Every chat provider bounds each HTTP request at 300 seconds. Slow hosted
+gateways (observed with free aggregator tiers) can stream a long completion
+past that ceiling and fail every request with `http: error sending request`;
+raise `AI_MEMORY_LLM_TIMEOUT_SECS` in the container environment to match the
+gateway's worst-case generation time.
 
 ## Backups
 

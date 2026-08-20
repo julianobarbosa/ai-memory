@@ -1072,6 +1072,355 @@ async fn api_recent_and_briefing_return_project_data() {
     assert_eq!(json["recent_pages"][0]["path"], "foo.md");
 }
 
+/// Seed one session in `(ws, proj)` with `(kind, title, body)` rows, ended
+/// when `completed`. Returns the session id.
+async fn seed_session(
+    store: &Store,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+    completed: bool,
+    rows: &[(ai_memory_core::ObservationKind, &str, &str)],
+) -> ai_memory_core::SessionId {
+    let session_id = ai_memory_core::SessionId::new();
+    store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::OpenCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    for (kind, title, body) in rows {
+        store
+            .writer
+            .insert_observation(ai_memory_core::Sanitized::new(
+                ai_memory_core::NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: *kind,
+                    extension: None,
+                    source_event: None,
+                    title: (*title).to_owned(),
+                    body: (*body).to_owned(),
+                    importance: 5,
+                },
+                &ai_memory_core::Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+    }
+    if completed {
+        store.writer.end_session(session_id, None).await.unwrap();
+    }
+    session_id
+}
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn api_sessions_lists_completed_sessions_for_the_scope() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let completed = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[(ObservationKind::UserPrompt, "done", "completed work")],
+    )
+    .await;
+    let open = seed_session(
+        &store,
+        ws,
+        proj,
+        false,
+        &[(ObservationKind::UserPrompt, "live", "still running")],
+    )
+    .await;
+    seed_session(
+        &store,
+        ws,
+        other,
+        true,
+        &[(ObservationKind::UserPrompt, "elsewhere", "other project")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let json = json_body(resp).await;
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "open and other-project sessions are hidden"
+    );
+    assert_eq!(sessions[0]["session_id"], completed.to_string());
+    assert_eq!(sessions[0]["observation_count"], 1);
+    assert!(sessions[0]["ended_at"].is_string());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions?include_open=true&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "limit=1 must cap the list");
+    assert_eq!(
+        sessions[0]["session_id"],
+        open.to_string(),
+        "newest first, and include_open surfaces the open one"
+    );
+}
+
+#[tokio::test]
+async fn api_session_observations_pages_orders_and_caps() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let long_body = "x".repeat(1_000);
+    let session_id = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[
+            (ObservationKind::UserPrompt, "first", "one quokka"),
+            (ObservationKind::PostToolUse, "second", long_body.as_str()),
+            (ObservationKind::Stop, "third", "three"),
+        ],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let base = format!("/workspaces/default/projects/scratch/sessions/{session_id}/observations");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?limit=2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let json = json_body(resp).await;
+    assert_eq!(json["session"]["session_id"], session_id.to_string());
+    assert_eq!(json["total"], 3);
+    assert_eq!(json["limit"], 2);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["order"], "asc");
+    assert_eq!(json["elided_other_scope"], 0);
+    assert_eq!(json["body_max_chars"], 4000);
+    let titles: Vec<&str> = json["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["first", "second"]);
+    assert_eq!(json["observations"][1]["body"], long_body);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{base}?order=desc&kinds=post-tool-use,stop&body_max_chars=50"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["order"], "desc");
+    assert_eq!(json["total"], 2);
+    assert_eq!(json["body_max_chars"], 200, "cap clamps up to the floor");
+    let titles: Vec<&str> = json["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["third", "second"]);
+    let body = json["observations"][1]["body"].as_str().unwrap();
+    assert!(body.starts_with(&"x".repeat(200)));
+    assert!(
+        body.ends_with("[body truncated; 800 chars omitted]"),
+        "got {body}"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?q=quokka"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["observations"][0]["title"], "first");
+}
+
+#[tokio::test]
+async fn api_session_routes_return_404_for_missing_project_and_foreign_session() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let foreign = seed_session(
+        &store,
+        ws,
+        other,
+        true,
+        &[(ObservationKind::UserPrompt, "hidden", "in other")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for uri in [
+        "/workspaces/default/projects/missing/sessions".to_owned(),
+        format!("/workspaces/default/projects/missing/sessions/{foreign}/observations"),
+        format!("/workspaces/default/projects/scratch/sessions/{foreign}/observations"),
+        format!(
+            "/workspaces/default/projects/scratch/sessions/{}/observations",
+            ai_memory_core::SessionId::new()
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn api_session_observations_reject_bad_params() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let session_id = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[(ObservationKind::UserPrompt, "p", "b")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let base = format!("/workspaces/default/projects/scratch/sessions/{session_id}/observations");
+    for (uri, needle) in [
+        (
+            "/workspaces/default/projects/scratch/sessions/not-a-uuid/observations".to_owned(),
+            "invalid session id",
+        ),
+        (
+            format!("{base}?kinds=user-prompt,bogus"),
+            "unknown observation kind",
+        ),
+        (format!("{base}?order=sideways"), "unknown order"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let json = json_body(resp).await;
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains(needle), "{uri}: got {msg}");
+    }
+}
+
 #[tokio::test]
 async fn api_workspace_overview_returns_aggregated_overview() {
     let (_tmp, store, wiki) = setup().await;

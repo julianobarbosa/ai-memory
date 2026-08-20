@@ -219,6 +219,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
+| `memory_read_session_observations` | Page through one session's raw hook observations in the resolved scope, body-capped | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
 | `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
 | `memory_forget_sweep` | Retention sweep (M8); wiki-backed eviction below cold threshold; `dry_run=true` previews | destructive |

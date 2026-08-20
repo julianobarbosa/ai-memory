@@ -94,15 +94,62 @@ fn configured(value: Option<&String>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty())
 }
 
+/// What the bound address tells us about network exposure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpExposure {
+    /// Loopback-only, or authenticated. Nothing to warn about.
+    Safe,
+    /// Unauthenticated on a non-loopback address, allowed because the
+    /// operator passed `--allow-insecure-no-auth`.
+    InsecureByOverride,
+    /// Unauthenticated on a non-loopback address inside a container, where
+    /// the bind address is not evidence either way. See
+    /// [`validate_http_exposure`].
+    UndeterminedInContainer,
+}
+
+/// Detect that this process is running inside a container.
+///
+/// `/.dockerenv` is created by Docker, `/run/.containerenv` by Podman. The
+/// official image also sets `AI_MEMORY_IN_CONTAINER`, so the signal survives
+/// runtimes that create neither file.
+fn running_in_container() -> bool {
+    if std::env::var("AI_MEMORY_IN_CONTAINER").is_ok_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
 /// Refuse accidental unauthenticated network exposure after the listener has
 /// selected its actual local address (which may differ from the bind input).
+///
+/// The check reads the bind address as evidence of reachability. That
+/// inference holds on a host, but **not** inside a container: publishing a
+/// port with `-p` requires binding `0.0.0.0` inside the namespace, and
+/// whether that port reaches the network is decided by the host-side publish
+/// spec — `-p 127.0.0.1:49374:49374` versus `-p 0.0.0.0:49374:49374` — which
+/// the process cannot observe. Refusing there is a false positive that took
+/// down the documented Quick Start container (#407), so containers get a
+/// loud warning instead.
+///
+/// Note this is deliberately not backstopped by the `Host` allowlist: that
+/// allowlist defends against DNS rebinding, where a browser sets the header.
+/// A client that can route to the port sets `Host` freely, so it is not an
+/// access control and cannot substitute for a token here.
 fn validate_http_exposure(
     local_addr: SocketAddr,
     auth_enabled: bool,
     allow_insecure_no_auth: bool,
-) -> Result<()> {
-    if local_addr.ip().is_loopback() || auth_enabled || allow_insecure_no_auth {
-        return Ok(());
+    containerized: bool,
+) -> Result<HttpExposure> {
+    if local_addr.ip().is_loopback() || auth_enabled {
+        return Ok(HttpExposure::Safe);
+    }
+    if allow_insecure_no_auth {
+        return Ok(HttpExposure::InsecureByOverride);
+    }
+    if containerized {
+        return Ok(HttpExposure::UndeterminedInContainer);
     }
 
     anyhow::bail!(
@@ -485,7 +532,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone())
         .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
-        .with_per_user_slots(config.slots.per_user);
+        .with_per_user_slots(config.slots.per_user)
+        .with_strip_root_combinators(config.strip_root_combinators);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -787,19 +835,34 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let local_addr = listener
                 .local_addr()
                 .context("reading bound HTTP listener address")?;
-            validate_http_exposure(local_addr, auth_enabled, args.allow_insecure_no_auth)?;
+            let exposure = validate_http_exposure(
+                local_addr,
+                auth_enabled,
+                args.allow_insecure_no_auth,
+                running_in_container(),
+            )?;
             info!(
                 %local_addr,
                 auth = auth_enabled,
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
-            if !auth_enabled && !local_addr.ip().is_loopback() {
+            if exposure == HttpExposure::InsecureByOverride {
                 tracing::warn!(
                     %local_addr,
                     "starting unauthenticated plain HTTP on a non-loopback address because \
                      --allow-insecure-no-auth was supplied — anyone on the network can call \
                      destructive MCP tools"
+                );
+            } else if exposure == HttpExposure::UndeterminedInContainer {
+                tracing::warn!(
+                    %local_addr,
+                    "no AI_MEMORY_AUTH_TOKEN configured. Inside a container the bind address \
+                     cannot show whether this port reaches the network — that is decided by \
+                     the host publish spec. If you published it with `-p 127.0.0.1:49374:49374` \
+                     you are fine; if you published it on 0.0.0.0 or to a LAN address, anyone \
+                     on the network can call destructive MCP tools. Generate a token with \
+                     `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN"
                 );
             } else if auth_enabled && !local_addr.ip().is_loopback() {
                 // Auth IS configured but the server is reachable from
@@ -989,9 +1052,12 @@ async fn start_maintenance_scheduler(
                     let reader = reader.clone();
                     let wiki = wiki.clone();
                     let llm = llm.clone();
+                    let decay_lambda = decay.decay_params().lambda;
                     async move {
                         let started = std::time::Instant::now();
-                        let outcome = run_scheduled_lint_tick(&reader, &wiki, llm.as_ref()).await?;
+                        let outcome =
+                            run_scheduled_lint_tick(&reader, &wiki, llm.as_ref(), decay_lambda)
+                                .await?;
                         if outcome.errors > 0 {
                             anyhow::bail!(
                                 "scheduled rule-based lint had {} scope errors",
@@ -1183,6 +1249,7 @@ async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
     wiki: &Wiki,
     llm: Option<&Arc<dyn LlmProvider>>,
+    decay_lambda: f64,
 ) -> Result<ScheduledLintTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledLintTickOutcome {
@@ -1197,8 +1264,11 @@ async fn run_scheduled_lint_tick(
             llm,
             scope.workspace_id,
             scope.project_id,
-            false,
-            false,
+            ai_memory_consolidate::LintOptions {
+                dry_run: false,
+                use_llm: false,
+                decay_lambda,
+            },
         )
         .await
         {
@@ -1656,15 +1726,59 @@ mod tests {
             let local_addr: SocketAddr = address.parse().expect("valid test address");
             for auth_enabled in [false, true] {
                 for allow_override in [false, true] {
+                    // On a host, the bind address IS the evidence: an
+                    // unauthenticated non-loopback bind is refused unless
+                    // the operator overrode it.
                     let allowed = loopback || auth_enabled || allow_override;
                     assert_eq!(
-                        validate_http_exposure(local_addr, auth_enabled, allow_override).is_ok(),
+                        validate_http_exposure(local_addr, auth_enabled, allow_override, false)
+                            .is_ok(),
                         allowed,
                         "address={address}, auth={auth_enabled}, override={allow_override}"
                     );
                 }
             }
         }
+    }
+
+    /// Regression for #407. The published image binds `0.0.0.0` because that
+    /// is the only way `-p` publishing works, so the host-side rule above
+    /// refused every container started from the documented Quick Start and
+    /// left it crash-looping under `--restart unless-stopped`.
+    #[test]
+    fn containers_warn_instead_of_refusing_because_the_bind_proves_nothing() {
+        let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        // The exact Quick Start shape: no token, no override, in a container.
+        assert_eq!(
+            validate_http_exposure(quick_start, false, false, true).expect("must not refuse"),
+            HttpExposure::UndeterminedInContainer,
+        );
+
+        // Identical inputs on a host still refuse — the carve-out is scoped
+        // to the container case and does not soften the host rule.
+        assert!(validate_http_exposure(quick_start, false, false, false).is_err());
+
+        // A container is not a blanket downgrade: with auth configured the
+        // verdict is Safe, so the operator gets no spurious warning.
+        assert_eq!(
+            validate_http_exposure(quick_start, true, false, true).expect("auth is fine"),
+            HttpExposure::Safe,
+        );
+
+        // An explicit override still reports as an override, not as the
+        // container case, so the startup log keeps naming the real reason.
+        assert_eq!(
+            validate_http_exposure(quick_start, false, true, true).expect("override is fine"),
+            HttpExposure::InsecureByOverride,
+        );
+
+        // Loopback inside a container is plain Safe.
+        let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
+        assert_eq!(
+            validate_http_exposure(loopback, false, false, true).expect("loopback is fine"),
+            HttpExposure::Safe,
+        );
     }
 
     #[test]
@@ -2446,9 +2560,14 @@ mod tests {
         }
 
         let panic_llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
-        let outcome = run_scheduled_lint_tick(&store.reader, &wiki, Some(&panic_llm))
-            .await
-            .unwrap();
+        let outcome = run_scheduled_lint_tick(
+            &store.reader,
+            &wiki,
+            Some(&panic_llm),
+            ai_memory_store::DecayParams::default().lambda,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.scopes, 2);
         assert_eq!(outcome.errors, 0);

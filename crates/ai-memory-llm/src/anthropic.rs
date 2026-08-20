@@ -45,6 +45,7 @@ pub struct AnthropicProvider {
     auth: AnthropicAuth,
     base_url: String,
     model: String,
+    timeout: Duration,
 }
 
 impl AnthropicProvider {
@@ -54,17 +55,13 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        // 300s matches the OpenAI/openai-compat client — same reason:
-        // first request after a model swap on a local inference server
-        // (Ollama, llama-swap, vLLM) can take 30-90s of cold-load.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::ApiKey(api_key),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -78,14 +75,13 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new_oauth(token: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::OAuth(token),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -93,6 +89,14 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
         self
     }
 }
@@ -260,6 +264,7 @@ impl AnthropicProvider {
         let mut builder = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
         // Apply the auth headers through the same helper the tests assert on,

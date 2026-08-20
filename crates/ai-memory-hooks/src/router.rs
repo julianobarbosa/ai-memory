@@ -2916,12 +2916,7 @@ fn build_auto_handoff(
             observations.len()
         ),
     };
-    let open_questions = if let Some(last) = last_prompt {
-        // Heuristic: last user prompt often *is* the open question.
-        vec![format!("Continue from: {}", cap(&last))]
-    } else {
-        Vec::new()
-    };
+    let open_questions = derive_open_questions(observations, &last_prompt);
     let next_steps = if tools.is_empty() {
         Vec::new()
     } else {
@@ -2942,6 +2937,163 @@ fn build_auto_handoff(
         next_steps,
         files_touched: Vec::new(),
         owner_user,
+    }
+}
+
+/// Derive the `open_questions` field for an automatic SessionEnd handoff
+/// using multi-signal heuristics, instead of blindly copying the last user
+/// prompt.
+///
+/// The previous implementation always did `"Continue from: <last prompt>"`,
+/// which produced useless entries when the last prompt was an acknowledgment
+/// ("ok", "thanks", "好的") or when the session ended mid-task after an edit
+/// but before verification. This function inspects the *tail* of the
+/// observation stream to choose the most informative framing.
+///
+/// Heuristics (first match wins):
+/// 1. Last prompt ends with `?` or `？` → tag as an unresolved question.
+/// 2. Last tool was an edit/write/patch with no subsequent Stop → the
+///    session ended before verification; advise the receiver to run tests.
+/// 3. Has Stop but no SessionEnd → mid-task exit; use the last
+///    *substantive* prompt (filtering acknowledgments).
+/// 4. Normal end → last substantive prompt as "Continue from: …".
+/// 5. Fallback → empty Vec (same as the old behaviour when no prompts).
+fn derive_open_questions(
+    observations: &[ai_memory_core::Observation],
+    last_prompt: &Option<String>,
+) -> Vec<String> {
+    let last_of_kind = |kind: ObservationKind| -> Option<&ai_memory_core::Observation> {
+        observations.iter().rev().find(|o| o.kind == kind)
+    };
+
+    let last_prompt_obs = last_of_kind(ObservationKind::UserPrompt);
+    let last_tool = last_of_kind(ObservationKind::PostToolUse);
+    let last_stop = last_of_kind(ObservationKind::Stop);
+    let has_session_end = observations
+        .iter()
+        .any(|o| o.kind == ObservationKind::SessionEnd);
+
+    // Heuristic 1: last prompt is a question → it is the open question.
+    if let Some(p) = last_prompt_obs {
+        let body = p.body.trim();
+        if body.ends_with('?') || body.ends_with('？') {
+            return vec![format!("Unresolved question: {}", cap_handoff_text(body))];
+        }
+    }
+
+    // Heuristic 2: file activity with no subsequent Stop → the session ended
+    // abnormally while working in the tree.
+    //
+    // The signal is the tool *family*, not the tool name. A PostToolUse
+    // observation's title is `canonical_tool_name(tool_family)`, which is
+    // only ever "file" / "search-list" / "non-file" / "unknown" — the
+    // reserved protocol deliberately carries no raw tool names. Matching
+    // "edit"/"write"/"patch" against that title can never succeed.
+    //
+    // That same closed schema means read and write are indistinguishable:
+    // `ToolFamily::File` covers both, and `ToolOutcome` is only
+    // success/error/unknown. So this cannot honestly claim changes were
+    // made — only that the session touched files and then ended without a
+    // normal Stop, which is worth telling the receiver either way.
+    if let Some(tool) = last_tool {
+        let touched_files = tool.title == canonical_tool_name(ToolFamily::File);
+        if touched_files && last_stop.is_none() {
+            return vec![
+                "Session ended without a normal stop while working with files".into(),
+                "Check the working tree for uncommitted or unverified changes".into(),
+            ];
+        }
+    }
+
+    // Heuristic 3 & 4: use the last *substantive* prompt.
+    if let Some(p) = last_prompt {
+        let body = p.trim();
+        if !body.is_empty() && !is_acknowledgment(body) {
+            // Heuristic 3 signal: no SessionEnd → flag as mid-task.
+            if !has_session_end && last_stop.is_some() {
+                return vec![format!(
+                    "Continue from (mid-task exit): {}",
+                    cap_handoff_text(body)
+                )];
+            }
+            // Heuristic 4: normal end.
+            return vec![format!("Continue from: {}", cap_handoff_text(body))];
+        }
+    }
+
+    // Fallback: no substantive prompt → empty (same as old behaviour).
+    Vec::new()
+}
+
+/// Whether a prompt is a pure acknowledgment with no substantive content.
+/// Used by [`derive_open_questions`] to skip "ok" / "thanks" / "好的" so
+/// the handoff does not carry a useless `Continue from: 好的` line.
+///
+/// Intentionally conservative: only short, well-known phrases are caught.
+/// Anything longer than 20 chars or containing a verb-like word is kept.
+fn is_acknowledgment(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // Short single-word/phrase acknowledgments.
+    const ACK_PHRASES: &[&str] = &[
+        "ok",
+        "okay",
+        "okk",
+        "k",
+        "kk",
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
+        "got it",
+        "done",
+        "great",
+        "nice",
+        "cool",
+        "perfect",
+        "sure",
+        "sounds good",
+        "will do",
+        "understood",
+        // CJK acknowledgments.
+        "好的",
+        "好",
+        "嗯",
+        "谢谢",
+        "收到",
+        "明白",
+        "了解",
+        "可以的",
+    ];
+    if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
+        return true;
+    }
+    // Also catch "ok, thanks" / "好的，谢谢" style compounds up to 20 chars.
+    if trimmed.chars().count() <= 20 && ACK_PHRASES.iter().any(|phrase| trimmed.starts_with(phrase))
+    {
+        let remainder = trimmed
+            .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || !c.is_ascii())
+            .trim_start_matches([',', '.', ' ', '，', '。']);
+        if remainder.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cap so a single long prompt does not blow up the handoff body.
+/// Mirrors the inner `cap` in [`build_auto_handoff`] but is standalone so
+/// [`derive_open_questions`] can use it without access to the closure.
+fn cap_handoff_text(s: &str) -> String {
+    const MAX: usize = 1500;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(MAX).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -11599,5 +11751,189 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ── derive_open_questions heuristic tests ─────────────────────────────
+
+    /// Build a synthetic observation for unit tests.
+    fn mk_obs(kind: ObservationKind, title: &str, body: &str) -> ai_memory_core::Observation {
+        use ai_memory_core::{ObservationId, ProjectId, WorkspaceId};
+        ai_memory_core::Observation {
+            id: ObservationId::new(),
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind,
+            extension: None,
+            source_event: None,
+            title: title.into(),
+            body: body.into(),
+            importance: 5,
+            created_at: jiff::Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn open_questions_extracts_question_mark_prompt() {
+        let obs = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "question",
+                "what is the return type?",
+            ),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+        ];
+        let last = Some("what is the return type?".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 1);
+        assert!(q[0].starts_with("Unresolved question:"));
+        assert!(q[0].contains("return type"));
+    }
+
+    /// The fixture title must come from `canonical_tool_name`, the same
+    /// function the ingest path uses. An earlier version of this test passed
+    /// a literal `"edit"`, which production never emits — so the heuristic
+    /// was dead code while the test stayed green.
+    #[test]
+    fn open_questions_detects_abnormal_exit_after_file_activity() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                canonical_tool_name(ToolFamily::File),
+                "tool_family: file\noutcome: unknown",
+            ),
+            // No Stop observation — session ended mid-task.
+        ];
+        let last = Some("fix the bug".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 2, "got: {q:?}");
+        assert!(q[0].contains("without a normal stop"), "got: {q:?}");
+        assert!(q[1].contains("working tree"), "got: {q:?}");
+    }
+
+    /// Guard against the regression this heuristic already had once: only
+    /// titles the ingest path can actually produce may drive it, so a raw
+    /// tool name must NOT trigger the file branch.
+    #[test]
+    fn open_questions_ignores_raw_tool_names_production_never_emits() {
+        for bogus in ["edit", "write", "patch", "Edit"] {
+            let obs = vec![
+                mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+                mk_obs(ObservationKind::PostToolUse, bogus, "edited main.rs"),
+            ];
+            let q = derive_open_questions(&obs, &Some("fix the bug".to_string()));
+            assert!(
+                q.iter().all(|s| !s.contains("without a normal stop")),
+                "title {bogus:?} is not a canonical tool family and must not \
+                 drive the file heuristic; got: {q:?}"
+            );
+        }
+    }
+
+    /// A search/list tool is file-adjacent but not file activity; it must
+    /// fall through to the prompt-based heuristics.
+    #[test]
+    fn open_questions_search_tool_does_not_trigger_file_branch() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "find it", "find the caller"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                canonical_tool_name(ToolFamily::SearchList),
+                "tool_family: search-list\noutcome: success",
+            ),
+        ];
+        let q = derive_open_questions(&obs, &Some("find the caller".to_string()));
+        assert_eq!(q.len(), 1, "got: {q:?}");
+        assert!(q[0].starts_with("Continue from:"), "got: {q:?}");
+    }
+
+    #[test]
+    fn open_questions_filters_acknowledgment() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix", "fix the bug"),
+            mk_obs(ObservationKind::PostToolUse, "edit", "edited main.rs"),
+            mk_obs(ObservationKind::Stop, "stop", "done"),
+            mk_obs(ObservationKind::UserPrompt, "ack", "好的"),
+        ];
+        let last = Some("好的".to_string());
+        let q = derive_open_questions(&obs, &last);
+        // "好的" is filtered → fallback to empty.
+        assert!(q.is_empty(), "expected empty for acknowledgment, got {q:?}");
+    }
+
+    #[test]
+    fn open_questions_uses_substantive_last_prompt() {
+        let obs = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "start",
+                "fix the bug in main.rs",
+            ),
+            mk_obs(ObservationKind::Stop, "stop", "done"),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        let last = Some("fix the bug in main.rs".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 1);
+        assert!(q[0].starts_with("Continue from:"));
+        assert!(q[0].contains("fix the bug"));
+    }
+
+    #[test]
+    fn open_questions_empty_when_no_prompts() {
+        let obs = vec![
+            mk_obs(ObservationKind::PostToolUse, "read", "read file"),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+        ];
+        let last = None;
+        let q = derive_open_questions(&obs, &last);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn open_questions_chinese_question_mark_detected() {
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "q",
+            "这个函数的返回值能不能是None？",
+        )];
+        let last = Some("这个函数的返回值能不能是None？".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 1);
+        assert!(q[0].starts_with("Unresolved question:"));
+    }
+
+    #[test]
+    fn open_questions_mid_task_exit_has_signal() {
+        let obs = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "start",
+                "fix the bug in main.rs",
+            ),
+            mk_obs(ObservationKind::PostToolUse, "edit", "edited main.rs"),
+            mk_obs(ObservationKind::Stop, "stop", "done"),
+            // No SessionEnd — mid-task exit.
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "followup",
+                "also check the tests",
+            ),
+        ];
+        let last = Some("also check the tests".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 1);
+        assert!(q[0].contains("mid-task exit"), "got: {q:?}");
+    }
+
+    #[test]
+    fn is_acknowledgment_catches_common_phrases() {
+        assert!(is_acknowledgment("ok"));
+        assert!(is_acknowledgment("thanks"));
+        assert!(is_acknowledgment("好的"));
+        assert!(is_acknowledgment("谢谢"));
+        assert!(!is_acknowledgment("fix the bug in main.rs"));
+        assert!(!is_acknowledgment("what is the return type?"));
     }
 }
