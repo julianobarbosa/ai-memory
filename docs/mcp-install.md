@@ -1085,6 +1085,71 @@ OMP / Oh My Pi remains separate: use `--client omp` / `--agent omp` (or
 
 ---
 
+## Schema dialects for strict upstreams
+
+Some model APIs validate MCP tool parameter schemas against a narrower dialect
+than JSON Schema and reject the whole `tools/list` with a 400. ai-memory can
+serve a relaxed dialect per request, via a `?flavor=` query on the MCP URL, or
+server-wide via config for clients that cannot carry one. Runtime argument
+validation is identical in every dialect — only the advertised schema changes.
+
+| Marker | Config key | What it changes | Who needs it |
+| --- | --- | --- | --- |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kimi Code (Moonshot); appended by `install-mcp` |
+| `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
+| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+
+The Gemini dialect exists because `schemars` renders every optional tool
+argument as a nullable union:
+
+```json
+"max_proposals": {
+  "description": "Override the maximum validated proposal count for this run.",
+  "type": ["integer", "null"], "format": "uint", "minimum": 0
+}
+```
+
+Google's `Schema` (Vertex/Gemini `functionDeclaration.parameters`) takes one
+`type` and treats `any_of` as exclusive with every sibling key, so a converter
+that forwards this untouched produces `any_of` with `description` next to it and
+Vertex refuses the request:
+
+```
+Unable to submit request because `ai-memory_memory_auto_improve` functionDeclaration
+`parameters.max_proposals` schema specified other fields alongside any_of.
+When using any_of, it must be the only field set.
+```
+
+The dialect collapses it to `"type": "integer"` plus `nullable: true` — the same
+normalization Gemini CLI performs client-side, which is why Gemini CLI and
+Antigravity CLI work on Vertex without any marker and do not need this. Reach
+for it when a pass-through client fails at `tools/list` with that error.
+
+`install-mcp` does not append `?flavor=gemini` for any client: OpenCode is
+provider-agnostic, so the right lever there is the server-side key.
+
+```bash
+# server-wide, for clients that cannot carry a query marker
+AI_MEMORY_GEMINI_SAFE_SCHEMAS=true ai-memory serve
+# or `gemini_safe_schemas = true` in config.toml
+
+# or per client, by hand in its MCP config
+#   "url": "http://homelab:49374/mcp?flavor=gemini"
+```
+
+Confirm which dialect a request gets by inspecting `tools/list` directly:
+
+```bash
+curl -s 'http://127.0.0.1:49374/mcp?flavor=gemini' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | jq '.result.tools[] | select(.name=="memory_auto_improve")
+        | .inputSchema.properties.max_proposals'
+```
+
+---
+
 ## After registering MCP - verify it works
 
 Regardless of which client you used, the first sanity check is the

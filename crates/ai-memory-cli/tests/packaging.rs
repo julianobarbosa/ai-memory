@@ -1444,6 +1444,102 @@ fn powershell_wrapper_trims_paths_with_single_character_separators() {
     );
 }
 
+// The PowerShell counterpart of run_wrapper_on_fake_macos: a fake `docker.cmd`
+// records the argv the wrapper built. No `uname` shadowing is needed because
+// the Windows arm under test is selected by running on Windows at all.
+#[cfg(windows)]
+fn run_powershell_wrapper(args: &[&str]) -> String {
+    run_powershell_wrapper_with_server_url(args, None)
+}
+
+#[cfg(windows)]
+fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str>) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker_args = tmp.path().join("docker-args.txt");
+    let docker = tmp.path().join("docker.cmd");
+    std::fs::write(
+        &docker,
+        "@echo off\r\n>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+
+    let mut command = Command::new("powershell.exe");
+    // See the execution-policy note on the OAuth-token test below.
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repo_root().join("bin/ai-memory.ps1"))
+        .args(args)
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env_remove("AI_MEMORY_DATA_DIR");
+    match server_url {
+        Some(url) => command.env("AI_MEMORY_SERVER_URL", url),
+        None => command.env_remove("AI_MEMORY_SERVER_URL"),
+    };
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "PowerShell wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(docker_args).unwrap()
+}
+
+// The Windows mirror of macos_wrapper_routes_urls_by_real_subcommand: Docker
+// Desktop gives Linux containers no host networking on Windows either, so the
+// helper container cannot reach the host-published server over loopback.
+#[cfg(windows)]
+#[test]
+fn windows_wrapper_routes_urls_by_real_subcommand() {
+    for subcommand in ["install-mcp", "install-hooks", "setup-agent"] {
+        let args = run_powershell_wrapper(&[subcommand]);
+        assert!(
+            !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+            "{subcommand} renders host-side config and must keep loopback defaults; got {args}"
+        );
+    }
+
+    let args = run_powershell_wrapper(&["status"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "thin-client commands must reach the host server through Docker Desktop; got {args}"
+    );
+
+    let args = run_powershell_wrapper(&["search", "install-hooks"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "only the actual subcommand should control URL routing; got {args}"
+    );
+
+    let args = run_powershell_wrapper(&["--config", "C:\\tmp\\config.toml", "install-hooks"]);
+    assert!(
+        !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "global options before install-hooks must not hide the real subcommand; got {args}"
+    );
+
+    // A homelab/remote server is configured through the environment, and the
+    // helper container must not be redirected back at the local Docker host.
+    let args =
+        run_powershell_wrapper_with_server_url(&["status"], Some("http://192.168.1.50:49374"));
+    assert!(
+        !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "an explicit AI_MEMORY_SERVER_URL must win over the Docker Desktop alias; got {args}"
+    );
+    assert!(
+        args.contains("-e AI_MEMORY_SERVER_URL"),
+        "an explicit AI_MEMORY_SERVER_URL must still be forwarded by name; got {args}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_in_argv() {
@@ -1462,7 +1558,22 @@ fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_
     ];
     let mut command = Command::new("powershell.exe");
     command
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        // -ExecutionPolicy Bypass: `-File` loads a script from disk, and execution policy
+        // governs script *files*, so on a machine left at the Windows client default of
+        // `Restricted` the unsigned bin/ai-memory.ps1 is refused (`UnauthorizedAccess`) and
+        // the wrapper never runs — failing this test for a reason unrelated to what it
+        // checks. The other in-repo invocation (render_shared.rs) uses `-Command`, which is
+        // not policy-gated and therefore needs no override; the generated hook commands pass
+        // Bypass defensively. GitHub's runner is permissive enough that this passes there
+        // today, so the fix is for running the suite on a stock Windows install.
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(repo_root().join("bin/ai-memory.ps1"))
         .args(["llm-test", "--provider", "anthropic-oauth"])
         .env("AI_MEMORY_DOCKER", &docker)

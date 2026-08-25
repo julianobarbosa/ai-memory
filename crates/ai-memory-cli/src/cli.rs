@@ -1089,6 +1089,17 @@ pub enum AgentChoice {
     /// `~/.commandcode/settings.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// Pool (Poolside Agent CLI, `pool`) — project-scoped YAML hooks in
+    /// the repo-root `.poolside/settings.yaml`. ai-memory stages the hook
+    /// scripts and prints a ready-to-paste `hooks:` snippet; it does not
+    /// write project-local files. NOTE: Pool's `SessionStart` stdout
+    /// injection is not demonstrated, so capture works but handoff
+    /// injection does not — recover the prior session's handoff via the
+    /// MCP `memory_handoff_accept` tool, and close sessions with
+    /// `ai-memory finalize-session --agent pool` (Pool has no true
+    /// session-end event).
+    #[value(alias = "poolside")]
+    Pool,
 }
 
 impl AgentChoice {
@@ -1116,6 +1127,7 @@ impl AgentChoice {
             Self::KimiCode => AgentKind::KimiCode,
             Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
+            Self::Pool => AgentKind::Pool,
         }
     }
 
@@ -1137,7 +1149,7 @@ impl AgentChoice {
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
     /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex and Antigravity CLI have no reliable true SessionEnd hook.
+    /// Codex, Antigravity CLI, and Pool have no reliable true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
@@ -1499,6 +1511,28 @@ pub struct LlmTestArgs {
 /// resolves its project from the main git repo root (collapsing
 /// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
 /// marker. A marker's own `project_strategy` still wins.
+/// Which way capture fails when a repository has no `.ai-memory.toml`
+/// marker (#446).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CaptureModeArg {
+    /// Capture unless a marker excludes it — the historical default.
+    Denylist,
+    /// Capture only repositories that carry a marker. A repository without
+    /// one emits no lifecycle events at all.
+    Allowlist,
+}
+
+impl CaptureModeArg {
+    /// The policy value this flag selects.
+    #[must_use]
+    pub const fn mode(self) -> ai_memory_hooks::CaptureMode {
+        match self {
+            Self::Denylist => ai_memory_hooks::CaptureMode::Denylist,
+            Self::Allowlist => ai_memory_hooks::CaptureMode::Allowlist,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStrategyArg {
     /// `project = basename(cwd)` — the default; bakes nothing.
@@ -1544,6 +1578,12 @@ pub struct HookArgs {
     /// Inspect capture policy without spooling, draining, or contacting the server.
     #[arg(long)]
     pub check_capture: bool,
+    /// Capture failure mode baked in by `install-hooks --capture-mode`.
+    /// Under `allowlist`, a repository with no `.ai-memory.toml` marker emits
+    /// no lifecycle event at all — the event is dropped before it can reach
+    /// the local spool or the wire.
+    #[arg(long, value_enum)]
+    pub capture_mode: Option<CaptureModeArg>,
     /// Opt in to assistant/Stop capture: on a Claude Code `stop` event, attach a
     /// sanitized, capped excerpt of the assistant's final turn as the Stop body.
     /// Baked onto the native `stop` command by
@@ -1629,6 +1669,24 @@ pub struct InstallHooksArgs {
     /// without this flag removes it (idempotent). Default off.
     #[arg(long)]
     pub capture_assistant: bool,
+    /// Persist the capture failure mode for this install (#446). Under
+    /// `allowlist`, a repository with no `.ai-memory.toml` marker emits no
+    /// lifecycle event at all, for every agent. Stored in the data dir, so a
+    /// later bare `--apply` — including the auto-refresh inside `upgrade` —
+    /// cannot regenerate it away. Omitting the flag leaves the stored mode
+    /// untouched; `--capture-mode denylist` restores the default.
+    #[arg(long, value_enum)]
+    pub capture_mode: Option<CaptureModeArg>,
+    /// Do not install Claude Code's `UserPromptSubmit` capture hook. Prompt
+    /// text is then excluded before it can enter the local spool or wire.
+    /// A bare `--apply` re-run preserves an existing opt-out; use
+    /// `--capture-prompts` to enable prompt capture again explicitly.
+    #[arg(long, conflicts_with = "capture_prompts")]
+    pub no_capture_prompts: bool,
+    /// Explicitly enable Claude Code prompt capture after an earlier
+    /// `--no-capture-prompts` install. Only valid for Claude Code.
+    #[arg(long, conflicts_with = "no_capture_prompts")]
+    pub capture_prompts: bool,
     /// Profile to use for OMP extensions, which relocates the path to
     /// `~/.omp/profiles/<profile>/agent/extensions/`.
     #[arg(long)]
@@ -2347,6 +2405,33 @@ mod tests {
     }
 
     #[test]
+    fn pool_hook_and_finalize_aliases_parse() {
+        for alias in ["pool", "poolside"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Pool alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Pool alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::Pool);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Pool);
+            assert_eq!(args.agent.script_hook_subdir(), Some("pool"));
+        }
+        let cli = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "pool"])
+            .expect("failed to parse finalize-session --agent pool");
+        let Command::FinalizeSession(args) = cli.command else {
+            panic!("expected finalize-session for pool");
+        };
+        assert_eq!(args.agent, AgentChoice::Pool);
+    }
+
+    #[test]
     fn command_code_mcp_and_hook_aliases_parse() {
         for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
             let mcp = Cli::try_parse_from([
@@ -2417,6 +2502,48 @@ mod tests {
         assert_eq!(
             args.project_strategy.and_then(ProjectStrategyArg::baked),
             Some("repo-root")
+        );
+    }
+
+    #[test]
+    fn install_hooks_prompt_capture_flags_parse_and_conflict() {
+        let disabled = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--no-capture-prompts",
+        ])
+        .expect("--no-capture-prompts parses");
+        let Command::InstallHooks(disabled) = disabled.command else {
+            panic!("expected install-hooks command");
+        };
+        assert!(disabled.no_capture_prompts);
+        assert!(!disabled.capture_prompts);
+
+        let enabled = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--capture-prompts",
+        ])
+        .expect("--capture-prompts parses");
+        let Command::InstallHooks(enabled) = enabled.command else {
+            panic!("expected install-hooks command");
+        };
+        assert!(!enabled.no_capture_prompts);
+        assert!(enabled.capture_prompts);
+
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--no-capture-prompts",
+                "--capture-prompts",
+            ])
+            .is_err(),
+            "the two prompt-capture choices must conflict"
         );
     }
 

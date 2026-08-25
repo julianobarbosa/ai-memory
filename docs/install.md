@@ -9,11 +9,11 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
-  (cargo install, building from source)
+  (mise, building from source)
 - [Managed cross-harness workstreams](managed-workstreams.md)
   (`ai-memory run`, transparent native resume, and argument forwarding)
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
@@ -421,6 +421,24 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
+### Hook latency expectations
+
+Hook-capable agents launch one short-lived hook process per lifecycle event. A
+successful tool call normally fires both a pre-tool and a post-tool event, so
+per-invocation overhead is paid twice. As an order-of-magnitude reference, one
+independent v1.29.0 evaluation on native macOS aarch64 measured about 145 ms per
+`posix-native` invocation (about 290 ms per completed tool call) and about 172
+ms per legacy `.sh` invocation.
+
+Those figures are one host's measurements, not a benchmark or performance
+guarantee. Process startup, filesystem and security software, the selected
+data directory, authentication, and host load can all change the result. The
+native hook fast path skips full config loading and tracing, and normally
+spools locally instead of waiting for the server, so keep the installer's
+native default where supported. Latency-sensitive deployments should measure
+their own agent host before opting into additional captured events or choosing
+a script fallback.
+
 ### Capture-policy capability and refresh
 
 `[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
@@ -440,6 +458,76 @@ including script and generated clients, then applies a 16 KiB backstop after
 sanitization before any observation reaches SQLite or FTS. Native hook commands
 invoke the installed binary directly, so upgrading that binary is enough to
 receive the client-side cap.
+
+**Disable Claude Code prompt capture.** Regulated or mixed-trust machines can
+leave the rest of Claude Code's lifecycle capture enabled while preventing
+`UserPromptSubmit` text from entering the local spool or wire:
+
+```bash
+ai-memory install-hooks --agent claude-code --no-capture-prompts --apply
+```
+
+The installer removes only ai-memory's prompt hook and preserves third-party
+hooks registered under the same event. A later bare `install-hooks --apply`
+(including an upgrade refresh) inherits the disabled state. Re-enable prompt
+capture explicitly with `--capture-prompts`. These options are Claude Code-only:
+some other agents use their prompt hook to inject handoff context, so removing
+it would break continuity. Disabling prompt capture reduces session summaries
+and recall quality because user intent is no longer part of the observation
+stream; tool and session-boundary capture continues unchanged.
+
+**Capture only repositories that opt in.** The controls above narrow *what* is
+captured; this one narrows *where*. By default a repository with no
+`.ai-memory.toml` marker is still captured, so a machine that works across many
+checkouts captures every new one automatically — forgetting a marker means
+capturing more, not less. Allowlist mode inverts that:
+
+```bash
+ai-memory install-hooks --apply --capture-mode allowlist
+```
+
+A repository without a marker then emits **no lifecycle event at all** — not a
+trimmed one. The event is dropped in the hook process before it can reach the
+local spool or the wire, so nothing is written to disk for a repository that
+never opted in. Opting a repository in is just placing a `.ai-memory.toml`
+marker in it, which is the same file that already configures routing and
+`ignore_paths`.
+
+**It is enforced by native `ai-memory hook` commands only** — the same
+boundary that already applies to `[capture] ignore_paths`, and for the same
+reason: the gate runs inside the hook binary, immediately before it spools.
+
+That is what a normal `install-hooks --apply` writes on Linux, macOS and
+Windows, so the usual install is covered. It is the *script* installs that are
+not: the bundled shell/PowerShell hooks POST to the server directly and never
+execute the binary, so nothing reads the mode. In practice that means the
+legacy `posix`/`windows` platform override (`AI_MEMORY_HOOK_PLATFORM`), the
+Docker host wrapper, and `setup-agent` snippets, which emit script commands by
+design. `install-hooks --apply` prints the mode and warns when the install it
+is writing cannot enforce it.
+
+Within that boundary the mode is not per-agent: it is stored once in the data
+directory and every native hook command reads it, whichever agent invoked it.
+That also means a later bare
+`install-hooks --apply` — including the auto-refresh inside `ai-memory upgrade`
+— leaves it alone by construction rather than by re-detecting it. Every
+`--apply` prints the mode in force. Return to the default with
+`--capture-mode denylist`.
+
+Verify it on any repository without changing anything:
+
+```bash
+printf '{"cwd":"%s"}' "$PWD" | ai-memory hook --event user-prompt-submit \
+    --agent claude-code --server-url "$AI_MEMORY_SERVER_URL" --check-capture
+```
+
+`--check-capture` inspects policy without spooling, draining, or contacting the
+server, and needs a JSON payload naming the directory to test. In the output,
+`"admits_capture": false` means that repository captures nothing;
+`"marker_present"` shows whether a marker was found by the upward walk.
+
+Note the trade: recall is lost for every repository you do not mark, and a
+repository you *intended* to capture stays silent until you add its marker.
 
 Some agent harnesses attach the assistant's final turn to their `Stop` event —
 Claude Code sends it as a raw `last_assistant_message`. By default that text is
@@ -905,6 +993,48 @@ bare `ai-memory run` considers checkout-local sessions from both incompatible
 stores. See
 [managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
+### Pool (Poolside Agent CLI)
+
+Pool reads lifecycle hooks from a project-scoped `.poolside/settings.yaml` at
+the root of each repository it runs in — there is no user-global hook file for
+ai-memory to merge. `install-hooks --agent pool` (alias `poolside`) therefore
+stages the hook scripts to the stable user-global location and prints a
+ready-to-paste `hooks:` snippet; ai-memory deliberately does not write files
+inside your repositories.
+
+```bash
+# Stage the scripts and print the snippet to paste into
+# <repo>/.poolside/settings.yaml:
+ai-memory install-hooks --agent pool --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The snippet wires Pool's five documented events — `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` (Claude-shaped
+names, snake_case JSON payload on stdin, verified against Poolside CLI
+v1.0.16). Local installs use the native `ai-memory hook` command, so Pool's
+documented `tool_name`/`tool_input` file operations honor `[capture]
+ignore_paths` and unknown file-tool payload shapes degrade to metadata-only
+capture.
+
+Pool has no true session-end event; `Stop` is a turn boundary. After the final
+turn, close the session explicitly; use the exact id when several Pool
+sessions are open in the same project:
+
+```bash
+ai-memory finalize-session --agent pool
+ai-memory finalize-session --agent pool --session-id <uuid>
+```
+
+Pool tolerates hook stdout, but model-visible context injection from
+`SessionStart` stdout is not demonstrated, so the session-start hook captures
+only and never fetches the (single-use) handoff — recover a prior session's
+handoff via the MCP `memory_handoff_accept` tool. No first-party
+`install-mcp` client and no managed workstream (`ai-memory run pool`) are
+claimed: Pool's native session-store contract is not demonstrated, per
+[managed-harness contributions](managed-harness-contributions.md).
+
 ### OpenCode
 
 ```bash
@@ -928,6 +1058,27 @@ docker run --rm akitaonrails/ai-memory:latest \
 
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
+
+**On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
+tool schemas to the configured provider verbatim, and Google's `Schema`
+(Vertex/Gemini `functionDeclaration.parameters`) accepts only a single `type` per
+field. `schemars` renders every optional tool argument as a nullable union
+(`"type": ["integer", "null"]`), so the provider rewrites it into `any_of` with
+`description` still beside it and Vertex fails the whole session at
+`tools/list`:
+
+```
+Unable to submit request because `ai-memory_memory_auto_improve` functionDeclaration
+`parameters.max_proposals` schema specified other fields alongside any_of.
+When using any_of, it must be the only field set.
+```
+
+Either set `gemini_safe_schemas = true` in `config.toml`
+(`AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`) on the server, which collapses those
+unions to `"type": "integer"` plus `nullable: true` for every client, or append
+`?flavor=gemini` to just this client's MCP URL. Runtime validation is unchanged
+either way. Gemini CLI and Antigravity CLI normalize schemas client-side and
+need neither.
 
 ### Oh My Pi / OMP
 
@@ -1167,11 +1318,40 @@ automatically; you only set it by hand for custom container setups.
 
 ## Running ai-memory without docker
 
-Most users should stick to the docker wrapper from the Quick start. On macOS,
-tagged releases also publish native `ai-memory-macos-aarch64.tar.gz` and
-`ai-memory-macos-x86_64.tar.gz` archives when you only need the client CLI.
-Build from source only when hacking on ai-memory itself or running on a platform
-docker doesn't support.
+Most users should stick to the docker wrapper from the Quick start. Arch
+Linux users have the [AUR packages](#arch-linux-native-packages-aur). For any
+other host, `mise` installs a tagged release binary directly from GitHub —
+no Rust toolchain needed:
+
+```bash
+mise use -g github:akitaonrails/ai-memory
+```
+
+This uses [mise's GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html),
+which downloads the release archive matching your OS/arch
+(`ai-memory-linux-x86_64.tar.gz`, `ai-memory-macos-aarch64.tar.gz`, etc.),
+verifies its checksum against the published `.sha256` sidecar, then extracts
+it and puts `ai-memory` on `PATH`. (mise can also check GitHub artifact
+attestation and SLSA provenance where a project publishes them; ai-memory's
+release workflow does not emit either today, so only the checksum applies.)
+No dedicated mise plugin or
+registry entry is required — the backend works against any repo whose
+release assets follow this naming convention. By default mise also holds back
+the very newest release for a short safety window
+([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+so a fresh tag may resolve to the previous version for a day or so; pin an
+exact tag with `mise use -g github:akitaonrails/ai-memory@1.30.0` to bypass
+that.
+
+`cargo install ai-memory` is not available: the crate name is already taken
+by an unrelated project on crates.io, as is `ai-memory-core` (the workspace's
+foundational internal crate). Publishing would require renaming at least
+that crate for the registry — a naming decision the project hasn't made yet.
+
+Build from source only when hacking on ai-memory itself or running on a
+platform none of the above covers. On macOS, tagged releases also publish
+native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz`
+archives when you only need the client CLI.
 
 ```bash
 git clone https://github.com/akitaonrails/ai-memory ~/.ai-memory
@@ -1857,6 +2037,11 @@ image, re-stages hook scripts under
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
+When a Compose file is found, the wrapper first verifies that its project owns
+the running `ai-memory` container. A standalone container is never handed to an
+unrelated Compose project just because its file occupies a conventional path;
+the wrapper instead writes the inspected standalone recreation script for
+review, preserving the existing `/data` mount and other runtime options.
 
 Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check. To pin wrapper
 self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;

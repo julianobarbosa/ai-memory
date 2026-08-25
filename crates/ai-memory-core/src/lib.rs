@@ -9,6 +9,8 @@ pub mod active_project;
 pub mod actor;
 pub mod error;
 pub mod handoff;
+pub mod ingest_metrics;
+pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
 pub mod observation;
 pub mod page;
@@ -45,7 +47,10 @@ pub use actor::{
     skip_admission_chain_for,
 };
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
+pub use handoff::{
+    Handoff, HandoffAcceptance, HandoffContent, HandoffLifecycle, HandoffOrigin, HandoffScope,
+    HandoffState, NewHandoff,
+};
 pub use ids::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
     ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
@@ -59,6 +64,7 @@ pub use page::{
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
+    truncate_utf8_bytes_head_tail,
 };
 pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,

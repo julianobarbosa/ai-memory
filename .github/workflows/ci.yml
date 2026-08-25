@@ -134,6 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/check-native-packaging.sh
+      - run: tests/wrapper_upgrade.sh
 
   # `bin/release` copies `## [Unreleased]` into the new version section
   # verbatim, so a repeated `### ` heading there ships release notes with the

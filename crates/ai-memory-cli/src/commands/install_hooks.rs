@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{AgentChoice, InstallHooksArgs, McpClient, ProjectStrategyArg};
+use crate::cli::{AgentChoice, CaptureModeArg, InstallHooksArgs, McpClient, ProjectStrategyArg};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
@@ -27,13 +27,16 @@ use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    POOL_EVENTS, build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
     build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value, build_profile_payload_for_agent,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
+    build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
     local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
+
+const CLAUDE_PROMPT_EVENT: &str = "UserPromptSubmit";
 
 /// Claude Code's settings file — hooks live under `hooks`.
 /// `$CLAUDE_CONFIG_DIR/settings.json` when the var is set, else
@@ -355,7 +358,35 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
              switch to a native Claude Code install."
         );
     }
+    if (args.no_capture_prompts || args.capture_prompts)
+        && !prompt_capture_options_allowed(args.agent)
+    {
+        anyhow::bail!(
+            "--no-capture-prompts and --capture-prompts require --agent claude-code. Other \
+             agents may use their prompt hook to deliver handoff context, so removing it could \
+             break cross-agent continuity."
+        );
+    }
     if args.apply {
+        // #446: settle the capture failure mode before any agent-specific
+        // work, and say which mode is in force. A protection the operator
+        // cannot see is one they cannot trust.
+        let capture_mode = persist_capture_mode(&config.data_dir, args.capture_mode)?;
+        println!("capture mode: {capture_mode}");
+        if capture_mode == "allowlist" {
+            println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
+            // The gate lives inside the native hook binary, immediately before
+            // the spool write. A script install POSTs to the server directly
+            // and never runs it, so the mode is stored but unenforced. Saying
+            // nothing would leave an operator trusting a protection this
+            // install does not have — the exact failure #446 is about.
+            if !local_hook_policy_v1_supported() {
+                println!(
+                    "  WARNING: this install uses script hooks, which POST directly and \
+                     cannot enforce the mode. Allowlist is stored but NOT in force here."
+                );
+            }
+        }
         // Preserve a project-strategy an earlier `--apply` baked when this run
         // did not pass `--project-strategy`. Without this, a bare re-apply —
         // notably the auto-refresh in `ai-memory upgrade` — re-renders the hook
@@ -439,6 +470,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Pool => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_pool(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -461,7 +496,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 &config.data_dir,
                 strategy,
                 &settings_path,
-                args.capture_assistant,
+                ClaudeCaptureScope {
+                    assistant: args.capture_assistant,
+                    prompts: install_claude_prompt_capture(&args),
+                },
             )
         }
         AgentChoice::Codex => {
@@ -544,6 +582,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::Pool => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_pool(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
     }
 }
 
@@ -570,6 +612,69 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
     existing_agent_config(args)
         .as_deref()
         .and_then(|existing| baked_project_strategy(args.agent, existing))
+}
+
+/// Settle and persist the capture failure mode (#446), returning the mode now
+/// in force.
+///
+/// An explicit flag writes the file. Omitting the flag *reads* the stored
+/// value rather than defaulting to it, so a bare `--apply` — including the
+/// auto-refresh inside `ai-memory upgrade` — can never quietly downgrade an
+/// existing opt-in back to capture-by-default.
+fn persist_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> Result<String> {
+    let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+    let Some(requested) = requested else {
+        return Ok(match fs::read_to_string(&path) {
+            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
+            _ => "denylist".to_string(),
+        });
+    };
+    let value = match requested {
+        CaptureModeArg::Allowlist => "allowlist",
+        CaptureModeArg::Denylist => "denylist",
+    };
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    fs::write(&path, format!("{value}\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(value.to_string())
+}
+
+/// Whether the Claude Code install should include its prompt-capture hook.
+/// Explicit flags win. A bare apply preserves the state of an existing
+/// ai-memory install so `upgrade` cannot silently restore a privacy opt-out.
+fn install_claude_prompt_capture(args: &InstallHooksArgs) -> bool {
+    if args.no_capture_prompts {
+        return false;
+    }
+    if args.capture_prompts || !args.apply {
+        return true;
+    }
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_claude_prompt_capture)
+        .unwrap_or(true)
+}
+
+/// Recover prompt-capture state only from hook entries owned by ai-memory.
+/// `None` means this is not an existing ai-memory Claude Code install.
+fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let has_ai_memory_hooks = hooks.values().any(|value| {
+        value
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
+    });
+    if !has_ai_memory_hooks {
+        return None;
+    }
+    Some(
+        hooks
+            .get(CLAUDE_PROMPT_EVENT)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry)),
+    )
 }
 
 /// Read the config file `--apply` will update for the selected agent.
@@ -599,6 +704,9 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
+            // Pool's hook config is per-repo (`.poolside/settings.yaml`), not a
+            // user-global file the installer could re-read a baked strategy from.
+            AgentChoice::Pool => return None,
             AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
         }
     };
@@ -954,6 +1062,9 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
         AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
+        // No first-party Pool MCP installer ships yet, so there is no
+        // config file to infer a server URL or token from.
+        AgentChoice::Pool => None,
     }
 }
 
@@ -1178,6 +1289,19 @@ fn overlay_event_hooks(
     map.insert(event.to_string(), serde_json::Value::Array(entries));
 }
 
+/// Remove only ai-memory's entries for one event. Delete the event key when
+/// no third-party hooks remain so a rendered opt-out stays minimal.
+fn remove_ai_memory_event_hooks(map: &mut serde_json::Map<String, serde_json::Value>, event: &str) {
+    overlay_event_hooks(map, event, &serde_json::Value::Array(Vec::new()));
+    if map
+        .get(event)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        map.remove(event);
+    }
+}
+
 fn overlay_kiro_cli_event_hooks(
     map: &mut serde_json::Map<String, serde_json::Value>,
     event: &str,
@@ -1216,6 +1340,24 @@ fn capture_assistant_allowed(agent: AgentChoice) -> bool {
     matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
 }
 
+fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
+    agent == AgentChoice::ClaudeCode
+}
+
+fn configure_claude_prompt_capture(
+    mut payload: serde_json::Value,
+    capture_prompts: bool,
+) -> serde_json::Value {
+    if !capture_prompts
+        && let Some(hooks) = payload
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        hooks.remove(CLAUDE_PROMPT_EVENT);
+    }
+    payload
+}
+
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -1238,15 +1380,19 @@ fn apply_to_claude_code_settings_in(
 ) -> Result<()> {
     let staged = stage_hook_scripts_in(hooks_dir, "claude-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "claude-code");
-    let payload = crate::commands::render_shared::build_claude_code_script_payload_for_test(
-        &command_dir,
-        server_url,
-        auth_token,
-        Some(data_dir),
-        args.project_strategy.and_then(ProjectStrategyArg::baked),
-        args.capture_assistant,
+    let capture_prompts = install_claude_prompt_capture(args);
+    let payload = configure_claude_prompt_capture(
+        crate::commands::render_shared::build_claude_code_script_payload_for_test(
+            &command_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            args.capture_assistant,
+        ),
+        capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args)
+    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_staged(
@@ -1257,20 +1403,25 @@ fn apply_to_claude_code_settings_with_staged(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let command_dir = staged_command_dir(staged, "claude-code");
-    let payload = build_claude_code_payload_with_data_dir(
-        &command_dir,
-        server_url,
-        auth_token,
-        Some(data_dir),
-        args.project_strategy.and_then(ProjectStrategyArg::baked),
-        args.capture_assistant,
+    let capture_prompts = install_claude_prompt_capture(args);
+    let payload = configure_claude_prompt_capture(
+        build_claude_code_payload_with_data_dir(
+            &command_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            args.capture_assistant,
+        ),
+        capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args)
+    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_payload(
     payload: serde_json::Value,
     args: &InstallHooksArgs,
+    capture_prompts: bool,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
@@ -1295,6 +1446,9 @@ fn apply_to_claude_code_settings_with_payload(
                 .context("`hooks` is present in settings.json but not an object")?;
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
+            }
+            if !capture_prompts {
+                remove_ai_memory_event_hooks(hooks, CLAUDE_PROMPT_EVENT);
             }
             Ok(())
         })
@@ -4056,6 +4210,22 @@ fn exe_dir_guess() -> Option<PathBuf> {
 // CLAUDE_CODE_EVENTS + build_claude_code_payload now live in
 // `super::render_shared`, shared with `setup-agent`.
 
+/// Which optional capture surfaces the generated Claude Code settings should
+/// include.
+///
+/// Grouped rather than passed as two positional bools: at the call site
+/// `true, false` said nothing about which surface was which, and the pair is
+/// exactly the privacy-relevant part of this install — worth naming.
+#[derive(Debug, Clone, Copy)]
+struct ClaudeCaptureScope {
+    /// Include the assistant-message capture hook (double opt-in, off by
+    /// default).
+    assistant: bool,
+    /// Include the `UserPromptSubmit` hook. When false the entry is omitted
+    /// entirely, so the agent never emits prompt text at all.
+    prompts: bool,
+}
+
 fn render_claude_code(
     hooks_dir: &Path,
     server_url: &str,
@@ -4063,13 +4233,20 @@ fn render_claude_code(
     data_dir: &Path,
     project_strategy: Option<&str>,
     settings_path: &Path,
-    capture_assistant: bool,
+    capture: ClaudeCaptureScope,
 ) -> Result<()> {
+    let ClaudeCaptureScope {
+        assistant: capture_assistant,
+        prompts: capture_prompts,
+    } = capture;
     // Soft check: warn (don't bail) if a script is missing. The user
     // may be running this command inside docker against a host path
     // that exists only on the host's filesystem — bailing would
     // sabotage the docker-only flow `setup-agent` enables.
-    for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+    for (event, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+        if !capture_prompts && event == CLAUDE_PROMPT_EVENT {
+            continue;
+        }
         let script = hook_script_for_claude_code(script);
         let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
@@ -4082,13 +4259,16 @@ fn render_claude_code(
             );
         }
     }
-    let payload = build_claude_code_payload_with_data_dir(
-        hooks_dir,
-        server_url,
-        auth_token,
-        Some(data_dir),
-        project_strategy,
-        capture_assistant,
+    let payload = configure_claude_prompt_capture(
+        build_claude_code_payload_with_data_dir(
+            hooks_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            project_strategy,
+            capture_assistant,
+        ),
+        capture_prompts,
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing claude code hook config")?;
@@ -4463,9 +4643,151 @@ fn render_kiro_cli_v3(
     Ok(())
 }
 
+/// Print Pool's `.poolside/settings.yaml` `hooks:` block to stdout. Pool's
+/// hook config lives at the root of each repository the agent runs in, so
+/// there is no user-global file for an atomic merge — the snippet is pasted
+/// per project. `--apply` still stages the scripts to the stable user-global
+/// location first so the printed commands reference paths that outlive the
+/// source checkout / docker image (see [`apply_to_pool`]).
+fn render_pool(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in POOL_EVENTS {
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    print!(
+        "{}",
+        render_pool_output(
+            hooks_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy
+        )
+    );
+    Ok(())
+}
+
+fn render_pool_output(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> String {
+    let snippet = build_pool_settings_yaml_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut out = String::new();
+    out.push_str("# Pool (Poolside Agent CLI) hook config — merge into the repo-root\n");
+    out.push_str("# .poolside/settings.yaml of each project Pool runs in. ai-memory\n");
+    out.push_str("# does not write project-local files, so paste this snippet manually\n");
+    out.push_str("# (re-run with --apply first to stage the scripts to a stable path).\n");
+    out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
+    out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
+    if auth_token.is_some() {
+        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
+        out.push_str("#       Treat .poolside/settings.yaml as sensitive (chmod 600).\n");
+    }
+    out.push_str("# NOTE: Pool's SessionStart stdout injection is not demonstrated —\n");
+    out.push_str("#       capture works, but handoff injection does not. Recover a prior\n");
+    out.push_str("#       session's handoff via the MCP `memory_handoff_accept` tool.\n");
+    out.push_str("# NOTE: Pool has no true session-end event; `Stop` is a turn boundary.\n");
+    out.push_str(
+        "#       Close a finished session with `ai-memory finalize-session --agent pool`.\n",
+    );
+    out.push('\n');
+    out.push_str(&snippet);
+    out
+}
+
+/// `--apply` for Pool: stage the hook scripts to the stable user-global
+/// location (the same step every other script agent's apply performs), then
+/// print the ready-to-paste snippet pointing at the staged copies. The
+/// project-local `.poolside/settings.yaml` itself is deliberately NOT
+/// written: install-hooks is a user-scoped operation and must not mutate
+/// files inside the user's repositories.
+fn apply_to_pool(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "pool")?;
+    let command_dir = staged_command_dir(&staged, "pool");
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    print!(
+        "{}",
+        render_pool_output(&command_dir, server_url, auth_token, data_dir, strategy)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #446's binding requirement: "a protection that disappears on upgrade
+    /// without saying so is worse than no protection". A bare `--apply` — what
+    /// `ai-memory upgrade` runs — must leave an existing opt-in alone.
+    #[test]
+    fn bare_apply_preserves_an_existing_allowlist_optin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = persist_capture_mode(tmp.path(), Some(CaptureModeArg::Allowlist)).unwrap();
+        assert_eq!(mode, "allowlist");
+
+        // The upgrade path: no flag at all.
+        let after = persist_capture_mode(tmp.path(), None).unwrap();
+        assert_eq!(
+            after, "allowlist",
+            "a bare re-apply must not revert the opt-in"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(crate::commands::hook::CAPTURE_MODE_FILE))
+                .unwrap()
+                .trim(),
+            "allowlist"
+        );
+    }
+
+    #[test]
+    fn absent_file_reports_the_historical_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(persist_capture_mode(tmp.path(), None).unwrap(), "denylist");
+    }
+
+    #[test]
+    fn explicit_denylist_downgrades_an_earlier_optin() {
+        // The opt-in must be reversible, or operators cannot undo a mistake.
+        let tmp = tempfile::tempdir().unwrap();
+        persist_capture_mode(tmp.path(), Some(CaptureModeArg::Allowlist)).unwrap();
+        assert_eq!(
+            persist_capture_mode(tmp.path(), Some(CaptureModeArg::Denylist)).unwrap(),
+            "denylist"
+        );
+        assert_eq!(persist_capture_mode(tmp.path(), None).unwrap(), "denylist");
+    }
     use crate::cli::ProjectStrategyArg;
     use crate::commands::render_shared::KIRO_CLI_V2_SESSION_START_MAX_OUTPUT;
     use std::collections::BTreeMap;
@@ -4495,6 +4817,7 @@ mod tests {
             KimiCode,
             KiroCli,
             KiroCliV3,
+            Pool,
         ] {
             assert!(
                 !capture_assistant_allowed(agent),
@@ -4506,6 +4829,64 @@ mod tests {
             capture_assistant_allowed(ClaudeCode),
             local_hook_policy_v1_supported()
         );
+    }
+
+    #[test]
+    fn prompt_capture_options_are_claude_code_only() {
+        use crate::cli::AgentChoice::*;
+        assert!(prompt_capture_options_allowed(ClaudeCode));
+        for agent in [
+            Codex,
+            CommandCode,
+            Cursor,
+            GeminiCli,
+            OpenCode,
+            Pi,
+            Omp,
+            Openclaw,
+            AntigravityCli,
+            Grok,
+            Zero,
+            Devin,
+            KimiCode,
+            KiroCli,
+            KiroCliV3,
+            Pool,
+        ] {
+            assert!(!prompt_capture_options_allowed(agent), "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn baked_prompt_capture_reads_only_owned_claude_hooks() {
+        let enabled = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "command": "ai-memory hook --event user-prompt" }] }]
+            }
+        });
+        assert_eq!(
+            baked_claude_prompt_capture(&enabled.to_string()),
+            Some(true)
+        );
+
+        let disabled = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "command": "third-party prompt guard" }] }]
+            }
+        });
+        assert_eq!(
+            baked_claude_prompt_capture(&disabled.to_string()),
+            Some(false)
+        );
+
+        let unrelated = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [{ "command": "third-party prompt guard" }] }]
+            }
+        });
+        assert_eq!(baked_claude_prompt_capture(&unrelated.to_string()), None);
     }
 
     #[cfg(unix)]
@@ -4730,6 +5111,9 @@ mod tests {
             profile: None,
             agent: AgentChoice::OpenCode,
             capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
             hooks_dir: None,
             server_url: None,
             auth_token: None,
@@ -5220,6 +5604,75 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert_eq!(resolved, tmp.path().join("grok"));
     }
 
+    #[test]
+    fn resolve_hooks_dir_uses_pool_bundle_for_pool() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("pool")).unwrap();
+        fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
+
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Pool).unwrap();
+        assert_eq!(resolved, tmp.path().join("pool"));
+    }
+
+    #[test]
+    fn pool_settings_yaml_covers_all_events_with_bounded_entries() {
+        let snippet = super::super::render_shared::build_pool_settings_yaml_with_data_dir(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+        assert!(snippet.starts_with("hooks:\n"), "snippet: {snippet}");
+        for (event, script) in POOL_EVENTS {
+            assert!(
+                snippet.contains(&format!("  {event}:\n")),
+                "missing {event} in: {snippet}"
+            );
+            let stem = script.strip_suffix(".sh").unwrap();
+            assert!(
+                snippet.contains(&format!("- name: ai-memory-{stem}\n")),
+                "missing name for {event} in: {snippet}"
+            );
+        }
+        assert_eq!(
+            snippet.matches("matcher: \"*\"").count(),
+            POOL_EVENTS.len(),
+            "one wildcard matcher per event"
+        );
+        assert_eq!(
+            snippet.matches("timeout: 20").count(),
+            POOL_EVENTS.len(),
+            "one bounded timeout per event"
+        );
+        // Every command is a YAML single-quoted scalar so the embedded POSIX
+        // quoting survives; the auth token rides inside the command.
+        assert_eq!(
+            snippet.matches("command: '").count(),
+            POOL_EVENTS.len(),
+            "one single-quoted command per event"
+        );
+        assert!(snippet.contains("tok-test"), "auth token must be embedded");
+    }
+
+    #[test]
+    fn render_pool_output_states_manual_paste_and_finalize_path() {
+        let out = render_pool_output(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            None,
+            Path::new("/data"),
+            None,
+        );
+        assert!(out.contains(".poolside/settings.yaml"));
+        assert!(out.contains("does not write project-local files"));
+        assert!(out.contains("finalize-session --agent pool"));
+        assert!(out.contains("memory_handoff_accept"));
+        assert!(out.contains("hooks:\n"));
+        // No token was passed, so none of the auth caution lines render.
+        assert!(!out.contains("AI_MEMORY_AUTH_TOKEN embedded"));
+    }
+
     // Issue #156: Zero hook install writes exec-form entries into Zero's
     // hooks.json shape and merges around third-party hooks by id prefix.
     #[test]
@@ -5523,17 +5976,26 @@ model = "gpt-5"
             "PowerShell hooks require the shared lib helper"
         );
 
-        for agent_dir in [
-            "claude-code",
-            "codex",
-            "cursor",
-            "gemini-cli",
-            "grok",
-            "devin",
-            "opencode",
-            "antigravity-cli",
-            "kimi-code",
-        ] {
+        // Enumerate the bundles instead of listing them: a hardcoded
+        // list silently skips whatever agent lands next, which is how
+        // `command-code` and `kiro-cli` shipped uncovered. `lib/` holds
+        // the shared PowerShell helper, not an agent bundle.
+        let mut agent_dirs: Vec<String> = fs::read_dir(&hooks_root)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", hooks_root.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+            .filter(|name| name != "lib")
+            .collect();
+        agent_dirs.sort();
+        assert!(
+            !agent_dirs.is_empty(),
+            "no agent hook bundles found under {}",
+            hooks_root.display()
+        );
+
+        for agent_dir in agent_dirs {
+            let agent_dir = agent_dir.as_str();
             let dir = hooks_root.join(agent_dir);
             let mut sh = BTreeMap::new();
             let mut ps1 = BTreeMap::new();
@@ -6355,6 +6817,9 @@ model = "gpt-5"
         let args = InstallHooksArgs {
             agent: AgentChoice::Omp,
             capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
@@ -6385,6 +6850,9 @@ model = "gpt-5"
         let args = InstallHooksArgs {
             agent: AgentChoice::Pi,
             capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
@@ -6749,6 +7217,9 @@ model = "gpt-5"
                 profile: None,
                 agent: AgentChoice::Codex,
                 capture_assistant: false,
+                no_capture_prompts: false,
+                capture_mode: None,
+                capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -7233,6 +7704,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 profile: None,
                 agent: AgentChoice::ClaudeCode,
                 capture_assistant: false,
+                no_capture_prompts: false,
+                capture_mode: None,
+                capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -7266,6 +7740,117 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             command.contains(&staged_script.to_string_lossy().into_owned()),
             "generated command must reference staged script {}: {command}",
             staged_script.display()
+        );
+    }
+
+    #[test]
+    fn claude_prompt_opt_out_survives_reapply_and_preserves_third_party_hook() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("settings.json");
+        let staging_tmp = TempDir::new().unwrap();
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "hooks": [{ "command": "third-party prompt guard" }] },
+                        { "hooks": [{ "command": "/old/ai-memory hook --event user-prompt" }] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let disabled = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            no_capture_prompts: true,
+            capture_mode: None,
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &disabled,
+        )
+        .unwrap();
+
+        let assert_disabled = || {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let prompts = parsed["hooks"][CLAUDE_PROMPT_EVENT]
+                .as_array()
+                .expect("third-party prompt hook keeps the event present");
+            assert_eq!(prompts.len(), 1);
+            assert!(
+                serde_json::to_string(prompts)
+                    .unwrap()
+                    .contains("third-party prompt guard")
+            );
+            assert!(!prompts.iter().any(is_ai_memory_hook_entry));
+        };
+        assert_disabled();
+
+        let bare_reapply = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &bare_reapply,
+        )
+        .unwrap();
+        assert_disabled();
+
+        let enabled = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            capture_prompts: true,
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &enabled,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let prompts = parsed["hooks"][CLAUDE_PROMPT_EVENT].as_array().unwrap();
+        assert_eq!(prompts.len(), 2, "third-party + one ai-memory hook");
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .count(),
+            1
         );
     }
 
@@ -7680,6 +8265,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
+                no_capture_prompts: false,
+                capture_mode: None,
+                capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -7744,6 +8332,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
+                no_capture_prompts: false,
+                capture_mode: None,
+                capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -7797,6 +8388,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
@@ -7843,6 +8437,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
@@ -7914,6 +8511,9 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
+                no_capture_prompts: false,
+                capture_mode: None,
+                capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,

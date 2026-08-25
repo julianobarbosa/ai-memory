@@ -245,7 +245,8 @@ impl Sanitized<NewObservation> {
     #[must_use]
     pub fn new(mut obs: NewObservation, sanitizer: &Sanitizer) -> Self {
         obs.title = sanitizer.scrub(&obs.title);
-        obs.body = truncate_utf8_bytes(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
+        obs.body =
+            truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
         Self(obs)
     }
 }
@@ -272,6 +273,66 @@ pub fn truncate_utf8_bytes(input: &str, max: usize) -> String {
     let mut output = String::with_capacity(max);
     output.push_str(&input[..end]);
     output.push('…');
+    output
+}
+
+/// Truncate text to at most `max` UTF-8 bytes, keeping **both** the head
+/// and the tail so the middle can be elided.
+///
+/// The plain [`truncate_utf8_bytes`] keeps only the head, which loses the
+/// tail of a long tool output (e.g. a 50 KB file read). When the LLM
+/// consolidator later reads the observation body it sees an incomplete
+/// picture and may produce less accurate summaries. This variant splits
+/// the budget: head gets `max/2`, tail gets `max/2`, and a truncation
+/// marker is inserted between them so the boundary is visible.
+///
+/// Never splits a code point. Falls back to [`truncate_utf8_bytes`] when
+/// the budget is too small to split meaningfully (under 64 bytes).
+#[must_use]
+pub fn truncate_utf8_bytes_head_tail(input: &str, max: usize) -> String {
+    if input.len() <= max {
+        return input.to_string();
+    }
+    // For small budgets the head-tail split produces tiny fragments with
+    // a marker that is longer than the content. Fall back to head-only.
+    if max < 64 {
+        return truncate_utf8_bytes(input, max);
+    }
+    // Reserve bytes for the truncation marker: "\n...[truncated N bytes]...\n"
+    // where N is at most ~10 digits. Use a fixed 48-byte reservation —
+    // generous enough for the marker plus newlines, small enough to leave
+    // meaningful head/tail budgets.
+    const MARKER_RESERVE: usize = 48;
+    let usable = max.saturating_sub(MARKER_RESERVE);
+    let half = usable / 2;
+
+    // Walk forward for the head.
+    let mut head_end = 0;
+    for (index, character) in input.char_indices() {
+        let next = index + character.len_utf8();
+        if next > half {
+            break;
+        }
+        head_end = next;
+    }
+
+    // Walk backward from the end for the tail.
+    let total = input.len();
+    let tail_start_target = total.saturating_sub(half);
+    let mut tail_start = total;
+    for (index, _) in input.char_indices().rev() {
+        if index <= tail_start_target {
+            tail_start = index;
+            break;
+        }
+        tail_start = index;
+    }
+
+    let omitted = tail_start.saturating_sub(head_end);
+    let mut output = String::with_capacity(max);
+    output.push_str(&input[..head_end]);
+    output.push_str(&format!("\n...[truncated {omitted} bytes]...\n"));
+    output.push_str(&input[tail_start..]);
     output
 }
 
@@ -560,8 +621,10 @@ mod tests {
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
         assert!(scrubbed.body.contains("[REDACTED]"));
-        assert!(!scrubbed.body.contains("TAIL_SENTINEL"));
-        assert!(scrubbed.body.ends_with('…'));
+        // Head-tail truncation preserves the tail sentinel so the LLM
+        // consolidator sees both the start and the end of the original body.
+        assert!(scrubbed.body.contains("TAIL_SENTINEL"));
+        assert!(scrubbed.body.contains("[truncated"));
     }
 
     #[test]
@@ -571,6 +634,40 @@ mod tests {
         assert_eq!(truncated.len(), 6);
         assert_eq!(truncate_utf8_bytes("unchanged", 9), "unchanged");
         assert!(truncate_utf8_bytes("large", 2).is_empty());
+    }
+
+    #[test]
+    fn head_tail_truncation_preserves_head_and_tail() {
+        let input = format!("HEAD{}TAIL", "x".repeat(200));
+        let truncated = truncate_utf8_bytes_head_tail(&input, 128);
+        assert!(truncated.starts_with("HEAD"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.contains("[truncated"));
+        assert!(truncated.len() <= 128);
+    }
+
+    #[test]
+    fn head_tail_truncation_short_input_unchanged() {
+        let input = "short body";
+        assert_eq!(truncate_utf8_bytes_head_tail(input, 128), "short body");
+    }
+
+    #[test]
+    fn head_tail_truncation_small_budget_falls_back_to_head_only() {
+        let input = "HEADxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxTAIL";
+        let truncated = truncate_utf8_bytes_head_tail(input, 32);
+        assert!(truncated.ends_with('…'));
+        assert!(!truncated.contains("TAIL"));
+    }
+
+    #[test]
+    fn head_tail_truncation_no_split_on_utf8_boundary() {
+        let input = format!("H{}T", "é".repeat(200));
+        let truncated = truncate_utf8_bytes_head_tail(&input, 128);
+        // Must not split a code point — the tail should start at a char
+        // boundary and the result must be valid UTF-8.
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.ends_with('T'));
     }
 
     #[test]

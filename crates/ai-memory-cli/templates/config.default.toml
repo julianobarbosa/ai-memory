@@ -43,6 +43,18 @@ log_level = "info"
 # `AI_MEMORY_STRIP_ROOT_COMBINATORS=true`.
 # strip_root_combinators = false
 
+# Serve MCP tool input schemas in the subset Google's Schema (Vertex/Gemini
+# functionDeclaration.parameters) accepts: the nullable unions schemars emits
+# for every optional tool argument (`"type": ["integer", "null"]`) collapse to a
+# single type plus `nullable: true`. A client that forwards our schema verbatim
+# to Vertex otherwise fails the whole session at tools/list with "specified
+# other fields alongside any_of". Gemini CLI and Antigravity CLI normalize
+# schemas client-side and need nothing; this is for pass-through clients such as
+# OpenCode on a Gemini/Vertex model. Implies strip_root_combinators; runtime
+# validation is unchanged. Per-client equivalent: append `?flavor=gemini` to the
+# MCP URL. Env equivalent: `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`.
+# gemini_safe_schemas = false
+
 # Optional final LLM relevance pass for project/scopes memory_query calls.
 # Requires an LLM provider and adds at most one provider call per eligible
 # query. The bounded query, page titles, and search snippets are sent to that

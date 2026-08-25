@@ -253,6 +253,30 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   every project in the workspace, or add `--project <name>` to scope
   the rebuild. Scheduled embedding backfill can also fill missing
   rows when enabled.
+- **Capture looks delayed, or observations are missing**: `ai-memory
+  status` reports local hook-spool health — how many events are queued
+  client-side, the age of the oldest one, and the total failed-delivery
+  attempts:
+
+  ```
+    spool:
+      pending:    2
+      oldest:     15m 0s
+      retries:    4
+  ```
+
+  A non-empty spool with an aging oldest entry means hooks are reaching
+  the local queue but not the server; events are not lost, they drain
+  once it is reachable. `pending: 0` means capture is keeping up.
+
+  The spool is **client-side**, so this section reflects the machine you
+  run the command on, not the server — it is the local data dir even when
+  `AI_MEMORY_SERVER_URL` points at a homelab. It is also printed when the
+  server cannot be reached at all (to stderr, so `--json` consumers still
+  get a single object on stdout), which is precisely when a backlog is
+  worth seeing. `--json` carries the same numbers under a `spool` object
+  (`pending`, `oldest_age_ms`, `retries_total`).
+
 - **Provider failures**: `ai-memory status` reports passive LLM and
   embedding health from the last real provider call. A fresh process
   reports `unknown` until the server actually uses that role; it does

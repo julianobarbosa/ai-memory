@@ -247,9 +247,11 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::Gemini => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(
-                GeminiProvider::new(key, config.model)?.with_timeout_secs(timeout),
-            ))
+            let mut provider = GeminiProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
+            Ok(Arc::new(provider.with_timeout_secs(timeout)))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config

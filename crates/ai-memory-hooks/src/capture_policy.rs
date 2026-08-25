@@ -28,6 +28,41 @@ pub struct CaptureConfig {
     pub ignore_paths: Vec<String>,
 }
 
+/// Whether a repository is captured unless excluded, or only when it opts in.
+///
+/// This is the failure-mode switch requested in #446. Under [`Self::Denylist`]
+/// — the historical behaviour and still the default — a repository with no
+/// marker is captured, so forgetting a marker leaks. Under
+/// [`Self::Allowlist`] the same omission captures nothing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    /// Absence of a marker means capture normally.
+    #[default]
+    Denylist,
+    /// Absence of a marker means capture nothing at all.
+    Allowlist,
+}
+
+/// Whether this repository may emit *any* lifecycle event, decided before the
+/// per-event policy in [`CapturePolicy::inspect`] and before anything is
+/// spooled.
+///
+/// Deliberately independent of the event kind. `inspect` is reached only for
+/// tool events (`is_tool_event` in the CLI hook), so a gate expressed through
+/// [`CaptureDisposition`] alone would leave `UserPromptSubmit`,
+/// `SessionStart`/`SessionEnd`, and `Stop` bodies flowing while reporting the
+/// repository as opted out — the precise false guarantee #446 is about. Prompt
+/// text is the field that issue cares about most, so this must gate every
+/// event or it gates nothing that matters.
+#[must_use]
+pub const fn repository_admits_capture(mode: CaptureMode, marker_present: bool) -> bool {
+    match mode {
+        CaptureMode::Denylist => true,
+        CaptureMode::Allowlist => marker_present,
+    }
+}
+
 /// Typed result of marker discovery and parsing, supplied by the IO-owning caller.
 pub enum CaptureSource<'a> {
     /// No nearest marker exists.
@@ -150,6 +185,11 @@ pub(crate) fn tool_observation_metadata(
                 .and_then(|extra| extra.get("tool_call_id"))
                 .and_then(Value::as_str),
         ),
+        // Pool (Poolside Agent CLI) tool hooks use snake_case `tool_name` +
+        // `tool_input` (hooks api 1.0, verified against Poolside CLI v1.0.16);
+        // no tool-call id is documented. Unknown payload shapes fail safe to
+        // metadata-only under an active policy.
+        AgentKind::Pool => (object.get("tool_name")?.as_str()?, None),
         _ => return None,
     };
     // PreToolUse needs a proven input shape. PostToolUse deliberately does
@@ -165,6 +205,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CommandCode
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
+                            | AgentKind::Pool
                     ) {
                         "tool_input"
                     } else {
@@ -538,7 +579,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::GeminiCli
         | AgentKind::Devin
         | AgentKind::Hermes
-        | AgentKind::KiroCli => object
+        | AgentKind::KiroCli
+        | AgentKind::Pool => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -595,6 +637,7 @@ fn family(name: &str) -> ToolFamily {
         | "notebook_edit"
         | "create_file"
         | "delete_file"
+        | "remove"
         | "rename_file"
         | "move_file"
         | "multi_edit"
@@ -923,6 +966,24 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denylist_admits_every_repository() {
+        assert!(repository_admits_capture(CaptureMode::Denylist, false));
+        assert!(repository_admits_capture(CaptureMode::Denylist, true));
+    }
+
+    #[test]
+    fn allowlist_admits_only_a_marked_repository() {
+        assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+        assert!(repository_admits_capture(CaptureMode::Allowlist, true));
+    }
+
+    #[test]
+    fn default_mode_is_the_historical_one() {
+        // A new field must not silently tighten capture for existing installs.
+        assert_eq!(CaptureMode::default(), CaptureMode::Denylist);
+    }
     #[test]
     fn fixture_vectors() {
         let fixture: Value =
@@ -1076,6 +1137,51 @@ mod tests {
             ("patch", ToolFamily::File),
             ("search_files", ToolFamily::SearchList),
             ("terminal", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn pool_documented_tool_shape_is_closed_and_honors_exclusions() {
+        let raw = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": "secret/token.txt", "content": "do not retain"},
+            "session_id": "pool-session",
+            "cwd": "/repo"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Pool, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id, None);
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Pool, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn pool_documented_tool_names_map_to_canonical_families() {
+        for (tool, expected) in [
+            ("read", ToolFamily::File),
+            ("edit", ToolFamily::File),
+            ("write", ToolFamily::File),
+            ("remove", ToolFamily::File),
+            ("shell", ToolFamily::NonFile),
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }

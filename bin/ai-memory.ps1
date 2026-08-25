@@ -26,6 +26,26 @@ function Get-EnvOrDefault {
     return $value
 }
 
+# Resolve the real subcommand, skipping the global options that may precede
+# it. `--config` and `--data-dir` take a separate value, so their argument has
+# to be stepped over as well or it would be mistaken for the subcommand.
+function Get-WrapperSubcommand {
+    param([string[]]$WrapperArgs)
+
+    $Index = 0
+    while ($Index -lt $WrapperArgs.Count) {
+        $Arg = $WrapperArgs[$Index]
+        if ($Arg -eq "--config" -or $Arg -eq "--data-dir") {
+            $Index += 2
+        } elseif ($Arg -like "--*") {
+            $Index += 1
+        } else {
+            return $Arg
+        }
+    }
+    return ""
+}
+
 $Image = Get-EnvOrDefault "AI_MEMORY_IMAGE" "akitaonrails/ai-memory:latest"
 $Docker = Get-EnvOrDefault "AI_MEMORY_DOCKER" "docker"
 $DataVolume = Get-EnvOrDefault "AI_MEMORY_DATA_VOLUME" "ai-memory-data"
@@ -128,6 +148,26 @@ foreach ($Name in @(
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Name))) {
         $DockerArgs += @("-e", $Name)
     }
+}
+
+# Docker Desktop gives Windows no host networking for Linux containers, so a
+# thin-client command (status, search, bootstrap, ...) reaches the loopback-
+# published server from this helper container through Docker Desktop's host
+# alias; 127.0.0.1 would mean the helper container itself and the call dies
+# with "Connection refused". But install-mcp/install-hooks/setup-agent RENDER
+# the URL into the *host* agent config, and host.docker.internal does NOT
+# resolve on the Windows host: baking it in silently breaks MCP and every
+# capture hook. So for those commands leave AI_MEMORY_SERVER_URL unset, letting
+# the CLI render its host-reachable default (http://127.0.0.1:49374).
+# (issue #107)
+$RendersHostConfig = (Get-WrapperSubcommand $CommandArgs) -in @(
+    "install-mcp",
+    "install-hooks",
+    "setup-agent"
+)
+if (-not $RendersHostConfig -and
+    [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("AI_MEMORY_SERVER_URL"))) {
+    $DockerArgs += @("-e", "AI_MEMORY_SERVER_URL=http://host.docker.internal:49374")
 }
 
 $DockerArgs += $Image

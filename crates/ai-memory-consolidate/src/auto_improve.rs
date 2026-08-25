@@ -261,7 +261,15 @@ impl<'de> Deserialize<'de> for AutoImproveEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoImproveProposal {
     /// Currently only `create_or_update` is supported.
+    ///
+    /// Advertised to the model as a single-value enum so providers with
+    /// constrained decoding cannot generate anything else. The field stays a
+    /// `String` rather than becoming a Rust enum on purpose: a provider
+    /// *without* constrained decoding that emits `"create"` should be
+    /// normalised by [`normalize_operation`], not fail to deserialise and take
+    /// the whole proposal with it.
     #[serde(default = "default_operation")]
+    #[schemars(extend("enum" = ["create_or_update"]))]
     pub operation: String,
     /// Relative wiki path that would be created or updated.
     #[serde(default)]
@@ -315,8 +323,33 @@ pub struct AutoImprovePatchEdit {
     pub context: Option<String>,
 }
 
+/// The one operation this pipeline performs.
+pub const CANONICAL_OPERATION: &str = "create_or_update";
+
 fn default_operation() -> String {
-    "create_or_update".into()
+    CANONICAL_OPERATION.into()
+}
+
+/// Map the ways a model spells the single supported operation onto its
+/// canonical form.
+///
+/// Deliberately narrow: only spellings that unambiguously mean "write this
+/// page" are folded in. Anything else is left untouched so it still fails
+/// validation — the point is to stop losing work to a wording difference,
+/// not to accept an operation the pipeline cannot perform.
+fn normalize_operation(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-' | '/'))
+        .collect();
+    match squashed.as_str() {
+        "createorupdate" | "create" | "update" | "upsert" | "createupdate" | "write" => {
+            CANONICAL_OPERATION.to_string()
+        }
+        _ => raw.to_string(),
+    }
 }
 
 fn default_edit_mode() -> String {
@@ -1511,7 +1544,15 @@ fn validate_proposal(
     cfg: &AutoImproveReviewConfig,
     existing_index: &ExistingPageIndex,
 ) -> Result<(), String> {
-    if proposal.operation != "create_or_update" {
+    // Normalise before comparing. The field description next door says the
+    // path "would be created or updated", which invites exactly the values
+    // rejected here, and models take the invitation: two different local
+    // models emitted `"create"` for 6/6 candidates, so every run finished
+    // with zero validated proposals and the learning loop silently did
+    // nothing (#458). Rejecting a wording difference is not a safety
+    // property — there is only one operation.
+    proposal.operation = normalize_operation(&proposal.operation);
+    if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
     if proposal.confidence < cfg.min_confidence {
@@ -2933,6 +2974,39 @@ mod tests {
         }
     }
 
+    /// The end-to-end shape of #458: a model emits `"operation": "create"`
+    /// and every candidate is rejected `unsupported_operation`, so with
+    /// `require_approval = false` the loop finishes having done nothing.
+    /// Reproduced there with two local models, 6/6 candidates.
+    #[test]
+    fn a_proposal_saying_create_is_validated_not_rejected() {
+        let cfg = AutoImproveReviewConfig::default();
+        let index = ExistingPageIndex::default();
+
+        for spelling in ["create", "update", "create/update", "CREATE"] {
+            let mut candidate = proposal("notes/thing.md", "note", 0.91);
+            candidate.operation = spelling.into();
+            let outcome = validate_proposal(&mut candidate, &cfg, &index);
+            assert!(
+                outcome.is_ok(),
+                "{spelling:?} must validate, got {outcome:?}"
+            );
+            assert_eq!(
+                candidate.operation, CANONICAL_OPERATION,
+                "validation should also canonicalise the stored value"
+            );
+        }
+
+        // An operation the pipeline cannot perform still fails, and fails
+        // with the same reason as before.
+        let mut deleting = proposal("notes/thing.md", "note", 0.91);
+        deleting.operation = "delete".into();
+        assert_eq!(
+            validate_proposal(&mut deleting, &cfg, &index),
+            Err("unsupported_operation".into())
+        );
+    }
+
     #[test]
     fn patch_to_missing_or_non_context_target_rejects() {
         let raw = AutoImproveLlmResponse {
@@ -3271,5 +3345,74 @@ mod tests {
         assert!(accepted.is_empty());
         assert!(rejected.iter().any(|r| r.reason == "duplicate_anchor"));
         assert!(rejected.iter().any(|r| r.reason == "patch_extra_h1"));
+    }
+}
+
+#[cfg(test)]
+mod operation_normalization_tests {
+    use super::*;
+
+    /// #458: two local models emitted `"create"` for every candidate, so the
+    /// loop rejected 6/6 as `unsupported_operation` and silently did nothing.
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "create_or_update",
+            "create",
+            "update",
+            "upsert",
+            "create/update",
+            "create or update",
+            "CREATE",
+            "  Create_Or_Update  ",
+            "write",
+        ] {
+            assert_eq!(
+                normalize_operation(raw),
+                CANONICAL_OPERATION,
+                "{raw:?} means write-this-page and must normalise"
+            );
+        }
+    }
+
+    /// The normaliser must not become a rubber stamp: an operation this
+    /// pipeline genuinely cannot perform still has to fail validation.
+    #[test]
+    fn operations_we_cannot_perform_are_left_to_fail() {
+        for raw in ["delete", "rename", "move", "archive", "drop", "merge", ""] {
+            assert_ne!(
+                normalize_operation(raw),
+                CANONICAL_OPERATION,
+                "{raw:?} is not a write and must keep failing validation"
+            );
+        }
+    }
+
+    /// The schema must advertise the constraint, so a provider with
+    /// constrained decoding cannot generate a bad value in the first place.
+    #[test]
+    fn schema_constrains_operation_to_the_canonical_value() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let op = value
+            .pointer("/properties/operation")
+            .expect("operation property present");
+        let variants = op
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .expect("operation carries an enum constraint");
+        assert_eq!(variants, &vec![serde_json::json!(CANONICAL_OPERATION)]);
+    }
+
+    /// A `String` field, not a Rust enum: a provider without constrained
+    /// decoding that emits `"create"` must still deserialise, so the
+    /// normaliser gets a chance to fix it rather than the whole proposal
+    /// failing to parse.
+    #[test]
+    fn a_non_canonical_operation_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "operation": "create" }))
+                .expect("must not fail to parse; normalisation happens in validation");
+        assert_eq!(parsed.operation, "create");
     }
 }

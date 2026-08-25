@@ -405,14 +405,15 @@ pub struct AiMemoryServer {
     /// keeps manual runs at least as strict as the operator's configured
     /// Phase 1/2 budgets instead of falling back to compiled defaults.
     auto_improve_review_config: AutoImproveReviewConfig,
-    /// Opt-in: strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
-    /// schemas on every `tools/list`, even without a `?flavor=` marker
-    /// (issue #412). Generic MCP clients (OpenCode, Cursor) never send the
-    /// flavor marker, and Moonshot/Bedrock reject root combinators with a
-    /// 400 — so operators behind a strict upstream set this via
-    /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true`. Runtime "exactly one of"
-    /// validation is unchanged.
-    strip_root_combinators: bool,
+    /// Operator-configured floor for the tool-schema dialect served on every
+    /// `tools/list`, even without a `?flavor=` marker. Generic MCP clients
+    /// (OpenCode, Cursor) never send the marker yet forward schemas verbatim
+    /// to a strict upstream, so operators behind one raise this via
+    /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true` (issue #412) or
+    /// `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`. A request's marker can only
+    /// raise it further, never lower it. Runtime validation is unchanged in
+    /// every dialect.
+    schema_dialect: SchemaDialect,
     /// Cooldown clock for the M8 access-bump reinforcement: the last
     /// instant each page's access counter was bumped. A page returned by
     /// many searches in quick succession is bumped at most once per
@@ -1262,7 +1263,7 @@ impl AiMemoryServer {
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
-            strip_root_combinators: false,
+            schema_dialect: SchemaDialect::default(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
@@ -1291,11 +1292,29 @@ impl AiMemoryServer {
 
     /// Opt in to stripping root-level combinators from MCP tool input schemas
     /// on every `tools/list`, independent of the `?flavor=` marker (issue
-    /// #412). See [`Self::strip_root_combinators`].
+    /// #412). See [`Self::schema_dialect`].
     #[must_use]
     pub fn with_strip_root_combinators(mut self, enabled: bool) -> Self {
-        self.strip_root_combinators = enabled;
+        self.raise_schema_dialect(enabled, SchemaDialect::RootCombinators);
         self
+    }
+
+    /// Opt in to serving Gemini/Vertex-safe tool input schemas on every
+    /// `tools/list`, independent of the `?flavor=` marker. Implies
+    /// [`Self::with_strip_root_combinators`]; see [`Self::schema_dialect`].
+    #[must_use]
+    pub fn with_gemini_safe_schemas(mut self, enabled: bool) -> Self {
+        self.raise_schema_dialect(enabled, SchemaDialect::GeminiSafe);
+        self
+    }
+
+    /// Raise the configured dialect floor, never lower it: the two opt-ins are
+    /// independent switches over one ordered dialect, so `false` must leave a
+    /// stricter setting from the other switch alone.
+    fn raise_schema_dialect(&mut self, enabled: bool, dialect: SchemaDialect) {
+        if enabled {
+            self.schema_dialect = self.schema_dialect.max(dialect);
+        }
     }
 
     /// Configure whether auto-improvement requires manual pending-writes approval.
@@ -3496,7 +3515,7 @@ impl AiMemoryServer {
                 let claimed = self
                     .writer
                     .accept_handoff(ai_memory_core::HandoffAcceptance {
-                        handoff_id: h.id,
+                        handoff_id: h.scope.id,
                         workspace_id: ws,
                         project_id: proj,
                         accepting_agent: AgentKind::Other,
@@ -3561,11 +3580,11 @@ impl AiMemoryServer {
                     None,
                 )
             })?;
-        if handoff.state != HandoffState::Open {
+        if handoff.lifecycle.state != HandoffState::Open {
             return ok_json(&serde_json::json!({
                 "handoff_id": handoff_id.to_string(),
                 "cancelled": false,
-                "state": handoff.state.as_str(),
+                "state": handoff.lifecycle.state.as_str(),
             }));
         }
         // Cancelling is scoped the same way as accepting: you can discard your
@@ -3877,24 +3896,41 @@ impl ServerHandler for AiMemoryServer {
         // available even without peer clientInfo.
         // Operator opt-in (issue #412): generic clients such as OpenCode and
         // Cursor never send the `?flavor=` marker, yet forward tool schemas
-        // verbatim to strict upstreams (Moonshot, Bedrock) that 400 on root
-        // combinators. `strip_root_combinators` serves the restricted
-        // dialect unconditionally; the flavor marker remains the
-        // per-client override.
-        let restricted_schema = self.strip_root_combinators
-            || context
+        // verbatim to strict upstreams (Moonshot, Bedrock, Vertex) that 400 on
+        // shapes their dialect rejects. The configured dialect is the floor; a
+        // request's marker can raise it for one client.
+        let dialect = self.schema_dialect.max(
+            context
                 .extensions
                 .get::<http::request::Parts>()
                 .and_then(|parts| parts.uri.query())
-                .is_some_and(has_restricted_schema_flavor);
-        if restricted_schema {
-            Ok(ListToolsResult::with_all_items(
-                restricted_schema_tool_list(tools),
-            ))
-        } else {
+                .and_then(restricted_schema_flavor)
+                .unwrap_or_default(),
+        );
+        if dialect == SchemaDialect::Upstream {
             Ok(ListToolsResult::with_all_items(tools))
+        } else {
+            Ok(ListToolsResult::with_all_items(
+                restricted_schema_tool_list(tools, dialect),
+            ))
         }
     }
+}
+
+/// Tool input-schema dialect served for one `tools/list`, ordered by
+/// strictness: each variant applies every rewrite of the one before it, plus
+/// its own. That ordering is what lets the operator's configured floor and a
+/// request's `?flavor=` marker combine with a plain `max`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum SchemaDialect {
+    /// The schemas `schemars` generated, verbatim.
+    #[default]
+    Upstream,
+    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Moonshot, Bedrock).
+    RootCombinators,
+    /// Also collapses the nullable unions `Option<T>` produces into Google's
+    /// single-`type` plus `nullable` form (Gemini / Vertex).
+    GeminiSafe,
 }
 
 /// Bedrock and Moonshot reject root-level
@@ -3902,20 +3938,26 @@ impl ServerHandler for AiMemoryServer {
 /// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
 /// `?flavor=bedrock` both get schemas with those root keys stripped;
 /// nested combinators stay, and runtime validation remains unchanged.
-fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
+/// [`SchemaDialect::GeminiSafe`] strips the same root keys and additionally
+/// rewrites every subschema through [`gemini_safe_schema`].
+fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+    let gemini_safe = dialect >= SchemaDialect::GeminiSafe;
     tools
         .into_iter()
         .map(|mut tool| {
-            if !ROOT_COMBINATORS
+            let has_root_combinator = ROOT_COMBINATORS
                 .iter()
-                .any(|key| tool.input_schema.contains_key(*key))
-            {
+                .any(|key| tool.input_schema.contains_key(*key));
+            if !has_root_combinator && !gemini_safe {
                 return tool;
             }
             let mut schema = (*tool.input_schema).clone();
             for key in ROOT_COMBINATORS {
                 schema.shift_remove(key);
+            }
+            if gemini_safe {
+                gemini_safe_schema(&mut schema);
             }
             tool.input_schema = Arc::new(schema);
             tool
@@ -3923,10 +3965,139 @@ fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
         .collect()
 }
 
-fn has_restricted_schema_flavor(query: &str) -> bool {
+/// Rewrite one subschema — and everything below it — into the subset Google's
+/// `Schema` (Vertex/Gemini `functionDeclaration.parameters`) accepts.
+///
+/// `schemars` renders every `Option<T>` field as a union type, e.g.
+/// `{"description": …, "type": ["integer", "null"], "format": "uint"}`. Google's
+/// `Schema` takes a single `type`, so a converter that forwards our schema
+/// verbatim turns the union into `any_of` and leaves `description` beside it —
+/// which Vertex rejects outright ("specified other fields alongside any_of.
+/// When using any_of, it must be the only field set"), failing the whole
+/// session at `tools/list`. Gemini CLI never hits this because it performs the
+/// same collapse client-side; OpenCode and other pass-through clients do.
+///
+/// Two rewrites, both keyed on what `schemars` actually emits, applied
+/// bottom-up so a merged branch is already normalized:
+/// [`collapse_nullable_type`] and [`flatten_sibling_combinator`]. Everything
+/// else is left alone — Gemini CLI ships `$ref`, `$defs`, `title`, `const`, and
+/// `format: "uint"` to Vertex untouched, so those are not part of the problem.
+/// This mirrors [`ai_memory_llm`]'s outbound `normalize_nullable_types`, which
+/// solves the same mismatch for structured-output schemas.
+///
+/// Known limit, deliberate: a `$defs` entry can still carry a combinator with a
+/// sibling `description` — `FeedbackKind` renders as a `oneOf` of `const`
+/// branches — because a union of several real branches has no single-subschema
+/// equivalent, and collapsing it to `enum` would drop the per-value docs a
+/// working client receives today.
+fn gemini_safe_schema(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    for nested in schema.values_mut() {
+        gemini_safe_value(nested);
+    }
+    collapse_nullable_type(schema);
+    flatten_sibling_combinator(schema);
+}
+
+/// Recurse into whatever can hold a subschema: object values and array items
+/// (`properties`, `items`, `anyOf` branches, `$defs`, …). Scalars are terminal.
+fn gemini_safe_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(gemini_safe_value),
+        serde_json::Value::Object(map) => gemini_safe_schema(map),
+        _ => {}
+    }
+}
+
+/// `type: [<t>, "null"]` becomes `type: <t>` plus `nullable: true`, and
+/// `type: ["null"]` drops the type and keeps `nullable: true`.
+///
+/// A genuine multi-type union has no single-`type` equivalent, so it is left
+/// for the client rather than silently narrowing the advertised contract;
+/// `schemars` only emits the two-element form, for `Option<T>`.
+fn collapse_nullable_type(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(types) = schema.get("type").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if !types.iter().any(|entry| entry.as_str() == Some("null")) {
+        return;
+    }
+    let mut non_null: Vec<serde_json::Value> = types
+        .iter()
+        .filter(|entry| entry.as_str() != Some("null"))
+        .cloned()
+        .collect();
+    if non_null.len() > 1 {
+        return;
+    }
+    match non_null.pop() {
+        Some(single) => schema.insert("type".into(), single),
+        None => schema.shift_remove("type"),
+    };
+    schema.insert("nullable".into(), serde_json::Value::Bool(true));
+}
+
+/// Google allows nothing beside `any_of`, so reconcile a combinator that
+/// carries siblings: drop the `{"type": "null"}` branch `schemars` adds for
+/// `Option<T>` and merge the lone survivor into the parent, where the parent's
+/// own keys win so the field's doc comment survives.
+///
+/// Only that shape collapses cleanly. A combinator that is already the only key
+/// is what Google wants, and a union of several real branches cannot be
+/// expressed as one Google subschema at all — both are left untouched.
+fn flatten_sibling_combinator(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    const COMBINATORS: [&str; 2] = ["anyOf", "oneOf"];
+
+    fn is_null_branch(branch: &serde_json::Value) -> bool {
+        branch.as_object().is_some_and(|branch| {
+            branch.len() == 1
+                && branch.get("type").and_then(serde_json::Value::as_str) == Some("null")
+        })
+    }
+
+    if schema.len() == 1 {
+        return;
+    }
+    let Some(key) = COMBINATORS
+        .into_iter()
+        .find(|key| schema.contains_key(*key))
+    else {
+        return;
+    };
+    let Some(branches) = schema.get(key).and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let kept: Vec<serde_json::Value> = branches
+        .iter()
+        .filter(|branch| !is_null_branch(branch))
+        .cloned()
+        .collect();
+    let nullable = kept.len() < branches.len();
+    let [serde_json::Value::Object(survivor)] = kept.as_slice() else {
+        return;
+    };
+    let survivor = survivor.clone();
+    schema.shift_remove(key);
+    if nullable {
+        schema.insert("nullable".into(), serde_json::Value::Bool(true));
+    }
+    for (field, value) in survivor {
+        schema.entry(field).or_insert(value);
+    }
+    // The merged branch can itself carry a union type (`Option<Option<T>>`).
+    collapse_nullable_type(schema);
+}
+
+/// The dialect a request's `?flavor=` marker asks for, if any. Several markers
+/// resolve to the strictest one rather than to whichever came first.
+fn restricted_schema_flavor(query: &str) -> Option<SchemaDialect> {
     query
         .split('&')
-        .any(|pair| matches!(pair, "flavor=moonshot" | "flavor=bedrock"))
+        .filter_map(|pair| match pair {
+            "flavor=moonshot" | "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
+            "flavor=gemini" | "flavor=vertex" => Some(SchemaDialect::GeminiSafe),
+            _ => None,
+        })
+        .max()
 }
 
 /// A page's access counter is bumped at most once per this window. Repeated
@@ -6963,7 +7134,7 @@ mod tests {
             .unwrap();
         let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
 
-        let patched = restricted_schema_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
         let out = &patched[0].input_schema;
 
         for key in ["anyOf", "oneOf", "allOf"] {
@@ -6993,7 +7164,7 @@ mod tests {
         let tool = Tool::new("memory_status", "Status counts", schema);
         let before = serde_json::to_value(&tool).unwrap();
 
-        let patched = restricted_schema_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
         let after = serde_json::to_value(&patched[0]).unwrap();
 
         assert_eq!(before, after, "flat tools must pass through unchanged");
@@ -7001,14 +7172,273 @@ mod tests {
 
     #[test]
     fn restricted_schema_flavor_matches_complete_query_pairs_only() {
-        assert!(has_restricted_schema_flavor("flavor=moonshot"));
-        assert!(has_restricted_schema_flavor(
-            "client=kiro&flavor=bedrock&debug=false"
-        ));
-        assert!(!has_restricted_schema_flavor("flavor=unknown"));
-        assert!(!has_restricted_schema_flavor(
-            "note=flavor=bedrock&client=kiro"
-        ));
+        assert_eq!(
+            restricted_schema_flavor("flavor=moonshot"),
+            Some(SchemaDialect::RootCombinators)
+        );
+        assert_eq!(
+            restricted_schema_flavor("client=kiro&flavor=bedrock&debug=false"),
+            Some(SchemaDialect::RootCombinators)
+        );
+        assert_eq!(
+            restricted_schema_flavor("flavor=gemini"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        assert_eq!(
+            restricted_schema_flavor("flavor=vertex&client=opencode"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        // Several markers resolve to the strictest, whatever their order.
+        assert_eq!(
+            restricted_schema_flavor("flavor=gemini&flavor=moonshot"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        assert_eq!(restricted_schema_flavor("flavor=unknown"), None);
+        assert_eq!(
+            restricted_schema_flavor("note=flavor=bedrock&client=kiro"),
+            None
+        );
+    }
+
+    fn gemini_safe(schema: serde_json::Value) -> serde_json::Value {
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(schema).unwrap();
+        gemini_safe_schema(&mut map);
+        serde_json::Value::Object(map)
+    }
+
+    // The reported Vertex 400: `schemars` renders every `Option<T>` argument as
+    // a union type, which a pass-through client turns into `any_of` with
+    // `description` still beside it.
+    #[test]
+    fn gemini_safe_schema_collapses_nullable_unions() {
+        let out = gemini_safe(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "max_proposals": {
+                    "description": "Override the maximum validated proposal count.",
+                    "type": ["integer", "null"],
+                    "format": "uint",
+                    "minimum": 0
+                },
+                "kinds": {
+                    "type": ["array", "null"],
+                    "items": { "type": ["string", "null"] }
+                },
+                "nothing": { "type": ["null"] }
+            }
+        }));
+        let properties = &out["properties"];
+
+        assert_eq!(
+            properties["max_proposals"],
+            serde_json::json!({
+                "description": "Override the maximum validated proposal count.",
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "nullable": true
+            }),
+            "the union must collapse; every other keyword must survive"
+        );
+        assert_eq!(properties["kinds"]["type"], serde_json::json!("array"));
+        assert_eq!(
+            properties["kinds"]["items"],
+            serde_json::json!({ "type": "string", "nullable": true }),
+            "nested subschemas must be rewritten too"
+        );
+        assert_eq!(
+            properties["nothing"],
+            serde_json::json!({ "nullable": true }),
+            "a null-only union has no type to keep"
+        );
+    }
+
+    // `Option<T>` over a `$ref`ed inner type: schemars wraps it in `anyOf` and
+    // leaves the doc comment as a sibling, which is the exact shape Vertex names
+    // in its error.
+    #[test]
+    fn gemini_safe_schema_flattens_combinator_carrying_siblings() {
+        let out = gemini_safe(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "description": "Scope to read.",
+                    "anyOf": [
+                        { "$ref": "#/$defs/MemoryScopeArg" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        }));
+
+        assert_eq!(
+            out["properties"]["scope"],
+            serde_json::json!({
+                "description": "Scope to read.",
+                "nullable": true,
+                "$ref": "#/$defs/MemoryScopeArg"
+            }),
+            "the lone real branch must merge into the parent, doc comment intact"
+        );
+    }
+
+    // The parent's own keys win, so a merge can never overwrite the field's
+    // description with the branch's.
+    #[test]
+    fn gemini_safe_schema_merge_keeps_the_parent_description() {
+        let out = gemini_safe(serde_json::json!({
+            "description": "Field docs.",
+            "anyOf": [
+                { "type": "string", "description": "Branch docs." },
+                { "type": "null" }
+            ]
+        }));
+
+        assert_eq!(out["description"], serde_json::json!("Field docs."));
+        assert_eq!(out["type"], serde_json::json!("string"));
+        assert_eq!(out["nullable"], serde_json::json!(true));
+    }
+
+    // Both shapes the rewrite deliberately declines to touch: narrowing a real
+    // union would change the advertised contract, and a lone combinator is
+    // already what Google wants.
+    #[test]
+    fn gemini_safe_schema_leaves_shapes_it_cannot_express_alone() {
+        let real_union = serde_json::json!({ "type": ["string", "integer", "null"] });
+        assert_eq!(gemini_safe(real_union.clone()), real_union);
+
+        let lone_combinator = serde_json::json!({
+            "anyOf": [{ "required": ["path"] }, { "required": ["query"] }]
+        });
+        assert_eq!(gemini_safe(lone_combinator.clone()), lone_combinator);
+
+        let several_real_branches = serde_json::json!({
+            "description": "Either shape.",
+            "anyOf": [{ "type": "string" }, { "type": "integer" }, { "type": "null" }]
+        });
+        assert_eq!(
+            gemini_safe(several_real_branches.clone()),
+            several_real_branches
+        );
+    }
+
+    // The Gemini dialect is a superset: root combinators still go, and every
+    // subschema is rewritten on top.
+    #[test]
+    fn restricted_schema_tool_list_gemini_safe_also_strips_root_combinators() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": ["string", "null"] } },
+                "anyOf": [{ "required": ["path"] }, { "required": ["query"] }]
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::GeminiSafe);
+        let out = &patched[0].input_schema;
+
+        assert!(
+            !out.contains_key("anyOf"),
+            "root combinator must be stripped"
+        );
+        assert_eq!(
+            out["properties"]["query"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+    }
+
+    // Dialect isolation: the shipped Moonshot/Bedrock behavior must not change.
+    #[test]
+    fn restricted_schema_tool_list_root_combinators_keeps_nullable_unions() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": ["string", "null"] } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
+        let before = serde_json::to_value(&tool).unwrap();
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
+
+        assert_eq!(
+            serde_json::to_value(&patched[0]).unwrap(),
+            before,
+            "the root-combinator dialect must leave union types alone"
+        );
+    }
+
+    // The two opt-ins are independent switches over one ordered dialect, so
+    // passing `false` to the weaker one must not undo the stronger one.
+    #[tokio::test]
+    async fn schema_dialect_opt_ins_only_raise_the_floor() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        assert_eq!(server.schema_dialect, SchemaDialect::Upstream);
+
+        let gemini = server
+            .clone()
+            .with_gemini_safe_schemas(true)
+            .with_strip_root_combinators(false);
+        assert_eq!(gemini.schema_dialect, SchemaDialect::GeminiSafe);
+
+        let combinators = server
+            .with_strip_root_combinators(true)
+            .with_gemini_safe_schemas(false);
+        assert_eq!(combinators.schema_dialect, SchemaDialect::RootCombinators);
+    }
+
+    // The guard that actually pins "our tool surface is Vertex-safe": a future
+    // optional argument on any tool cannot silently reintroduce a union type or
+    // a combinator with siblings.
+    #[tokio::test]
+    async fn every_tool_schema_is_gemini_safe() {
+        fn assert_safe(tool: &str, pointer: &str, schema: &serde_json::Value) {
+            match schema {
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_safe(tool, &format!("{pointer}/{index}"), item);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    assert!(
+                        !map.get("type").is_some_and(serde_json::Value::is_array),
+                        "{tool}{pointer}: Google's Schema takes a single `type`, got {:?}",
+                        map.get("type")
+                    );
+                    for key in ["anyOf", "oneOf"] {
+                        assert!(
+                            !(map.contains_key(key) && map.len() > 1),
+                            "{tool}{pointer}: `{key}` must be the only field, got keys {:?}",
+                            map.keys().collect::<Vec<_>>()
+                        );
+                    }
+                    for (key, value) in map {
+                        assert_safe(tool, &format!("{pointer}/{key}"), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools =
+            restricted_schema_tool_list(server.tool_router.list_all(), SchemaDialect::GeminiSafe);
+        assert!(!tools.is_empty(), "tools must be registered");
+        for tool in &tools {
+            let mut schema = serde_json::to_value(&tool.input_schema).unwrap();
+            // `$defs` is out of scope for this dialect (see
+            // [`gemini_safe_schema`]): `FeedbackKind` renders as a `oneOf` of
+            // `const` branches with a sibling `description`, and Gemini CLI
+            // forwards `$defs`/`$ref` to Vertex untouched without trouble. What
+            // this guard pins is the argument schemas, where every `Option`
+            // field lives.
+            if let Some(schema) = schema.as_object_mut() {
+                schema.shift_remove("$defs");
+            }
+            assert_safe(&tool.name, "", &schema);
+        }
     }
 
     // Issue #155: the neither-arg error must teach a looping model what a
@@ -9209,6 +9639,86 @@ mod tests {
         assert!(again_text.contains("\"handoff\": null"));
     }
 
+    /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/
+    /// `HandoffContent`/`HandoffLifecycle` sub-structs, each `#[serde(flatten)]`ed
+    /// so the wire JSON stays flat. This locks that in: the response must keep
+    /// exactly the pre-grouping key set at `handoff`, with no nested objects.
+    #[tokio::test]
+    async fn memory_handoff_accept_response_json_stays_flat() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "wire-shape probe".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim-wire".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let accept = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("/tmp/aim-wire".into()),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let accept_text = accept
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&accept_text).unwrap();
+        let handoff = value
+            .get("handoff")
+            .and_then(serde_json::Value::as_object)
+            .expect("handoff must be a flat JSON object");
+
+        let mut keys: Vec<&str> = handoff.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "id",
+            "workspace_id",
+            "project_id",
+            "from_session_id",
+            "from_agent",
+            "to_agent",
+            "cwd",
+            "summary",
+            "open_questions",
+            "next_steps",
+            "files_touched",
+            "state",
+            "created_at",
+            "accepted_by",
+            "accepted_at",
+            "accepted_by_session",
+            "owner_user",
+            "accepted_by_user",
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "handoff sub-struct grouping must not change the flat MCP wire shape"
+        );
+        assert!(
+            handoff.values().all(|v| !v.is_object()),
+            "no field may have become a nested object"
+        );
+    }
+
     #[tokio::test]
     async fn handoff_begin_caps_manual_text_after_scrub() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -9498,7 +10008,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.state, HandoffState::Expired);
+        assert_eq!(stored.lifecycle.state, HandoffState::Expired);
     }
 
     #[tokio::test]
@@ -9574,6 +10084,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .lifecycle
                 .state,
             HandoffState::Open,
         );

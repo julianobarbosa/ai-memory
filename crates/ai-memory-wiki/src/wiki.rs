@@ -1631,6 +1631,18 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
+        // Reject a path that cannot be materialised and checkpointed on every
+        // supported platform, before anything is written.
+        //
+        // This is the single funnel every page creation passes through, and
+        // it is the moment the two failing operations happen: the file hits
+        // the filesystem and libgit2 checkpoints it. Catching it earlier (in
+        // `PagePath::new`) would break reads of already-stored pages, and
+        // catching it later leaves the worst outcome observed in #462 — a
+        // page written successfully but uncheckpointable and undeletable
+        // through the normal API.
+        req.path.ensure_portable()?;
+
         let WritePageRequest {
             workspace_id,
             project_id,

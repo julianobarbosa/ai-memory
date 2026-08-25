@@ -177,6 +177,20 @@ pub struct Config {
     /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true` or `strip_root_combinators = true`
     /// in config.toml.
     pub strip_root_combinators: bool,
+    /// Serve MCP tool input schemas in the subset Google's `Schema`
+    /// (Vertex/Gemini `functionDeclaration.parameters`) accepts: the nullable
+    /// unions `schemars` emits for every optional argument collapse to a single
+    /// `type` plus `nullable: true`. Vertex rejects the union outright once a
+    /// client forwards it verbatim — "specified other fields alongside any_of"
+    /// — and fails the whole session at `tools/list`. Gemini CLI and
+    /// Antigravity CLI normalize schemas client-side and need nothing; this is
+    /// for pass-through clients such as OpenCode on a Gemini/Vertex model.
+    /// Implies `strip_root_combinators`. Runtime validation is unchanged. Set
+    /// with `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true` or
+    /// `gemini_safe_schemas = true` in config.toml; the per-request
+    /// `?flavor=gemini` marker on the MCP URL is the equivalent opt-in for one
+    /// client.
+    pub gemini_safe_schemas: bool,
     /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
     /// supported: LLM-as-judge over the configured LLM provider, so it
     /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
@@ -566,6 +580,7 @@ impl Default for Config {
             consolidate_on_session_end: false,
             capture_assistant: false,
             strip_root_combinators: false,
+            gemini_safe_schemas: false,
             reranker: None,
             embedding_provider: None,
             embedding_model: None,
@@ -2022,4 +2037,36 @@ mod tests {
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert_eq!(provider.provider, ProviderChoice::AnthropicOAuth);
     }
+}
+
+#[test]
+fn llm_provider_config_passes_base_url_to_gemini() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: Some("http://localhost:9379".into()),
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::Gemini);
+    assert_eq!(provider.base_url.as_deref(), Some("http://localhost:9379"));
+}
+
+#[test]
+fn llm_provider_config_gemini_uses_default_base_url_when_none_provided() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: None, // Explicitly None
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::Gemini);
+    assert_eq!(provider.base_url, None);
 }

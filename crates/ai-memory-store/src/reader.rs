@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
-    IdentityKey, ManagedRunId, Observation, ObservationId, ObservationKind, OwnerFilter, PageId,
-    PagePath, ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffContent, HandoffId,
+    HandoffLifecycle, HandoffOrigin, HandoffScope, HandoffState, IdentityKey, ManagedRunId,
+    Observation, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId,
+    SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -73,6 +74,123 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
             END \
         )"
     )
+}
+
+/// Leading body characters scanned when a page carries no frontmatter
+/// `summary`. Wide enough to step past the `# Title` line and a structural
+/// heading or two before the first real prose.
+const DESCRIPTOR_SCAN_CHARS: usize = 600;
+
+/// Maximum length of a synthesised page descriptor, in characters.
+const DESCRIPTOR_MAX_CHARS: usize = 240;
+
+/// SQL expression yielding the raw material for [`page_descriptor`]: the
+/// page's own frontmatter `summary` when it has a non-blank one, otherwise a
+/// prefix of the body. `NULLIF(TRIM(...), '')` keeps an empty summary from
+/// winning the `COALESCE` over real body text.
+fn page_descriptor_expr(body_column: &str, frontmatter_column: &str) -> String {
+    format!(
+        "COALESCE( \
+            NULLIF(TRIM(json_extract({frontmatter_column}, '$.summary')), ''), \
+            substr({body_column}, 1, {DESCRIPTOR_SCAN_CHARS}) \
+        )"
+    )
+}
+
+/// Strip a leading markdown list marker (`- `, `* `, `+ `, `1. `) so a kept
+/// line reads as prose in the descriptor.
+fn strip_list_marker(line: &str) -> &str {
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return rest.trim_start();
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 && line[digits..].starts_with(". ") {
+        return line[digits + 2..].trim_start();
+    }
+    line
+}
+
+/// `true` for the `- **key:** value` bullets that open a compiled session
+/// page's metadata block — session id, timestamps, observation count. They
+/// are addressing, not content.
+fn is_metadata_bullet(line: &str) -> bool {
+    line.starts_with("- **") && line.contains(":**")
+}
+
+/// Page-intrinsic descriptor for a retrieval hit.
+///
+/// The FTS path centres its excerpt on the matched terms through
+/// `snippet(pages_fts, ...)`. The vector, entity-match, graph-neighbour and
+/// recency paths have no matched term to centre on. They previously returned
+/// `substr(body, 1, 240)`, which on a compiled page is the `# Title` line plus
+/// the `## Session metadata` block under it — the title the hit already
+/// carries, followed by a session id and three timestamps.
+///
+/// Fills the [`DESCRIPTOR_MAX_CHARS`] budget from the page's own text,
+/// skipping four things that carry no signal for the reader deciding whether
+/// to open the page: structural lines, metadata bullets, and any line that
+/// merely repeats `title`. On a session page that lands on the prompts after
+/// the first, which is the part `title` does not already show.
+fn page_descriptor(raw: &str, title: &str) -> String {
+    // `truncate_for_title` suffixes an ellipsis only when it shortened the
+    // title, so an ellipsis-free title is complete: a longer line that merely
+    // opens with it is a different sentence and must be kept.
+    let title_trimmed = title.trim();
+    let title_was_truncated = title_trimmed.ends_with('\u{2026}');
+    let title_key = title_trimmed.trim_end_matches('\u{2026}').trim();
+    let mut out = String::new();
+    for line in raw.lines().map(str::trim) {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("---")
+            || line.starts_with("___")
+            || line.starts_with("***")
+            || is_metadata_bullet(line)
+        {
+            continue;
+        }
+        let content = strip_list_marker(line).trim();
+        if content.is_empty() {
+            continue;
+        }
+        let repeats_title = !title_key.is_empty()
+            && if title_was_truncated {
+                content.starts_with(title_key)
+            } else {
+                content == title_key
+            };
+        if repeats_title {
+            continue;
+        }
+        if !out.is_empty() {
+            if out.chars().count() + 1 + content.chars().count() > DESCRIPTOR_MAX_CHARS {
+                break;
+            }
+            out.push(' ');
+        }
+        out.push_str(content);
+        if out.chars().count() >= DESCRIPTOR_MAX_CHARS {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return truncate_chars(raw.trim(), DESCRIPTOR_MAX_CHARS);
+    }
+    truncate_chars(&out, DESCRIPTOR_MAX_CHARS)
+}
+
+/// Truncate on a character boundary, marking elision with an ellipsis.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 const AUTHORITY_CANDIDATE_MULTIPLIER: usize = 4;
@@ -1585,12 +1703,13 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
-                        substr(body, 1, 240) AS snip, \
+                        {descriptor} AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
                  WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
+                descriptor = page_descriptor_expr("body", "frontmatter_json"),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1599,7 +1718,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet: String = row.get(3)?;
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let rank: f64 = row.get(4)?;
                 Ok((id_bytes, path, title, snippet, rank))
             })?;
@@ -1632,12 +1751,13 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
-                        substr(body, 1, 240) AS snip, \
+                        {descriptor} AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
+                descriptor = page_descriptor_expr("body", "frontmatter_json"),
                 not_expired = not_expired("pages", "?4"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1653,7 +1773,7 @@ impl ReaderPool {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
                     let title: String = row.get(2)?;
-                    let snippet: String = row.get(3)?;
+                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                     let rank: f64 = row.get(4)?;
                     Ok((id_bytes, path, title, snippet, rank))
                 },
@@ -1690,7 +1810,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
-                        substr(pages.body, 1, 240) AS snip, \
+                        {descriptor} AS snip, \
                         CAST(pages.updated_at AS REAL) AS rank \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
@@ -1698,6 +1818,7 @@ impl ReaderPool {
                  WHERE pages.is_latest = 1{not_expired} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
+                descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1707,7 +1828,7 @@ impl ReaderPool {
                 let project_name: String = row.get(1)?;
                 let path: String = row.get(2)?;
                 let title: String = row.get(3)?;
-                let snippet: String = row.get(4)?;
+                let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
                 Ok((workspace_name, project_name, path, title, snippet, rank))
             })?;
@@ -3157,7 +3278,7 @@ impl ReaderPool {
                    WHERE 1 = 1{freq_not_expired} \
                    GROUP BY m.entity_id, m.name \
                  ) \
-                 SELECT pg.id, pg.path, pg.title, substr(pg.body, 1, 240) AS snippet, \
+                 SELECT pg.id, pg.path, pg.title, {descriptor} AS snippet, \
                         SUM(1.0 / f.pages) AS weight, \
                         COUNT(*) AS matches, \
                         json_group_array(f.name) AS names \
@@ -3168,6 +3289,7 @@ impl ReaderPool {
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
+                descriptor = page_descriptor_expr("pg.body", "pg.frontmatter_json"),
                 not_expired = not_expired("pg", "?"),
                 freq_not_expired = not_expired("p", "?"),
             )
@@ -3178,7 +3300,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet: String = row.get(3)?;
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let weight: f64 = row.get(4)?;
                 let names_json: String = row.get(6)?;
                 Ok((id_bytes, path, title, snippet, weight, names_json))
@@ -3330,6 +3452,8 @@ impl ReaderPool {
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
 
+            let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
+            let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
             let out_not_expired = not_expired("tp", "?");
             let in_not_expired = not_expired("fp", "?");
             let mut sql = String::with_capacity(values_clause.len() + 1_500);
@@ -3338,7 +3462,7 @@ impl ReaderPool {
                 "WITH seeds(seed_id, seed_ord) AS (VALUES {values_clause}), \
                  neighbors AS ( \
                    SELECT tp.id AS id, tp.path AS path, tp.title AS title, \
-                          substr(tp.body, 1, 240) AS snippet, \
+                          {out_descriptor} AS snippet, \
                           seeds.seed_ord * 2 AS stream_ord, tp.updated_at AS updated_at \
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
@@ -3346,7 +3470,7 @@ impl ReaderPool {
                    WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1{out_not_expired} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
-                          substr(fp.body, 1, 240) AS snippet, \
+                          {in_descriptor} AS snippet, \
                           seeds.seed_ord * 2 + 1 AS stream_ord, fp.updated_at AS updated_at \
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
@@ -3365,7 +3489,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet: String = row.get(3)?;
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let stream_ord: i64 = row.get(4)?;
                 Ok((id_bytes, path, title, snippet, stream_ord))
             })?;
@@ -7186,7 +7310,7 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &Ow
     // cross-operator mixing this filter exists to stop. Handoffs with no owner
     // (every pre-V39 row, and anything written without an actor) stay visible
     // to everyone, which preserves single-operator behaviour untouched.
-    if !owner_filter.admits(h.owner_user.as_deref()) {
+    if !owner_filter.admits(h.origin.owner_user.as_deref()) {
         return false;
     }
     // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
@@ -7194,10 +7318,10 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &Ow
     // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
     // handoff always beats the auto one" deterministic on from_session_id,
     // instead of relying on a manual handoff happening to have a NULL cwd.
-    if h.from_session_id.is_none() {
+    if h.origin.from_session_id.is_none() {
         return true;
     }
-    auto_handoff_matches_cwd(h.cwd.as_deref(), cwd_filter)
+    auto_handoff_matches_cwd(h.origin.cwd.as_deref(), cwd_filter)
 }
 
 /// Whether an automatic handoff is eligible for a session starting in
@@ -7242,16 +7366,16 @@ pub(crate) fn handoff_selection_key(
 
 fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
     handoff_selection_key(
-        a.from_session_id.is_none(),
-        a.created_at.as_microsecond(),
-        a.cwd.as_deref(),
-        a.id,
+        a.origin.from_session_id.is_none(),
+        a.lifecycle.created_at.as_microsecond(),
+        a.origin.cwd.as_deref(),
+        a.scope.id,
     )
     .cmp(&handoff_selection_key(
-        b.from_session_id.is_none(),
-        b.created_at.as_microsecond(),
-        b.cwd.as_deref(),
-        b.id,
+        b.origin.from_session_id.is_none(),
+        b.lifecycle.created_at.as_microsecond(),
+        b.origin.cwd.as_deref(),
+        b.scope.id,
     ))
 }
 
@@ -7318,35 +7442,43 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
             .map(SessionId::from_slice)
             .transpose()?;
         Ok(Handoff {
-            id: HandoffId::from_slice(&id_bytes)?,
-            workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
-            project_id: ProjectId::from_slice(&pj_bytes)?,
-            from_session_id: from_session,
-            from_agent: parse_agent(&from_agent),
-            to_agent: to_agent.as_deref().map(parse_agent),
-            cwd,
-            summary,
-            open_questions,
-            next_steps,
-            files_touched,
-            state: state.parse::<HandoffState>().map_err(StoreError::from)?,
-            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
-                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                    "bad created_at: {e}"
-                )))
-            })?,
-            accepted_by: accepted_by.as_deref().map(parse_agent),
-            accepted_at: accepted_at_us
-                .map(jiff::Timestamp::from_microsecond)
-                .transpose()
-                .map_err(|e| {
+            scope: HandoffScope {
+                id: HandoffId::from_slice(&id_bytes)?,
+                workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
+                project_id: ProjectId::from_slice(&pj_bytes)?,
+            },
+            origin: HandoffOrigin {
+                from_session_id: from_session,
+                from_agent: parse_agent(&from_agent),
+                to_agent: to_agent.as_deref().map(parse_agent),
+                cwd,
+                owner_user,
+            },
+            content: HandoffContent {
+                summary,
+                open_questions,
+                next_steps,
+                files_touched,
+            },
+            lifecycle: HandoffLifecycle {
+                state: state.parse::<HandoffState>().map_err(StoreError::from)?,
+                created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
                     StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                        "bad accepted_at: {e}"
+                        "bad created_at: {e}"
                     )))
                 })?,
-            accepted_by_session: accepted_session,
-            owner_user,
-            accepted_by_user,
+                accepted_by: accepted_by.as_deref().map(parse_agent),
+                accepted_at: accepted_at_us
+                    .map(jiff::Timestamp::from_microsecond)
+                    .transpose()
+                    .map_err(|e| {
+                        StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                            "bad accepted_at: {e}"
+                        )))
+                    })?,
+                accepted_by_session: accepted_session,
+                accepted_by_user,
+            },
         })
     })())
 }
@@ -7589,12 +7721,34 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
-    use super::{entity_query_tokens, handoff_listing_sql, like_escape};
+    use super::{
+        DESCRIPTOR_MAX_CHARS, entity_query_tokens, handoff_listing_sql, like_escape,
+        page_descriptor, page_descriptor_expr,
+    };
     use crate::Store;
 
+    #[test]
+    fn a_metadata_styled_descriptor_source_is_echoed_verbatim() {
+        // Every line here is a metadata bullet, so all of them are skipped
+        // and nothing accumulates. The fallback then echoes the raw input —
+        // the result is not empty, it is the unusable input reproduced whole.
+        //
+        // This is the failure mode for a writer that fills frontmatter
+        // `summary` in the same house style it renders a session page's
+        // metadata block in. Because `summary` wins the COALESCE, such a
+        // page trades a usable body-derived descriptor for this, and nothing
+        // anywhere reports an error. Writers must emit plain prose.
+        let metadata_styled = "- **session_id:** `9f2c`\n- **observations:** 2";
+        assert_eq!(
+            page_descriptor(metadata_styled, "Some title"),
+            metadata_styled
+        );
+    }
+
     use ai_memory_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, NewSession, OwnerFilter,
-        ProjectId, SessionId, WorkspaceId,
+        AgentKind, Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin,
+        HandoffScope, HandoffState, NewHandoff, NewSession, OwnerFilter, ProjectId, SessionId,
+        WorkspaceId,
     };
 
     #[test]
@@ -7641,29 +7795,38 @@ mod tests {
     /// which handoff won.
     fn handoff(summary: &str, cwd: Option<&str>, manual: bool, t: i64) -> Handoff {
         Handoff {
-            id: HandoffId::new(),
-            workspace_id: WorkspaceId::new(),
-            project_id: ProjectId::new(),
-            from_session_id: if manual { None } else { Some(SessionId::new()) },
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: cwd.map(str::to_string),
-            summary: summary.to_string(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-            state: HandoffState::Open,
-            created_at: jiff::Timestamp::from_microsecond(t).unwrap(),
-            accepted_by: None,
-            accepted_at: None,
-            accepted_by_session: None,
-            owner_user: None,
-            accepted_by_user: None,
+            scope: HandoffScope {
+                id: HandoffId::new(),
+                workspace_id: WorkspaceId::new(),
+                project_id: ProjectId::new(),
+            },
+            origin: HandoffOrigin {
+                from_session_id: if manual { None } else { Some(SessionId::new()) },
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: cwd.map(str::to_string),
+                owner_user: None,
+            },
+            content: HandoffContent {
+                summary: summary.to_string(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            },
+            lifecycle: HandoffLifecycle {
+                state: HandoffState::Open,
+                created_at: jiff::Timestamp::from_microsecond(t).unwrap(),
+                accepted_by: None,
+                accepted_at: None,
+                accepted_by_session: None,
+                accepted_by_user: None,
+            },
         }
     }
 
     fn pick(candidates: Vec<Handoff>, cwd: Option<&str>) -> String {
-        super::select_open_handoff(candidates, cwd).map_or_else(|| "—".to_string(), |h| h.summary)
+        super::select_open_handoff(candidates, cwd)
+            .map_or_else(|| "—".to_string(), |h| h.content.summary)
     }
 
     #[test]
@@ -7890,7 +8053,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(handoff.summary, "right project");
+        assert_eq!(handoff.content.summary, "right project");
     }
 
     #[tokio::test]
@@ -7958,6 +8121,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .lifecycle
                 .state,
             HandoffState::Expired,
             "a newer auto from the exact cwd must bound pre-accept accumulation"
@@ -7977,7 +8141,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(selected.id, newest_parent, "newest eligible auto must win");
+        assert_eq!(
+            selected.scope.id, newest_parent,
+            "newest eligible auto must win"
+        );
 
         // A manual handoff appearing between selection and acceptance must not
         // be swept by automatic-handoff cleanup.
@@ -8001,7 +8168,7 @@ mod tests {
         store
             .writer
             .accept_handoff(ai_memory_core::HandoffAcceptance {
-                handoff_id: selected.id,
+                handoff_id: selected.scope.id,
                 workspace_id: ws,
                 project_id: proj,
                 accepting_agent: AgentKind::Codex,
@@ -8020,6 +8187,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .lifecycle
                 .state,
             HandoffState::Expired
         );
@@ -8030,6 +8198,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .lifecycle
                 .state,
             HandoffState::Accepted
         );
@@ -8041,6 +8210,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
+                    .lifecycle
                     .state,
                 HandoffState::Open
             );
@@ -8266,5 +8436,111 @@ mod tests {
         assert_eq!(like_escape("100%"), "100\\%");
         assert_eq!(like_escape("back\\slash"), "back\\\\slash");
         assert_eq!(like_escape("plain-name"), "plain-name");
+    }
+
+    #[test]
+    fn page_descriptor_skips_heading_and_rule_lines() {
+        let body = concat!(
+            "# Session 2026-04-20\n",
+            "\n",
+            "---\n",
+            "\n",
+            "## Summary\n",
+            "\n",
+            "Switched the scheduler to a single writer actor.\n",
+        );
+        assert_eq!(
+            page_descriptor(body, ""),
+            "Switched the scheduler to a single writer actor."
+        );
+    }
+
+    #[test]
+    fn page_descriptor_fills_the_budget_across_prose_lines() {
+        // A short opening line must not cost the rest of the budget: the
+        // `_lint` pages open with "N finding(s)." and everything that tells
+        // you what the findings were comes after it.
+        let body = concat!(
+            "# Lint findings\n",
+            "\n",
+            "501 finding(s).\n",
+            "\n",
+            "## 1 - stale (info)\n",
+            "\n",
+            "Episodic page sessions/e24f6fbc.md is 30 days old with zero accesses.\n",
+        );
+        assert_eq!(
+            page_descriptor(body, ""),
+            "501 finding(s). Episodic page sessions/e24f6fbc.md is 30 days old \
+             with zero accesses."
+        );
+    }
+
+    #[test]
+    fn page_descriptor_falls_back_to_raw_text_when_all_lines_are_structural() {
+        assert_eq!(page_descriptor("# Only a title\n", ""), "# Only a title");
+        assert_eq!(page_descriptor("   ", ""), "");
+    }
+
+    #[test]
+    fn page_descriptor_skips_metadata_bullets_and_the_repeated_title() {
+        // The compiled session-page shape: the title again as prompt 1, with
+        // the metadata block in between. What the reader does not already
+        // have is prompt 2 onward.
+        let title = "vamos revisar o deploy";
+        let body = concat!(
+            "# vamos revisar o deploy\n",
+            "\n",
+            "## Session metadata\n",
+            "\n",
+            "- **session_id:** `4e79a7ce-55e9-44c1-bcb5-74a6fe740900`\n",
+            "- **started_at:** 2026-08-22T19:26:07Z\n",
+            "- **observations:** 59\n",
+            "\n",
+            "## Prompts\n",
+            "\n",
+            "1. vamos revisar o deploy\n",
+            "2. o rollback falhou no passo do migrate\n",
+        );
+        assert_eq!(
+            page_descriptor(body, title),
+            "o rollback falhou no passo do migrate"
+        );
+    }
+
+    #[test]
+    fn page_descriptor_keeps_a_line_that_only_starts_with_a_complete_title() {
+        // `truncate_for_title` appends the ellipsis only past 80 chars, so a
+        // title without one is complete. A longer line that merely opens with
+        // it is a different sentence, not a repeat.
+        let title = "vamos revisar o deploy";
+        let body = "# vamos revisar o deploy\n\n1. vamos revisar o deploy\n2. vamos revisar o deploy e o rollback do migrate\n";
+        assert_eq!(
+            page_descriptor(body, title),
+            "vamos revisar o deploy e o rollback do migrate"
+        );
+    }
+
+    #[test]
+    fn page_descriptor_matches_a_title_truncated_with_an_ellipsis() {
+        let title = "vamos revisar o deploy do SHVIA-WEB e o rollback\u{2026}";
+        let body = "# x\n\n1. vamos revisar o deploy do SHVIA-WEB e o rollback do migrate\n2. depois o resto\n";
+        assert_eq!(page_descriptor(body, title), "depois o resto");
+    }
+
+    #[test]
+    fn page_descriptor_truncates_on_a_character_boundary() {
+        let body = "\u{e7}".repeat(DESCRIPTOR_MAX_CHARS + 10);
+        let out = page_descriptor(&body, "");
+        assert_eq!(out.chars().count(), DESCRIPTOR_MAX_CHARS);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn page_descriptor_expr_prefers_a_non_blank_frontmatter_summary() {
+        let sql = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+        assert!(sql.contains("json_extract(pages.frontmatter_json, '$.summary')"));
+        assert!(sql.contains("NULLIF(TRIM("));
+        assert!(sql.contains("substr(pages.body, 1, 600)"));
     }
 }

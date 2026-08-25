@@ -224,6 +224,27 @@ ENVEOF
   return 0
 }
 
+# A compose file found in a conventional location is only relevant when its
+# project actually owns the running container. A stale or unrelated file may
+# declare the same container_name and `compose up` would then fail with a name
+# conflict instead of taking the safe standalone recovery path.
+compose_manages_container() {
+  local container="$1" compose_dir="$2" container_id compose_id
+  container_id="$("${DOCKER}" inspect "${container}" --format '{{.Id}}' 2>/dev/null)" || return 1
+  [ -n "${container_id}" ] || return 1
+
+  while IFS= read -r compose_id; do
+    [ -n "${compose_id}" ] || continue
+    case "${container_id}" in
+      "${compose_id}"*) return 0 ;;
+    esac
+    case "${compose_id}" in
+      "${container_id}"*) return 0 ;;
+    esac
+  done < <((cd "${compose_dir}" && "${DOCKER}" compose ps -q) 2>/dev/null)
+  return 1
+}
+
 cmd_upgrade() {
   if [ -z "${AI_MEMORY_SKIP_SELF_UPGRADE:-}" ]; then
     self_upgrade_script
@@ -271,11 +292,9 @@ cmd_upgrade() {
        | grep -q '^ai-memory$'; then
     # A LOCAL ai-memory container is running. We've just pulled a new
     # image; `docker restart` won't recreate from the new image, so we
-    # need to stop+remove+recreate. The safe way is via `docker compose
-    # up -d` when a compose file is reachable (it remembers all the
-    # ports/volumes/env). Without compose we can't recreate safely
-    # because we don't know the original `docker run` args — fall
-    # back to a clear instruction.
+    # need to stop+remove+recreate. Use `docker compose up -d` only when
+    # the discovered project owns this container; otherwise reconstruct
+    # the standalone `docker run` from its inspected runtime settings.
     local compose_dir=""
     if [ -f "$(pwd)/docker/docker-compose.yml" ]; then
       compose_dir="$(pwd)/docker"
@@ -284,14 +303,19 @@ cmd_upgrade() {
     elif [ -f "${HOME}/deploy/ai-memory/docker-compose.yml" ]; then
       compose_dir="${HOME}/deploy/ai-memory"
     fi
-    if [ -n "${compose_dir}" ]; then
+    if [ -n "${compose_dir}" ] && compose_manages_container "ai-memory" "${compose_dir}"; then
       echo "→ restarting local ai-memory container via docker compose (${compose_dir})"
       ( cd "${compose_dir}" && "${DOCKER}" compose up -d ) \
         || echo "  (compose restart failed; re-run manually: cd ${compose_dir} && docker compose up -d)"
     else
-      echo "→ a local ai-memory container is running but no compose file"
-      echo "  was found in \$PWD/docker-compose.yml, ./docker/docker-compose.yml,"
-      echo "  or ~/deploy/ai-memory/docker-compose.yml."
+      if [ -n "${compose_dir}" ]; then
+        echo "→ the compose file at ${compose_dir} does not manage the running ai-memory container"
+        echo "  Treating it as a standalone docker run install to avoid a container-name conflict."
+      else
+        echo "→ a local ai-memory container is running but no compose file"
+        echo "  was found in \$PWD/docker-compose.yml, ./docker/docker-compose.yml,"
+        echo "  or ~/deploy/ai-memory/docker-compose.yml."
+      fi
       local recreate_script="${CACHE_DIR}/recreate-ai-memory.sh"
       mkdir -p "${CACHE_DIR}" 2>/dev/null || true
       if emit_docker_run_script "ai-memory" "${recreate_script}"; then

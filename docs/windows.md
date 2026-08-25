@@ -69,7 +69,13 @@ inside WSL2, no Windows wrapper is involved.
 ## Scenario B: Native Windows With Docker Desktop
 
 Use this when the agent CLI runs as a native Windows process and you want
-the ai-memory server to run from the Docker image.
+the ai-memory server to run from the Docker image. The wrapper renders
+host-side agent config with `http://127.0.0.1:49374`, but its own thin-client
+commands reach the server from inside a helper container via Docker Desktop's
+`host.docker.internal` alias, because Docker Desktop gives Linux containers no
+host networking on Windows. Set `AI_MEMORY_SERVER_URL` only when the server
+lives somewhere else (a homelab or remote host); the wrapper honours it and
+skips the alias.
 
 ```powershell
 # Install the Windows Docker wrapper.
@@ -106,7 +112,9 @@ if (($UserPath -split ';') -notcontains $UserBin) {
     $env:Path = "$env:Path;$UserBin"
 }
 
-# Start the server with Docker Desktop.
+# Start the server with Docker Desktop. The image default allowlist includes
+# host.docker.internal so wrapper thin-client commands (status, search, …) are
+# not rejected with 403.
 docker run -d --name ai-memory `
     --restart unless-stopped `
     -p 127.0.0.1:49374:49374 `
