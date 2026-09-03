@@ -12,7 +12,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
@@ -57,7 +59,7 @@ const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // this window to influence the reviewer.
 const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
-const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
+pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
 const MAX_REJECTION_REASON_CHARS: usize = 512;
 const MAX_REJECTION_FINGERPRINT_CHARS: usize = 128;
@@ -513,7 +515,8 @@ pub async fn run_auto_improve_review(
         max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request).await?;
+    let raw: AutoImproveLlmResponse =
+        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);
@@ -576,7 +579,7 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
-async fn apply_eval_gate(
+pub(crate) async fn apply_eval_gate(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -853,29 +856,29 @@ fn eval_rejection(
     }
 }
 
-struct PromptInput {
-    prompt: String,
-    patchable_paths: BTreeSet<String>,
-    rejected_candidates: Vec<AutoImproveRejectedCandidate>,
-    warnings: Vec<String>,
+pub(crate) struct PromptInput {
+    pub(crate) prompt: String,
+    pub(crate) patchable_paths: BTreeSet<String>,
+    pub(crate) rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
-struct RenderedPatchablePages {
-    text: String,
-    included_paths: BTreeSet<String>,
+pub(crate) struct RenderedPatchablePages {
+    pub(crate) text: String,
+    pub(crate) included_paths: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
-struct ExistingPageIndex {
+pub(crate) struct ExistingPageIndex {
     paths: BTreeSet<String>,
     titles: BTreeSet<String>,
     patchable: BTreeMap<String, PatchablePageContext>,
 }
 
 #[derive(Debug, Clone)]
-struct PatchablePageContext {
-    path: String,
+pub(crate) struct PatchablePageContext {
+    pub(crate) path: String,
     title: String,
     kind: String,
     body: String,
@@ -893,7 +896,10 @@ struct MarkdownSection {
 }
 
 impl ExistingPageIndex {
-    fn from_pages(pages: &[BriefingPage], patchable_pages: &[PatchablePageContext]) -> Self {
+    pub(crate) fn from_pages(
+        pages: &[BriefingPage],
+        patchable_pages: &[PatchablePageContext],
+    ) -> Self {
         Self {
             paths: pages.iter().map(|page| page.path.clone()).collect(),
             titles: pages
@@ -930,7 +936,7 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
-async fn load_patchable_pages(
+pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -961,7 +967,7 @@ async fn load_patchable_pages(
     Ok(out)
 }
 
-async fn load_rejection_context(
+pub(crate) async fn load_rejection_context(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -1100,7 +1106,7 @@ fn rejection_context_char_budget(usable_chars: usize) -> usize {
     (usable_chars / 8).min(MAX_REJECTION_CONTEXT_CHARS)
 }
 
-fn render_rejection_context(
+pub(crate) fn render_rejection_context(
     rejections: &[AutoImproveRejectionSummary],
     max_total_chars: usize,
 ) -> String {
@@ -1187,7 +1193,7 @@ fn render_session_page(
     )
 }
 
-fn render_recent_pages(pages: &[BriefingPage]) -> String {
+pub(crate) fn render_recent_pages(pages: &[BriefingPage]) -> String {
     if pages.is_empty() {
         return "(none)".into();
     }
@@ -1201,7 +1207,7 @@ fn render_recent_pages(pages: &[BriefingPage]) -> String {
     out
 }
 
-fn render_patchable_pages(
+pub(crate) fn render_patchable_pages(
     pages: &[PatchablePageContext],
     max_body_chars: usize,
     max_total_chars: usize,
@@ -1397,7 +1403,7 @@ fn preflight_rejection(
     None
 }
 
-fn validate_response(
+pub(crate) fn validate_response(
     raw: AutoImproveLlmResponse,
     cfg: &AutoImproveReviewConfig,
     existing_index: &ExistingPageIndex,
@@ -1832,7 +1838,7 @@ fn session_duration_secs(observations: &[Observation]) -> u64 {
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
-fn estimate_tokens(text: &str) -> usize {
+pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(CHARS_PER_TOKEN)
 }
 

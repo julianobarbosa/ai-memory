@@ -22,6 +22,13 @@ pub struct ConsolidatedPage {
     /// outputs still deserialise.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Typed edges to existing pages (2.0 item 3). Keys are the closed
+    /// vocabulary `causes` / `fixes` / `contradicts`; values are wiki
+    /// paths of the target pages. Only declare a relation when the
+    /// session's evidence states it plainly — an empty map is the
+    /// normal case. Unknown keys are dropped at the write boundary.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub relations: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Semantic classification of one consolidated page. Surfaced into

@@ -39,16 +39,16 @@ function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
-    $home = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
     $boundary = $null
-    if ($home) {
-        $homePrefix = $home.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
-        $insideHome = ($dir -eq $home) -or $dir.StartsWith(
-            $homePrefix,
+    if ($userHome) {
+        $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        $insideHome = ($dir -eq $userHome) -or $dir.StartsWith(
+            $userHomePrefix,
             [StringComparison]::OrdinalIgnoreCase
         )
         if ($insideHome) {
-            $boundary = $home
+            $boundary = $userHome
         } else {
             $probe = $dir
             while ($probe -and (Test-Path $probe)) {
@@ -268,36 +268,6 @@ function Read-AiMemoryStdin {
     return ""
 }
 
-# Fire-and-forget POST honouring the 200 ms hook latency budget
-# (`docs/ARCHITECTURE.md` cross-cutting invariant 5). `Invoke-WebRequest`
-# cannot express it: `-TimeoutSec` takes whole seconds and 0 means
-# *infinite*, so the capture path uses `HttpClient` with a millisecond
-# timeout instead. Failures are swallowed by design — the agent's hot
-# path must never observe this call.
-function Invoke-AiMemoryHookPost {
-    param(
-        [string] $Uri,
-        [hashtable] $Headers,
-        [string] $Payload
-    )
-
-    $Client = $null
-    try {
-        $Client = [System.Net.Http.HttpClient]::new()
-        $Client.Timeout = [TimeSpan]::FromMilliseconds(200)
-        foreach ($Key in $Headers.Keys) {
-            $null = $Client.DefaultRequestHeaders.TryAddWithoutValidation(
-                $Key, [string] $Headers[$Key])
-        }
-        $Content = [System.Net.Http.StringContent]::new(
-            $Payload, [System.Text.Encoding]::UTF8, "application/json")
-        $null = $Client.PostAsync($Uri, $Content).GetAwaiter().GetResult()
-    } catch {
-    } finally {
-        if ($null -ne $Client) { $Client.Dispose() }
-    }
-}
-
 function Test-AiMemoryAntigravityInitialInvocation {
     param([string] $Payload)
     try {
@@ -354,10 +324,18 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
-    Invoke-AiMemoryHookPost `
-        -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
-        -Headers $Headers `
-        -Payload $Payload
+    $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+    try {
+        Invoke-WebRequest `
+            -UseBasicParsing `
+            -TimeoutSec 3 `
+            -Method Post `
+            -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
+            -Headers $Headers `
+            -ContentType "application/json; charset=utf-8" `
+            -Body $BodyBytes | Out-Null
+    } catch {
+    }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
         Clear-AiMemorySessionId -Agent $Agent
     }

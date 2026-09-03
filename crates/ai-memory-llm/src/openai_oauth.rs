@@ -22,7 +22,7 @@ use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
 
 /// OpenAI OAuth issuer used by Codex/OpenCode.
 pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
@@ -139,6 +139,7 @@ pub struct OpenAiOAuthProvider {
     token_path: PathBuf,
     token: Mutex<OpenAiOAuthToken>,
     timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl OpenAiOAuthProvider {
@@ -160,6 +161,7 @@ impl OpenAiOAuthProvider {
             token_path,
             token: Mutex::new(token),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
         })
     }
 
@@ -168,6 +170,14 @@ impl OpenAiOAuthProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Set Responses API `reasoning.effort`. `None` omits the field so the
+    /// model default applies.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -238,7 +248,12 @@ impl LlmProvider for OpenAiOAuthProvider {
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let response = self
-            .post(&build_request(&self.model, &request, None))
+            .post(&build_request(
+                &self.model,
+                &request,
+                None,
+                self.reasoning_effort,
+            ))
             .await?;
         Ok(into_chat_response(response))
     }
@@ -257,7 +272,12 @@ impl LlmProvider for OpenAiOAuthProvider {
             },
         };
         let response = self
-            .post(&build_request(&self.model, &request, Some(response_format)))
+            .post(&build_request(
+                &self.model,
+                &request,
+                Some(response_format),
+                self.reasoning_effort,
+            ))
             .await?;
         let text = extract_output_text(&response).unwrap_or_default();
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -292,15 +312,13 @@ fn build_request<'a>(
     model: &'a str,
     request: &'a ChatRequest,
     text: Option<CodexText>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> CodexResponsesRequest<'a> {
     let input = request
         .messages
         .iter()
         .map(|msg| CodexInputMessage {
-            role: match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: msg.role.as_str(),
             content: vec![CodexInputContent {
                 kind: "input_text",
                 text: &msg.content,
@@ -322,6 +340,9 @@ fn build_request<'a>(
         store: false,
         stream: true,
         text,
+        reasoning: reasoning_effort.map(|effort| CodexReasoning {
+            effort: effort.openai_wire_effort(),
+        }),
     }
 }
 
@@ -444,6 +465,13 @@ struct CodexResponsesRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<CodexText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<CodexReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,7 +594,7 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
+    use rstest::rstest;
     use serde_json::json;
 
     use super::*;
@@ -700,20 +728,34 @@ mod tests {
     fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
         let request = ChatRequest {
             system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, None)).unwrap();
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, None)).unwrap();
         assert_eq!(value["instructions"], "sys");
         assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
         assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("temperature").is_none());
+        assert!(value.get("reasoning").is_none());
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+    }
+
+    #[rstest]
+    #[case::omitted(None, None)]
+    #[case::low(Some(ReasoningEffort::Low), Some("low"))]
+    #[case::persistent_clamps_max(Some(ReasoningEffort::Persistent), Some("max"))]
+    fn codex_request_reasoning_effort(
+        #[case] effort: Option<ReasoningEffort>,
+        #[case] expected: Option<&str>,
+    ) {
+        let request = ChatRequest::user_prompt("hello");
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, effort)).unwrap();
+        match expected {
+            Some(effort) => assert_eq!(value["reasoning"]["effort"], effort),
+            None => assert!(value.get("reasoning").is_none()),
+        }
     }
 
     #[test]
@@ -862,7 +904,8 @@ mod tests {
                 strict: true,
             },
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, Some(text))).unwrap();
+        let value =
+            serde_json::to_value(build_request("gpt-5.5", &request, Some(text), None)).unwrap();
         assert_eq!(value["text"]["format"]["type"], "json_schema");
         assert_eq!(value["text"]["format"]["name"], "Result");
         assert_eq!(value["text"]["format"]["strict"], true);

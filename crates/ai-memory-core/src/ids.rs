@@ -87,6 +87,7 @@ id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
+id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credential.");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
@@ -245,6 +246,8 @@ pub enum AgentKind {
     Hermes,
     /// Pool (Poolside Agent CLI).
     Pool,
+    /// ZCode (z.ai) coding agent.
+    Zcode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -255,7 +258,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -275,6 +278,7 @@ impl AgentKind {
         Self::CommandCode,
         Self::Hermes,
         Self::Pool,
+        Self::Zcode,
         Self::Other,
     ];
 
@@ -301,6 +305,7 @@ impl AgentKind {
             Self::CommandCode => "command-code",
             Self::Hermes => "hermes",
             Self::Pool => "pool",
+            Self::Zcode => "zcode",
             Self::Other => "other",
         }
     }
@@ -330,6 +335,7 @@ impl AgentKind {
             "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
+            "zcode" | "zai" => Self::Zcode,
             _ => Self::Other,
         }
     }
@@ -361,6 +367,12 @@ impl AgentKind {
     /// (verified against Poolside CLI v1.0.16), so Pool fails safe like other
     /// unproven agents: the handoff stays available on demand via the MCP
     /// `memory_handoff_accept` tool.
+    ///
+    /// ZCode (z.ai) DOES inject: a `hookSpecificOutput.additionalContext`
+    /// canary printed by the session-start hook appeared verbatim inside a
+    /// `<system-reminder>` text block of the first user message sent to the
+    /// model (verified live against the embedded engine v0.16.5, capture logs
+    /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -509,6 +521,28 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_zcode_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::Zcode.as_str(), "zcode");
+        assert_eq!(AgentKind::from_wire("zcode"), AgentKind::Zcode);
+        assert_eq!(AgentKind::from_wire("zai"), AgentKind::Zcode);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Zcode).unwrap(),
+            "\"zcode\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"zcode\"").unwrap(),
+            AgentKind::Zcode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("zcode-2"), AgentKind::Other);
+        // ZCode injects SessionStart stdout as additionalContext (live canary
+        // capture against engine v0.16.5), so the destructive handoff fetch
+        // is safe from its native hook.
+        assert!(AgentKind::Zcode.session_start_injects_handoff());
+        assert!(!AgentKind::Zcode.user_prompt_injects_handoff());
     }
 
     #[test]
