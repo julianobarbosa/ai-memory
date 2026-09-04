@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `bootstrap` now retries a chunk's LLM call on a transient error before
+  giving up, instead of letting one blip discard the whole multi-chunk run
+  (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
+  chunk *n* previously aborted the run and threw away chunks *1..n-1* — the
+  reporter's own runs died repeatedly to provider `520`s and connection
+  resets. Each chunk now gets up to 3 short, fixed-delay attempts;
+  deterministic failures (auth, schema, a `4xx`, malformed JSON) are not
+  retried. The retry is deliberately short and bounded, not tenacity-style
+  escalating backoff (cognee #2840). A durable `--resume` for the rarer
+  crash/hard-failure case remains tracked separately in #617.
 - `bootstrap` no longer aborts the whole multi-chunk run when one chunk
   returns no `pages` key (#614). Later chunks are told which paths
   earlier ones wrote, so a model that judges the material already
@@ -34,7 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real warnings, including, on one host, a 22-hour `sqlite: disk I/O error`.
   Reconcile now checks the project scope once per directory and skips an
   unresolvable one wholesale at `debug`, rather than retrying its pages; if
-  the row later appears the directory indexes normally on the next pass.
+  the row later appears the directory indexes normally on the next pass. The
+  same orphan skip now also guards the real-time directory-event path
+  (`reindex_project_dir`), not just the periodic pass (#616).
 - The store error for an unknown project id now says "does not exist" instead
   of "does not belong to workspace X" (#612). A dangling id names no
   workspace mismatch to hunt for; the disambiguating lookup runs only on the
