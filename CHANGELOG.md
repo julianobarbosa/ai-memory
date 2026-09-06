@@ -7,7 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The build is self-contained on every platform: the vendored web stylesheet
+  is now the default and `TAILWIND_BUILD=1 cargo build -p ai-memory-web`
+  regenerates it, so no command needs `TAILWIND_SKIP=1` any more. CI
+  regenerates the bundle on Linux and fails if the committed
+  `static/tailwind.css` is stale, a check that did not exist before.
+- Developer loop: `cargo t` (everyday, skips `slow`/`stress` modules) and
+  `cargo tf` (everything) aliases over cargo-nextest, integration tests that
+  compile into each crate's own test harness from `tests/suite/` (78 test
+  binaries down to 11 in the everyday loop; only the CLI keeps a separate one,
+  and the evals harness builds only under `--workspace`), a dev profile that
+  keeps only line tables, and an opt-in pre-push hook that runs the full tier.
+  `bin/release` and the documented gate also run `git diff --check`. Measured:
+  workspace edit-to-result ~380s to ~150s on macOS; the warm everyday test run
+  28s to 19s on a 32-thread Windows box.
+
 ### Fixed
+- Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
+  headers and preserve anonymous access. Previously, a client retaining an old
+  `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
+  reported `auth=false`; invalid Bearers remain rejected whenever static or
+  human authentication is enabled. (#639)
+- Cursor sessions no longer land in the default `default/scratch` bucket.
+  Cursor sends the workspace directory only as `workspace_roots` — its
+  `sessionStart` / `sessionEnd` payloads carry no `cwd` key at all, and its
+  tool events send `cwd: ""` — so cwd resolution produced nothing and the
+  server fell back to its default project for every Cursor event. Both the
+  native `ai-memory hook` path and the POSIX/PowerShell hook scripts now read
+  `workspace_roots` (alongside Antigravity's `workspacePaths`) and treat an
+  empty `cwd` as absent rather than as an answer.
+- Cursor sessions are no longer attributed to `claude-code`. The Cursor CLI
+  also runs the hook commands declared in Claude Code's
+  `~/.claude/settings.json`, which `install-hooks --agent claude-code`
+  hardcoded to `--agent claude-code`, so a Cursor-driven session was stored
+  with `agent_kind = claude-code`. Hook payloads carrying Cursor's
+  `cursor_version` marker are now attributed to `cursor` regardless of the
+  `?agent=` the hook command declared.
+- A project that first materializes while the server is running is now
+  self-describing immediately, instead of only after the next startup
+  backfill (#643). Scope manifests (`_meta.md`) were written at startup and on
+  the rename/move admin paths, so a session in a checkout the server had not
+  seen before produced a scope directory with pages but no manifest. Stop the
+  server in that window and `reindex` could not rebuild that tree — the one
+  situation where an operator most needs the rebuild to work. The manifest is
+  now written with the scope's first page, one store lookup per scope per
+  process, byte-identical to what the backfill writes so restarts still do not
+  churn the wiki's git history. The startup backfill is unchanged and remains
+  the repair path for trees written by older releases.
+- `ai-memory reindex` now names the exact missing or unreadable scope
+  `_meta.md` path instead of collapsing the filesystem error to a bare `No such
+  file or directory (os error 2)`. This makes the existing startup-backfill
+  workaround discoverable when a scope was first created during the server's
+  last run. (#643)
+- Generated routing instructions and all project-scoped managed Agent Skills now
+  distinguish session-aware MCP clients from static clients. Static clients are
+  told to pass exact `workspace` + `project` values from `.ai-memory.toml` or
+  operator configuration on every project-scoped call, preventing another
+  session's last active project from capturing reads or writes; global searches
+  and global preference writes retain their scope-free argument rules (#372).
+- Consolidation prompt assembly no longer re-renders the whole observation
+  projection and re-scores every observation after each pruned one. With a few
+  hundred long observations the quadratic loop cost ~14s per prompt; pruning
+  now works from per-observation scores and block sizes computed once, with
+  byte-identical output.
+
+## [2.0.3] - 2026-09-04
+
+### Changed
+- Release, Docker, and the `cargo install --git` snippet now build with
+  `--locked` (#628). Without it `cargo install` re-resolves dependencies and
+  ignores the committed `Cargo.lock`, so a source install could silently pull
+  a different `schemars` than the one tested — a plausible source of
+  build-to-build structured-output schema drift. A unit guard also asserts the
+  strict-schema normalizer keeps `required` equal to `properties` (and closes
+  open maps), catching that drift class at build time rather than in
+  production.
+- The `_pending/auto-improve/` sidecar no longer renders a `status:` line
+  (#624). It was written once at staging and could never change from
+  `pending` — no code path updates or garbage-collects the sidecar — so it
+  contradicted design principle 14 (SQLite owns approval status) and misled a
+  human (or a second agent) reading the file. Status lives in
+  `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
+  snapshot.
+
+### Added
+- `ai-memory status` and the pre-migration backup log now report the data
+  directory's **filesystem free space** (#629). The OKF-migration backup gate
+  proves the archive is writable but said nothing about disk headroom — an
+  operator whose 447 MB safety archive left 77 MB free had the store fail to
+  extend its WAL eight minutes later, unlogged, for hours. This is pure signal
+  (no threshold, no refusal): `status` shows `filesystem free:` beside the
+  storage figures, and the "pre-migration backup verified" line now carries
+  `dest_free_bytes`, so the same number is visible right before a migration.
+
+### Fixed
+- The pre-migration safety archive is now taken **before** the SQLite schema
+  is migrated, so it is a genuine pre-2.0 recovery point a 1.x binary can
+  reopen — restoring the documented "reversible upgrade" (#633). Previously the
+  archive was written inside the wiki migration, which runs *after*
+  `Store::open` has already advanced the DB schema, so the archived `db/` was
+  already at 2.x and a 1.x binary refused it — the documented rollback was
+  impossible. The snapshot now runs in the boot path before `Store::open`,
+  gated to the real 1.x→2.0 upgrade (a fresh install or already-migrated store
+  takes nothing, unchanged) and idempotent; the OKF migration reuses that
+  archive instead of taking a second one. An integration test asserts the
+  archived DB reflects the pre-migration state.
+- Typed edges (`relations`) now actually work on OpenAI-family providers
+  (#630). `ConsolidatedPage.relations` was an open map
+  (`BTreeMap<String, Vec<String>>`), which the strict structured-output
+  normalizer closes to `additionalProperties: false` — OpenAI strict mode
+  cannot express arbitrary-key maps — so the model was structurally unable to
+  emit any `causes`/`fixes`/`contradicts` edge on `openai`, `openai-oauth`,
+  `copilot`, `opencode`, or `openai-compat`; the 2.0 typed-edges feature was
+  silently dead there. `relations` is now a fixed three-field object
+  (`causes`/`fixes`/`contradicts`), which strict mode expresses and which
+  serializes to the identical `relations:` frontmatter — no migration, no
+  downstream change. A schema guard pins the fixed shape.
+- `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
+  is accepted again (#623). These agents are captured and stored, but
+  `finalize-session` reused the install-oriented agent enum — which is
+  deliberately limited to agents with a first-party installer — so it rejected
+  them at parse time and their sessions could never be closed, summarised, or
+  consolidated. `finalize-session` is agent-agnostic, so `--agent` now accepts
+  any agent the store recognises (a genuine typo is still rejected);
+  `install-hooks`/`setup-agent` stay limited. A drift guard keeps the two sets
+  from diverging again.
+- generated TypeScript integrations (`--agent open-code`, `omp`, `pi`,
+  `openclaw`) authenticate again under `install-hooks --apply`. Since #552
+  the bearer is deliberately omitted from the rendered file and persisted to
+  the 0600 `<data_dir>/auth-token` file, but only the native hook runtimes
+  learned to read it back: the generated TS adapters kept rendering
+  `TOKEN = null` with no runtime resolution, so every request they make
+  (hook capture, spool drain, handoff fetch) goes out unauthenticated and is
+  rejected by a Bearer-enabled server. The templates now render a
+  `resolveToken()` helper (static embed, then `AI_MEMORY_AUTH_TOKEN`, then
+  the auth-token file) used by `authHeaders()` and the spool writer.
+  `fetchHandoff()` in the same adapters also ignored `response.ok`, so a
+  401 error body could be injected into model context as if it were a
+  handoff; non-OK responses now return `undefined` like other failures.
 - `bootstrap` now retries a chunk's LLM call on a transient error before
   giving up, instead of letting one blip discard the whole multi-chunk run
   (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
@@ -4904,7 +5042,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
