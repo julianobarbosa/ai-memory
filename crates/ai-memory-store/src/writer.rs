@@ -77,6 +77,26 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ScopeIsPurged {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    RecordBootstrapChunk {
+        fingerprint: String,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    LoadBootstrapProgress {
+        fingerprint: String,
+        reply: oneshot::Sender<StoreResult<Vec<ops::BootstrapChunkRecord>>>,
+    },
+    ClearBootstrapProgress {
+        fingerprint: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
@@ -722,6 +742,84 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Whether the scope was purged by `purge_project` / `delete_workspace` and
+    /// tombstoned. `reindex` consults this before recreating a scope from
+    /// on-disk `_meta.md` so a purge that crashed before its files were removed
+    /// cannot be silently undone (#607). Routed through the writer actor
+    /// because it owns the connection and is always present.
+    pub async fn scope_is_purged(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Durably record one completed bootstrap chunk's output, keyed by a
+    /// fingerprint of the run's inputs (#621). See
+    /// [`crate::ops::record_bootstrap_chunk`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_bootstrap_chunk(
+        &self,
+        fingerprint: String,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordBootstrapChunk {
+            fingerprint,
+            chunk_index,
+            pages_json,
+            rationale,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Load every recorded chunk for `fingerprint`, ordered by chunk index.
+    /// See [`crate::ops::load_bootstrap_progress`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn load_bootstrap_progress(
+        &self,
+        fingerprint: String,
+    ) -> StoreResult<Vec<ops::BootstrapChunkRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LoadBootstrapProgress {
+            fingerprint,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete every recorded chunk for `fingerprint`. Call once a bootstrap
+    /// run completes successfully. See [`crate::ops::clear_bootstrap_progress`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn clear_bootstrap_progress(&self, fingerprint: String) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearBootstrapProgress {
+            fingerprint,
             reply: tx,
         })
         .await?;
@@ -2444,6 +2542,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     repo_path.as_deref(),
                 );
                 send_or_warn(reply, result, "ensure_project_with_id");
+            }
+            WriteCmd::ScopeIsPurged {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "scope_is_purged");
+            }
+            WriteCmd::RecordBootstrapChunk {
+                fingerprint,
+                chunk_index,
+                pages_json,
+                rationale,
+                reply,
+            } => {
+                let result = ops::record_bootstrap_chunk(
+                    &conn,
+                    &fingerprint,
+                    chunk_index,
+                    &pages_json,
+                    &rationale,
+                );
+                send_or_warn(reply, result, "record_bootstrap_chunk");
+            }
+            WriteCmd::LoadBootstrapProgress { fingerprint, reply } => {
+                let result = ops::load_bootstrap_progress(&conn, &fingerprint);
+                send_or_warn(reply, result, "load_bootstrap_progress");
+            }
+            WriteCmd::ClearBootstrapProgress { fingerprint, reply } => {
+                let result = ops::clear_bootstrap_progress(&conn, &fingerprint);
+                send_or_warn(reply, result, "clear_bootstrap_progress");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);

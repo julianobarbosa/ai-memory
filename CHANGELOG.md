@@ -7,7 +7,217 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-09-07
+
 ### Changed
+- The managed routing snippet now states that ai-memory is the cross-harness
+  memory of record: when the surrounding harness has its own local memory
+  feature, durable project facts should be captured in ai-memory rather than
+  duplicated in a harness-local store that other agents cannot see (#671).
+
+### Fixed
+- A nested `.ai-memory.toml` marker whose only content is a `[capture]`
+  section (e.g. one that just sets `ignore_paths`) no longer resets scope
+  resolution to `default` / basename. The native binary, the POSIX shell
+  hooks, and the generated TypeScript integrations all used to resolve
+  `workspace`/`project` and the other forwarded root-level settings
+  (`project_strategy`, `drop_subagent_captures`, `[recall] default_global`,
+  `[briefing]` keys) from the single nearest marker — the same one that
+  decided `[capture]`/`ignore_paths` — so a capture-only marker in a
+  subdirectory silently shadowed an ancestor marker's declared
+  workspace/project and captures landed in the wrong scope. Scope and the
+  other forwarded settings now resolve from the nearest marker that
+  declares more than `[capture]`, while `[capture]`/`ignore_paths` keeps
+  reading the nearest marker unchanged — a marker that declares nothing
+  else is scope/settings-transparent. Applies to the native `ai-memory`
+  binary, the POSIX shell hooks (`hooks/_lib.sh`), and the generated
+  TypeScript integrations for every adapter that resolves scope client-side
+  (OpenCode, OpenCode2, pi, OMP, OpenClaw); outputs remain byte-identical
+  otherwise. (#668)
+- Wiki auto-commits no longer re-hash the whole tree. Since the #594 guard,
+  every commit cleared the git index and re-read every page, so a session
+  end cost the size of the wiki and grew with it; the LongMemEval harness
+  saw its ingest rate fall from 141 to 50 session ends a minute as the tree
+  grew. Staging now goes through libgit2's stat cache and re-hashes the tree
+  only when the tree write fails, which is the #594 case and is now covered
+  by a test that removes a blob from the object store. Commits on one wiki
+  are also serialized: two session ends at once used to collide on the index
+  lock, and the losing snapshot was dropped with a warning. (#665)
+- Preserved typed relation edges in multi-page consolidation. Batch updates
+  now include the same closed `causes` / `fixes` / `contradicts` schema as
+  single-page consolidation and carry non-empty relations into wiki
+  frontmatter and the link index, instead of silently discarding them. (#667)
+- OKF-conformed event ledgers are skipped by the indexer again, so a migrated
+  store stops growing without bound. The reserved-file check treated any
+  `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
+  but the OKF v0.2 migration stamps frontmatter on every `.md` under `wiki/`,
+  ledgers included. A migrated store therefore indexed its ledgers, and each
+  hook `append_event` superseded them: one `pages` row per appended line,
+  holding the whole multi-megabyte ledger body. One affected store reached
+  6,539 page versions and 14 GB from 101 live pages within four days of
+  migrating. The check now reads past the frontmatter fence and classifies on
+  the first body line, so a real page that happens to be named `log.md` is
+  still indexed. (#660)
+- `install-hooks --apply --capture-mode allowlist` no longer captures
+  repositories with no `.ai-memory.toml` marker on the five generated
+  TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`,
+  `openclaw`). The native `ai-memory hook` path already gated every
+  lifecycle event on marker presence before spooling or sending anything
+  (`repository_admits_capture` in `ai-memory-hooks::capture_policy`), but
+  the generated adapters POST to `<server>/hook` directly and had only
+  ported the `ignore_paths` denylist logic into their shared
+  `capturePolicy` — never the allowlist admit gate — so an unmarked
+  repository was still fully captured while the CLI printed that the
+  protection was active. The shared template now bakes the selected
+  `--capture-mode` into a `CAPTURE_MODE` constant and gates on
+  marker *presence* (not on marker configuration state, so a marker with
+  an empty `[capture]` section still opts a repository in) before any
+  per-event disposition runs. The install-time "enforced"/"NOT in force"
+  messaging is corrected to match: a script-fallback install is now the
+  only path flagged as unenforced. (#661)
+- A UTF-8 BOM on a hand-edited wiki page that has no frontmatter no longer
+  rides into the page body. `markdown::parse` stripped the mark before looking
+  for the frontmatter fence, but the no-frontmatter path returned the untouched
+  input as the body, so the mark stayed in front of the first line. Two things
+  followed from that: `derive_title` no longer read the leading `# ` as a
+  heading, so the page was indexed under its filename instead of its title, and
+  the OKF v0.2 file pass (which conforms frontmatter and leaves the body alone)
+  re-emitted the mark after the closing `---` fence, where it is a stray
+  zero-width no-break space rather than a byte-order mark. Both paths now drop
+  the leading BOM, which is what the frontmatter path already did. (#663)
+- `serve` no longer re-archives the whole data dir on every start once a
+  monthly log ledger exists. The OKF conformance migration's
+  `nonconformant_files` scan flagged every frontmatter-less `log-YYYY-MM.md`
+  / `log.md` event ledger as a pre-OKF page (`okf::is_conformant` requires a
+  `type` key and a ledger has none), so the pre-migration backup gate saw a
+  non-empty pending list and took a full `tar.gz` snapshot on every boot —
+  the flip side of #660, which taught only the watcher's indexer to skip
+  ledgers by content. The migration scan now shares that same content-gated
+  check (a reserved-looking filename is excluded only when its first body
+  line is a hook log entry), moved into a shared `ledger` module so both
+  call sites stay in sync; a page literally named `log-2026-09.md` whose
+  body is prose is still migrated. (#669)
+- SessionEnd no longer writes an ephemeral `sessions/<id>.md` page for a
+  session that logged no real work. `is_lifecycle_only_session` treated a
+  session as skippable only when every observation was `SessionStart` or
+  `SessionEnd`, so a single `Stop` observation — which OpenCode fires for
+  purely internal work like branch-naming, alongside `session.created` +
+  `session.idle` with no user prompt and no tool use — was enough to make
+  the session look substantive and get a wiki page synthesized for it,
+  flooding the wiki with no-op session pages. "Substantive" is now defined
+  positively instead of negatively: a session counts as real work only if
+  it contains a `UserPrompt`, `PreToolUse`, or `PostToolUse` observation
+  (`is_ephemeral_session` in `ai-memory-hooks`). The atomic store-side
+  check (`end_lifecycle_only_session_in_tx` in `ai-memory-store`) moved to
+  the same positive `kind IN ('user-prompt', 'pre-tool-use',
+  'post-tool-use')` test so the two stay in agreement, and the
+  PreCompact/PostCompaction checkpoint path gates on the same test rather
+  than only `observations.is_empty()`. Provider-agnostic: this fixes the
+  class for any harness that fires lifecycle-only `Stop`/`Notification`
+  events, not just OpenCode. (#662)
+
+## [2.1.0] - 2026-09-06
+
+### Added
+- Ordered LLM provider fallback chains (#648). `[[llm_fallbacks]]` in
+  `config.toml` configures one or more additional providers, each with its
+  own `provider`, `model`, optional `base_url`, and optional `api_key_env`
+  (the environment-variable *name* holding that profile's key — never the
+  key itself in config). The primary provider (`llm_provider`) always runs
+  first; fallbacks run only after a transient failure
+  (`LlmError::is_transient()`: 429, 5xx, timeout, connection error) advances
+  past the current candidate, in declaration order, with the original
+  request, JSON schema, and logical operation id preserved on every
+  attempt. A deterministic failure (400/401/403/404/422, an unsupported
+  schema, or a malformed response) still stops immediately — the same
+  policy a single provider already had. Each candidate carries a 30s
+  in-memory circuit: a transient failure opens it, a success closes it,
+  and a restart clears all circuit state. `Config::load` validates every
+  profile and resolves its credential once, at startup — a missing/empty
+  provider or model, an unknown provider, or a `RequiredApiKey` provider
+  with no resolved `api_key_env` fails startup rather than leaving a
+  latent fallback that only fails once the primary is already down; a
+  provider with a native credential source (OpenAI OAuth, Copilot) needs
+  no `api_key_env`. `GET /admin/status` (and `ai-memory status`) now
+  reports each candidate's provider/model label, last-selected/last
+  success/error state, and circuit-open-until timestamp alongside the
+  existing top-level LLM provider/model fields, which are unchanged for
+  every existing single-provider deployment.
+- `bootstrap --resume` recovers an interrupted run from durable per-chunk
+  progress instead of re-paying for every LLM call (#621). Each chunk's pages
+  are recorded (keyed by a fingerprint of the pruned sources + chunk budget, so
+  a re-run after new commits re-chunks and starts fresh) and `--resume` seeds
+  them and skips those chunks; the wiki write stays atomic (nothing lands until
+  the whole run completes) and progress is cleared on success. It adopts only
+  the **contiguous** prefix of completed chunks and re-runs from the first gap
+  or unreadable row (#635), so a resumed run can never diverge from a clean one
+  by seeding a later chunk with context an earlier, still-missing chunk never
+  produced. Complements the transient-retry from 2.0.3 (#617): retry reduces
+  how often you need resume; resume covers the crash / restart case.
+- Added first-party OpenCode 2.0 beta (`opencode2`) support.
+  `install-mcp --client opencode2` merges the V2 `mcp.servers` remote entry
+  (no `enabled` field, `oauth: false` for header credentials);
+  `install-hooks --agent opencode2` writes an `ai-memory-opencode2.ts`
+  plugin in the beta `{ id, setup }` shape (no runtime dependency:
+  `Plugin.define` is identity), with handoff injection through the
+  `context` hook and the same `session.*` lifecycle coverage as v1;
+  `ai-memory run opencode2` launches through the `opencode2` binary and
+  imports the beta `session_v2`/`session_message` transcript. The beta
+  shares v1's config dir, session store, and agent kind, so no store
+  migration ships. Verified live against beta-18999 (hook capture,
+  handoff loop, managed launch/resume/import, `opencode↔opencode2`
+  session resume). Two beta caveats are documented: back up
+  `~/.local/share/opencode` first (the beta has migrated the shared
+  database in place before), and move its background service off port
+  49374 when ai-memory serves there. Managed ledger-delta
+  acknowledgement does not fire through the shared background service
+  (redelivery, never loss); see the managed-workstreams notes (#622).
+- `install-hooks --agent codex` now wires Codex's `SessionEnd` hook, so a
+  finished Codex session gets the same automatic end-of-session summary
+  and cross-agent handoff Claude Code already gets. Codex shipped a
+  first-class `SessionEnd` event in Codex CLI 0.145.0 (openai/codex#33895);
+  the `hooks/codex/session-end.{sh,ps1}` scripts already existed and only
+  needed adding to the Codex hook profile. On older Codex the event key is
+  inert; `ai-memory finalize-session --agent codex` remains the fallback.
+  `merge_codex_payload` no longer strips a `SessionEnd` key on every apply
+  — a third-party `SessionEnd` hook is preserved alongside ours. ([#604])
+- `AI_MEMORY_LLM_HEADERS` (`llm_headers` in `config.toml`) attaches extra
+  HTTP headers to every LLM chat request, for gateways that require a
+  caller-identifying header. Entries are `Name=Value` or `Name: Value`,
+  comma separated in the env var. Parsed and validated once at the
+  configuration boundary, so a malformed entry fails at startup rather than
+  on the first consolidation pass, and providers consume typed header
+  material instead of operator strings. Headers ai-memory sets itself
+  (`authorization`, `content-type`, `x-api-key`, `x-goog-api-key`,
+  `anthropic-version`, `anthropic-beta`, `openai-beta`, `host`,
+  `content-length`) are refused: `reqwest` appends rather than replaces, so a
+  duplicate would break the request instead of overriding it. Values are
+  marked sensitive on the wire and never logged — the `Debug` output carries
+  header names only. ([#606])
+
+### Changed
+- Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
+  `reqwest` sends no user agent unless one is configured, so provider
+  requests previously arrived anonymous, and gateways that require callers to
+  identify themselves reported ai-memory as an unknown client. An
+  `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
+  provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
+  editor-plugin agent GitHub's Copilot API expects. ([#606])
+- `x-opencode-session` and the `opencode` user agent, both shipped in 2.0.2,
+  are now operator-overridable like any other header: an
+  `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence over the
+  provider's default. The default remains 2.0.2's — one `LlmOperationId` per
+  logical operation, stable across retries and the strict/tolerant fallback —
+  so nothing changes unless an operator asks for it. Override the session
+  header to tell several ai-memory instances apart in OpenCode's metrics.
+  ([#606])
+- The session-start brief's `[briefing] max_chars` now bounds the whole
+  rendered brief, and its floor rose from 500 to 1500 chars. The scaffold the
+  brief may never drop — the security notice plus both untrusted-history
+  markers and the closing instruction — costs 832 chars by itself, so any
+  budget under that could only ever have been honoured by dropping the
+  boundary that marks the brief as untrusted. A project whose marker sets a
+  smaller `max_chars` now gets 1500. (#657)
 - The build is self-contained on every platform: the vendored web stylesheet
   is now the default and `TAILWIND_BUILD=1 cargo build -p ai-memory-web`
   regenerates it, so no command needs `TAILWIND_SKIP=1` any more. CI
@@ -24,6 +234,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   28s to 19s on a 32-thread Windows box.
 
 ### Fixed
+- The `bin/ai-memory` container wrapper now runs on Podman without Docker
+  (#636). It auto-selects the engine (`AI_MEMORY_DOCKER` override → `docker` →
+  `podman`), defaults to the fully-qualified `docker.io/akitaonrails/ai-memory`
+  image so Podman's non-interactive short-name resolution does not fail, and
+  preserves the selected engine in the standalone-container recovery script
+  `ai-memory upgrade` emits instead of hard-coding `docker`.
+- The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
+  Responses endpoint. Luna is not served through Chat Completions, where plain
+  and structured ai-memory calls returned HTTP 500 (#618).
+- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
+  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
+  the configured base URL without a word, so Zen's general catalogue at
+  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
+  separate products, not two spellings of one. Go remains the default, so
+  existing setups are unaffected; an override keeps the `x-opencode-session`
+  default and the user agent, since both endpoints correlate requests the
+  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
+  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
+  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
+  held Go's URL. It keeps its value, so code compiled against it is
+  unaffected. ([#606])
+- Fixed `purge-session` leaving the live `sessions/<id>.md` wiki file behind
+  after deleting the session's SQLite rows. The admin endpoint now removes the
+  scoped page file after the DB purge commits, reports actual cleanup through
+  `files_deleted` / `files_failed`, and marks `purge_session` observer webhooks
+  with `partial_failure: true` when file cleanup fails, so a later wiki reindex
+  cannot resurrect the purged session. (#653)
+- `[briefing] max_chars` is now the size of the brief the agent actually
+  receives. Page bodies were budgeted, but every section rendered *after*
+  them escaped the accounting: the truncation notice, the crowded-out core
+  page list, the recently-updated pointers, the closing untrusted-history
+  fence and the agent footer. The escape pass that neutralises an untrusted
+  `<!-- ai-memory:untrusted-history -->` marker inside a page body then
+  lengthened the text by a further 6 chars per marker, after the count. A
+  4000-char budget rendered 6577 chars, and the 500-char floor rendered
+  3054 — six times what the operator asked for, on every opted-in session
+  start. Bodies are now served first, the pointer sections are sized
+  against what the bodies left (the omitted list degrading to a bare count
+  when not even the paths fit), and the mandatory scaffold is reserved
+  before a single body char is spent. The regression test asserting this
+  was named `render_session_brief_enforces_budget` but only checked the
+  brief's contents, never its length. (#657)
 - Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
   headers and preserve anonymous access. Previously, a client retaining an old
   `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
@@ -71,6 +323,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hundred long observations the quadratic loop cost ~14s per prompt; pruning
   now works from per-observation scores and block sizes computed once, with
   byte-identical output.
+
+### Security
+- A purged project or workspace can no longer be resurrected by a later
+  `reindex` (#607, data-layer audit follow-up, item 2). `purge_project` /
+  `delete_workspace` commit the DB deletion first and remove on-disk files
+  afterward, best-effort; a crash or failure in that window left the markdown
+  directory (`_meta.md` included) on disk with no row, and `reindex` rebuilt
+  the scope from that manifest — silently undoing the purge. Each purge now
+  writes a `purged_scopes` tombstone in the same transaction as the deletion
+  (a whole-workspace delete uses a `zeroblob(16)` sentinel project id), and
+  `reindex_all` skips any tombstoned scope instead of recreating it. The
+  inert files are left for a later purge or manual cleanup; reindex stays
+  non-destructive.
+- Concurrent writes to the *same* page path are now serialized (#607, item 3).
+  Per-page writes take the shared side of the wiki mutation lock, so two
+  writes to one `(workspace, project, path)` could interleave their
+  file-rename and DB-upsert and transiently leave the on-disk markdown
+  disagreeing with the DB `is_latest` row (self-healing on reindex, no data
+  loss). A per-path async lock now serializes same-path writers while
+  different paths still proceed concurrently; batches acquire their paths in a
+  fixed global order so they cannot deadlock.
 
 ## [2.0.3] - 2026-09-04
 
@@ -5042,7 +5315,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1

@@ -56,7 +56,10 @@ managed `ai-memory run` launches add the portable visible-event ledger. Do not
 manually write routine notes. Only write durable memory when the user explicitly asks
 to remember or annotate something permanently. For an explicitly time-bounded note,
 set `expires_at`; expired pages are hidden from normal reads and deleted by the next
-forget sweep, and a TTL outranks `pinned`.
+forget sweep, and a TTL outranks `pinned`. ai-memory is the cross-harness memory of
+record for this project: if the harness you run in has its own local memory feature,
+do not keep durable project facts there in parallel — a harness-local store is
+invisible to every other agent and fragments continuity, so capture them here instead.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
@@ -92,7 +95,7 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
 but if the project says one file is canonical, use that file.
 
 If the rule is a standing *user/team* preference that should apply to
@@ -109,7 +112,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned

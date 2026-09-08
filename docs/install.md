@@ -34,9 +34,11 @@ path (docker + Claude Code). This page covers everything else:
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 
-> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
-> through the `podman-docker` `docker` shim or by pointing it at podman
-> directly with `AI_MEMORY_DOCKER=podman`. See
+> **Podman.** The `bin/ai-memory` wrapper automatically uses rootless Podman
+> when Docker is not installed. It also works through the `podman-docker`
+> `docker` shim; set `AI_MEMORY_DOCKER=podman` to force Podman when both engines
+> are installed. The default image name is fully qualified for non-interactive
+> Podman short-name resolution. See
 > [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
 > engine's rootless and SELinux state.
 
@@ -1110,6 +1112,51 @@ docker run --rm akitaonrails/ai-memory:latest \
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
 
+### OpenCode 2 (beta)
+
+The 2.0 beta installs side by side as `opencode2` and shares v1's config
+dir and session store, but its MCP schema and plugin API changed. Wire it
+with the `opencode2` client/agent names:
+
+```bash
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client opencode2 \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+# Plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts.
+# If you have the local wrapper installed, prefer `--apply`:
+ai-memory install-hooks --agent opencode2 --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+V2 nests servers under `mcp.servers` (no `enabled` field), so the v1
+(`mcp`) and v2 (`mcp.servers`) entries coexist in the one
+`~/.config/opencode/opencode.json(c)` file — the beta explicitly supports
+this mixed nesting, so keep both entries and do not "convert" the file by
+removing the v1 one
+(see [Migrate from V1](https://opencode.ai/v2/docs/migrate-v1)). `ai-memory run opencode2`
+resumes the same native sessions as `ai-memory run opencode` through the
+`opencode2` binary. Both plugins share the one auto-loaded dir while the
+beta is side-by-side; a host may warn about its sibling's file (the two
+plugin APIs are incompatible) — that warning is benign, and `uninstall`
+removes each file only on its own ownership markers.
+
+> **Back up `~/.local/share/opencode` before running the beta against
+> your real data.** The two binaries share the one `opencode.db` file and
+> the beta has migrated its schema in place before, leaving stable
+> `opencode` 1.x broken
+> ([upstream #42260](https://github.com/anomalyco/opencode/issues/42260)).
+> ai-memory only ever opens that database read-only; the migration risk
+> comes from launching `opencode2` itself, not from this integration.
+>
+> **The beta's background service defaults to port 49374 — ai-memory's own
+> default.** Running both on defaults crash-loops the opencode2 service
+> (`Managed service port 49374 ... is already in use`). Move one side:
+> `opencode2 service set port <free-port>`, or start ai-memory with
+> `--bind 127.0.0.1:<free-port>` (and matching `--server-url` installs).
+
 **On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
 tool schemas to the configured provider verbatim, and Google's `Schema`
 (Vertex/Gemini `functionDeclaration.parameters`) accepts only a single `type` per
@@ -1347,7 +1394,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
@@ -1499,7 +1546,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API at the OpenAI-compatible `opencode.ai/zen/go/v1` endpoint. Requests identify ai-memory by version and reuse one session header across related attempts. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. GPT-5.6 Luna uses Go's Responses endpoint; other models use Chat Completions. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
@@ -1761,6 +1808,32 @@ ceiling to match the gateway's worst-case generation time:
 ```bash
 -e AI_MEMORY_LLM_TIMEOUT_SECS=900
 ```
+
+#### Send a caller-identifying header to a gateway that requires one
+
+Every chat request already carries `User-Agent: ai-memory/<version>`, so a
+gateway can tell what is calling it. Some also require a header of their own
+for request correlation, and reject or throttle traffic without it. Declare
+those once — they are sent on every chat request, whatever the provider:
+
+```bash
+-e AI_MEMORY_LLM_HEADERS=x-opencode-session=prod-01,x-opencode-client=ai-memory
+```
+
+Entries are `Name=Value` or `Name: Value`, comma separated. A header *value*
+cannot contain a comma through the env var; use `llm_headers = [...]` in
+`config.toml` when one must. Headers ai-memory sets itself (`authorization`,
+`content-type`, `x-api-key`, `x-goog-api-key`, `anthropic-version`,
+`anthropic-beta`, `openai-beta`, `host`, `content-length`) are refused at
+startup rather than duplicated onto the request. An entry for `user-agent`
+overrides the default. Values are never logged.
+
+The `opencode` provider needs no configuration for this: OpenCode asks
+callers for `x-opencode-session`, and that provider already sends one id per
+logical operation — stable across retries and the structured-output
+fallback, so one consolidation pass reads as one operation in OpenCode's
+metrics. Supply the header through `AI_MEMORY_LLM_HEADERS` to override that,
+for instance to tell several ai-memory instances apart under one account.
 
 #### Match the consolidation budget to a local model's context window
 

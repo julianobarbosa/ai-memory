@@ -82,8 +82,9 @@ from hook paths.
    converge. Existing ended sessions are baselined at migration instead of
    becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
-   use `ai-memory finalize-session` for Codex, or
-   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
+   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI
+   (Codex has a native `SessionEnd` since CLI 0.145.0; `finalize-session
+   --agent codex` is only the fallback on older Codex).
    The command selects the latest matching open session and enters the same
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
@@ -595,7 +596,9 @@ AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
-AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
+                           opencode (defaults to the Go endpoint, set
+                           https://opencode.ai/zen/v1 for Zen's catalogue)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -606,11 +609,79 @@ AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            Codex `reasoning.effort`. Gemini and Copilot
                            ignore the key. Host-unsupported values are
                            clamped to each provider's published enum.
+AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
+                           comma-separated `Name=Value` (or `Name: Value`) entries;
+                           e.g. `x-opencode-session=prod-01,x-opencode-client=ai-memory`.
+                           For gateways that require a caller-identifying header.
+                           Headers ai-memory sets itself (authorization,
+                           content-type, x-api-key, x-goog-api-key,
+                           anthropic-version, anthropic-beta, openai-beta,
+                           host, content-length) are refused at startup.
+                           Values are never logged. A header value cannot
+                           contain a comma through the env var — use
+                           `llm_headers = [...]` in config.toml for that.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
+
+**Ordered LLM fallback chain** (opt-in, TOML only — see
+`docs/llm-provider-fallback.md`, #648): the primary provider above always
+runs first; `[[llm_fallbacks]]` entries run only after a transient failure
+(429, 5xx, timeout, connection error), in declaration order, with the
+original request/schema/operation id preserved on every attempt. A
+deterministic failure (4xx other than 429, an unsupported schema, a
+malformed response) still stops on the first candidate — no chain-wide
+retry loop.
+
+```toml
+llm_provider = "opencode"
+llm_model = "mimo-v2.5-free"
+
+[[llm_fallbacks]]
+provider = "openai-compat"          # same wire names as llm_provider
+model = "poolside/laguna-s-2.1-free"
+base_url = "http://127.0.0.1:49375/v1"   # required for openai-compat, as above
+api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"  # env var *name*; the key itself
+                                               # never lives in config.toml
+
+[[llm_fallbacks]]
+provider = "gemini"
+model = "gemini-3.5-flash"
+api_key_env = "GEMINI_API_KEY"
+```
+
+`api_key_env` is required for any provider that needs an API key
+(`anthropic`, `openai`, `gemini`, `opencode`; optional for `openai-compat`,
+which may run keyless) — it is never inherited from the primary's own
+fixed env var, so a fallback cannot look configured while actually
+resolving no credential. It is optional only for a provider with a native
+credential source (`openai-oauth`, `copilot`, `anthropic-oauth`), which
+shares the primary's process-wide token material. `Config::load` validates
+every profile and resolves its credential once, at startup: a
+missing/empty provider or model, an unknown provider, or a missing
+credential fails startup rather than leaving a latent fallback that only
+fails once the primary is already down. Each candidate carries its own
+30s in-memory circuit (`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`): a
+transient failure opens it, a success closes it, and a restart clears all
+circuit state — there is no durable circuit or forced chain-wide deadline.
+
+`GET /admin/status` (`ai-memory status`) reports an `llm_candidates` list
+alongside the existing `llm`/`embedding` roles: each candidate's
+provider/model label, whether it answered the most recently completed
+call, its last success/error timestamp, a redacted error class + HTTP
+status (never a response body or credential), and its circuit-open-until
+timestamp. It is empty for a plain single-provider setup; the top-level
+`llm` role fields are unchanged.
+
+Every chat request carries `User-Agent: ai-memory/<version>`
+(`ai_memory_llm::DEFAULT_USER_AGENT`, layered in `build_provider`). `reqwest`
+sends no user agent unless configured, so provider requests used to arrive
+anonymous — which gateways that require callers to identify themselves report
+as an unknown client. `AI_MEMORY_LLM_HEADERS=user-agent=...` overrides it. The
+Copilot provider keeps `GitHubCopilotChat/<version>` instead, the
+editor-plugin agent GitHub's Copilot API expects.
 
 `openai-oauth` uses `auth login openai-oauth` and stores the ChatGPT/Codex
 refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer

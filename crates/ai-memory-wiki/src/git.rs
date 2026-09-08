@@ -6,6 +6,7 @@
 //! can't accidentally leak the maintainer's git identity.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
 use tracing::{debug, warn};
@@ -18,10 +19,15 @@ pub const COMMIT_AUTHOR_NAME: &str = "ai-memory";
 /// Author email used for ai-memory's own commits.
 pub const COMMIT_AUTHOR_EMAIL: &str = "ai-memory@local";
 
-/// Thin handle over the wiki repo. Cheap to clone — internally a `PathBuf`.
+/// Thin handle over the wiki repo. Cheap to clone — a `PathBuf` and a
+/// shared lock.
 #[derive(Clone)]
 pub struct GitAdapter {
     root: PathBuf,
+    /// One commit at a time per repository: libgit2 fails a concurrent
+    /// commit with "the index is locked" instead of waiting. Clones share
+    /// the lock; a second adapter opened on the same root does not.
+    commit_lock: Arc<Mutex<()>>,
 }
 
 /// One git checkpoint in the wiki repository.
@@ -57,6 +63,7 @@ impl GitAdapter {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            commit_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -83,29 +90,34 @@ impl GitAdapter {
     }
 
     fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
+        let _one_at_a_time = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
         let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
 
-        // Stage everything (including deletions). Clear the index first so
-        // every entry is re-hashed from the working tree: libgit2 keeps a
-        // stat cache and will skip re-reading a file whose size/mtime look
-        // unchanged, trusting the cached blob OID. When that cached OID is
-        // stale or its blob is absent from the object database — which a
-        // store carried across libgit2/git versions or an interrupted
-        // earlier operation can leave behind — `write_tree` below aborts
-        // with "invalid object specified … class=Tree" and, since the wiki
-        // migration commits through this path, the server crash-loops and
-        // never starts (#594). Clearing drops the stat cache, so `add_all`
-        // re-hashes each working-tree file into the ODB and every entry the
-        // tree references is guaranteed present.
+        // Stage through libgit2's stat cache: an entry whose size and mtime
+        // are unchanged keeps its cached blob OID and is not re-read, so a
+        // commit costs what changed rather than the whole tree. The cache can
+        // name a blob that is gone from the object database (a store carried
+        // across libgit2/git versions, or an interrupted operation); then
+        // `write_tree` fails, and through the wiki migration that crash-looped
+        // the server at boot (#594). That is the recovery path: drop the index
+        // and hash every file again, once.
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
-        index.clear().map_err(CommitGit2Error::Other)?;
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .map_err(CommitGit2Error::Other)?;
-        index.write().map_err(CommitGit2Error::Other)?;
+        let touched = stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+        debug!(touched, "staged working tree");
+        let tree_oid = match index.write_tree() {
+            Ok(oid) => oid,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "index could not be written as a tree; re-hashing the working tree (#594)"
+                );
+                index.clear().map_err(CommitGit2Error::Other)?;
+                stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                index.write_tree().map_err(CommitGit2Error::Other)?
+            }
+        };
 
         // If the index matches HEAD, there is nothing to commit.
-        let tree_oid = index.write_tree().map_err(CommitGit2Error::Other)?;
         if let Ok(head) = repo.head()
             && let Some(target) = head.target()
             && let Ok(parent_commit) = repo.find_commit(target)
@@ -222,6 +234,27 @@ impl GitAdapter {
         })?;
         Ok(blob.content().to_vec())
     }
+}
+
+/// Bring the index in line with the working tree: refresh modified
+/// entries, drop deleted ones, add untracked files. libgit2 does all three
+/// from one index-to-workdir diff. Returns how many paths that diff
+/// touched; the index file is rewritten only when it touched some, so a
+/// clean commit does not serialize every entry.
+fn stage_working_tree(index: &mut git2::Index) -> Result<usize, git2::Error> {
+    let mut touched = 0usize;
+    index.add_all(
+        ["*"].iter(),
+        IndexAddOption::DEFAULT,
+        Some(&mut |_: &Path, _: &[u8]| {
+            touched += 1;
+            0
+        }),
+    )?;
+    if touched > 0 {
+        index.write()?;
+    }
+    Ok(touched)
 }
 
 #[cfg(windows)]
@@ -488,39 +521,138 @@ mod tests {
         assert_eq!(adapter.commit_count(), 1);
     }
 
-    /// #594 hardening: the commit re-hashes every file from the working
-    /// tree rather than trusting cached index blob OIDs. A store carried
-    /// across libgit2/git versions (or an interrupted operation) can leave
-    /// the index's stat cache pointing at a blob absent from the object
-    /// database; `write_tree` then aborts with "invalid object specified"
-    /// and the migration crash-loops. The fix clears the index before
-    /// `add_all`. We can't fabricate a missing-blob entry through git2's
-    /// safe API (it validates the OID on `add`), so we verify the
-    /// behaviour the clear guarantees: the *current* working-tree content
-    /// is what gets committed, even after the same path was committed
-    /// before — i.e. staging always reflects disk, never a cache.
+    /// #594 as it happens: the index trusts a cached blob OID whose object
+    /// is gone from the store. Stat-cache staging cannot see that, so the
+    /// tree write refuses it and the commit must recover by re-hashing.
     #[test]
-    fn commit_all_commits_current_working_tree_content() {
+    fn commit_all_recovers_when_the_index_names_a_missing_blob() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join("cached.md"), "content the index remembers").unwrap();
+        adapter.commit_all("first").unwrap();
 
-        std::fs::write(root.join("log-2026-07.md"), "v1").unwrap();
-        adapter.commit_all("v1").unwrap();
+        // Remove the blob the index entry points at. The file on disk is
+        // untouched, so its size and mtime still match the cached entry.
+        let blob = {
+            let repo = Repository::open(&root).unwrap();
+            let index = repo.index().unwrap();
+            index.get_path(Path::new("cached.md"), 0).unwrap().id
+        };
+        let hex = blob.to_string();
+        let object = root
+            .join(".git")
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::remove_file(&object).expect("a fresh repo stores the blob loose");
 
-        // Overwrite in place and commit again: the committed blob must be v2.
-        std::fs::write(root.join("log-2026-07.md"), "v2 rewritten").unwrap();
-        let oid = adapter.commit_all("v2").unwrap();
-        assert!(oid.is_some(), "a content change must produce a commit");
-
-        let committed = adapter
-            .file_at_rev("HEAD", Path::new("log-2026-07.md"))
-            .unwrap();
+        std::fs::write(root.join("other.md"), "a second file").unwrap();
+        let oid = adapter
+            .commit_all("second")
+            .expect("the commit recovers by re-hashing the tree");
+        assert!(oid.is_some());
+        assert!(object.exists(), "the re-hash wrote the blob back");
         assert_eq!(
-            committed, b"v2 rewritten",
-            "commit must reflect the working-tree file, re-hashed from disk"
+            adapter.file_at_rev("HEAD", Path::new("cached.md")).unwrap(),
+            b"content the index remembers"
         );
         assert_eq!(adapter.commit_count(), 2);
+    }
+
+    /// The cost of a commit is what changed, not the size of the wiki: after
+    /// a hundred files are committed, changing one must stage one path.
+    #[test]
+    fn commit_stages_only_what_changed_since_the_last_one() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        for i in 0..100 {
+            std::fs::write(root.join(format!("page-{i}.md")), format!("page {i}")).unwrap();
+        }
+        adapter.commit_all("hundred pages").unwrap();
+
+        let staged = |root: &Path| {
+            let repo = Repository::open(root).unwrap();
+            let mut index = repo.index().unwrap();
+            stage_working_tree(&mut index).unwrap()
+        };
+        assert_eq!(staged(&root), 0, "a clean tree stages nothing");
+        std::fs::write(root.join("page-7.md"), "page 7, revised").unwrap();
+        assert_eq!(staged(&root), 1, "one changed file stages one path");
+        std::fs::remove_file(root.join("page-8.md")).unwrap();
+        std::fs::write(root.join("page-100.md"), "new page").unwrap();
+        assert_eq!(staged(&root), 2, "a delete and an add stage two paths");
+        assert!(adapter.commit_all("edits").unwrap().is_some());
+        assert_eq!(adapter.commit_count(), 2);
+    }
+
+    /// The stat cache's blind spot: a file rewritten with the same size and
+    /// an mtime no newer than the index looks unchanged by stat alone. git
+    /// treats an entry whose mtime is not older than the index as "racy"
+    /// and re-reads it; the commit must carry the new content, or a page
+    /// saved right after a session end would be snapshotted stale. The
+    /// rewritten file is given the index file's own mtime so the case is
+    /// forced rather than left to the clock.
+    #[test]
+    fn a_same_size_rewrite_with_an_unchanged_mtime_is_still_committed() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let file = root.join("racy.md");
+        std::fs::write(&file, "version A").unwrap();
+        adapter.commit_all("A").unwrap();
+
+        std::fs::write(&file, "version B").unwrap();
+        let index_written = std::fs::metadata(root.join(".git").join("index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(index_written)
+            .unwrap();
+
+        adapter.commit_all("B").unwrap();
+        assert_eq!(
+            adapter.file_at_rev("HEAD", Path::new("racy.md")).unwrap(),
+            b"version B"
+        );
+        assert_eq!(adapter.commit_count(), 2);
+    }
+
+    /// Two session ends at once used to collide on libgit2's index lock and
+    /// one of them lost its snapshot; now they queue.
+    #[test]
+    fn concurrent_commits_queue_instead_of_failing() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let adapter = adapter.clone();
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    std::fs::write(root.join(format!("s{i}.md")), format!("session {i}")).unwrap();
+                    adapter.commit_all(&format!("session {i}")).unwrap()
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Every file is in HEAD whether its own commit ran or a later one
+        // swept it up; nothing was dropped.
+        for i in 0..8 {
+            assert_eq!(
+                adapter
+                    .file_at_rev("HEAD", Path::new(&format!("s{i}.md")))
+                    .unwrap(),
+                format!("session {i}").as_bytes()
+            );
+        }
     }
 
     #[test]

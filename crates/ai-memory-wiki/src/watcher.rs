@@ -521,50 +521,6 @@ fn is_manifest_filename(page_path: &PagePath) -> bool {
         .is_some_and(|name| name == "_meta.md")
 }
 
-/// `log.md` / `log-YYYY-MM.md` are the raw per-project event ledger the hooks
-/// append to (see `ai-memory-hooks::log::log_filename_for`): `## [ts] ...`
-/// entries, never YAML frontmatter.
-fn is_log_ledger_filename(page_path: &PagePath) -> bool {
-    let s = page_path.as_str();
-    s == "log.md" || is_rotated_log_filename(s)
-}
-
-fn is_rotated_log_filename(s: &str) -> bool {
-    let Some(stem) = s.strip_prefix("log-").and_then(|v| v.strip_suffix(".md")) else {
-        return false;
-    };
-    let bytes = stem.as_bytes();
-    bytes.len() == "YYYY-MM".len()
-        && bytes[4] == b'-'
-        && bytes[..4].iter().all(|b| b.is_ascii_digit())
-        && bytes[5..].iter().all(|b| b.is_ascii_digit())
-}
-
-/// Cheap peek: does the file open with a `---` YAML frontmatter fence?
-/// Used to tell a real page apart from the raw event ledger.
-fn opens_with_frontmatter(abs: &Path) -> bool {
-    use std::io::{BufRead, BufReader};
-    let Ok(file) = std::fs::File::open(abs) else {
-        return false;
-    };
-    let mut line = String::new();
-    BufReader::new(file).read_line(&mut line).is_ok() && line.trim_end() == "---"
-}
-
-/// Cheap check for the raw hook event ledger shape. Real page markdown can be
-/// frontmatter-free; a reserved-looking filename is only a ledger when the
-/// content starts with the hook log prefix.
-fn opens_with_log_ledger(abs: &Path) -> bool {
-    use std::io::{BufRead, BufReader};
-    let Ok(file) = std::fs::File::open(abs) else {
-        return false;
-    };
-    let mut line = String::new();
-    BufReader::new(file)
-        .read_line(&mut line)
-        .is_ok_and(|_| line.starts_with("## ["))
-}
-
 /// Returns `true` for markdown files that are NOT wiki pages and must be
 /// skipped by the indexer:
 /// - `_meta.md` (the self-describing scope manifest) and `bootstrap.md` —
@@ -572,13 +528,13 @@ fn opens_with_log_ledger(abs: &Path) -> bool {
 /// - the raw event ledger (`log.md` / exact `log-YYYY-MM.md`) — skipping which
 ///   avoids supersession loops, since every `append_event` write triggers a
 ///   watcher event. A reserved-looking filename is skipped only when its
-///   content opens with the raw hook log prefix; ordinary markdown pages with
-///   those names are indexed.
+///   first body line is a raw hook log entry; ordinary markdown pages with
+///   those names are indexed, frontmatter or not.
 fn is_reserved_page_file(abs: &Path, page_path: &PagePath) -> bool {
     if is_manifest_filename(page_path) || page_path.as_str() == "bootstrap.md" {
         return true;
     }
-    is_log_ledger_filename(page_path) && !opens_with_frontmatter(abs) && opens_with_log_ledger(abs)
+    crate::ledger::is_log_ledger_filename(page_path) && crate::ledger::opens_with_log_ledger(abs)
 }
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
@@ -1083,6 +1039,14 @@ mod tests {
             "## [t] evt | x\nrawledgertoken\n",
         )
         .unwrap();
+        // An OKF-conformed ledger: the migration stamps frontmatter on
+        // every .md, ledgers included. Still a ledger, still skipped.
+        std::fs::write(
+            proj_dir.join("log-2026-07.md"),
+            "---\ntype: Note\ngenerated:\n  by: process:ai-memory/2.0.0\n---\n\
+             ## [t] evt | x\nstampedledgertoken\n",
+        )
+        .unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         reconcile(&wiki).await.unwrap();
@@ -1117,6 +1081,21 @@ mod tests {
         assert!(
             ledger_hits.is_empty(),
             "raw ledger (no frontmatter) must not be indexed"
+        );
+
+        // Regression: before this check looked past the frontmatter fence,
+        // an OKF-migrated ledger was indexed as a page. Every hook
+        // `append_event` then superseded it, writing the whole (ever
+        // growing) ledger body as a new `pages` row — a store that grew
+        // into the gigabytes within days.
+        let stamped_hits = store
+            .reader
+            .search_pages("stampedledgertoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            stamped_hits.is_empty(),
+            "OKF-conformed ledger (frontmatter + log entries) must not be indexed"
         );
 
         handle.shutdown().await;
