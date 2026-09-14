@@ -2,7 +2,7 @@
 //!
 //! Every file the wiki owns is written via a tmp + rename + fsync dance.
 //! Two payoffs: a crash mid-write never produces a torn file, and the
-//! upcoming watcher (M1-D) can ignore "own writes" by inode tracking.
+//! watcher skips its own writes by the `.ai-memory-tmp.` filename prefix.
 
 use std::fs::File;
 use std::io::Write;
@@ -92,8 +92,8 @@ fn is_transient_sharing_violation(err: &std::io::Error) -> bool {
 /// tempfile, `persist` it over the destination, then best-effort `sync_all`
 /// the parent directory so the rename hits stable storage.
 ///
-/// Returns the inode number of the persisted file (used by the watcher to
-/// skip its own writes).
+/// Returns the inode number of the persisted file. No production caller
+/// reads it; the watcher skips its own writes by filename prefix instead.
 ///
 /// # Errors
 /// Propagates I/O and [`tempfile::PersistError`] failures.

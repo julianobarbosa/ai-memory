@@ -347,7 +347,7 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
    at ≤200 ms; the server returns 202 immediately or 429 when saturated.
    No unbounded `tokio::spawn` fan-out or queues on hook paths.
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>` has
-   no constructor other than `sanitize()`; the hook router's sanitizer is
+   no constructor other than `Sanitized::new()`; the hook router's sanitizer is
    the only path from untrusted text into the store.
 7. **JSON-schema structured outputs only** for LLM calls; no XML or
    wrapper libraries.
@@ -367,8 +367,9 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
 14. **Provider auth resolves before provider construction**; provider
     clients consume typed `ProviderAuth` material and never read env vars
     directly.
-15. **Tracing subscribers explicitly filter their own module** — no
-    feedback loops.
+15. **Tracing subscribers filter the log-writer crate** — the default
+    filter pins `tracing_appender=warn`, so the file appender cannot feed
+    its own output back into the subscriber.
 
 16. **Multi-session and multi-user access to one project is a core
     capability.** One operator running several harnesses at once, and
@@ -459,9 +460,11 @@ Additional boundary rules:
   `.ai-memory.toml` marker) drop recognized file-tool events before they
   reach spool, transport, logs, or storage — preserve this behavior in
   native hook commands and generated integrations.
-- **Auth ladder:** static root bearer token → DB-user tokens
-  (attribution only, no admin) → OIDC device tokens at the hook edge.
-  `/admin/*` becomes root-only the moment the first DB user exists.
+- **Auth ladder:** static root bearer token → proxy-asserted user (a
+  distinct proxy bearer plus trusted `X-Memory-Actor-*` OIDC identity
+  headers) → DB-user tokens (attribution only, no admin); see
+  `docs/users.md`. `/admin/*` becomes root-only the moment the first DB
+  user exists.
 - **Dependency policy:** `cargo deny check --all-features` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
@@ -513,8 +516,8 @@ Additional boundary rules:
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — operational map: data
   flow, crate breakdown, schema, invariants, config reference.
-- [`docs/design-decisions.md`](docs/design-decisions.md) — full v1 spec
-  and milestone plan.
+- [`docs/design-decisions.md`](docs/design-decisions.md) — historical
+  rationale distilled from the original research and issue reports.
 - [`docs/install.md`](docs/install.md) — installation cookbook for every
   supported agent client.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
