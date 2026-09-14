@@ -82,6 +82,11 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    PurgedSessionIds {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<Vec<SessionId>>>,
+    },
     RecordBootstrapChunk {
         fingerprint: String,
         chunk_index: u32,
@@ -309,6 +314,14 @@ pub(crate) enum WriteCmd {
     },
     StoreEmbeddingBatch {
         embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    StoreAbstractEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    DeleteAbstractEmbedding {
+        page_id: PageId,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     DeleteStalePageEmbeddings {
@@ -760,6 +773,29 @@ impl WriterHandle {
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Session ids tombstoned by `purge_session` in this scope. The wiki
+    /// reindex consults these so a purge whose page-file removal did not
+    /// complete cannot be undone by the next pass (#701). Loaded once per
+    /// directory per pass, not once per page. Routed through the writer actor
+    /// for the same reason [`Self::scope_is_purged`] is.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn purged_session_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgedSessionIds {
             workspace_id,
             project_id,
             reply: tx,
@@ -1292,6 +1328,38 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Store or replace a batch of L0 abstract embeddings
+    /// (`page_abstract_embeddings`) in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_abstract_embeddings(
+        &self,
+        embeddings: Vec<EmbeddingWrite>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreAbstractEmbeddingBatch {
+            embeddings,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Remove a page's L0 abstract embedding row (`page_abstract_embeddings`),
+    /// if any. Called when a page is rewritten without its frontmatter
+    /// `abstract:` so the abstract stream never ranks a line the page no
+    /// longer carries.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn delete_abstract_embedding(&self, page_id: PageId) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteAbstractEmbedding { page_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Remove embedding rows in a workspace/project scope whose triple does not match the configured provider/model/dim.
     ///
     /// Used when re-embedding after a model migration (e.g. Gemini → OpenRouter).
@@ -1534,6 +1602,11 @@ impl WriterHandle {
     /// named workspace and project is [`StoreError::NotFound`] and nothing is
     /// deleted. See [`ops::purge_session`] for what is and is not removed —
     /// in particular, handoffs this session *accepted* are left alone.
+    ///
+    /// Server callers must go through `Wiki::purge_session` instead, which
+    /// holds the wiki mutation guard across this deletion and the page-file
+    /// cleanup. Calling this directly commits the rows with no guard, so a
+    /// watcher reindex can reinsert the page before the file is removed (#653).
     ///
     /// # Errors
     /// [`StoreError::NotFound`] when the session is absent from that scope,
@@ -2551,6 +2624,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
                 send_or_warn(reply, result, "scope_is_purged");
             }
+            WriteCmd::PurgedSessionIds {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::purged_session_ids(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "purged_session_ids");
+            }
             WriteCmd::RecordBootstrapChunk {
                 fingerprint,
                 chunk_index,
@@ -2933,6 +3014,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StoreEmbeddingBatch { embeddings, reply } => {
                 let result = ops::store_embeddings(&mut conn, &embeddings);
                 send_or_warn(reply, result, "store_embeddings");
+            }
+            WriteCmd::StoreAbstractEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_abstract_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_abstract_embeddings");
+            }
+            WriteCmd::DeleteAbstractEmbedding { page_id, reply } => {
+                let result = ops::delete_abstract_embedding(&mut conn, &page_id);
+                send_or_warn(reply, result, "delete_abstract_embedding");
             }
             WriteCmd::DeleteStalePageEmbeddings {
                 workspace_id,
@@ -3457,6 +3546,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 

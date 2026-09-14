@@ -82,6 +82,22 @@ impl ProviderChoice {
             },
         }
     }
+
+    /// Whether the operator, rather than the vendor, decides where this
+    /// provider's endpoint lives.
+    ///
+    /// True for the self-hosted / aggregator dialects: `openai-compat` has
+    /// no endpoint at all without one, and `opencode` reaches Zen's general
+    /// catalogue only through an override. Every other provider talks to a
+    /// fixed vendor host, and a base URL aimed elsewhere does not speak its
+    /// dialect — a Gemini request against an Ollama host is a 404, not a
+    /// degraded answer. Callers use this to decide whether an *ambient*
+    /// base URL (the cross-tool `LLM_BASE_URL` convention) may configure the
+    /// provider; an explicit ai-memory setting always may.
+    #[must_use]
+    pub const fn endpoint_is_operator_chosen(self) -> bool {
+        matches!(self, Self::OpenAiCompat | Self::OpenCode)
+    }
 }
 
 /// All settings needed to construct one LLM provider instance.
@@ -284,6 +300,29 @@ fn with_default_user_agent(
     headers
 }
 
+/// Layer OpenRouter's app-attribution headers (`HTTP-Referer`, `X-Title`)
+/// under the operator's headers when the `openai-compat` base URL points at
+/// OpenRouter, so ai-memory's usage shows up on OpenRouter's app leaderboard
+/// without requiring `AI_MEMORY_LLM_HEADERS` configuration. An explicit
+/// operator entry for either header still wins, same precedence as the
+/// default user agent.
+fn with_default_openrouter_headers(
+    base_url: &str,
+    mut headers: crate::ExtraHeaders,
+) -> crate::ExtraHeaders {
+    if crate::openai::is_openrouter_base(base_url) {
+        headers.set_default(
+            reqwest::header::HeaderName::from_static("http-referer"),
+            reqwest::header::HeaderValue::from_static(crate::OPENROUTER_HTTP_REFERER),
+        );
+        headers.set_default(
+            reqwest::header::HeaderName::from_static("x-title"),
+            reqwest::header::HeaderValue::from_static(crate::OPENROUTER_X_TITLE),
+        );
+    }
+    headers
+}
+
 /// Construct an `Arc<dyn LlmProvider>` matching the config.
 ///
 /// # Errors
@@ -327,6 +366,7 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
+            let extra_headers = with_default_openrouter_headers(&base, extra_headers);
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
@@ -388,6 +428,33 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exhaustive on purpose: adding a provider must be a decision about whose
+    // endpoint it is, not a default inherited from whichever arm was copied.
+    #[test]
+    fn only_the_operator_supplied_dialects_accept_an_ambient_base_url() {
+        for choice in [ProviderChoice::OpenAiCompat, ProviderChoice::OpenCode] {
+            assert!(
+                choice.endpoint_is_operator_chosen(),
+                "{} has no endpoint without an operator-supplied one",
+                choice.name()
+            );
+        }
+        for choice in [
+            ProviderChoice::Anthropic,
+            ProviderChoice::OpenAi,
+            ProviderChoice::Gemini,
+            ProviderChoice::OpenAiOAuth,
+            ProviderChoice::Copilot,
+            ProviderChoice::AnthropicOAuth,
+        ] {
+            assert!(
+                !choice.endpoint_is_operator_chosen(),
+                "{} talks to a fixed vendor host",
+                choice.name()
+            );
+        }
+    }
 
     #[test]
     fn provider_choices_declare_current_auth_requirements() {
@@ -462,6 +529,42 @@ mod tests {
         assert!(ua.starts_with("ai-memory/"), "{ua}");
         assert!(ua.len() > "ai-memory/".len(), "{ua} carries no version");
         assert!(!ua.contains("opencode"), "{ua} impersonates another client");
+    }
+
+    /// OpenRouter attributes usage on its app leaderboard by these headers;
+    /// without a default, a plain `openai-compat` setup pointed at
+    /// OpenRouter would arrive unattributed.
+    #[test]
+    fn openrouter_app_headers_are_layered_for_an_openrouter_base_url() {
+        let headers = with_default_openrouter_headers(
+            "https://openrouter.ai/api/v1",
+            crate::ExtraHeaders::default(),
+        );
+        assert_eq!(
+            headers.get("http-referer"),
+            Some(crate::OPENROUTER_HTTP_REFERER)
+        );
+        assert_eq!(headers.get("x-title"), Some(crate::OPENROUTER_X_TITLE));
+    }
+
+    /// A self-hosted `openai-compat` endpoint (Ollama, vLLM, LM Studio) has
+    /// no leaderboard to attribute to, so it must not receive these.
+    #[test]
+    fn openrouter_app_headers_are_absent_for_a_non_openrouter_base_url() {
+        let headers = with_default_openrouter_headers(
+            "http://localhost:11434/v1",
+            crate::ExtraHeaders::default(),
+        );
+        assert_eq!(headers.get("http-referer"), None);
+        assert_eq!(headers.get("x-title"), None);
+    }
+
+    #[test]
+    fn an_operator_http_referer_wins_over_the_openrouter_default() {
+        let operator = crate::ExtraHeaders::parse(["http-referer: https://example.com"]).unwrap();
+        let headers = with_default_openrouter_headers("https://openrouter.ai/api/v1", operator);
+        assert_eq!(headers.get("http-referer"), Some("https://example.com"));
+        assert_eq!(headers.get("x-title"), Some(crate::OPENROUTER_X_TITLE));
     }
 
     #[test]

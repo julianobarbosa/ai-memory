@@ -17,7 +17,6 @@
 //!
 //! Idempotent: on a conformant store both passes find nothing and the
 //! backup gate never engages (fresh installs never create archives).
-
 use std::path::{Path, PathBuf};
 
 use ai_memory_store::WriterHandle;
@@ -173,9 +172,9 @@ impl WikiMigration for OkfConformance {
 
         // 4. File pass.
         for file in file_pending {
-            conform_file(wiki_root, &file, &at_by_page)?;
+            conform_file(&git, &file, &at_by_page)?;
         }
-        ensure_bundle_indexes(wiki_root)?;
+        ensure_bundle_indexes(&git)?;
 
         // 5. One commit for the whole rewrite.
         git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
@@ -204,6 +203,23 @@ fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
             let ft = entry.file_type()?;
             if ft.is_dir() {
                 if path.file_name().is_some_and(|n| n == ".git") {
+                    continue;
+                }
+                // Staging sidecars under `_pending/` (auto-improve proposals)
+                // are not pages: SQLite owns their approval state, and
+                // `render_auto_improve_sidecar` writes them with no OKF
+                // frontmatter. Left in scope they read as nonconformant on
+                // every boot, and since this scan feeds the pre-migration
+                // backup gate, that re-archives the whole data dir each time
+                // once the receipt's archive is gone (#695, same class as the
+                // ledger skip for #669). Only the project-root subtree is
+                // reserved, matching the watcher indexer's `_pending/` rule;
+                // a nested path like notes/_pending still contains pages.
+                if path.file_name().is_some_and(|n| n == "_pending")
+                    && path
+                        .strip_prefix(wiki_root)
+                        .is_ok_and(|relative| relative.components().count() == 3)
+                {
                     continue;
                 }
                 stack.push(path);
@@ -260,11 +276,11 @@ fn is_ledger_file(path: &Path) -> bool {
 /// (`_meta.md`) get their `type` only — they are identity records, not
 /// concept pages with provenance.
 fn conform_file(
-    wiki_root: &Path,
+    git: &crate::git::GitAdapter,
     rel: &Path,
     at_by_page: &std::collections::HashMap<(String, String, String), String>,
 ) -> WikiResult<()> {
-    let abs = wiki_root.join(rel);
+    let abs = git.root().join(rel);
     let raw = std::fs::read_to_string(&abs)?;
     let mut md = parse(&raw).unwrap_or_else(|_| Markdown {
         frontmatter: serde_json::Value::Object(serde_json::Map::new()),
@@ -306,9 +322,7 @@ fn conform_file(
 
     let emitted = emit(&md)?;
     if emitted != raw {
-        let tmp = tempfile::NamedTempFile::new_in(abs.parent().unwrap_or(wiki_root))?;
-        std::fs::write(tmp.path(), emitted.as_bytes())?;
-        crate::atomic::persist_with_retry(tmp, &abs)?;
+        git.write_atomic(&abs, emitted.as_bytes())?;
     }
     Ok(())
 }
@@ -327,8 +341,8 @@ fn mtime_iso(path: &Path) -> String {
 /// Each project directory is one OKF bundle: give it an `index.md`
 /// declaring `okf_version` when absent (the only place index.md may
 /// carry frontmatter, per spec).
-fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
-    let Ok(workspaces) = std::fs::read_dir(wiki_root) else {
+fn ensure_bundle_indexes(git: &crate::git::GitAdapter) -> WikiResult<()> {
+    let Ok(workspaces) = std::fs::read_dir(git.root()) else {
         return Ok(());
     };
     for ws in workspaces.flatten() {
@@ -362,13 +376,14 @@ fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
             let body =
                 format!("# Bundle index\n\nConcept files live in these directories:\n\n{listing}");
             let content = format!("---\nokf_version: \"0.2\"\n---\n\n{body}");
-            std::fs::write(&index, content)?;
+            git.write_atomic(&index, content.as_bytes())?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use ai_memory_core::{PagePath, Tier};
     use ai_memory_store::Store;
@@ -411,6 +426,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -577,7 +593,8 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "\u{FEFF}# Hand written\n\nBody.\n").unwrap();
 
-        conform_file(tmp.path(), rel, &std::collections::HashMap::new()).unwrap();
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        conform_file(&git, rel, &std::collections::HashMap::new()).unwrap();
 
         let conformed = std::fs::read_to_string(&abs).unwrap();
         assert!(
@@ -783,6 +800,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -815,6 +833,95 @@ mod tests {
             std::fs::read_dir(dest.path()).unwrap().count(),
             0,
             "the ledger caused a full data-dir archive"
+        );
+    }
+
+    #[test]
+    fn a_nested_pending_directory_still_requires_a_migration_backup() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_root = tmp.path().join("wiki");
+        let relative = PathBuf::from("w/p/notes/_pending/legacy.md");
+        let path = wiki_root.join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "# Ordinary old page\n").unwrap();
+        let page = PagePath::new("notes/_pending/legacy.md").unwrap();
+        assert!(!crate::watcher::is_pending_path(&page));
+        assert_eq!(nonconformant_files(&wiki_root).unwrap(), vec![relative]);
+        let dest = TempDir::new().unwrap();
+        assert!(
+            snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+                .unwrap()
+                .is_some(),
+            "ordinary legacy pages still require a pre-migration backup"
+        );
+    }
+
+    /// A conformant store whose only "nonconformant" files are auto-improve
+    /// staging sidecars under `_pending/` must not re-archive the data dir.
+    /// The sidecars carry no OKF frontmatter and are never migrated (SQLite
+    /// owns approval state), so leaving them in scope made every boot fall
+    /// through the backup gate once the receipt's archive was gone (#695).
+    #[tokio::test]
+    async fn a_conformant_store_with_pending_sidecars_skips_the_backup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/setup.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "setup"}),
+            body: "how it was set up".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let pending_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("_pending")
+            .join("auto-improve");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        // Exactly what `render_auto_improve_sidecar` writes: a heading, no
+        // frontmatter at all.
+        std::fs::write(
+            pending_dir.join("0001.md"),
+            "# Pending auto-improvement proposal\n\nProposal body.\n",
+        )
+        .unwrap();
+
+        let wiki_root = tmp.path().join("wiki");
+        let pending = nonconformant_files(&wiki_root).unwrap();
+        assert!(
+            pending.is_empty(),
+            "a _pending/ sidecar must not be listed as nonconformant: {pending:?}"
+        );
+
+        let dest = TempDir::new().unwrap();
+        let receipt = snapshot_before_db_migration(tmp.path(), Some(dest.path())).unwrap();
+        assert!(
+            receipt.is_none(),
+            "a conformant store plus a _pending/ sidecar must not trigger a backup"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.path()).unwrap().count(),
+            0,
+            "the _pending/ sidecar caused a full data-dir archive"
         );
     }
 

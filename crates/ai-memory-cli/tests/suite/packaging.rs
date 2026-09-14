@@ -221,6 +221,28 @@ fn aur_packages_install_all_native_assets() {
         );
     }
 
+    // The from-source PKGBUILD builds and runs `check()` on the AUR host.
+    // Two things keep that green (see #677): `!lto` avoids the release-LTO
+    // link step that OOM-killed the build on constrained AUR builders, and
+    // pinning CARGO_HOME to the real registry before the HOME override lets
+    // the `--frozen` check() resolve the packages build() already fetched.
+    let src_pkgbuild = read_repo("packaging/aur/PKGBUILD");
+    assert!(
+        src_pkgbuild.contains("options=('!debug' '!lto')"),
+        "from-source PKGBUILD must disable LTO to survive constrained AUR builders"
+    );
+    let cargo_home = src_pkgbuild
+        .find("export CARGO_HOME=")
+        .expect("check() must pin CARGO_HOME");
+    let home_override = src_pkgbuild
+        .find(r#"export HOME="$srcdir/test-home""#)
+        .expect("check() must override HOME");
+    assert!(
+        cargo_home < home_override,
+        "CARGO_HOME must be pinned to the real registry before HOME is repointed, \
+         or --frozen check() cannot resolve the fetched packages"
+    );
+
     let install = read_repo("packaging/aur/ai-memory.install");
     assert!(install.contains("sudo -u ai-memory ai-memory --data-dir /var/lib/ai-memory"));
     assert!(!install.contains("sudo ai-memory --data-dir /var/lib/ai-memory"));
@@ -464,6 +486,32 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
         flags.contains(&"docker.io/akitaonrails/ai-memory:latest"),
         "default image must not require Podman short-name resolution: {args}"
     );
+}
+
+#[test]
+fn wrapper_forwards_every_supported_provider_api_key() {
+    // The wrapper runs the server in a container, so any provider credential
+    // the operator exports must be on the `-e` forwarding allowlist or it
+    // never reaches the process and the provider reports "not configured".
+    // Gemini/Google were missing while every other provider key was
+    // forwarded (#698), so the guard names each key the config layer reads.
+    let wrapper = read_repo("bin/ai-memory");
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VOYAGE_API_KEY",
+        "COPILOT_GITHUB_TOKEN",
+        "LLM_API_KEY",
+        "EMBEDDING_API_KEY",
+    ] {
+        assert!(
+            wrapper.contains(&format!("  {key} \\")),
+            "wrapper must forward {key} into the container"
+        );
+    }
 }
 
 #[test]

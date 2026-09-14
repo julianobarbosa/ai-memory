@@ -124,6 +124,12 @@ legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
 
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 ---
 
 ## Configuring the CLI URL and auth
@@ -333,6 +339,19 @@ curl -sI http://127.0.0.1:49374/handoff
 ```
 
 ### LLM provider login with native services
+
+> **You do not need a paid platform API key.** ai-memory's LLM features
+> (consolidation, lint, auto-improve) are opt-in, and when you enable them you
+> can authenticate with a **subscription you already pay for** instead of a
+> metered API key: a Claude Pro/Max plan via `anthropic-oauth`
+> (`claude setup-token`), a ChatGPT Plus/Pro/Codex plan via `openai-oauth`
+> (`ai-memory auth login openai-oauth`), or a GitHub Copilot plan via `copilot`
+> (`ai-memory auth login copilot`). See
+> [`docs/llm-providers.md`](llm-providers.md) for the full table. And you can
+> skip an LLM entirely: the default zero-LLM path still captures, searches
+> (FTS), and writes rule-based summaries with no provider at all —
+> [`docs/local-embeddings.md`](local-embeddings.md) makes vector search
+> keyless too.
 
 API-key providers go in the relevant env file:
 
@@ -574,7 +593,12 @@ agent host, then use that native executable to run
 `install-hooks --agent claude-code --apply`. Even if the script fallback is
 retained, the server still strips any raw field on receipt before persistence.
 
-Native `ai-memory hook --event ...` commands spool events locally. Session start
+Native `ai-memory hook --event ...` commands spool events locally. The POSIX
+shell bundle spools too, but only on failure: it POSTs first and writes the
+event to the same `<data_dir>/hook-spool/` contract when the server is
+unreachable or answers 5xx, then flushes the backlog behind the next delivery
+that succeeds. A 4xx is a permanent rejection and is not retried. (The
+PowerShell bundle still drops an undelivered event.) Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -737,10 +761,28 @@ docker run --rm akitaonrails/ai-memory:latest \
         --auth-token "$TOKEN"
 ```
 
-Codex still does not expose a reliable true session-end hook. Its `Stop` hook is
-captured as a turn/stop observation only; ai-memory does **not** treat it as
-SessionEnd. When you need the final session summary, handoff, and
-auto-improvement eligibility for the current project, run:
+Native Codex tool hooks use top-level `tool_name`, `tool_input`, `tool_response`,
+and `tool_use_id` fields (verified against CLI 0.154.0). ai-memory records the
+tool family and call ID on `PreToolUse` and `PostToolUse`; recognized tools such
+as `Bash` and `apply_patch` also retain a sanitized response excerpt on
+`PostToolUse`, capped at 2 KB including metadata. Structured JSON responses are
+flattened using the same bounded excerpt path. Inputs are not copied into
+observations, and unknown tools (including unrecognized MCP names) retain only
+metadata. `PostToolUse` alone does not prove success, so Codex outcomes remain
+`unknown`.
+
+Capture exclusions still run before native spooling. Codex's `apply_patch`
+passes patch text in `tool_input.command`, which does not provide direct file
+paths to the capture policy. With active `ignore_paths`, those events retain
+only metadata; ai-memory does not parse patch or shell text to infer paths.
+Tool events are delivered at the normal 32-event catch-up threshold or a
+lifecycle drain boundary, so a small active turn may still have queued events.
+
+Codex CLI 0.145.0 and later expose a native `SessionEnd` hook. `Stop` is captured
+as a turn boundary and leaves the session open; a native `SessionEnd` triggers
+the final summary, handoff, and auto-improvement eligibility. See the
+[Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
+Codex ends a session. For older clients or a missed session-end delivery, run:
 
 ```bash
 ai-memory finalize-session
@@ -828,7 +870,8 @@ successful calls; it reuses the post-tool-use handler), `Stop`,
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
-compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+compatibility fallback (POSTs to `/hook`, spooling a failed delivery for a
+later drain, without capture-policy v1 enforcement). A pending handoff
 is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
 appends to the model context as a user message before the turn; Kimi Code
 fires `SessionStart` but discards that hook's stdout, so hooks installed by

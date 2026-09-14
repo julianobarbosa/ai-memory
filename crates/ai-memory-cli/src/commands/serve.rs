@@ -1,6 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -69,6 +69,98 @@ const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
 /// Lock file guarding a data dir against a second `ai-memory serve` (#563).
 const SERVE_LOCK_FILE: &str = ".serve.lock";
+
+/// How long a wait on the shutdown path may run before the drain it is
+/// waiting for is abandoned. axum's graceful shutdown waits for every
+/// in-flight connection and a stateful or SSE MCP client can hold one open
+/// indefinitely, so an unbounded drain is indistinguishable from ignoring the
+/// signal: `docker stop` and `systemctl stop` would still burn their own
+/// grace period and finish with SIGKILL (#699). Each wait is bounded on its
+/// own, so a stop can take a small multiple of this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// The signals that stop a running server, listened for on both transports.
+///
+/// Installed before the transport starts. The server runs as PID 1 under
+/// `docker run` (no init shim), and for PID 1 the kernel discards any signal
+/// whose handler is not installed — so a SIGTERM arriving during a slow boot
+/// (the pre-migration archive, wiki migrations) must already have a listener
+/// waiting for it. A tokio `Signal` queues a signal received before the first
+/// `recv`, so registering early loses nothing (#699).
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Install the listeners.
+    ///
+    /// A listener that cannot be registered degrades to the remaining one with
+    /// a warning: losing one way to stop the server is bad, refusing to start
+    /// over it is worse.
+    #[cfg(unix)]
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        fn listen(kind: SignalKind, name: &str) -> Option<tokio::signal::unix::Signal> {
+            match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        signal = name,
+                        "cannot listen for this shutdown signal; the server will not stop on it"
+                    );
+                    None
+                }
+            }
+        }
+
+        Self {
+            interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+            terminate: listen(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// Install the listeners. Non-unix has only ctrl-c.
+    #[cfg(not(unix))]
+    fn install() -> Self {
+        Self {}
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(unix)]
+    async fn recv(&mut self) -> &'static str {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
+                "SIGINT"
+            }
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+                "SIGTERM"
+            }
+            // Both registrations failed: there is nothing left to wait for.
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(not(unix))]
+    async fn recv(&mut self) -> &'static str {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "ctrl-c listener failed; the server will not stop on it");
+            std::future::pending::<()>().await;
+        }
+        "ctrl-c"
+    }
+}
 
 /// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
 /// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
@@ -707,6 +799,11 @@ async fn run_session_consolidation_worker(
 /// Returns an error if the store cannot be opened, the watcher cannot
 /// install, or the transport setup fails.
 pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
+    // Before anything slow: boot takes the pre-migration archive and runs the
+    // wiki migrations, and a signal arriving in that window has to be caught
+    // rather than fall through to the default disposition (#699).
+    let mut shutdown = ShutdownSignals::install();
+
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -733,8 +830,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
         .with_context(|| "taking the pre-migration safety backup")?;
 
-    let store = Store::open(&config.data_dir)
+    let mut store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
+    // Every reader handle below is cloned from this one, so the opt-in
+    // ranking signals are set once, here, and inherited everywhere.
+    store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
     // is a prefix-match catch-all. That means the $HOME and filesystem-root
@@ -905,10 +1006,53 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     match args.transport {
         TransportKind::Stdio => {
             info!("MCP server ready on stdio (Ctrl-C to stop)");
-            let service = server.serve(stdio()).await?;
-            service.waiting().await?;
+            // `serve` resolves only once a client has completed the MCP
+            // `initialize` handshake, so the signal races the handshake as
+            // well as the session that follows it: a Ctrl-C before any client
+            // connected is the exact state a launched-but-unused server sits
+            // in, and until #699 nothing here listened for one at all.
+            let service = tokio::select! {
+                service = server.serve(stdio()) => Some(service?),
+                signal = shutdown.recv() => {
+                    info!(signal, "shutdown signal received before a client connected; stopping");
+                    None
+                }
+            };
+            if let Some(service) = service {
+                // Take the token before `waiting` consumes the service:
+                // stopping the transport is the only way out of that await.
+                let stop = service.cancellation_token();
+                let mut waiting = std::pin::pin!(service.waiting());
+                let signal = tokio::select! {
+                    result = &mut waiting => {
+                        result?;
+                        None
+                    }
+                    signal = shutdown.recv() => Some(signal),
+                };
+                if let Some(signal) = signal {
+                    info!(
+                        signal,
+                        "shutdown signal received; stopping the stdio transport"
+                    );
+                    stop.cancel();
+                    // A signal is a normal stop, so nothing below turns it
+                    // into a failing exit — but neither does it wait forever.
+                    match tokio::time::timeout(SHUTDOWN_GRACE, waiting).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "stdio transport ended abnormally during shutdown");
+                        }
+                        Err(_) => tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "stdio transport did not stop within the shutdown grace period; exiting anyway"
+                        ),
+                    }
+                }
+            }
         }
         TransportKind::Http => {
+            seed_active_project_fallback(&store.reader, &active_project).await;
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let (session_consolidation_notify, session_consolidation_task) =
@@ -1286,23 +1430,58 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let shutdown_cancel = cancel.clone();
-            let serve_result = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("ctrl-c received; shutting down");
-                shutdown_cancel.cancel();
-            })
-            .await;
+            let serve_result = {
+                let serve = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let signal = shutdown.recv().await;
+                    info!(signal, "shutdown signal received; draining");
+                    shutdown_cancel.cancel();
+                })
+                .into_future();
+                let mut serve = std::pin::pin!(serve);
+                // Bound the drain. axum waits for every in-flight connection
+                // to close, and a stateful or SSE MCP client never closes one
+                // on its own — without this the shutdown outlives the
+                // supervisor's own patience and ends in SIGKILL (#699).
+                tokio::select! {
+                    result = &mut serve => Some(result),
+                    () = async {
+                        cancel.cancelled().await;
+                        tokio::time::sleep(SHUTDOWN_GRACE).await;
+                    } => {
+                        tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "connections still open past the shutdown grace period; exiting anyway"
+                        );
+                        None
+                    }
+                }
+            };
             cancel.cancel();
-            if let Some(task) = session_consolidation_task
-                && let Err(error) = task.await
-            {
-                tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+            if let Some(task) = session_consolidation_task {
+                // Bounded like the drain above. The worker can be parked in
+                // `claim_session_consolidation` or `release_session_consolidation`,
+                // neither of which races the cancellation, behind the
+                // single-writer actor's queue — an unbounded join here would
+                // sit outside the shutdown bound entirely (#699).
+                match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                    }
+                    Err(_) => tracing::warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "SessionEnd consolidation worker did not stop within the shutdown \
+                         grace period; exiting anyway"
+                    ),
+                }
             }
-            serve_result?;
+            if let Some(serve_result) = serve_result {
+                serve_result?;
+            }
         }
     }
     Ok(())
@@ -2138,6 +2317,60 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     })
 }
 
+/// Seed the read-side active-project fallback from the most recently active
+/// project already on disk.
+///
+/// The pointer lives only in process memory, so restarting the daemon
+/// mid-session drops it. An unscoped read then resolves through the baked
+/// default scope and answers zero counts for a project holding thousands of
+/// observations — through the SUCCESS path, with nothing in the log, so
+/// neither the agent nor the operator can tell it apart from a genuinely
+/// empty project (#678). Failing such a read closed is not the fix: a keyed
+/// miss is also the normal shape of the pre-publish window (hooks are
+/// fire-and-forget) and of TTL/cap eviction, both of which must keep
+/// degrading gracefully.
+///
+/// So make the degraded answer a real one. The seed lands in a slot only READS
+/// consult: a keyed hit still wins, an unscoped write from an unrecognized
+/// caller still fails closed rather than being attributed to a reconstructed
+/// project, and the first hook event publishes straight over it. The recency
+/// bound is the pointer's own per-key TTL: activity older than that would have
+/// aged out of a live pointer anyway. Non-fatal — a server that cannot read
+/// this starts exactly as it does today.
+async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &ActiveProject) {
+    if active_project.get().is_some() {
+        return;
+    }
+    let ttl_us = i64::try_from(active_project.per_key_ttl().as_micros()).unwrap_or(i64::MAX);
+    let since = jiff::Timestamp::now()
+        .as_microsecond()
+        .saturating_sub(ttl_us);
+    match reader.most_recently_active_scope(since).await {
+        Ok(Some((workspace_id, project_id))) => {
+            active_project.seed_read_fallback(workspace_id, project_id);
+            let workspace = reader
+                .workspace_name_by_id(workspace_id)
+                .await
+                .ok()
+                .flatten();
+            let project = reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .ok()
+                .flatten();
+            info!(
+                workspace = workspace.as_deref().unwrap_or("<unknown>"),
+                project = project.as_deref().unwrap_or("<unknown>"),
+                "seeded active-project fallback from the last recorded activity"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "active-project fallback seed skipped (non-fatal)");
+        }
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -2933,6 +3166,180 @@ mod tests {
         }
     }
 
+    /// #678: the pointer is process memory, so `systemctl restart` mid-session
+    /// drops it. An unscoped read then resolved through the baked default scope
+    /// and reported zero counts for a project holding thousands of observations,
+    /// through the success path. Seeding the shared slot from the last recorded
+    /// activity makes that degraded answer a real one.
+    #[tokio::test]
+    async fn a_restart_seeds_the_active_project_fallback_from_the_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        // The baked default scope: empty, and where the bug parked every read.
+        let scratch = store
+            .writer
+            .get_or_create_project(workspace_id, "scratch", None)
+            .await
+            .unwrap();
+        let worked_in = store
+            .writer
+            .get_or_create_project(workspace_id, "real-project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: worked_in,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: worked_in,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "the session that outlived the daemon".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        // A pointer as empty as it is one instruction after a restart.
+        let active_project = ActiveProject::new();
+        seed_active_project_fallback(&store.reader, &active_project).await;
+        assert_eq!(
+            active_project.seeded(),
+            Some((workspace_id, worked_in)),
+            "the seed must name the project the last activity landed in"
+        );
+        assert_eq!(
+            active_project.get(),
+            None,
+            "a reconstruction is not a publish: the shared slot stays empty"
+        );
+
+        // The live session's keyed entry died with the process, so its read
+        // misses the map — and must now degrade to real data, not to `scratch`.
+        let actor = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some(session_id.to_string()),
+        };
+        let resolved = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.as_tuple(),
+            (workspace_id, worked_in),
+            "an unscoped read after a restart must not silently answer for the baked default"
+        );
+
+        // ...while an unscoped WRITE from a caller the pointer cannot place is
+        // untouched by the seed: it resolves exactly where it did before, so a
+        // page is never attributed to a project reconstructed from a session
+        // that is not this caller's.
+        let written = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project)
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.as_tuple(),
+            (workspace_id, scratch),
+            "the seed must not retarget unscoped writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_never_overwrites_a_pointer_a_hook_already_published() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let published = store
+            .writer
+            .get_or_create_project(workspace_id, "published", None)
+            .await
+            .unwrap();
+        // Activity in a DIFFERENT project, or the seed no-ops and this test
+        // passes with the guard deleted.
+        let elsewhere = store
+            .writer
+            .get_or_create_project(workspace_id, "elsewhere", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: elsewhere,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: elsewhere,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "activity the seed would otherwise reach for".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        let active_project = ActiveProject::new();
+        active_project.set(workspace_id, published);
+        seed_active_project_fallback(&store.reader, &active_project).await;
+
+        assert_eq!(
+            active_project.get(),
+            Some((workspace_id, published)),
+            "a live pointer outranks anything the DB remembers"
+        );
+        assert_eq!(
+            active_project.seeded(),
+            None,
+            "no seed is taken while a real publish already stands"
+        );
+    }
+
     #[tokio::test]
     async fn session_consolidation_worker_consumes_and_completes_durable_job() {
         let tmp = TempDir::new().unwrap();
@@ -3079,6 +3486,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -3665,6 +4073,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
