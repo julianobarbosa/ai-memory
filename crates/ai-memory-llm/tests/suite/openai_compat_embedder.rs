@@ -85,6 +85,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: Some("http://localhost:11434/v1".into()),
         models_dir: None,
+        copilot_auth: None,
         defaulted: false,
     })
     .expect("factory builds compat embedder");
@@ -98,6 +99,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: None,
         models_dir: None,
+        copilot_auth: None,
         defaulted: false,
     }) {
         Ok(_) => panic!("compat embedder must not build without a base URL"),
@@ -115,6 +117,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: Some("http://localhost:11434/v1".into()),
         models_dir: None,
+        copilot_auth: None,
         defaulted: false,
     });
     assert!(

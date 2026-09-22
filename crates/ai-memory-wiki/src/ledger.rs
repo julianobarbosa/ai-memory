@@ -1,10 +1,11 @@
 //! Shared helpers for recognizing the raw hook event ledger
 //! (`log.md` / `log-YYYY-MM.md`) by filename shape and by content.
 //!
-//! Both the watcher's indexer (#660) and the OKF conformance migration
-//! (#669) must treat these files identically: a reserved-looking filename
-//! is only a ledger when its content opens with a hook log entry, never on
-//! filename alone (an ordinary page can be named `log-2026-09.md`).
+//! The watcher's indexer (#660), the OKF conformance migration (#669) and
+//! the OKF bundle export (#748) must treat these files identically: a
+//! reserved-looking filename is only a ledger when its content opens with a
+//! hook log entry, never on filename alone (an ordinary page can be named
+//! `log-2026-09.md`).
 
 use std::path::Path;
 
@@ -79,6 +80,21 @@ pub(crate) fn opens_with_log_ledger(abs: &Path) -> bool {
             return line.starts_with("## [");
         }
     }
+}
+
+/// True when `abs` is a **rotated** event ledger (`log-YYYY-MM.md`) and not an
+/// ordinary page that merely carries that name: the filename shape and the
+/// body's opening line have to agree, the same content gate the migration scan
+/// applies (#669).
+///
+/// `log.md` is left to the caller: OKF reserves that name, so a consumer of
+/// this crate already excludes it by reserved name, with or without ledger
+/// content. Only the rotated form needs ai-memory-specific knowledge.
+pub fn is_rotated_event_ledger(abs: &Path) -> bool {
+    abs.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_rotated_log_filename)
+        && opens_with_log_ledger(abs)
 }
 
 /// Upper bound on frontmatter lines scanned by [`opens_with_log_ledger`].

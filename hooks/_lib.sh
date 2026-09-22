@@ -444,6 +444,15 @@ ai_memory_clear_session_id() {
     rm -f "$(ai_memory_session_id_file "$agent")" 2>/dev/null || true
 }
 
+# POST stdin to "$1" as JSON. Adds an
+# `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
+# The 0.2s timeout is invariant 5's budget for a script hook
+# (never block the agent), and the trailing `|| true` makes the
+# function safe to call from `set -e` scripts. An undelivered event
+# (unreachable server or 5xx) is spooled for a later drain instead of
+# being dropped; a 4xx is a permanent rejection and is not retried.
+# Stdout is the HTTP status code, not the response body — every caller
+# in this bundle discards it.
 # Path of the `Authorization:` header file `install-hooks --apply` writes
 # (0600, inside the 0700 data dir). Printed only when readable.
 ai_memory_auth_header_file() {
@@ -451,33 +460,53 @@ ai_memory_auth_header_file() {
     [ -r "$_amhf" ] && printf '%s' "$_amhf"
 }
 
-# POST stdin to "$1" as JSON, fire-and-forget. Adds an
-# `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
-# The 0.2s timeout is the project-wide hook latency budget
-# (`docs/ARCHITECTURE.md` cross-cutting invariant 5 — never block the
-# agent), and the trailing `|| true` makes the function safe to call
-# from `set -e` scripts. Do not raise it: the server answers 202
-# immediately and 429 when saturated, so a longer wait buys nothing
-# and costs the agent's hot path.
+# Mint the key before the first POST so an ambiguous delivery and its spool
+# replay carry the same identity. The server can then discard a replay whose
+# original response was lost after the observation committed.
+ai_memory_ingest_key() {
+    _amrnd=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$_amrnd" ] || _amrnd=$(printf '%s%s' "$(date +%s 2>/dev/null || printf '0')" "$$")
+    printf 'sh%s' "$_amrnd"
+}
+
+ai_memory_url_with_ingest_key() {
+    case "$1" in
+        *\?ingest_key=* | *\&ingest_key=*) printf '%s' "$1" ;;
+        *\?*) printf '%s&ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+        *) printf '%s?ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+    esac
+}
+
 ai_memory_post_hook() {
-    _amhdr=$(ai_memory_auth_header_file)
+    _amurl=$(ai_memory_url_with_ingest_key "$1")
+    _ambody=$(cat)
+    _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 0.2 -X POST "$1" \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
-            --data-binary @-
+            --data-binary @- 2>/dev/null) || _amcode=000
     elif [ -n "$_amhdr" ]; then
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
-        curl -s --max-time 0.2 -X POST "$1" \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
-            --data-binary @-
+            --data-binary @- 2>/dev/null) || _amcode=000
     else
-        curl -s --max-time 0.2 -X POST "$1" \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
-            --data-binary @-
+            --data-binary @- 2>/dev/null) || _amcode=000
     fi
+    case "$_amcode" in
+        2*) ai_memory_kick_drain ;;
+        4*) ;;
+        *) ai_memory_spool_event "$_amurl" "$_ambody" ;;
+    esac
+    return 0
 }
 
 # GET "$1" with the same auth-header rules as `ai_memory_post_hook`.
@@ -506,15 +535,240 @@ ai_memory_get_handoff() {
 # handoff in hookSpecificOutput.additionalContext).
 ai_memory_json_string() {
     awk '
-        BEGIN { printf "\"" }
+        # BusyBox awk applies backslash processing to a gsub REPLACEMENT
+        # string; gawk, mawk and one-true-awk pass it through literally. Every
+        # replacement below carries a backslash, so on BusyBox all four escapes
+        # were silently no-ops (#733): a backslash stayed bare, a quote stayed
+        # bare, and -- not in the report, but the same root cause -- \t and \r
+        # collapsed to the letters "t" and "r", corrupting content rather than
+        # only breaking the framing.
+        #
+        # Detect the behaviour once instead of guessing at it, and pre-double
+        # the replacements where they will be halved. Done with gsub rather
+        # than a split/concat loop on purpose: concatenating per occurrence is
+        # quadratic in the value length, which is the cost #727 was about.
+        BEGIN {
+            probe = "X"; gsub(/X/, "\\\\", probe)
+            if (length(probe) == 1) {
+                busybox = 1
+                BS = "\\\\\\\\"; QT = "\\\\\""; TB = "\\\\t"; CR = "\\\\r"
+                UP = "\\\\u"
+            } else {
+                busybox = 0
+                BS = "\\\\"; QT = "\\\""; TB = "\\t"; CR = "\\r"
+                UP = "\\u"
+            }
+            # JSON forbids a raw control character (U+0000..U+001F) inside a
+            # string, but the four gsubs above only cover backslash, quote, tab
+            # and CR — so a replayed tool result carrying e.g. an ANSI colour
+            # escape (0x1b) reached stdout unescaped and Claude Code rejected
+            # the whole SessionStart packet as invalid JSON (#732). Build a
+            # \u00XX escape for every other control byte once; newline (0x0a) is
+            # never inside a record, it is the record separator handled below.
+            nc = 0
+            for (c = 1; c < 32; c++) {
+                if (c == 9 || c == 10 || c == 13) continue
+                cc[++nc] = sprintf("%c", c)
+                cr[nc] = sprintf("%s%04x", UP, c)
+            }
+            printf "\""
+        }
         {
-            gsub(/\\/, "\\\\")
-            gsub(/"/, "\\\"")
-            gsub(/\t/, "\\t")
-            gsub(/\r/, "\\r")
+            gsub(/\\/, BS)
+            gsub(/"/, QT)
+            gsub(/\t/, TB)
+            gsub(/\r/, CR)
+            # After the backslash gsub, so the backslashes these introduce are
+            # not doubled. Each control byte is a literal (none is a regex
+            # metacharacter), and the pass is linear, not the per-char loop #727
+            # replaced.
+            for (k = 1; k <= nc; k++) gsub(cc[k], cr[k])
             printf "%s%s", sep, $0
             sep = "\\n"
         }
         END { printf "\"" }
     '
+}
+
+# --- offline spool -----------------------------------------------------
+# A failed delivery is written to `<data_dir>/hook-spool/` in the same
+# on-disk contract `ai-memory hook-drain` reads (same filenames, same
+# `SpoolEntry` JSON, same 0600/0700 modes, tmp+rename), so an unreachable
+# or erroring server costs latency instead of the event. The generated
+# TypeScript integrations gained this in #580; the script bundle is the
+# remaining capture path that POSTs and forgets.
+#
+# The backlog is drained at session boundaries only — never on the
+# per-tool-call hot path, which must not block the agent.
+
+ai_memory_spool_dir() {
+    printf '%s/hook-spool' "$(ai_memory_state_dir)"
+}
+
+# Unix milliseconds. `date +%s%N` gives nanoseconds on GNU (and the width
+# modifier `%3N` is not honoured everywhere, so it is not used); BSD/macOS
+# date leaves a literal `N`. Anything that is not a long enough run of digits
+# falls back to whole seconds, which keeps filenames ordered and parseable.
+ai_memory_now_ms() {
+    _amnow=$(date +%s%N 2>/dev/null || printf '')
+    case "$_amnow" in
+        '' | *[!0-9]*) _amnow='' ;;
+    esac
+    if [ -n "$_amnow" ] && [ "${#_amnow}" -ge 13 ]; then
+        _amnow=$(printf '%s' "$_amnow" | cut -c1-13)
+    else
+        _amnow="$(date +%s 2>/dev/null || printf '0')000"
+    fi
+    printf '%s' "$_amnow"
+}
+
+# The bearer a drain should replay this event with, or empty for none.
+ai_memory_spool_token() {
+    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
+        printf '%s' "$AI_MEMORY_AUTH_TOKEN"
+        return 0
+    fi
+    _amtf=$(ai_memory_auth_header_file || printf '')
+    [ -n "$_amtf" ] || return 0
+    sed -n 's/^[Aa]uthorization:[[:space:]]*[Bb]earer[[:space:]]*//p' "$_amtf" \
+        | head -n 1 | tr -d '\r\n'
+}
+
+# Persist one undelivered event. Best-effort on top of best-effort capture:
+# every failure path returns 0 so a hook never fails because of the spool.
+ai_memory_spool_event() {
+    _amsurl=$(ai_memory_url_with_ingest_key "$1")
+    _amsbody="$2"
+    _amsdir=$(ai_memory_spool_dir)
+    mkdir -p "$_amsdir" 2>/dev/null || return 0
+    chmod 700 "$_amsdir" 2>/dev/null || true
+    _amstok=$(ai_memory_spool_token)
+    _amsnow=$(ai_memory_now_ms)
+    AI_MEMORY_SPOOL_SEQ=$((${AI_MEMORY_SPOOL_SEQ:-0} + 1))
+    _amsname=$(printf '%013d-%s-%016x.json' "$_amsnow" "$$" "$AI_MEMORY_SPOOL_SEQ")
+    (
+        umask 077
+        {
+            printf '{"url":'
+            printf '%s' "$_amsurl" | ai_memory_json_string
+            printf ',"body":'
+            printf '%s' "$_amsbody" | ai_memory_json_string
+            printf ',"created_ms":%s' "$_amsnow"
+            if [ -n "$_amstok" ]; then
+                printf ',"auth_mode":"static","token":'
+                printf '%s' "$_amstok" | ai_memory_json_string
+            else
+                printf ',"auth_mode":"none"'
+            fi
+            printf ',"attempts":0}'
+        } >"$_amsdir/$_amsname.tmp" 2>/dev/null
+    ) || return 0
+    mv -f "$_amsdir/$_amsname.tmp" "$_amsdir/$_amsname" 2>/dev/null \
+        || rm -f "$_amsdir/$_amsname.tmp" 2>/dev/null
+    return 0
+}
+
+# Read one top-level string field out of a spool entry, undoing the escapes
+# `ai_memory_json_string` produces. The regex is the JSON string grammar, so
+# the match ends at the first quote that is not escaped, which is the only
+# correct way to find the end. `match` itself cannot fail — the pattern accepts
+# the empty string — so the terminator check on the line after it is what
+# rejects an unterminated value, and dropping that line drops the check. An
+# entry carrying a `\uXXXX` escape was written by a richer serializer (the
+# native binary); this prints nothing for it so the caller leaves it to
+# `ai-memory hook-drain`.
+#
+# Nothing accumulates: each segment goes straight to stdout. Appending into a
+# string that grows to the whole value costs time quadratic in the number of
+# appends, and that holds whether the step is one character or one
+# escaped-backslash pair — a 2.2 MB entry of `grep` output over source, where
+# every literal backslash is a pair, cost 36 s a pass that way under
+# one-true-awk. A drain pass reads every entry three times and one detached
+# pass starts behind every delivery that succeeds, so the cost is paid over
+# and over.
+#
+# Splitting on the escaped-backslash pairs first is what makes the unescaping
+# safe: no segment can contain one, so inside a segment every backslash starts
+# a real escape and no placeholder byte is needed, which keeps a raw control
+# byte in the value (`ai_memory_json_string` does not escape those)
+# round-tripping untouched. Validation is a pass of its own so that a declined
+# value prints nothing at all — a partial read must never look like a whole
+# one to `ai_memory_drain_spool`, which reads the field through `|| continue`.
+ai_memory_json_field() {
+    awk -v key="$1" '
+        { text = text (NR > 1 ? "\n" : "") $0 }
+        END {
+            needle = "\"" key "\":\""
+            start = index(text, needle)
+            if (start == 0) exit 1
+            rest = substr(text, start + length(needle))
+            match(rest, /^(\\.|[^"\\])*/)
+            if (substr(rest, RSTART + RLENGTH, 1) != "\"") exit 1
+            parts = split(substr(rest, RSTART, RLENGTH), seg, /\\\\/)
+            for (i = 1; i <= parts; i++)
+                if (seg[i] ~ /\\[^ntr"\/]/) exit 1
+            for (i = 1; i <= parts; i++) {
+                gsub(/\\n/, "\n", seg[i])
+                gsub(/\\t/, "\t", seg[i])
+                gsub(/\\r/, "\r", seg[i])
+                gsub(/\\"/, "\"", seg[i])
+                gsub(/\\\//, "/", seg[i])
+                printf "%s%s", (i == 1 ? "" : "\\"), seg[i]
+            }
+            exit 0
+        }
+    ' "$2"
+}
+
+# Deliver the queued backlog, oldest first. Bounded by count so a drain never
+# becomes an unbounded upload. A 2xx or 4xx retires the entry (delivered, or
+# permanently rejected); anything else stops the pass and keeps the remainder
+# for the next one. The bearer goes through a 0600 header file rather than
+# curl's argv, for the reason #552 moved it off the command line.
+ai_memory_drain_spool() {
+    _amdmax=${1:-64}
+    _amddir=$(ai_memory_spool_dir)
+    [ -d "$_amddir" ] || return 0
+    _amdn=0
+    for _amdf in "$_amddir"/*.json; do
+        [ -f "$_amdf" ] || break
+        [ "$_amdn" -lt "$_amdmax" ] || break
+        _amdn=$((_amdn + 1))
+        _amdurl=$(ai_memory_json_field url "$_amdf" 2>/dev/null) || continue
+        [ -n "$_amdurl" ] || continue
+        _amdbody=$(ai_memory_json_field body "$_amdf" 2>/dev/null) || continue
+        _amdtok=$(ai_memory_json_field token "$_amdf" 2>/dev/null) || _amdtok=''
+        if [ -n "$_amdtok" ]; then
+            _amdhdr="$_amddir/.drain-header.$$"
+            (umask 077; printf 'Authorization: Bearer %s\n' "$_amdtok" >"$_amdhdr") 2>/dev/null || continue
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -o /dev/null \
+                -w '%{http_code}' -X POST "$_amdurl" \
+                -H "Content-Type: application/json" -H @"$_amdhdr" \
+                --data-binary @- 2>/dev/null) || _amdcode=000
+            rm -f "$_amdhdr" 2>/dev/null || true
+        else
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -o /dev/null \
+                -w '%{http_code}' -X POST "$_amdurl" \
+                -H "Content-Type: application/json" \
+                --data-binary @- 2>/dev/null) || _amdcode=000
+        fi
+        case "$_amdcode" in
+            2*|4*) rm -f "$_amdf" 2>/dev/null || true ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# Piggyback drain: a delivery that just succeeded proves the server is
+# reachable, so flush the backlog behind it. Detached from the hook's own
+# process so the agent never waits, and a no-op when nothing is queued —
+# which is every call on a healthy install.
+ai_memory_kick_drain() {
+    _amkdir=$(ai_memory_spool_dir)
+    [ -d "$_amkdir" ] || return 0
+    set -- "$_amkdir"/*.json
+    [ -f "$1" ] || return 0
+    (ai_memory_drain_spool 64 >/dev/null 2>&1 &) 2>/dev/null || true
+    return 0
 }

@@ -138,6 +138,25 @@ homelab, and restarts. The compose file + env file on the homelab are
 unchanged between deploys; if you ever need to change them, scp the
 new copy + re-run `bin/deploy`.
 
+The restart step stops the running container with SIGTERM. The server
+handles SIGINT and SIGTERM on both transports and bounds each wait in
+its shutdown path at five seconds, so a restart — or a plain `docker
+stop` or `docker compose down` — drains and exits in a few seconds
+instead of waiting out the supervisor's grace period and ending in
+SIGKILL. Before those handlers existed the two deployment shapes failed
+differently. In the container the server is PID 1, and for PID 1 the
+kernel discards a signal whose handler is not installed, so `docker
+stop` burned its full grace period and `docker kill` was the only way
+out. Under the native systemd unit the server is not PID 1, so
+`systemctl stop` fell through to the kernel's default disposition and
+killed it instantly instead — fast, but with no drain and the durable
+SessionEnd consolidation worker cut off mid-flight. There the stop is
+now slower and clean. The five-second bound is fixed and not
+configurable. `docker kill` remains the way to stop the server without
+waiting for the drain. No container init shim is required: the binary
+installs its own signal handlers, so it stops correctly as PID 1 and you
+do not need `tini` or `docker run --init`.
+
 ## Updating API keys
 
 ```bash
@@ -387,7 +406,11 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **`unhealthy`** status: the container is running but its embedded
   `ai-memory status` healthcheck is failing. Most likely the data
   dir's permissions don't match the container's user (uid 1000). Fix
-  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host.
+  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host. A slower-onset
+  cause (days, not minutes) is fd exhaustion from dead-peer connections
+  (laptop sleep, a VPN flap) accumulating without TCP keepalive; `serve`
+  enables it by default (`tcp_keepalive_secs = 60`, `AI_MEMORY_TCP_KEEPALIVE_SECS`
+  to tune or `=0` to disable) (#792).
 - **Embedding mismatch after a model change**: startup logs a warning
   when stored `(provider, model, dim)` triples differ from config.
   Hybrid search ignores stale rows until they are re-embedded. Start

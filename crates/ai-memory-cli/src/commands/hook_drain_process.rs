@@ -92,6 +92,36 @@ pub fn command_spec(data_dir: &Path, live_token: Option<&str>) -> io::Result<Dra
     })
 }
 
+/// Build `ai-memory --data-dir <dir> backfill --auto --quiet`.
+///
+/// The one-time boot backfill of pre-hook local history is potentially long
+/// (it reads native transcripts and imports them), so it runs detached exactly
+/// like the drainer rather than inline in the SessionStart hook's tight budget.
+/// It carries no bearer on its argv or in its environment: `backfill` resolves
+/// auth from config / the persisted hook token itself, and the automatic path
+/// only runs in the loopback single-operator posture where no token is needed.
+pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
+    Ok(DrainCommandSpec {
+        exe: std::env::current_exe()?,
+        args: vec![
+            OsString::from("--data-dir"),
+            data_dir.as_os_str().to_os_string(),
+            OsString::from("backfill"),
+            OsString::from("--auto"),
+            OsString::from("--quiet"),
+        ],
+        stderr_log: data_dir.join("logs").join("backfill.log"),
+        live_token: None,
+    })
+}
+
+/// Spawn the detached one-time boot backfill without inheriting hook stdio.
+/// Best-effort: a spawn failure must never break session start.
+pub fn spawn_backfill(data_dir: &Path) -> io::Result<()> {
+    let spec = backfill_command_spec(data_dir)?;
+    spawn_spec(&spec)
+}
+
 /// Build the stdio/detach shape used when spawning.
 #[must_use]
 pub fn spawn_config(spec: &DrainCommandSpec, try_breakaway: bool) -> SpawnConfig {

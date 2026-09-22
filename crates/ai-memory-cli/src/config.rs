@@ -25,8 +25,19 @@ use serde::{Deserialize, Serialize};
 /// Default HTTP bind address for the local single-user server.
 pub const DEFAULT_BIND: &str = "127.0.0.1:49374";
 
+/// Default idle time (seconds) before TCP keepalive probes start on an
+/// accepted `serve` connection. Conservative: long enough to never fire on a
+/// live, merely-quiet MCP/hook connection, short enough that a dead peer's
+/// fd is reclaimed in minutes rather than the OS default of ~2 hours (#792).
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
+
+/// Placeholder credential that lets `Config::load` validate a fallback
+/// profile whose `api_key_env` is absent from this process. Never reaches a
+/// provider: the config built from it is discarded (#762).
+const UNRESOLVED_FALLBACK_KEY: &str = "unresolved-llm-fallback-credential";
 
 /// Default MCP endpoint URL rendered for client integrations.
 pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:49374/mcp";
@@ -40,6 +51,27 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
+
+/// Optional per-tier retention half-lives, expressed in **days**.
+///
+/// This is the operator-facing `[decay.half_life_days]` sub-table. Half-life in
+/// days is the intuitive knob ("episodic pages: a 180-day half-life"); it is
+/// converted to the internal per-day decay rate λ (`λ = ln(2) / days`) in
+/// [`DecaySettings::decay_params`]. Every key is optional: an omitted key falls
+/// back to the scalar `lambda`, so the default (all keys unset) reproduces
+/// today's single-λ behaviour byte-for-byte and no upgrade changes a score.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecayHalfLifeDays {
+    /// Half-life in days for `working`-tier pages; unset uses the scalar λ.
+    pub working: Option<f64>,
+    /// Half-life in days for `episodic`-tier pages; unset uses the scalar λ.
+    pub episodic: Option<f64>,
+    /// Half-life in days for `semantic`-tier pages; unset uses the scalar λ.
+    pub semantic: Option<f64>,
+    /// Half-life in days for `procedural`-tier pages; unset uses the scalar λ.
+    pub procedural: Option<f64>,
+}
 
 /// Config-file representation of retention settings.
 ///
@@ -68,6 +100,30 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
+    /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
+    /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
+    /// evicting it. Reversible (the full body stays in git + the supersession
+    /// chain) and non-destructive. Defaults to `false`, so an upgrade changes
+    /// nothing until an operator opts in.
+    pub compact_cold_episodic: bool,
+    /// A3 cold-cluster dedup (`[decay] dedup_cold_clusters`). When `true` AND an
+    /// embedder is configured, the forget sweep clusters near-duplicate cold
+    /// episodic pages by embedding (cosine DBSCAN, adaptive eps) and collapses
+    /// each cluster to one survivor via supersession + a merge note.
+    /// Non-destructive (merged-away members stay reachable) and zero generative
+    /// LLM. Defaults to `false`, and is a clean no-op with no embedder, so an
+    /// upgrade changes nothing until an operator opts in.
+    pub dedup_cold_clusters: bool,
+    /// DBSCAN density floor for A3. `0` ⇒ the conservative default (2).
+    pub dedup_min_pts: usize,
+    /// Conservative ceiling on the adaptive eps (cosine distance) for A3.
+    /// `0.0` ⇒ the conservative default. Lower errs harder toward NOT merging.
+    pub dedup_max_eps: f32,
+    /// Optional per-tier half-life overrides (`[decay.half_life_days]`). All
+    /// keys default to unset ⇒ the scalar `lambda` applies to every tier, which
+    /// is byte-identical to the historical single-λ behaviour.
+    pub half_life_days: DecayHalfLifeDays,
 }
 
 impl Default for DecaySettings {
@@ -83,6 +139,11 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            compact_cold_episodic: false,
+            dedup_cold_clusters: false,
+            dedup_min_pts: 0,
+            dedup_max_eps: 0.0,
+            half_life_days: DecayHalfLifeDays::default(),
         }
     }
 }
@@ -98,6 +159,28 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+            // Half-life-in-days is the user surface; λ is the math. Convert here
+            // once. An unset key stays `None`, so `lambda_for` falls back to the
+            // scalar `lambda` unchanged — the identity default, no days↔λ
+            // round-trip that could perturb an unconfigured store's scores.
+            tier_lambda: ai_memory_store::TierLambdas {
+                working: self
+                    .half_life_days
+                    .working
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                episodic: self
+                    .half_life_days
+                    .episodic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                semantic: self
+                    .half_life_days
+                    .semantic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                procedural: self
+                    .half_life_days
+                    .procedural
+                    .map(ai_memory_store::lambda_from_half_life_days),
+            },
         }
     }
 
@@ -111,6 +194,24 @@ impl DecaySettings {
         ai_memory_consolidate::ObservationRetention {
             days: self.observation_retention_days,
             batch: self.observation_prune_batch,
+        }
+    }
+
+    /// A3 cold-cluster dedup options for the M8 sweep.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case A3 is a clean no-op
+    /// even with the flag on (there are no stored vectors to cluster).
+    #[must_use]
+    pub fn cold_cluster_dedup(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::ColdClusterDedup {
+        ai_memory_consolidate::ColdClusterDedup {
+            enabled: self.dedup_cold_clusters,
+            embedding,
+            min_pts: self.dedup_min_pts,
+            max_eps: self.dedup_max_eps,
         }
     }
 }
@@ -154,6 +255,14 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
+    /// Idle-time (seconds) before the OS starts probing an accepted `serve`
+    /// connection with TCP keepalive. `0` disables keepalive entirely. A
+    /// hook client's peer can die without sending FIN (laptop sleep, a
+    /// VPN/Tailscale flap, an abrupt kill); without keepalive the socket
+    /// stays `ESTABLISHED` forever and leaks one fd per dead peer until
+    /// `accept()` fails with `EMFILE` and the healthcheck breaks (#792). Set
+    /// with `AI_MEMORY_TCP_KEEPALIVE_SECS`.
+    pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
     /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
@@ -167,15 +276,17 @@ pub struct Config {
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
-    /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
-    /// startup heal from treating `$HOME` as a prefix-match catch-all
-    /// (issue #103) without env reads scattered through the runtime. Not a
-    /// config.toml key: always derived from the process environment at load.
+    /// path) from `AI_MEMORY_HOME`, `$HOME`, or Windows `%USERPROFILE%`. Used
+    /// to keep the cwd->project resolver and the startup heal from treating
+    /// the user profile as a prefix-match catch-all (issue #103) without env
+    /// reads scattered through the runtime. Not a config.toml key: always
+    /// derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`,
+    /// `openai-oauth`, `codex`, `copilot`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -247,6 +358,14 @@ pub struct Config {
     /// hand.
     #[serde(skip)]
     pub llm_fallback_configs: Vec<ProviderConfig>,
+    /// One message per `llm_fallbacks` entry whose `api_key_env` names a
+    /// variable absent from this process's environment. Such an entry is left
+    /// out of [`Self::llm_fallback_configs`]; the failure is raised by
+    /// [`Self::require_llm_fallback_credentials`] instead of by `load`, so a
+    /// CLI invocation that never builds the LLM chain does not need the
+    /// server's credentials (#762). Same `pub` rationale as above.
+    #[serde(skip)]
+    pub llm_fallback_unresolved: Vec<String>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -263,6 +382,23 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// On by default. When the project's ai-memory store is brand new (empty),
+    /// the SessionStart hook triggers a one-time, bounded import of this
+    /// project's existing local harness session history so installing hooks
+    /// mid-project does not start amnesiac. The import is read-only on the local
+    /// side, sanitized on the server exactly like live capture, and only ever
+    /// bootstraps an empty project (never overwrites an established one). Turn
+    /// off with `AI_MEMORY_BACKFILL_ON_START=false` or `backfill_on_start =
+    /// false`; `ai-memory backfill` remains available to run it by hand.
+    pub backfill_on_start: bool,
+    /// On by default. The first time `ai-memory run <harness>` launches a
+    /// harness (per harness + binary version), it auto-installs that harness's
+    /// ai-memory lifecycle hooks and MCP server if they are not already wired,
+    /// so managed launches capture and can query memory without a manual
+    /// `install-hooks` / `install-mcp` step. Idempotent and one-time per
+    /// harness. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
+    /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
+    pub run_autowire: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -313,6 +449,14 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Opt-in LLM "dream" pass (B2/B3/B4): rewrite/merge cold clusters with the
+    /// configured provider, scheduled on idle and cancelled the moment the
+    /// operator returns. OFF by default and gated on an R2 number before it may
+    /// default on; never deletes a source.
+    pub dream: DreamSettings,
+    /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
+    /// lexical query-intent routing). All off by default.
+    pub retrieval: RetrievalSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
@@ -397,6 +541,9 @@ pub struct Config {
 pub struct RuntimeEnv {
     data_dir: Option<PathBuf>,
     home_dir: Option<String>,
+    platform_home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    codex_executable: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -421,9 +568,18 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     fn from_process() -> Self {
+        let platform_home = dirs::home_dir();
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
-            home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
+            home_dir: resolve_operator_home(
+                env_string("AI_MEMORY_HOME").as_deref(),
+                env_string("HOME").as_deref(),
+                env_string("USERPROFILE").as_deref(),
+                platform_home.as_deref(),
+            ),
+            platform_home,
+            codex_home: env_path("CODEX_HOME"),
+            codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -693,6 +849,7 @@ impl Default for Config {
         Self {
             data_dir: default_data_dir(),
             bind: DEFAULT_BIND.into(),
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
             base_path: String::new(),
             home_dir: None,
@@ -706,8 +863,11 @@ impl Default for Config {
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
             llm_fallback_configs: Vec::new(),
+            llm_fallback_unresolved: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
+            backfill_on_start: true,
+            run_autowire: true,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -717,6 +877,8 @@ impl Default for Config {
             embedding_base_url: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            dream: DreamSettings::default(),
+            retrieval: RetrievalSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
@@ -861,6 +1023,11 @@ pub struct AutoImproveSchedulerSettings {
     pub experience_every_sessions: u64,
     /// How many recent session summary pages one experience pass reads.
     pub experience_sessions: usize,
+    /// A4 entropy / boilerplate pre-filter for the experience pass
+    /// (`[auto_improve.scheduler.experience_entropy_filter]`). Off by default:
+    /// low-information session pages are skipped from consolidation only when an
+    /// operator enables it. Advisory (skip, never delete).
+    pub experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -872,6 +1039,7 @@ impl Default for AutoImproveSchedulerSettings {
             min_session_age_secs: 600,
             experience_every_sessions: 0,
             experience_sessions: 10,
+            experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig::default(),
         }
     }
 }
@@ -983,6 +1151,147 @@ impl Default for MaintenanceSettings {
     }
 }
 
+/// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
+///
+/// OFF by default (`enabled = false`): the scheduled job is not started, and even
+/// a direct call is a clean no-op. It runs only when this flag is set AND a
+/// provider AND an embedder are configured; a provider-less store keeps the
+/// zero-LLM A3 path (invariant #13). Gated on an R2 number before default-on.
+///
+/// Env form: `AI_MEMORY_DREAM__ENABLED=true`,
+/// `AI_MEMORY_DREAM__IDLE_WINDOW_SECS=600`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DreamSettings {
+    /// Master switch. `false` (the default) means the job never starts.
+    pub enabled: bool,
+    /// How often the scheduler CONSIDERS a run (seconds). It still only runs when
+    /// the operator has been idle for `idle_window_secs`. `0` ⇒ a conservative
+    /// default cadence.
+    pub interval_secs: u64,
+    /// Idle window (seconds) the operator must be quiet for before a run starts,
+    /// and past which returning activity cancels an in-flight run (B3). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_IDLE_WINDOW_SECS`].
+    pub idle_window_secs: u64,
+    /// DBSCAN density floor. `0` ⇒ the conservative default (2).
+    pub min_pts: usize,
+    /// Conservative eps ceiling (cosine distance). `0.0` ⇒ the conservative
+    /// default; lower errs harder toward NOT merging.
+    pub max_eps: f32,
+    /// Hard cap on clusters rewritten per run (bounded fan-out, invariant #5).
+    /// `0` ⇒ [`ai_memory_consolidate::DEFAULT_DREAM_MAX_CLUSTERS_PER_RUN`].
+    pub max_clusters_per_run: usize,
+    /// Minimum cold pages before a run does work (the events-accrued gate). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_MIN_COLD_PAGES`].
+    pub min_cold_pages: usize,
+}
+
+impl Default for DreamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // A conservative default cadence: the job wakes hourly to check
+            // whether the box has been idle long enough to run.
+            interval_secs: 3_600,
+            idle_window_secs: 0,
+            min_pts: 0,
+            max_eps: 0.0,
+            max_clusters_per_run: 0,
+            min_cold_pages: 0,
+        }
+    }
+}
+
+impl DreamSettings {
+    /// The effective scheduler interval in seconds (never zero).
+    #[must_use]
+    pub fn effective_interval_secs(self) -> u64 {
+        if self.interval_secs == 0 {
+            3_600
+        } else {
+            self.interval_secs
+        }
+    }
+
+    /// Build the [`ai_memory_consolidate::DreamConfig`] for the pass.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case the dream pass is a
+    /// clean no-op even with the flag on (there are no stored vectors).
+    #[must_use]
+    pub fn dream_config(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::DreamConfig {
+        ai_memory_consolidate::DreamConfig {
+            enabled: self.enabled,
+            embedding,
+            min_pts: self.min_pts,
+            max_eps: self.max_eps,
+            max_clusters_per_run: self.max_clusters_per_run,
+            min_cold_pages: self.min_cold_pages,
+            idle_window_secs: self.idle_window_secs,
+        }
+    }
+}
+
+/// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
+/// `memory_query`. Every default leaves ranking byte-identical to a store
+/// that never heard of this section.
+///
+/// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetrievalSettings {
+    /// Lexical session-recall routing: queries phrased as "find a past
+    /// session / what we did back then" ("上次 / …的会话 / last time /
+    /// yesterday …") hand session pages back their default kind/tier
+    /// authority penalty so they can compete for these queries.
+    pub query_intent: bool,
+    /// Extra authority granted to session pages when the routing fires,
+    /// on top of cancelling their default kind/tier penalty.
+    pub session_recall_bonus: f64,
+    /// Add the L0 abstract-embedding stream (`page_abstract_embeddings`) to
+    /// the RRF fusion. Pages gain an abstract vector when their frontmatter
+    /// carries `abstract:` and the embedding backfill runs.
+    pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into page
+    /// authority (P2). `0.0` (the default) is inert — ranking is byte-identical
+    /// and no belief query runs. Positive folds a page's evidence-derived
+    /// `confidence` into its authority factor, inside the existing bounds.
+    /// OFF by default: enabling it is gated on a positive R2 delta.
+    pub belief_authority_weight: f64,
+}
+
+impl Default for RetrievalSettings {
+    fn default() -> Self {
+        let base = ai_memory_store::RetrievalTuning::default();
+        Self {
+            query_intent: base.session_recall_routing,
+            session_recall_bonus: base.session_recall_bonus,
+            abstract_vectors: base.abstract_vectors,
+            belief_authority_weight: base.belief_authority_weight,
+        }
+    }
+}
+
+impl RetrievalSettings {
+    /// Store-side tuning consumed by `ReaderPool::set_retrieval_tuning`.
+    #[must_use]
+    pub fn tuning(self) -> ai_memory_store::RetrievalTuning {
+        ai_memory_store::RetrievalTuning {
+            session_recall_routing: self.query_intent,
+            session_recall_bonus: self.session_recall_bonus.max(0.0),
+            abstract_vectors: self.abstract_vectors,
+            // A negative weight would flip the boost into a penalty on
+            // supported pages; clamp it out so misconfiguration is inert, not
+            // inverted.
+            belief_authority_weight: self.belief_authority_weight.max(0.0),
+        }
+    }
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1041,7 +1350,9 @@ impl Config {
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
         // env directly. AI_MEMORY_HOME is accepted for tests/wrappers that need
-        // to emulate a host home distinct from the process HOME.
+        // to emulate a host home distinct from the process HOME. Native Windows
+        // often has no HOME; USERPROFILE (then dirs::home_dir) fills that gap
+        // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
         // CLI override always wins (figment doesn't see it because clap has
@@ -1061,6 +1372,27 @@ impl Config {
             );
         }
 
+        // A per-tier half-life must be a real, positive number of days: `0` (or
+        // negative/NaN) would convert to a nonsensical λ (+inf / negative /
+        // NaN) and silently mass-evict or never decay that tier. Reject it at
+        // load rather than at 3am inside the sweep. An unset key is fine — it
+        // falls back to the scalar `lambda`.
+        for (tier, value) in [
+            ("working", config.decay.half_life_days.working),
+            ("episodic", config.decay.half_life_days.episodic),
+            ("semantic", config.decay.half_life_days.semantic),
+            ("procedural", config.decay.half_life_days.procedural),
+        ] {
+            if let Some(days) = value
+                && (!days.is_finite() || days <= 0.0)
+            {
+                anyhow::bail!(
+                    "decay.half_life_days.{tier} must be a finite number greater than zero \
+                     (got {days}); omit the key to use the default decay rate"
+                );
+            }
+        }
+
         // Fail closed at load rather than at 3am inside a destructive pass: a
         // negative age would be a nonsensical cutoff, and a zero batch would
         // spin the prune loop forever without deleting anything.
@@ -1072,6 +1404,16 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+        // A4 entropy filter thresholds: reject an unusable threshold at startup
+        // rather than silently ignoring it on the first experience pass.
+        if let Err(message) = config
+            .auto_improve
+            .scheduler
+            .experience_entropy_filter
+            .validate()
+        {
+            anyhow::bail!("auto_improve.scheduler.experience_{message}");
         }
 
         // Fail at startup rather than shipping a prompt that is all scaffolding
@@ -1118,16 +1460,31 @@ impl Config {
         // sit unused for months and only fail once the primary is already
         // down. The environment is read here, once, per invariant #1 (no
         // `std::env::var` outside `load`).
+        //
+        // An absent credential is the one failure that is deferred rather than
+        // raised (#762): the variable belongs in the server's environment (a
+        // service wrapper's env block), not in every shell that runs
+        // `ai-memory status`. It is recorded here and enforced by
+        // `require_llm_fallback_credentials` at `serve` startup and by
+        // `llm_provider_chain`, so the server still fails closed.
         let mut fallback_configs = Vec::with_capacity(config.llm_fallbacks.len());
+        let mut unresolved = Vec::new();
         for (i, profile) in config.llm_fallbacks.iter().enumerate() {
-            let resolved_key = match non_empty(profile.api_key_env.as_deref()) {
-                Some(name) => Some(SecretString::from(env_string(name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "llm_fallbacks[{i}].api_key_env={name} is set but the environment \
-                         variable is missing or empty"
-                    )
-                })?)),
-                None => None,
+            let (resolved_key, missing) = match non_empty(profile.api_key_env.as_deref()) {
+                Some(name) => match env_string(name) {
+                    Some(key) => (Some(SecretString::from(key)), None),
+                    None => (
+                        // Stands in for the absent key so the rest of the
+                        // profile is still validated eagerly below; the
+                        // config built from it is discarded.
+                        Some(SecretString::from(UNRESOLVED_FALLBACK_KEY)),
+                        Some(format!(
+                            "llm_fallbacks[{i}].api_key_env={name} is set but the \
+                             environment variable is missing or empty"
+                        )),
+                    ),
+                },
+                None => (None, None),
             };
             let provider_cfg = config
                 .fallback_provider_config(i, profile, resolved_key)
@@ -1137,9 +1494,13 @@ impl Config {
             // silently sitting unused until the primary has an outage.
             build_provider(provider_cfg.clone())
                 .with_context(|| format!("building llm_fallbacks[{i}]"))?;
-            fallback_configs.push(provider_cfg);
+            match missing {
+                Some(message) => unresolved.push(message),
+                None => fallback_configs.push(provider_cfg),
+            }
         }
         config.llm_fallback_configs = fallback_configs;
+        config.llm_fallback_unresolved = unresolved;
 
         Ok(config)
     }
@@ -1173,7 +1534,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = match non_empty(self.llm_model.as_deref()) {
@@ -1184,6 +1545,7 @@ impl Config {
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+                ProviderChoice::Codex => "gpt-5.6-luna".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
@@ -1199,13 +1561,7 @@ impl Config {
             provider,
             model,
             auth: self.provider_auth(provider, None),
-            // base_url falls back to the runtime env (LLM_BASE_URL), mirroring
-            // how auth is sourced — otherwise openai-compat is only
-            // configurable via config.toml even though the key comes from env.
-            base_url: self
-                .llm_base_url
-                .clone()
-                .or_else(|| self.runtime_env.llm_base_url.clone()),
+            base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
@@ -1238,7 +1594,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "llm_fallbacks[{index}].provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -1293,6 +1649,16 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                resolve_codex_auth_file(
+                    self.runtime_env.codex_home.as_deref(),
+                    self.runtime_env.platform_home.as_deref(),
+                ),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1302,6 +1668,24 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
+        }
+    }
+
+    /// Fail when an `llm_fallbacks` credential named by `api_key_env` is
+    /// absent from this process's environment.
+    ///
+    /// `serve` calls this at startup, so a fallback that could never
+    /// authenticate stops the server before it runs, whether or not a primary
+    /// provider is configured. Other subcommands do not: they never build the
+    /// chain, and requiring the server's credentials in every shell would
+    /// spread them to every process the operator runs (#762).
+    ///
+    /// # Errors
+    /// Names the first unresolved profile and its variable.
+    pub fn require_llm_fallback_credentials(&self) -> Result<()> {
+        match self.llm_fallback_unresolved.first() {
+            Some(message) => anyhow::bail!("{message}"),
+            None => Ok(()),
         }
     }
 
@@ -1318,6 +1702,11 @@ impl Config {
     /// Propagates any error from constructing the primary or a fallback
     /// provider (`build_provider` is the sole construction path for both).
     pub fn llm_provider_chain(&self) -> LlmResult<Option<Arc<dyn LlmProvider>>> {
+        // A chain with a profile silently dropped would look healthy until
+        // the primary has an outage.
+        if let Some(message) = self.llm_fallback_unresolved.first() {
+            return Err(LlmError::NotConfigured(message.clone()));
+        }
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
@@ -1409,10 +1798,11 @@ impl Config {
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             "local" => EmbedderChoice::Local,
+            "copilot" => EmbedderChoice::Copilot,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat|local|none"
+                     openai|voyage|google|gemini|openai-compat|local|copilot|none"
                 )));
             }
         };
@@ -1430,6 +1820,7 @@ impl Config {
                     ));
                 }
                 EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
+                EmbedderChoice::Copilot => ai_memory_llm::COPILOT_DEFAULT_EMBED_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1470,6 +1861,8 @@ impl Config {
                 .unwrap_or_else(|| SecretString::from(String::new())),
             // In-process: no key, ever.
             EmbedderChoice::Local => SecretString::from(String::new()),
+            // OAuth-backed: no API key, ever; see `copilot_auth` below.
+            EmbedderChoice::Copilot => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1477,6 +1870,17 @@ impl Config {
                 "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
             ));
         }
+        // Resolve Copilot auth only when the embedding provider is actually
+        // copilot (invariant 14: auth resolves before construction). Mirrors
+        // exactly how the chat-provider path builds `ProviderAuth::copilot`.
+        let copilot_auth = if provider == EmbedderChoice::Copilot {
+            Some(
+                self.provider_auth(ProviderChoice::Copilot, None)
+                    .require_copilot_auth()?,
+            )
+        } else {
+            None
+        };
         Ok(Some(EmbedderConfig {
             provider,
             model,
@@ -1484,6 +1888,7 @@ impl Config {
             api_key,
             base_url,
             models_dir: Some(self.data_dir.join("models")),
+            copilot_auth,
             defaulted,
         }))
     }
@@ -1497,6 +1902,7 @@ impl Config {
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
             ProviderChoice::OpenAiOAuth => None,
+            ProviderChoice::Codex => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
@@ -1513,6 +1919,17 @@ impl Config {
     #[must_use]
     pub fn openai_oauth_token_path(&self) -> PathBuf {
         self.auth_token_path()
+    }
+
+    /// Codex CLI-owned auth file resolved from the Codex or platform home.
+    #[must_use]
+    pub fn codex_auth_file_path(&self) -> PathBuf {
+        let platform_home = self
+            .runtime_env
+            .platform_home
+            .as_deref()
+            .or_else(|| self.runtime_env.home_dir.as_deref().map(Path::new));
+        resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
     }
 
     /// Shared Copilot auth token file path.
@@ -1561,6 +1978,13 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                self.codex_auth_file_path(),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1576,14 +2000,44 @@ impl Config {
         }
     }
 
+    /// Base URL for `provider`, from the two sources that can supply one.
+    ///
+    /// An explicit ai-memory setting (`llm_base_url` in `config.toml`, or
+    /// `AI_MEMORY_LLM_BASE_URL`) configures any provider: naming ai-memory is
+    /// how an operator says they mean it, and proxying a vendor endpoint is a
+    /// legitimate deployment.
+    ///
+    /// The bare `LLM_BASE_URL` is different in kind — a cross-tool convention
+    /// an operator exports once for a local Ollama and forgets. It reaches
+    /// only the providers whose endpoint is theirs to choose anyway; sending
+    /// it to a vendor-fixed endpoint silently rewrites every request onto a
+    /// host that does not speak the dialect (#691), so it is ignored and the
+    /// reason is logged rather than left for a 404 to explain.
+    fn resolve_base_url(&self, provider: ProviderChoice) -> Option<String> {
+        if let Some(explicit) = non_empty(self.llm_base_url.as_deref()) {
+            return Some(explicit.to_string());
+        }
+        let ambient = non_empty(self.runtime_env.llm_base_url.as_deref())?;
+        if provider.endpoint_is_operator_chosen() {
+            return Some(ambient.to_string());
+        }
+        tracing::warn!(
+            provider = provider.name(),
+            base_url = ambient,
+            "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
+             endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
+             somewhere else on purpose."
+        );
+        None
+    }
+
     /// Base URL fallback for `llm-test`. Resolves exactly as
     /// [`Self::provider_config`] does, so `llm-test` exercises the endpoint
-    /// `serve` will use — including an `opencode` override onto Zen.
+    /// `serve` will use — including an `opencode` override onto Zen, and the
+    /// same refusal to inherit an ambient `LLM_BASE_URL`.
     #[must_use]
-    pub fn llm_test_base_url(&self) -> Option<String> {
-        self.llm_base_url
-            .clone()
-            .or_else(|| self.runtime_env.llm_base_url.clone())
+    pub fn llm_test_base_url(&self, provider: ProviderChoice) -> Option<String> {
+        self.resolve_base_url(provider)
     }
 }
 
@@ -1595,11 +2049,38 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "gemini" | "google" => ProviderChoice::Gemini,
         "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
         "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "codex" => ProviderChoice::Codex,
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
         _ => return None,
     })
+}
+
+/// Operator home used as the #103 catch-all prefix guard.
+///
+/// Precedence: `AI_MEMORY_HOME`, then `$HOME`, then Windows `%USERPROFILE%`,
+/// then the platform home from `dirs`. Empty strings are skipped so an
+/// exported-but-blank `HOME` cannot hide a real profile. Arguments are
+/// injected so tests do not mutate process env (`std::env::set_var` is
+/// `unsafe` under edition 2024).
+fn resolve_operator_home(
+    ai_memory_home: Option<&str>,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    platform_home: Option<&Path>,
+) -> Option<String> {
+    [ai_memory_home, home, userprofile]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            platform_home
+                .and_then(Path::to_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -1615,6 +2096,16 @@ fn env_string(name: &str) -> Option<String> {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     env_string(name).map(PathBuf::from)
+}
+
+fn resolve_codex_auth_file(codex_home: Option<&Path>, platform_home: Option<&Path>) -> PathBuf {
+    if let Some(home) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
+        return home.join("auth.json");
+    }
+    platform_home
+        .unwrap_or_else(|| Path::new("."))
+        .join(".codex")
+        .join("auth.json")
 }
 
 fn env_secret(name: &str) -> Option<SecretString> {
@@ -1948,6 +2439,7 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
@@ -2029,6 +2521,97 @@ mod tests {
             assert!(
                 error.to_string().contains("breadth_weight"),
                 "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
+    /// converts each to the internal λ; an omitted key falls back to the scalar
+    /// `lambda`, so the resulting `DecayParams` is a pure identity for every
+    /// unset tier.
+    #[test]
+    fn load_parses_per_tier_half_lives_and_falls_back_for_omitted_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[decay.half_life_days]\nepisodic = 365.0\nworking = 7.0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+
+        // Configured tiers convert days -> λ = ln(2) / days.
+        let expect = |days: f64| std::f64::consts::LN_2 / days;
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Episodic).to_bits(),
+            expect(365.0).to_bits(),
+        );
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Working).to_bits(),
+            expect(7.0).to_bits(),
+        );
+        // Omitted tiers fall back to the scalar λ, byte-for-byte.
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Semantic).to_bits(),
+            params.lambda.to_bits(),
+        );
+        assert_eq!(
+            params
+                .lambda_for(ai_memory_core::Tier::Procedural)
+                .to_bits(),
+            params.lambda.to_bits(),
+        );
+    }
+
+    /// With no `[decay.half_life_days]` table the resolved `DecayParams` is the
+    /// store default: every tier's λ is the scalar `lambda` (the identity
+    /// upgrade guarantee at the config layer).
+    #[test]
+    fn load_without_half_lives_is_identity_to_the_default_params() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+        let default = ai_memory_store::DecayParams::default();
+        for tier in [
+            ai_memory_core::Tier::Working,
+            ai_memory_core::Tier::Episodic,
+            ai_memory_core::Tier::Semantic,
+            ai_memory_core::Tier::Procedural,
+        ] {
+            assert_eq!(
+                params.lambda_for(tier).to_bits(),
+                default.lambda_for(tier).to_bits(),
+                "tier {tier:?} must decay at the default scalar λ",
+            );
+        }
+    }
+
+    /// A zero, negative, or non-finite half-life converts to a nonsensical λ,
+    /// so it is rejected at load rather than silently mass-evicting (or never
+    /// decaying) that tier.
+    #[test]
+    fn load_rejects_invalid_per_tier_half_lives() {
+        for (tier, value) in [
+            ("episodic", "0.0"),
+            ("working", "-5.0"),
+            ("semantic", "nan"),
+            ("procedural", "inf"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[decay.half_life_days]\n{tier} = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an invalid per-tier half-life must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("decay.half_life_days.{tier}")),
+                "unexpected error for {tier} = {value}: {error:#}"
             );
         }
     }
@@ -2245,17 +2828,57 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
         let cfg = Config::load(None, Some(cli_dir)).unwrap();
-        // `home_dir` is derived from AI_MEMORY_HOME or `$HOME` at load (the
-        // single config-read path), normalized so a trailing slash can't bypass
-        // the catch-all guards. Reading the env in a test is allowed; this
-        // fails if the load-time assignment is dropped while either env var is
-        // set.
+        // `home_dir` is derived from AI_MEMORY_HOME, `$HOME`, or Windows
+        // `%USERPROFILE%` at load (the single config-read path), normalized so
+        // a trailing slash can't bypass the catch-all guards. Reading the env
+        // in a test is allowed; this fails if the load-time assignment is
+        // dropped while any of those vars is set.
         assert_eq!(
             cfg.home_dir,
             std::env::var("AI_MEMORY_HOME")
                 .or_else(|_| std::env::var("HOME"))
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
+                .or_else(|| dirs::home_dir()
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .and_then(normalize_home_dir))
+        );
+    }
+
+    /// Native Windows often has `%USERPROFILE%` and no `$HOME`. The #103
+    /// catch-all guard is inert when `home_dir` stays `None`, so a project
+    /// whose `repo_path` is the user profile would prefix-match every cwd
+    /// beneath it.
+    #[test]
+    fn operator_home_falls_back_to_userprofile_when_home_is_unset() {
+        assert_eq!(
+            resolve_operator_home(None, None, Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        assert_eq!(
+            resolve_operator_home(
+                Some("/tmp/override"),
+                Some("/home/u"),
+                Some(r"C:\Users\tester"),
+                None
+            )
+            .as_deref(),
+            Some("/tmp/override")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some("/home/u"), Some(r"C:\Users\tester"), None).as_deref(),
+            Some("/home/u")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some(""), Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        let platform = PathBuf::from(r"C:\Users\from-dirs");
+        assert_eq!(
+            resolve_operator_home(None, None, None, Some(platform.as_path())).as_deref(),
+            Some(r"C:\Users\from-dirs")
         );
     }
 
@@ -2597,6 +3220,68 @@ mod tests {
     }
 
     #[test]
+    fn copilot_embedding_defaults_model_dim_and_reuses_copilot_auth() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            runtime_env: RuntimeEnv {
+                copilot_github_token: Some(SecretString::from("ghu-test")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::Copilot);
+        assert_eq!(embedder.model, "text-embedding-3-small");
+        assert_eq!(embedder.dim, 1536);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        let auth = embedder
+            .copilot_auth
+            .expect("copilot embedder config carries resolved Copilot auth");
+        assert_eq!(auth.token_file, tmp.path().join("auth.json"));
+        assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
+    }
+
+    #[test]
+    fn copilot_embedding_without_credentials_still_resolves_auth_material() {
+        // `embedder_config` only resolves auth *inputs*, mirroring the chat
+        // provider path (`copilot_provider_uses_data_dir_token_file_and_env_token`);
+        // whether a usable credential exists is checked at construction time
+        // by `CopilotEmbedder::new` (`ai-memory-llm`), not here.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        let auth = embedder.copilot_auth.expect("copilot auth is resolved");
+        assert!(auth.github_token.is_none());
+        assert!(auth.direct_api_token.is_none());
+    }
+
+    #[test]
+    fn non_copilot_embedding_leaves_copilot_auth_unresolved() {
+        // Auth resolution must be gated on the embedding provider actually
+        // being copilot — resolving it unconditionally would fail closed for
+        // every operator who has not logged into Copilot at all.
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("sk-embed-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert!(embedder.copilot_auth.is_none());
+    }
+
+    #[test]
     fn openai_embedding_does_not_use_llm_api_key_without_custom_base_url() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
@@ -2786,6 +3471,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_uses_codex_home_auth_and_default_model() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("custom-codex-home");
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                codex_home: Some(codex_home.clone()),
+                codex_executable: Some(PathBuf::from("codex-custom")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Codex);
+        assert_eq!(provider.model, "gpt-5.6-luna");
+        assert_eq!(auth.auth_file, codex_home.join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex-custom"));
+    }
+
+    #[test]
+    fn codex_provider_falls_back_to_platform_home() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(tmp.path().to_path_buf()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.auth_file, tmp.path().join(".codex").join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex"));
+    }
+
+    #[test]
     fn provider_config_forwards_the_operator_headers() {
         let tmp = TempDir::new().unwrap();
         let cfg = Config {
@@ -2799,6 +3526,24 @@ mod tests {
         assert_eq!(
             provider.extra_headers,
             ExtraHeaders::parse(["x-opencode-session=ses-1"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_auth_resolution_treats_empty_codex_home_as_unset() {
+        let platform_home = Path::new("/platform/home");
+
+        assert_eq!(
+            resolve_codex_auth_file(None, Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("")), Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("/custom/codex")), Some(platform_home)),
+            Path::new("/custom/codex").join("auth.json")
         );
     }
 
@@ -2966,20 +3711,93 @@ mod tests {
         );
     }
 
+    /// #762: a credential absent from the invoking shell no longer fails
+    /// `load` — `ai-memory status` must work from a shell that does not hold
+    /// the server's keys — but it still fails closed wherever the chain is
+    /// actually needed: `serve` startup and chain construction.
     #[test]
-    fn load_rejects_a_missing_or_empty_api_key_env_value() {
-        let error = load_with_toml(
-            "[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n\
+    fn a_missing_api_key_env_value_defers_to_serve_and_the_chain() {
+        let config = load_with_toml(
+            "llm_provider = \"gemini\"\n\
+             [[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n\
              api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648\"\n",
         )
-        .expect_err("an unresolved api_key_env must fail closed");
+        .expect("a CLI that never builds the chain must load without the credential");
+        let expected = "llm_fallbacks[0].api_key_env=AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648 is \
+                        set but the environment variable is missing or empty";
+
         assert!(
-            format!("{error:#}").contains(
-                "llm_fallbacks[0].api_key_env=AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648 is set but \
-                 the environment variable is missing or empty"
-            ),
+            config.llm_fallback_configs.is_empty(),
+            "an unresolved profile must never reach the chain"
+        );
+        let error = config
+            .require_llm_fallback_credentials()
+            .expect_err("serve startup must still fail closed");
+        assert_eq!(format!("{error:#}"), expected);
+        let error = config
+            .llm_provider_chain()
+            .err()
+            .expect("building the chain must fail rather than drop the fallback");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Deferring the credential must not defer the rest of the profile's
+    /// validation: a malformed profile still fails `load` for every command.
+    #[test]
+    fn a_missing_api_key_env_value_does_not_hide_a_malformed_profile() {
+        let error = load_with_toml(
+            "[[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"m\"\n\
+             api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_762\"\n",
+        )
+        .expect_err("openai-compat needs a base_url whether or not the key is present");
+        assert!(
+            format!("{error:#}").contains("LLM_BASE_URL"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// The placeholder that validates a profile with an absent credential
+    /// must be accepted by every API-key provider's constructor. If one ever
+    /// checks key shape (a prefix, a length), a correct profile would fail
+    /// `load` over a key the operator never set — this pins that it does not.
+    #[test]
+    fn every_api_key_provider_accepts_the_unresolved_placeholder() {
+        for (provider, extra) in [
+            ("anthropic", ""),
+            ("openai", ""),
+            ("gemini", ""),
+            ("opencode", ""),
+            (
+                "openai-compat",
+                "base_url = \"https://openrouter.ai/api/v1\"\n",
+            ),
+        ] {
+            let config = load_with_toml(&format!(
+                "[[llm_fallbacks]]\nprovider = \"{provider}\"\nmodel = \"m\"\n{extra}\
+                 api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_762\"\n"
+            ))
+            .unwrap_or_else(|error| {
+                panic!("{provider}: load must defer the credential: {error:#}")
+            });
+            assert_eq!(
+                config.llm_fallback_unresolved.len(),
+                1,
+                "{provider}: the absent credential must be recorded"
+            );
+            assert!(
+                config.llm_fallback_configs.is_empty(),
+                "{provider}: the placeholder-built config must be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_without_unresolved_fallbacks_passes_the_serve_check() {
+        let config = load_with_toml("").unwrap();
+        config.require_llm_fallback_credentials().unwrap();
     }
 
     #[test]
@@ -3147,4 +3965,113 @@ fn llm_provider_config_gemini_uses_default_base_url_when_none_provided() {
     let provider = cfg.llm_provider_config().unwrap().unwrap();
     assert_eq!(provider.provider, ProviderChoice::Gemini);
     assert_eq!(provider.base_url, None);
+}
+
+// #691: `LLM_BASE_URL` is an ambient, cross-tool convention — an operator who
+// once pointed it at Ollama for `openai-compat` keeps it exported. Feeding it
+// to Gemini builds `http://localhost:11434/v1beta/models/<model>:generateContent`,
+// which Ollama answers with a plain-text `404 page not found`; the bootstrap
+// surfaces that as a 502 with no server-side log line to explain it.
+#[test]
+fn ambient_llm_base_url_does_not_override_gemini() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::Gemini);
+    assert_eq!(provider.base_url, None);
+}
+
+// The other half of #691: the ambient fallback exists *for* the dialects whose
+// endpoint the operator supplies, and narrowing it must not take that away.
+// `openai-compat` has no endpoint at all without one.
+#[test]
+fn ambient_llm_base_url_still_configures_openai_compat() {
+    let cfg = Config {
+        llm_provider: Some("openai-compat".into()),
+        llm_model: Some("gemma4:26b-mlx".into()),
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            llm_base_url: Some("http://localhost:11434/v1".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::OpenAiCompat);
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("http://localhost:11434/v1")
+    );
+}
+
+// `opencode` defaults to Go and reaches Zen's general catalogue only through an
+// override, so it is operator-chosen too.
+#[test]
+fn ambient_llm_base_url_still_configures_opencode() {
+    let cfg = Config {
+        llm_provider: Some("opencode".into()),
+        runtime_env: RuntimeEnv {
+            opencode_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("https://opencode.ai/zen/v1".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::OpenCode);
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://opencode.ai/zen/v1")
+    );
+}
+
+// Naming ai-memory is how an operator says they mean it: proxying Gemini stays
+// possible, and the explicit setting outranks an ambient one that disagrees.
+#[test]
+fn explicit_llm_base_url_still_overrides_gemini_over_an_ambient_one() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: Some("https://gemini-proxy.internal".into()),
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://gemini-proxy.internal")
+    );
+}
+
+// `llm-test` is the tool an operator reaches for to reproduce what `serve`
+// does. It resolved base_url through its own copy of the old chain, so before
+// this fix it hit the ambient endpoint too — and agreed with the broken server
+// instead of exposing it.
+#[test]
+fn llm_test_base_url_resolves_per_provider_like_serve_does() {
+    let cfg = Config {
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    assert_eq!(cfg.llm_test_base_url(ProviderChoice::Gemini), None);
+    assert_eq!(
+        cfg.llm_test_base_url(ProviderChoice::OpenAiCompat)
+            .as_deref(),
+        Some("http://localhost:11434")
+    );
 }

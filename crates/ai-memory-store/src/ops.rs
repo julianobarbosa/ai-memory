@@ -7,9 +7,10 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageId,
-    PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
+    MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
+    ObservationKind, OwnerFilter, PageEvidence, PageId, PagePath, ProjectId, SessionId,
+    WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -820,6 +821,140 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
     Ok(summary)
 }
 
+/// Default batch size for [`backfill_page_windows`]: rows updated (and WAL
+/// pages accumulated) per transaction before the checkpoint truncates the
+/// log. Bounds peak `-wal` to a small multiple of this many two-column
+/// updates regardless of total store size.
+pub const PAGE_WINDOW_BACKFILL_BATCH: usize = 5_000;
+
+/// What a [`backfill_page_windows`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageWindowBackfillSummary {
+    /// Page versions whose `valid_from`/`valid_to` window was written.
+    pub pages_backfilled: u64,
+    /// Batched transactions committed (each followed by a WAL checkpoint).
+    pub batches: u64,
+}
+
+/// Chunked, resumable, WAL-bounded backfill of page ingestion windows
+/// (`valid_from`/`valid_to`) — the reshaped V62 (issue #776).
+///
+/// V62 adds the two columns and their index as cheap DDL; this reconstructs
+/// the windows the original in-migration `UPDATE`s produced, but in bounded
+/// batches instead of one multi-hour transaction that grew the WAL to the
+/// size of the database. End state is byte-identical to the original V62:
+///   * `valid_from` = the version's own `created_at`.
+///   * `valid_to` = the earliest successor's `created_at` when one exists.
+///   * else, for a superseded (`is_latest = 0`) version with no successor,
+///     `COALESCE(superseded_at, MIN(entity_page_links.superseded_at),
+///     updated_at)`.
+///   * else NULL (a latest version with no successor stays open).
+///
+/// The window is derived purely from immutable columns this pass never
+/// mutates (`created_at`, `supersedes`, `superseded_at`, `updated_at`,
+/// `is_latest`, `entity_page_links.superseded_at`), so batching cannot
+/// change the result and interruption is safe: the cursor is simply "pages
+/// whose `valid_from` is still NULL", which shrinks monotonically as
+/// batches commit and re-running converges. A store already backfilled
+/// (every page has a non-NULL `valid_from` — the state after the original
+/// V62) finds no candidates and returns immediately without writing.
+pub fn backfill_page_windows(conn: &mut Connection) -> StoreResult<PageWindowBackfillSummary> {
+    backfill_page_windows_in_batches(conn, PAGE_WINDOW_BACKFILL_BATCH)
+}
+
+/// [`backfill_page_windows`] with an explicit batch size (tests use a tiny
+/// batch to exercise the resume cursor and checkpoint cadence at scale).
+pub fn backfill_page_windows_in_batches(
+    conn: &mut Connection,
+    batch: usize,
+) -> StoreResult<PageWindowBackfillSummary> {
+    let batch = batch.max(1);
+    let mut summary = PageWindowBackfillSummary::default();
+
+    // Cheap up-front cursor size. On an already-migrated store this is 0 and
+    // the loop below exits on its first empty batch without any write.
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if remaining == 0 {
+        return Ok(summary);
+    }
+    tracing::info!(
+        pages = remaining,
+        batch,
+        "page ingestion-window backfill starting (V62, #776)"
+    );
+
+    loop {
+        let tx = conn.transaction()?;
+        // Batch by `rowid`, not `id`: `pages.id` is a BLOB, and rowid is a
+        // stable INTEGER handle that also lets synthetic fixtures use integer
+        // keys. The cursor ("valid_from IS NULL") shrinks as batches commit.
+        let rowids: Vec<i64> = {
+            let mut stmt =
+                tx.prepare("SELECT rowid FROM pages WHERE valid_from IS NULL LIMIT ?1")?;
+            stmt.query_map(params![batch as i64], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        if rowids.is_empty() {
+            tx.commit()?;
+            break;
+        }
+
+        let placeholders = std::iter::repeat_n("?", rowids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // One statement sets both columns for the batch, folding the original
+        // V62's three sequential `UPDATE`s into an equivalent CASE (see the
+        // rule list on `backfill_page_windows`). Scoped to this batch's rows;
+        // the correlated subqueries still read the full `pages` table, so a
+        // successor in another batch is accounted for regardless of order.
+        let sql = format!(
+            "UPDATE pages SET \
+                 valid_from = created_at, \
+                 valid_to = CASE \
+                     WHEN EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id) \
+                         THEN (SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id) \
+                     WHEN is_latest = 0 \
+                         THEN COALESCE( \
+                             superseded_at, \
+                             (SELECT MIN(l.superseded_at) FROM entity_page_links l \
+                              WHERE l.page_id = pages.id), \
+                             updated_at) \
+                     ELSE NULL \
+                 END \
+             WHERE rowid IN ({placeholders})"
+        );
+        let updated = {
+            let mut stmt = tx.prepare(&sql)?;
+            stmt.execute(rusqlite::params_from_iter(rowids.iter()))?
+        };
+        tx.commit()?;
+
+        // Truncate the WAL between batches so it never grows past one batch's
+        // worth of pages, the whole point of the reshape.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+        summary.pages_backfilled += updated as u64;
+        summary.batches += 1;
+        tracing::info!(
+            done = summary.pages_backfilled,
+            remaining = remaining.saturating_sub(summary.pages_backfilled as i64),
+            batches = summary.batches,
+            "page ingestion-window backfill progress"
+        );
+    }
+
+    tracing::info!(
+        pages = summary.pages_backfilled,
+        batches = summary.batches,
+        "page ingestion-window backfill complete"
+    );
+    Ok(summary)
+}
+
 pub(crate) fn upsert_page_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
@@ -838,6 +973,17 @@ pub(crate) fn upsert_page_in_tx(
     let mut conformed = page.frontmatter_json.clone();
     ai_memory_core::okf::conform_frontmatter(page.path.as_str(), &mut conformed);
     let tier_str = page.tier.as_str();
+    // A2 tier-down marker (V65). The `compacted: true` frontmatter mirror is
+    // the single source of truth an A2 compaction rewrite carries in through
+    // the wiki layer; the `compacted_at` column is derived from it here, at the
+    // one write choke point, so the marker and the compacted body always land
+    // in the same transaction (invariant: indexes commit with the data). A
+    // normal write has no `compacted` key, so the column stays NULL and every
+    // pre-A2 code path behaves exactly as before.
+    let compacted_at: Option<i64> = conformed
+        .get("compacted")
+        .and_then(serde_json::Value::as_bool)
+        .and_then(|flag| flag.then_some(now));
 
     let existing: Option<ExistingPageVersion> = tx
         .query_row(
@@ -871,13 +1017,21 @@ pub(crate) fn upsert_page_in_tx(
             && existing.tier == tier_str
             && existing.pinned == i64::from(page.pinned)
         {
-            return PageId::from_slice(&existing.id).map_err(StoreError::from);
+            let unchanged_id = PageId::from_slice(&existing.id).map_err(StoreError::from)?;
+            // The content short-circuit skips a new version row, but a
+            // reconsolidation from a different session still cites the
+            // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
+            // §3) — record the evidence against the still-current id.
+            insert_evidence_in_tx(tx, &unchanged_id, &page.evidence, now)?;
+            return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
+        // The page-grain ingestion window closes in the same statement,
+        // same instant (issue #656, docs/design-page-ingestion-windows.md).
         tx.execute(
-            "UPDATE pages SET is_latest = 0 WHERE id = ?1",
-            params![&existing.id],
+            "UPDATE pages SET is_latest = 0, valid_to = ?2 WHERE id = ?1",
+            params![&existing.id, now],
         )?;
         // Close the superseded version's entity-link windows at the new
         // version's birth instant (docs/temporal.md).
@@ -890,8 +1044,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15)",
+              created_at, updated_at, expires_at, valid_from, compacted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -908,11 +1062,13 @@ pub(crate) fn upsert_page_in_tx(
                 page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
                 page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
+        insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
         audit(
             tx,
             "supersede_page",
@@ -926,13 +1082,19 @@ pub(crate) fn upsert_page_in_tx(
         )?;
         return Ok(new_id);
     }
+    if let Some(existing) = colliding_live_path(tx, page)? {
+        return Err(StoreError::PagePathCollides {
+            requested: page.path.as_str().to_owned(),
+            existing,
+        });
+    }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from, compacted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13, ?15)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -948,11 +1110,13 @@ pub(crate) fn upsert_page_in_tx(
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
             page.expires_at.map(|ts| ts.as_microsecond()),
+            compacted_at,
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
+    insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
     audit(
         tx,
         "create_page",
@@ -965,6 +1129,36 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// The live page this create would share a file with on a case-folding or
+/// normalizing filesystem, if any.
+///
+/// Runs on creates only: a supersede targets a path that already has its own
+/// row, so it cannot introduce a pair that did not exist before. That keeps
+/// the scan off the rewrite-heavy path, where it would repeat for every
+/// consolidation pass over the same page.
+fn colliding_live_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+) -> StoreResult<Option<String>> {
+    let key = ai_memory_core::portable_page_key(page.path.as_str());
+    let mut stmt = tx.prepare_cached(
+        "SELECT path FROM pages \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path <> ?3",
+    )?;
+    let mut rows = stmt.query(params![
+        page.workspace_id.as_bytes(),
+        page.project_id.as_bytes(),
+        page.path.as_str(),
+    ])?;
+    while let Some(row) = rows.next()? {
+        let candidate: String = row.get(0)?;
+        if ai_memory_core::portable_page_key(&candidate) == key {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// Attach the normalized entity set to a new page version (V38). Entity
@@ -1049,6 +1243,28 @@ fn replace_links_in_tx(
                 link.relation
                     .map_or("references", ai_memory_core::Relation::as_str),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record a page write's evidence sources (P2,
+/// docs/design-hindsight-borrowings.md §3), in the same transaction as the
+/// page upsert. `INSERT OR IGNORE` on the `(page_id, source_kind,
+/// source_id)` PK makes re-citing the same source a no-op — a session that
+/// reconsolidates the same path twice does not inflate the count. Empty
+/// `evidence` (every pre-2.2 caller) inserts nothing.
+fn insert_evidence_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    evidence: &[PageEvidence],
+    now: i64,
+) -> StoreResult<()> {
+    for e in evidence {
+        tx.execute(
+            "INSERT OR IGNORE INTO page_evidence (page_id, source_kind, source_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![page_id.as_bytes(), e.kind.as_str(), e.source_id, now],
         )?;
     }
     Ok(())
@@ -1811,22 +2027,41 @@ pub fn store_embedding(
 
 /// Store / replace a batch of page embeddings in one transaction.
 pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_embeddings", embeddings)
+}
+
+/// Store / replace a batch of L0 abstract embeddings
+/// (`page_abstract_embeddings`) in one transaction. Same row shape and
+/// upsert rule as [`store_embeddings`]; only the table differs.
+pub fn store_abstract_embeddings(
+    conn: &mut Connection,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_abstract_embeddings", embeddings)
+}
+
+fn store_embeddings_in_table(
+    conn: &mut Connection,
+    table: &'static str,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
     if embeddings.is_empty() {
         return Ok(());
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+        let sql = format!(
+            "INSERT INTO {table} (page_id, vector, provider, model, dim, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(page_id) DO UPDATE SET \
                  vector = excluded.vector, \
                  provider = excluded.provider, \
                  model = excluded.model, \
                  dim = excluded.dim, \
-                 created_at = excluded.created_at",
-        )?;
+                 created_at = excluded.created_at"
+        );
+        let mut stmt = tx.prepare(&sql)?;
         for embedding in embeddings {
             stmt.execute(params![
                 embedding.page_id.as_bytes(),
@@ -1839,6 +2074,17 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Remove a page's L0 abstract embedding row, if any. Called when a page is
+/// rewritten without its frontmatter `abstract:` so the abstract stream
+/// never ranks on a line the page no longer carries.
+pub fn delete_abstract_embedding(conn: &mut Connection, page_id: &PageId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM page_abstract_embeddings WHERE page_id = ?1",
+        params![page_id.as_bytes()],
+    )?;
     Ok(())
 }
 
@@ -2095,7 +2341,7 @@ pub fn soft_delete_for_decay_if_latest(
     let tx = conn.transaction()?;
     let affected = tx.execute(
         "UPDATE pages \
-         SET is_latest = 0, superseded_at = ?1 \
+         SET is_latest = 0, superseded_at = ?1, valid_to = ?1 \
          WHERE id = ?2 \
            AND workspace_id = ?3 \
            AND project_id = ?4 \
@@ -2112,7 +2358,8 @@ pub fn soft_delete_for_decay_if_latest(
     if affected != 0 {
         // Retirement is supersession for the entity timeline too: an
         // open window on a tombstoned page made `as_of` resurrect
-        // retired knowledge forever (post-audit finding).
+        // retired knowledge forever (post-audit finding). The page-grain
+        // window closes in the same statement above (issue #656).
         tx.execute(
             "UPDATE entity_page_links SET superseded_at = ?1 \
              WHERE page_id = ?2 AND superseded_at IS NULL",
@@ -3046,6 +3293,291 @@ pub fn cancel_handoff(
     Ok(changed > 0)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-project agent messages (inbox/queue). See docs/agent-messaging.md and
+// V64__agent_messages.sql. Modeled on the handoff claim-once discipline above.
+// ---------------------------------------------------------------------------
+
+/// Store-boundary bound for a message field (16 KiB — the last gate; MCP
+/// callers scrub and cap tighter). Reuses the handoff field budget.
+const MESSAGE_FIELD_MAX_BYTES: usize = HANDOFF_FIELD_MAX_BYTES;
+
+/// Maximum pending messages one recipient project may hold. A full inbox
+/// rejects new sends, so a hostile or buggy sender cannot flood a recipient's
+/// context or exhaust its storage (context-flood / DoS guard).
+pub const MAX_PENDING_INBOX_MESSAGES: u64 = 256;
+
+fn bound_message_field(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, MESSAGE_FIELD_MAX_BYTES)
+}
+
+/// Read one message row into the materialized view. Column order must match the
+/// SELECTs in this module and in [`crate::reader`].
+pub(crate) fn row_to_agent_message(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoreResult<ai_memory_core::AgentMessage>> {
+    use ai_memory_core::{AgentMessage, MessageOrigin, MessageState};
+    let id_bytes: Vec<u8> = row.get(0)?;
+    let from_ws: Vec<u8> = row.get(1)?;
+    let from_pj: Vec<u8> = row.get(2)?;
+    let from_agent: String = row.get(3)?;
+    let from_owner_user: Option<String> = row.get(4)?;
+    let to_ws: Vec<u8> = row.get(5)?;
+    let to_pj: Vec<u8> = row.get(6)?;
+    let subject: Option<String> = row.get(7)?;
+    let body: String = row.get(8)?;
+    let state: String = row.get(9)?;
+    let created_us: i64 = row.get(10)?;
+    let claimed_at_us: Option<i64> = row.get(11)?;
+    Ok((|| {
+        Ok(AgentMessage {
+            id: MessageId::from_slice(&id_bytes)?,
+            to_workspace_id: WorkspaceId::from_slice(&to_ws)?,
+            to_project_id: ProjectId::from_slice(&to_pj)?,
+            origin: MessageOrigin {
+                from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
+                from_project_id: ProjectId::from_slice(&from_pj)?,
+                from_agent: AgentKind::from_wire(&from_agent),
+                from_owner_user,
+            },
+            subject,
+            body,
+            state: state.parse::<MessageState>().map_err(StoreError::from)?,
+            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad created_at: {e}"
+                )))
+            })?,
+            claimed_at: claimed_at_us
+                .map(jiff::Timestamp::from_microsecond)
+                .transpose()
+                .map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad claimed_at: {e}"
+                    )))
+                })?,
+        })
+    })())
+}
+
+/// The stable column list backing [`row_to_agent_message`].
+pub(crate) const MESSAGE_COLUMNS: &str = "id, from_workspace_id, from_project_id, from_agent, \
+     from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, claimed_at";
+
+/// Send a message into a recipient project's inbox.
+///
+/// Fails closed with [`StoreError::InvalidState`] when the recipient inbox is
+/// already at [`MAX_PENDING_INBOX_MESSAGES`] pending — the caller surfaces this
+/// as a full-inbox rejection rather than flooding the recipient.
+pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult<MessageId> {
+    validate_identity_storage_key(m.from_owner_user.as_deref(), "message sender")?;
+    let tx = conn.transaction()?;
+    // Backpressure: bound the recipient's pending depth. Counting inside the
+    // transaction (single-writer actor) makes the check-then-insert atomic.
+    let pending: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_messages \
+         WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending'",
+        params![m.to_workspace_id.as_bytes(), m.to_project_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if pending as u64 >= MAX_PENDING_INBOX_MESSAGES {
+        return Err(StoreError::InvalidState(format!(
+            "recipient inbox is full ({MAX_PENDING_INBOX_MESSAGES} pending messages); \
+             the recipient must pop or the sender cancel before more can be sent"
+        )));
+    }
+    let id = MessageId::new();
+    let now = Timestamp::now().as_microsecond();
+    // Store-boundary bound (defense in depth): MCP callers already scrub and cap,
+    // but the store is the last gate before durable persistence.
+    let subject = m.subject.as_deref().map(bound_message_field);
+    let body = bound_message_field(&m.body);
+    let from_session: Option<&[u8]> = m.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
+    tx.execute(
+        "INSERT INTO agent_messages ( \
+             id, from_workspace_id, from_project_id, from_agent, from_session_id, \
+             from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+        params![
+            id.as_bytes(),
+            m.from_workspace_id.as_bytes(),
+            m.from_project_id.as_bytes(),
+            m.from_agent.as_str(),
+            from_session,
+            m.from_owner_user.as_deref(),
+            m.to_workspace_id.as_bytes(),
+            m.to_project_id.as_bytes(),
+            subject,
+            body,
+            now,
+        ],
+    )?;
+    // Audit records the lifecycle event under the recipient scope (the crossing
+    // point), authorless like handoffs — the row itself carries sender identity.
+    audit(
+        &tx,
+        "send_message",
+        Some(m.to_workspace_id.as_bytes()),
+        Some(m.to_project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Pop (claim exactly once) a message from a recipient project's inbox.
+///
+/// With `specific_id`, pops that message; otherwise the oldest pending one.
+/// Returns `None` when nothing matched or another session claimed it first.
+/// Mirrors [`accept_handoff_in_transaction`]'s two `state='pending'` guards.
+pub fn pop_message(
+    conn: &mut Connection,
+    claim: &MessageClaim,
+    specific_id: Option<MessageId>,
+) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+    let tx = conn.transaction()?;
+    let popped = pop_message_in_transaction(&tx, claim, specific_id)?;
+    tx.commit()?;
+    Ok(popped)
+}
+
+pub(crate) fn pop_message_in_transaction(
+    tx: &Transaction<'_>,
+    claim: &MessageClaim,
+    specific_id: Option<MessageId>,
+) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+    validate_identity_storage_key(claim.claiming_user.as_deref(), "message recipient")?;
+    // Choose the target: an explicit id, or the oldest pending in this inbox.
+    let target: Option<MessageId> = match specific_id {
+        Some(id) => Some(id),
+        None => tx
+            .query_row(
+                "SELECT id FROM agent_messages \
+                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+                 ORDER BY created_at ASC LIMIT 1",
+                params![claim.workspace_id.as_bytes(), claim.project_id.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|b| MessageId::from_slice(&b))
+            .transpose()?,
+    };
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    // Guard 1: metadata lookup, scoped to the recipient coordinate. A message
+    // addressed to another project (or already popped/cancelled) is invisible.
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM agent_messages \
+             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 AND state = 'pending'",
+            params![
+                target.as_bytes(),
+                claim.workspace_id.as_bytes(),
+                claim.project_id.as_bytes()
+            ],
+            |_| Ok(true),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    // Guard 2: atomic compare-and-set. Only one racing session flips
+    // 'pending' -> 'claimed'; a loser changes 0 rows and gets nothing.
+    let now = Timestamp::now().as_microsecond();
+    let session: Option<&[u8]> = claim.claiming_session.as_ref().map(|s| &s.as_bytes()[..]);
+    let changed = tx.execute(
+        "UPDATE agent_messages SET state = 'claimed', claimed_at = ?1, \
+             claimed_by_session = ?2, claimed_by_agent = ?3, claimed_by_user = ?4 \
+         WHERE id = ?5 AND to_workspace_id = ?6 AND to_project_id = ?7 AND state = 'pending'",
+        params![
+            now,
+            session,
+            claim.claiming_agent.as_str(),
+            claim.claiming_user.as_deref(),
+            target.as_bytes(),
+            claim.workspace_id.as_bytes(),
+            claim.project_id.as_bytes(),
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    audit(
+        tx,
+        "pop_message",
+        Some(claim.workspace_id.as_bytes()),
+        Some(claim.project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    let sql = format!(
+        "SELECT {MESSAGE_COLUMNS} FROM agent_messages \
+         WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3"
+    );
+    let message = tx
+        .query_row(
+            &sql,
+            params![
+                target.as_bytes(),
+                claim.workspace_id.as_bytes(),
+                claim.project_id.as_bytes()
+            ],
+            row_to_agent_message,
+        )
+        .optional()?
+        .transpose()?;
+    Ok(message)
+}
+
+/// Cancel (retract) pending outbox messages a project has sent. With
+/// `specific_id`, cancels just that one; otherwise every still-pending message
+/// this project sent. Scoped to the SENDER coordinate, so a project can only
+/// retract its own mail. Returns the number of messages cancelled.
+pub fn cancel_messages(
+    conn: &mut Connection,
+    from_workspace_id: &WorkspaceId,
+    from_project_id: &ProjectId,
+    specific_id: Option<MessageId>,
+) -> StoreResult<u64> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let changed = match specific_id {
+        Some(id) => tx.execute(
+            "UPDATE agent_messages SET state = 'cancelled' \
+             WHERE id = ?1 AND from_workspace_id = ?2 AND from_project_id = ?3 \
+               AND state = 'pending'",
+            params![
+                id.as_bytes(),
+                from_workspace_id.as_bytes(),
+                from_project_id.as_bytes()
+            ],
+        )?,
+        None => tx.execute(
+            "UPDATE agent_messages SET state = 'cancelled' \
+             WHERE from_workspace_id = ?1 AND from_project_id = ?2 AND state = 'pending'",
+            params![from_workspace_id.as_bytes(), from_project_id.as_bytes()],
+        )?,
+    };
+    if changed > 0 {
+        audit(
+            &tx,
+            "cancel_message",
+            Some(from_workspace_id.as_bytes()),
+            Some(from_project_id.as_bytes()),
+            None,
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed as u64)
+}
+
 fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
     kind.as_str()
 }
@@ -3144,16 +3676,19 @@ pub fn reorg_sessions(
         observations_updated += obs_rows;
     }
     // Graveyard only this workspace's latest pages; sibling workspaces may
-    // have already-consolidated pages that must remain current.
+    // have already-consolidated pages that must remain current. Both
+    // grains close at one shared instant (issue #656).
+    let retire_at = Timestamp::now().as_microsecond();
     tx.execute(
         "UPDATE entity_page_links SET superseded_at = ?2 \
          WHERE superseded_at IS NULL AND page_id IN ( \
              SELECT id FROM pages WHERE workspace_id = ?1 AND is_latest = 1)",
-        params![workspace_id.as_bytes(), Timestamp::now().as_microsecond()],
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     let pages_graveyarded: usize = tx.execute(
-        "UPDATE pages SET is_latest = 0 WHERE workspace_id = ?1 AND is_latest = 1",
-        params![workspace_id.as_bytes()],
+        "UPDATE pages SET is_latest = 0, valid_to = ?2 \
+         WHERE workspace_id = ?1 AND is_latest = 1",
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     tx.commit()?;
     Ok(ReorgSummary {
@@ -3658,6 +4193,36 @@ pub fn scope_is_purged(
         )
         .optional()?;
     Ok(found.is_some())
+}
+
+/// Session ids tombstoned by `purge_session` in one scope.
+///
+/// The scope-level twin of [`scope_is_purged`], read the same way and for the
+/// same reason: a purge whose page-file removal did not complete leaves the
+/// markdown on disk, and the wiki reindex must not put it back (#701). Loaded
+/// once per directory per reindex pass rather than once per page — a purged
+/// scope is one row, but a project accumulates one purged session per purge.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn purged_session_ids(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<Vec<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM purged_sessions \
+         WHERE workspace_id = ?1 AND project_id = ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(SessionId::from_slice(&row?)?);
+    }
+    Ok(out)
 }
 
 /// One recorded bootstrap chunk, as loaded by [`load_bootstrap_progress`].
@@ -4498,7 +5063,10 @@ pub fn move_session(
             }
             PagesMode::Regenerate => {
                 // Close the retiring page's entity windows first (the
-                // predicate needs is_latest = 1, flipped just below).
+                // predicate needs is_latest = 1, flipped just below); the
+                // page-grain window closes with the flip, same instant
+                // (issue #656).
+                let retire_at = Timestamp::now().as_microsecond();
                 tx.execute(
                     &format!(
                         "UPDATE entity_page_links SET superseded_at = ?4 \
@@ -4510,15 +5078,20 @@ pub fn move_session(
                         page_scope_params.0,
                         page_scope_params.1,
                         page_path.as_str(),
-                        Timestamp::now().as_microsecond(),
+                        retire_at,
                     ],
                 )?;
                 summary.pages_regenerated = tx.execute(
                     &format!(
-                        "UPDATE pages SET is_latest = 0 \
+                        "UPDATE pages SET is_latest = 0, valid_to = ?4 \
                          WHERE {page_scope_sql} AND path = ?3 AND is_latest = 1"
                     ),
-                    params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        retire_at
+                    ],
                 )? as u64;
                 // The session's summary pointer targeted the page just
                 // retired; the next consolidation sets it again.
@@ -4635,8 +5208,8 @@ pub(crate) mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use ai_memory_core::{
-        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier,
-        UserId, WorkspaceId,
+        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PageEvidence, PageEvidenceKind,
+        PagePath, ProjectId, Tier, UserId, WorkspaceId,
     };
     use rusqlite::Connection;
     use std::io::Write;
@@ -6202,7 +6775,40 @@ pub(crate) mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
+    }
+
+    /// The V65 A2 marker is derived from the `compacted: true` frontmatter
+    /// mirror at the single write choke point, in the same transaction as the
+    /// body — a normal write leaves it NULL, so every pre-A2 path is unchanged.
+    #[test]
+    fn upsert_derives_compacted_at_from_frontmatter_mirror() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // A normal write has no `compacted` key → marker stays NULL.
+        let plain = upsert_page(&mut conn, &page(ws, proj, "notes/plain.md", "body")).unwrap();
+        let plain_marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![plain.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plain_marker, None, "an ordinary write is never marked");
+
+        // A write carrying the frontmatter mirror sets the marker.
+        let mut compacted = page(ws, proj, "notes/compacted.md", "residue");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        let compacted_id = upsert_page(&mut conn, &compacted).unwrap();
+        let marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![compacted_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_some(), "the frontmatter mirror sets compacted_at");
     }
 
     /// A page written before entity extraction — tags in frontmatter but
@@ -6278,6 +6884,208 @@ pub(crate) mod tests {
             links_after,
             links_before + 2,
             "the pre-existing entity page kept its single link; only the stale page gained two"
+        );
+    }
+
+    /// The exact backfill the original V62 ran in-migration, kept here as
+    /// the golden reference the chunked boot step must reproduce byte for
+    /// byte. (The shipped V62 is now DDL-only; #776.)
+    const ORIGINAL_V62_BACKFILL: &str = "\
+        UPDATE pages SET valid_from = created_at; \
+        UPDATE pages SET valid_to = ( \
+            SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id \
+        ) WHERE EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id); \
+        UPDATE pages SET valid_to = COALESCE( \
+            superseded_at, \
+            (SELECT MIN(l.superseded_at) FROM entity_page_links l WHERE l.page_id = pages.id), \
+            updated_at) \
+        WHERE is_latest = 0 AND valid_to IS NULL \
+          AND NOT EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);";
+
+    /// Seed a pre-backfill `pages` fixture (windows still NULL) exercising
+    /// every branch of the two supersession rules: a three-version chain, a
+    /// decay tombstone, a reorg retirement recorded only at link grain, an
+    /// `updated_at`-fallback retirement, and a latest open version.
+    fn seed_page_window_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE pages (
+                 id INTEGER PRIMARY KEY, created_at INTEGER, updated_at INTEGER,
+                 superseded_at INTEGER, supersedes INTEGER, is_latest INTEGER,
+                 valid_from INTEGER, valid_to INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);
+             INSERT INTO pages
+                 (id, created_at, updated_at, superseded_at, supersedes, is_latest) VALUES
+                 (1, 100, 100, NULL, NULL, 0),   -- chain v1, superseded by 2
+                 (2, 200, 200, NULL, 1,    0),   -- chain v2, superseded by 3
+                 (3, 300, 300, NULL, 2,    1),   -- chain v3, latest/open
+                 (4, 100, 100, 450,  NULL, 0),   -- decay tombstone
+                 (5, 100, 100, NULL, NULL, 0),   -- reorg: retired at link grain
+                 (6, 100, 600, NULL, NULL, 0),   -- successor-less: updated_at fallback
+                 (7, 100, 100, NULL, NULL, 1);   -- latest open, no successor
+             INSERT INTO entity_page_links (page_id, superseded_at) VALUES (5, 500);",
+        )
+        .unwrap();
+    }
+
+    fn read_windows(conn: &Connection) -> Vec<(i64, Option<i64>, Option<i64>)> {
+        conn.prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Golden equivalence: the chunked boot backfill produces exactly the
+    /// windows the original single-transaction V62 SQL produced.
+    #[test]
+    fn page_window_backfill_matches_original_v62_sql() {
+        let reference = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&reference);
+        reference.execute_batch(ORIGINAL_V62_BACKFILL).unwrap();
+        let expected = read_windows(&reference);
+
+        let mut chunked = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&chunked);
+        // A tiny batch forces several batches over the seven-row fixture.
+        let summary = backfill_page_windows_in_batches(&mut chunked, 2).unwrap();
+        assert_eq!(summary.pages_backfilled, 7);
+        assert!(summary.batches >= 4, "batch=2 over 7 rows: {summary:?}");
+
+        assert_eq!(read_windows(&chunked), expected);
+        // Spell out the intent so a rule regression is legible, not just a diff.
+        assert_eq!(
+            expected,
+            vec![
+                (1, Some(100), Some(200)), // closed at successor v2's birth
+                (2, Some(200), Some(300)), // closed at successor v3's birth
+                (3, Some(300), None),      // latest stays open
+                (4, Some(100), Some(450)), // decay marker wins
+                (5, Some(100), Some(500)), // link-grain retirement
+                (6, Some(100), Some(600)), // updated_at fallback
+                (7, Some(100), None),      // latest open, no successor
+            ],
+        );
+    }
+
+    /// Idempotency / resume: an interrupted run (some rows committed, the
+    /// rest still NULL) resumes from the cursor, does no double work, and
+    /// converges to the correct final state.
+    #[test]
+    fn page_window_backfill_resumes_after_interruption() {
+        let reference = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&reference);
+        reference.execute_batch(ORIGINAL_V62_BACKFILL).unwrap();
+        let expected = read_windows(&reference);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&conn);
+        // Simulate a prior run that committed the windows for a subset before
+        // being interrupted: copy the correct values for ids 1..=3 only.
+        for (id, from, to) in expected.iter().filter(|(id, _, _)| *id <= 3) {
+            conn.execute(
+                "UPDATE pages SET valid_from = ?2, valid_to = ?3 WHERE id = ?1",
+                params![id, from, to],
+            )
+            .unwrap();
+        }
+
+        // Resume: only the four still-NULL rows are touched — no double work.
+        let summary = backfill_page_windows_in_batches(&mut conn, 2).unwrap();
+        assert_eq!(
+            summary.pages_backfilled, 4,
+            "resume skips the already-committed rows: {summary:?}"
+        );
+        assert_eq!(read_windows(&conn), expected, "final state converges");
+
+        // Running once more is a pure no-op (cursor is empty).
+        let again = backfill_page_windows(&mut conn).unwrap();
+        assert_eq!(again, PageWindowBackfillSummary::default());
+        assert_eq!(read_windows(&conn), expected);
+    }
+
+    /// Inert on an already-migrated store: every page written through the
+    /// live path already has its window, so the boot step finds no candidate
+    /// and returns immediately without writing.
+    #[test]
+    fn page_window_backfill_is_inert_on_migrated_store() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for body in ["one", "two"] {
+            upsert_page(&mut conn, &page(ws, proj, "notes/x.md", body)).unwrap();
+        }
+        // The live write path stamps valid_from on every version.
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "write path already populated the windows");
+
+        let read = |conn: &Connection| -> Vec<(Option<i64>, Option<i64>)> {
+            conn.prepare("SELECT valid_from, valid_to FROM pages ORDER BY created_at, valid_from")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = read(&conn);
+        let summary = backfill_page_windows(&mut conn).unwrap();
+        assert_eq!(
+            summary,
+            PageWindowBackfillSummary::default(),
+            "no candidates: fast no-op with no writes"
+        );
+        assert_eq!(read(&conn), before, "state untouched");
+    }
+
+    /// WAL-bound: with a checkpoint after every batch, the `-wal` file stays
+    /// a small multiple of one batch's writes rather than growing with the
+    /// row count — the whole point of the reshape (#776).
+    #[test]
+    fn page_window_backfill_keeps_wal_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("wal.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pages (
+                 id INTEGER PRIMARY KEY, created_at INTEGER, updated_at INTEGER,
+                 superseded_at INTEGER, supersedes INTEGER, is_latest INTEGER,
+                 valid_from INTEGER, valid_to INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);",
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for id in 1..=2_000 {
+                tx.execute(
+                    "INSERT INTO pages (id, created_at, updated_at, is_latest) \
+                     VALUES (?1, 100, 100, 1)",
+                    params![id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+
+        let batch = 50;
+        let summary = backfill_page_windows_in_batches(&mut conn, batch).unwrap();
+        assert_eq!(summary.pages_backfilled, 2_000);
+        assert_eq!(summary.batches, 40, "2000 rows / batch of 50");
+
+        // The per-batch TRUNCATE keeps the log near-empty; it must not have
+        // grown to hold all 2000 updates as one un-checkpointed transaction.
+        let wal_len = std::fs::metadata(db_path.with_extension("sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_len < 256 * 1024,
+            "WAL not bounded by the between-batch checkpoint: {wal_len} bytes"
         );
     }
 
@@ -6668,6 +7476,102 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(total, 1, "no duplicate row for unchanged content");
+    }
+
+    fn evidence_count(conn: &Connection, page_id: &PageId) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM page_evidence WHERE page_id = ?1",
+            params![page_id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// P2 (docs/design-hindsight-borrowings.md §3): a page write's cited
+    /// evidence accrues in-transaction with the upsert. Reconsolidating the
+    /// same (unchanged) content from a different session still hits the
+    /// content short-circuit — same page id, no new version — but the new
+    /// session's citation lands, and the SAME session citing it again is a
+    /// no-op (`INSERT OR IGNORE` on the `(page_id, source_kind, source_id)`
+    /// PK), never inflating the count.
+    #[test]
+    fn reconsolidating_the_same_page_accrues_evidence_per_distinct_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "same body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-b".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id2, id, "unchanged content must not create a new version");
+        assert_eq!(evidence_count(&conn, &id), 2);
+
+        let id3 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id3, id);
+        assert_eq!(
+            evidence_count(&conn, &id),
+            2,
+            "re-citing the same session is a no-op"
+        );
+    }
+
+    /// A page written with no evidence stays at count 0 ("unknown"), and a
+    /// version created by a real content change (not the idempotent
+    /// short-circuit) starts its own, separate evidence trail.
+    #[test]
+    fn upsert_page_with_no_evidence_stays_at_zero_and_new_versions_start_fresh() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let id1 = upsert_page(&mut conn, &page(ws, proj, "notes/foo.md", "v1 body")).unwrap();
+        assert_eq!(evidence_count(&conn, &id1), 0);
+
+        let mut p2 = page(ws, proj, "notes/foo.md", "v2 body");
+        p2.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p2).unwrap();
+        assert_ne!(id2, id1, "changed body supersedes to a new version");
+        assert_eq!(
+            evidence_count(&conn, &id1),
+            0,
+            "the old version is untouched"
+        );
+        assert_eq!(evidence_count(&conn, &id2), 1);
+    }
+
+    /// Purging a page must take its evidence with it (`ON DELETE CASCADE`,
+    /// V63) — evidence never outlives the page version it supports.
+    #[test]
+    fn deleting_a_page_cascades_its_evidence_rows() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/foo.md").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_count(&conn, &id),
+            0,
+            "ON DELETE CASCADE must drop evidence with the page"
+        );
     }
 
     /// OKF conformance happens at this choke point for every writer

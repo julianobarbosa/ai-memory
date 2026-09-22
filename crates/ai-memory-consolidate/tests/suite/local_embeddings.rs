@@ -77,6 +77,7 @@ async fn write(
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -152,6 +153,7 @@ async fn paraphrase_recall_fts_alone_cannot_do() {
             384,
             4,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -188,6 +190,7 @@ async fn paraphrase_recall_fts_alone_cannot_do() {
             384,
             4,
             None,
+            false,
         )
         .await
         .unwrap();

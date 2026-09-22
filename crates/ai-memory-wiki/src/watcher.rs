@@ -196,7 +196,24 @@ async fn run_loop(
     }
 }
 
+/// Inside the wiki's own git directory or any nested git metadata: neither indexed nor reported.
+fn is_git_internal(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| {
+        rel.components()
+            .any(|c| ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy()))
+    })
+}
+
 async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent) {
+    // Nothing to index, but the next auto-commit must stage it.
+    if matches!(event.kind, EventKind::Remove(_)) {
+        for raw_path in &event.paths {
+            if !is_tempfile(raw_path) && !is_git_internal(wiki.root(), raw_path) {
+                wiki.git().mark_written(raw_path);
+            }
+        }
+        return;
+    }
     if !matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other
@@ -204,6 +221,9 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         return;
     }
     for raw_path in &event.paths {
+        if is_git_internal(wiki.root(), raw_path) {
+            continue;
+        }
         let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
             // Likely a transient state (mv, atomic rename in flight).
             continue;
@@ -219,13 +239,13 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
             reindex_project_dir(wiki, ws, proj, proj_root).await;
             continue;
         }
-        if !ft.is_file() {
+        if !ft.is_file() || is_tempfile(raw_path) {
             continue;
         }
+        // Reported before the indexer's filters, which skip ledgers,
+        // pending and non-markdown files.
+        wiki.git().mark_written(raw_path);
         if !is_markdown(raw_path) {
-            continue;
-        }
-        if is_tempfile(raw_path) {
             continue;
         }
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
@@ -236,6 +256,26 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         }
         if is_reserved_page_file(raw_path, &page_path) {
             continue;
+        }
+        // A tombstoned session's page must not come back from a file its
+        // purge could not remove (#701). The path shape decides whether the
+        // lookup is worth a round trip: only `sessions/<id>.md` can be that
+        // file, so an ordinary edit to `index.md` or a decision page never
+        // queries. The sweep paths amortise the same set over a whole
+        // directory instead; this one sees a single file per event.
+        if let Some(session) = crate::wiki::session_id_for_page(&page_path) {
+            match wiki.purged_sessions(ws, proj).await {
+                Ok(purged) if purged.contains(&session) => {
+                    debug!(path = %page_path, "ignoring event for a purged session page");
+                    continue;
+                }
+                Ok(_) => {}
+                // Fails open, deliberately: a transient lookup error must not
+                // stop the watcher from indexing edits. The cost of failing
+                // open here is bounded — the next reconcile pass loads the set
+                // again and skips the page then.
+                Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
+            }
         }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
@@ -285,7 +325,19 @@ async fn reindex_project_dir(
         }
     };
 
+    // Fails open for the same reason the single-event path does: a lookup
+    // error must not stop a directory event from indexing. `Wiki::reindex_all`
+    // is the one caller that fails closed, because an operator-triggered
+    // reindex should report the failure rather than quietly skip the gate.
+    let purged = wiki.purged_sessions(ws, proj).await.unwrap_or_else(|e| {
+        warn!(error = %e, "purged-session lookup failed; not gating this pass");
+        std::collections::HashSet::new()
+    });
     for path in pages {
+        if crate::wiki::is_purged_session_page(&path, &purged) {
+            debug!(path = %path, "skipping a purged session page");
+            continue;
+        }
         match wiki.reindex_page(ws, proj, path.clone()).await {
             Ok(_) => debug!(path = %path, "reindexed via watcher directory event"),
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
@@ -303,6 +355,9 @@ pub(crate) struct ReconcileStats {
     /// These are skipped wholesale rather than failing scope resolution on
     /// every page, every pass, forever (see #613).
     pub skipped_orphans: usize,
+    /// Session pages left on disk by a purge whose file cleanup failed, and
+    /// deliberately not re-indexed (#701).
+    pub skipped_purged_sessions: usize,
 }
 
 async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
@@ -339,7 +394,19 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         let pages = tokio::task::spawn_blocking(move || walk_markdown(&proj_root))
             .await
             .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+        // Once per directory, not once per page: a project accumulates one
+        // tombstone per purge, and the set is only consulted for the
+        // `sessions/<id>.md` paths that a session purge could have left behind.
+        let purged = wiki.purged_sessions(ws, proj).await?;
         for path in pages {
+            if crate::wiki::is_purged_session_page(&path, &purged) {
+                debug!(
+                    path = %path,
+                    "skipping reconcile of a purged (tombstoned) session page",
+                );
+                stats.skipped_purged_sessions += 1;
+                continue;
+            }
             if let Err(e) = wiki.reindex_page(ws, proj, path.clone()).await {
                 warn!(path = %path, error = %e, "reconcile reindex failed");
             } else {
@@ -350,6 +417,7 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
     info!(
         indexed = stats.indexed,
         skipped_orphans = stats.skipped_orphans,
+        skipped_purged_sessions = stats.skipped_purged_sessions,
         "reconciliation pass complete",
     );
     Ok(stats)
@@ -425,7 +493,7 @@ pub(crate) fn extract_project_ids(
 
     // Rejoin remaining segments as the page path.
     let page_rel: std::path::PathBuf = components.collect();
-    let page_str = page_rel.to_string_lossy().replace('\\', "/");
+    let page_str = crate::git::slash_path(&page_rel);
     if page_str.is_empty() {
         return None;
     }
@@ -539,11 +607,11 @@ fn is_reserved_page_file(abs: &Path, page_path: &PagePath) -> bool {
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
     let rel: &Path = abs.strip_prefix(root).ok()?;
-    let s = rel.to_string_lossy().replace('\\', "/");
-    PagePath::new(s).ok()
+    PagePath::new(crate::git::slash_path(rel)).ok()
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use ai_memory_store::Store;
@@ -582,6 +650,121 @@ mod tests {
             .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         (tmp, store, wiki, ws, proj)
+    }
+
+    /// A purge whose page-file cleanup failed must not be undone by the next
+    /// tick (#701).
+    ///
+    /// The guard #696 added closes the window where a reindex interleaves
+    /// between the database delete and the file cleanup. It cannot cover the
+    /// case where the file *outlives* the purge: a cleanup failure is a
+    /// reported, already-tested outcome, and after one the rows are gone while
+    /// the markdown is still on disk. Reverting the tombstone gate fails this.
+    #[tokio::test]
+    async fn purged_session_page_is_not_resurrected_by_a_reconcile_tick() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let sid = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        let sessions_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let abs = sessions_dir.join(format!("{sid}.md"));
+        std::fs::write(&abs, "---\ntitle: Session\n---\n\nzimbabwe pineapple\n").unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page_id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(page_id)).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .search_pages("zimbabwe".into(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "precondition: the session page is indexed",
+        );
+
+        // Make the unlink fail the way a read-only mount or a sharing
+        // violation does — the markdown itself stays intact and readable.
+        #[cfg(unix)]
+        let original = std::fs::metadata(&sessions_dir).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            let mut locked = original.clone();
+            locked.set_readonly(true);
+            std::fs::set_permissions(&sessions_dir, locked).unwrap();
+        }
+        #[cfg(windows)]
+        let _file_lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            // Windows checks the file handle's share mode when unlinking;
+            // a readonly directory does not prevent deletion there.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001 | 0x0000_0002) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                .open(&abs)
+                .unwrap()
+        };
+        let outcome = wiki
+            .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&sessions_dir, original).unwrap();
+
+        // Preconditions: this is the reported `files_failed` state.
+        assert_eq!(
+            outcome.files_failed,
+            vec![path.clone()],
+            "precondition: the unlink must have failed",
+        );
+        assert!(abs.exists(), "precondition: the page file survived");
+        assert!(
+            store
+                .reader
+                .search_pages("zimbabwe".into(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition: the purge made the page unsearchable",
+        );
+
+        let stats = reconcile(&wiki).await.unwrap();
+        assert_eq!(
+            stats.skipped_orphans, 0,
+            "a session purge leaves the project row, so the orphan guard passes",
+        );
+        assert_eq!(
+            stats.skipped_purged_sessions, 1,
+            "the leftover page is skipped, and the pass says so",
+        );
+
+        let back = store
+            .reader
+            .search_pages("zimbabwe".into(), 10)
+            .await
+            .unwrap();
+        assert!(
+            back.is_empty(),
+            "a purged session's page must not be resurrected from a leftover file: {back:?}",
+        );
     }
 
     /// `extract_project_ids` must parse a valid `<ws>/<proj>/<path>` triplet.
@@ -729,6 +912,56 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "external.md");
+    }
+
+    /// The watcher reports what the next auto-commit must stage: removals,
+    /// and files the indexer skips; never the wiki's own git directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_report_their_paths_for_the_next_commit() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let proj_dir = wiki.root().join(ws.to_string()).join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let ledger = proj_dir.join("events.jsonl");
+        std::fs::write(&ledger, "{}\n").unwrap();
+        let git_log = wiki.root().join(".git/logs/HEAD");
+        std::fs::create_dir_all(git_log.parent().unwrap()).unwrap();
+        std::fs::write(&git_log, "ref\n").unwrap();
+        let nested_git = proj_dir.join(".git/config");
+        std::fs::create_dir_all(nested_git.parent().unwrap()).unwrap();
+        std::fs::write(&nested_git, "config\n").unwrap();
+        let gone = proj_dir.join("gone.md");
+
+        for (kind, path) in [
+            (EventKind::Create(notify::event::CreateKind::File), &ledger),
+            (EventKind::Modify(notify::event::ModifyKind::Any), &git_log),
+            (
+                EventKind::Create(notify::event::CreateKind::File),
+                &nested_git,
+            ),
+            (EventKind::Remove(notify::event::RemoveKind::File), &gone),
+            (EventKind::Remove(notify::event::RemoveKind::File), &git_log),
+            (
+                EventKind::Remove(notify::event::RemoveKind::File),
+                &nested_git,
+            ),
+        ] {
+            let event = notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(kind).add_path(path.clone()),
+                std::time::Instant::now(),
+            );
+            handle_event(&wiki, event).await;
+        }
+
+        let reported = wiki.git().written_paths();
+        let rel = |p: &Path| p.strip_prefix(wiki.root()).unwrap().to_path_buf();
+        assert!(reported.contains(&rel(&ledger)), "{reported:?}");
+        assert!(reported.contains(&rel(&gone)), "{reported:?}");
+        assert!(
+            !reported
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
+            "{reported:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

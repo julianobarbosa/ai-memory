@@ -153,7 +153,7 @@ fn store_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
     let _ = fs::write(path, session_id);
 }
 
-fn clear_session_id(data_dir: &Path, agent: AgentKind) {
+pub(crate) fn clear_session_id(data_dir: &Path, agent: AgentKind) {
     let _ = fs::remove_file(session_id_state_path(data_dir, agent));
 }
 
@@ -250,6 +250,17 @@ fn payload_has_session_id(raw: &serde_json::Value) -> bool {
     })
 }
 
+/// Agents whose hook payloads do not reliably carry a session id. Devin's
+/// payloads may omit it; ZCode's do too (and ZCode fires `Stop` per turn with
+/// no SessionEnd, so without a persisted id each turn would fragment into a
+/// fresh server-side session). For these agents the hook maintains a
+/// `<data_dir>/hook-state/<agent>-session-id` file so a whole agent session
+/// shares one stable id. Agents whose payloads always carry an id never touch
+/// this path.
+fn agent_needs_session_id_state(agent_kind: AgentKind) -> bool {
+    matches!(agent_kind, AgentKind::Devin | AgentKind::Zcode)
+}
+
 fn session_id_query_suffix(
     data_dir: &Path,
     agent: &str,
@@ -257,7 +268,7 @@ fn session_id_query_suffix(
     raw: &serde_json::Value,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
-    if agent_kind != AgentKind::Devin || payload_has_session_id(raw) {
+    if !agent_needs_session_id_state(agent_kind) || payload_has_session_id(raw) {
         return String::new();
     }
 
@@ -416,6 +427,21 @@ fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_jso
     true
 }
 
+/// A `--agent claude-code` hook invoked by Cursor (it runs Claude Code's
+/// settings too) is a duplicate when Cursor's own ai-memory hooks are also
+/// installed: the native `--agent cursor` hook already delivers the same
+/// event. Dropping it keeps one observation per Cursor event (#721). The
+/// installed check runs last so ordinary Claude Code events never touch disk.
+fn is_redundant_cursor_copy(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    cursor_hooks_installed: impl FnOnce() -> bool,
+) -> bool {
+    agent == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(raw) == Some(AgentKind::Cursor)
+        && cursor_hooks_installed()
+}
+
 fn write_success_response<W: std::io::Write>(
     stdout: &mut W,
     agent: AgentKind,
@@ -496,7 +522,13 @@ where
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
-    if !should_process_hook_event(agent_kind, hook_event, &json) {
+    if !should_process_hook_event(agent_kind, hook_event, &json)
+        || is_redundant_cursor_copy(
+            agent_kind,
+            &json,
+            super::install_hooks::cursor_native_hooks_installed,
+        )
+    {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -651,6 +683,9 @@ where
             "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
         );
     }
+    // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
+    // per turn, so its stored id is cleared by `finalize-session` (or
+    // overwritten by the next session-start), never by a hook event.
     if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
         clear_session_id(&dd, AgentKind::Devin);
     }
@@ -673,6 +708,19 @@ where
             hook_spool::DrainLockWait::NoWait,
         )
         .await;
+    }
+
+    // session-start: if this checkout has never had the one-time boot backfill
+    // attempted, spawn it detached. It self-gates (config opt-out, empty-store
+    // check) and records the attempt, so this is at most one extra process the
+    // first time a project is opened after installing hooks — never inline, so
+    // the SessionStart budget is untouched. Best-effort; a spawn failure must
+    // not affect session start.
+    if args.event == "session-start"
+        && let Ok(trigger_cwd) = std::env::current_dir()
+        && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
+    {
+        let _ = hook_drain_process::spawn_backfill(&dd);
     }
 
     // session-start: drain any backlog (e.g. from a previous session that ended
@@ -1213,6 +1261,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cursor_copy_via_claude_code_hooks_is_dropped_only_when_cursor_hooks_exist() {
+        let cursor = serde_json::json!({
+            "cursor_version": "2026.09.02-c22c1a3",
+            "conversation_id": "c1",
+        });
+        let claude = serde_json::json!({"session_id": "s1"});
+        assert!(is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &cursor,
+            || true
+        ));
+        // Without Cursor's own hooks the Claude Code path is the only capture.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &cursor,
+            || false
+        ));
+        // The native Cursor hook itself is never dropped.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::Cursor,
+            &cursor,
+            || true
+        ));
+        // A real Claude Code payload never consults the filesystem.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &claude,
+            || { panic!("must not check Cursor hooks for a Claude Code payload") }
+        ));
+    }
+
     #[tokio::test]
     async fn antigravity_native_pre_tool_use_allows_and_spools_valid_input() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1548,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn session_id_query_suffix_is_devin_only() {
+    fn session_id_query_suffix_is_opt_in_per_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
@@ -1556,6 +1636,60 @@ mod tests {
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
+    }
+
+    #[test]
+    fn zcode_query_session_id_is_stable_across_turns_without_native_id() {
+        // ZCode fires Stop at the end of every turn and has no SessionEnd; the
+        // stored id must survive Stop so one agent session maps to one
+        // server-side session.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let bare = serde_json::json!({"hook_event_name": "SessionStart"});
+
+        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare);
+        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare);
+
+        assert!(first.starts_with("&session_id="), "{first}");
+        assert_eq!(after_stop, first);
+        assert_eq!(next_turn, first);
+        assert_eq!(
+            stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
+            first.strip_prefix("&session_id=")
+        );
+    }
+
+    #[test]
+    fn zcode_query_session_id_does_not_override_native_payload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_session = serde_json::json!({
+            "session_id": "zcode-native-session",
+            "hook_event_name": "PostToolUse"
+        });
+
+        let suffix = session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session);
+
+        assert!(suffix.is_empty());
+        assert!(stored_session_id(tmp.path(), AgentKind::Zcode).is_none());
+    }
+
+    #[test]
+    fn zcode_stop_event_does_not_clear_stored_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        store_session_id(data_dir, AgentKind::Zcode, "stable-zcode-session");
+
+        // The only hook-side clearing is Devin's session-end; ZCode's stored
+        // id is cleared by `finalize-session` (or overwritten by the next
+        // session-start), never by Stop.
+        let bare = serde_json::json!({"hook_event_name": "Stop"});
+        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+
+        assert_eq!(
+            stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
+            Some("stable-zcode-session")
+        );
     }
 
     #[test]
@@ -1922,6 +2056,79 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_native_capture_policy_runs_before_spool_and_preserves_identity() {
+        for (tool, input, disposition) in [
+            (
+                "read_file",
+                serde_json::json!({"path": "secret/private.txt"}),
+                CaptureDisposition::Drop,
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"command": "*** Begin Patch\n*** Add File: secret/private.txt\n+PRIVATE_CONTENT\n*** End Patch"}),
+                CaptureDisposition::MetadataOnly,
+            ),
+            (
+                "apply_patch",
+                serde_json::json!(null),
+                CaptureDisposition::MetadataOnly,
+            ),
+        ] {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "workspace = \"native\"\nproject = \"codex\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+                ).unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "codex".into();
+                let raw = serde_json::json!({
+                    "session_id": "native-codex", "cwd": tmp.path(), "turn_id": "turn-1",
+                    "hook_event_name": if event == "pre-tool-use" { "PreToolUse" } else { "PostToolUse" },
+                    "tool_name": tool, "tool_input": input, "tool_use_id": "call-native-1",
+                    "tool_response": {"content": [{"type": "text", "text": "PRIVATE_CONTENT"}]},
+                });
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut stdout,
+                    |_, _| {
+                        panic!("tool events below the threshold must only spool");
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(stdout, b"{}\n");
+                let spool = hook_spool::spool_dir(&data_dir);
+                if disposition == CaptureDisposition::Drop {
+                    assert!(!spool.exists());
+                } else {
+                    let entries = read_spooled_entries(&spool);
+                    assert_eq!(entries.len(), 1);
+                    let entry = &entries[0];
+                    assert_eq!(query_param(&entry.url, "agent"), Some("codex"));
+                    assert_eq!(query_param(&entry.url, "workspace"), Some("native"));
+                    assert_eq!(query_param(&entry.url, "project"), Some("codex"));
+                    assert!(query_param(&entry.url, "ingest_key").is_some());
+                    assert!(!entry.body.contains("PRIVATE_CONTENT"));
+                    assert!(!entry.body.contains("private.txt"));
+                    let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                    assert_eq!(body["session_id"], "native-codex");
+                    assert_eq!(body["tool_call_id"], "call-native-1");
+                    assert_eq!(body["_ai_memory_capture"]["disposition"], "metadata-only");
+                    assert_eq!(
+                        body["_ai_memory_capture"]["extraction_state"],
+                        "missing-or-malformed"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

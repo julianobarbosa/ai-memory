@@ -84,6 +84,7 @@ id_newtype!(pub ObservationId, "Identifier for a single observation captured dur
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub MessageId, "Identifier for one cross-project agent message (inbox/queue).");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
@@ -107,33 +108,6 @@ impl PagePath {
     ///
     /// # Errors
     /// Returns [`MemoryError::InvalidPagePath`] when the input is empty or
-    /// Reject a path that cannot be materialised and checkpointed on every
-    /// supported platform.
-    ///
-    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
-    /// reconstructed through that constructor on every read
-    /// (`reader.rs` does so in the recency, search, vector and graph
-    /// queries), so tightening it would make any already-stored
-    /// non-portable page unreadable — and because those are list queries,
-    /// one such page would break a whole listing rather than just itself.
-    /// The rule therefore applies where a *new* path enters the system.
-    ///
-    /// The rule is the same on every platform on purpose. A wiki authored
-    /// on Linux is expected to be usable on Windows by the same release;
-    /// making the check platform-conditional would let a Linux session
-    /// create pages a Windows session cannot read, which is the defect
-    /// being fixed rather than a fix for it (#462).
-    ///
-    /// # Errors
-    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
-    /// component and the reason.
-    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
-        for component in self.as_str().split('/') {
-            ensure_portable_component(component, self.as_str())?;
-        }
-        Ok(())
-    }
-
     /// contains a path component that would escape or alias the wiki root.
     pub fn new(raw: impl Into<String>) -> Result<Self, MemoryError> {
         let raw = raw.into();
@@ -183,6 +157,33 @@ impl PagePath {
         Ok(Self(raw))
     }
 
+    /// Reject a path that cannot be materialised and checkpointed on every
+    /// supported platform.
+    ///
+    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
+    /// reconstructed through that constructor on every read
+    /// (`reader.rs` does so in the recency, search, vector and graph
+    /// queries), so tightening it would make any already-stored
+    /// non-portable page unreadable — and because those are list queries,
+    /// one such page would break a whole listing rather than just itself.
+    /// The rule therefore applies where a *new* path enters the system.
+    ///
+    /// The rule is the same on every platform on purpose. A wiki authored
+    /// on Linux is expected to be usable on Windows by the same release;
+    /// making the check platform-conditional would let a Linux session
+    /// create pages a Windows session cannot read, which is the defect
+    /// being fixed rather than a fix for it (#462).
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
+    /// component and the reason.
+    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
+        for component in self.as_str().split('/') {
+            ensure_portable_component(component, self.as_str())?;
+        }
+        Ok(())
+    }
+
     /// Borrow the inner string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -199,6 +200,23 @@ impl fmt::Debug for PagePath {
 impl fmt::Display for PagePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The key a case-folding or Unicode-normalizing filesystem effectively
+/// stores a page path under: two paths with the same key are one file on
+/// macOS (APFS) and Windows (NTFS), whatever they look like here.
+///
+/// Lowercase first, then compose: `İ` lowercases to `i` + U+0307, which only
+/// composes back to a single scalar after the fold.
+#[must_use]
+pub fn portable_page_key(path: &str) -> String {
+    let lowered = path.to_lowercase();
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(&lowered) {
+        lowered
+    } else {
+        nfc.normalize(&lowered).into_owned()
     }
 }
 
@@ -703,6 +721,18 @@ const DOS_DEVICE_NAMES: &[&str] = &[
 /// [`PagePath::new`].
 const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
 
+/// Returns true if a path component is reserved by Git (`.git` case-insensitively,
+/// or an 8.3 short-name alias like `git~1`..`git~4`).
+#[must_use]
+pub fn is_git_reserved_component(component: &str) -> bool {
+    // Compare on bytes: a `str` slice at a fixed byte index panics on a
+    // multibyte component (a 5-byte UTF-8 name like "abcé" has no char
+    // boundary at 4), and this runs on untrusted write input.
+    let b = component.as_bytes();
+    component.eq_ignore_ascii_case(".git")
+        || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
+}
+
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
     let invalid = |reason: &str| {
         Err(MemoryError::InvalidPagePath(format!(
@@ -737,12 +767,18 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));
     }
+    // Git reserves `.git` for repository metadata. Any tree entry named `.git`
+    // or an 8.3 alias is refused by libgit2 with `GIT_EINVALIDPATH` and cannot
+    // be checkpointed.
+    if is_git_reserved_component(component) {
+        return invalid("is reserved by Git for repository metadata and refused in tree entries");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod portable_page_path_tests {
-    use super::PagePath;
+    use super::{PagePath, portable_page_key};
 
     /// Every shape #462 reproduced on native Windows. Each either fails late
     /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
@@ -777,6 +813,30 @@ mod portable_page_path_tests {
         }
     }
 
+    #[test]
+    fn git_reserved_paths_are_rejected() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".git/HEAD",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/.Git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "notes/git~4/config",
+            "a/b/c/.git/deep.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} contains a git-reserved component and must be refused at write time"
+            );
+        }
+    }
+
     /// The rule must not reject ordinary pages. `con` is only reserved as a
     /// whole component, so `concepts/` and `icon.md` are fine.
     #[test]
@@ -791,8 +851,37 @@ mod portable_page_path_tests {
             "a/b/c/deep.md",
             "notes/dot.in.middle.md",
             "notes/UPPER.MD",
+            "notes/.git.md",
+            "notes/.gitignore",
+            "notes/.gitattributes",
+            "notes/github.md",
+            "git-notes/index.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// A multibyte component whose byte length is 5 must not be mistaken for
+    /// a `git~N` alias, and must not panic: `is_git_reserved_component` once
+    /// sliced the string at byte index 4, which is not a char boundary in a
+    /// name like "abcé" (5 bytes) or "a😀" (5 bytes). Since this runs on the
+    /// write funnel for untrusted input, the panic was a crashable defect.
+    #[test]
+    fn multibyte_components_are_not_git_reserved_and_do_not_panic() {
+        for component in ["abcé", "ab€", "a😀", "éé", "🦀🦀"] {
+            assert!(
+                !super::is_git_reserved_component(component),
+                "{component:?} is an ordinary name, not a git-reserved alias"
+            );
+        }
+        // The full write funnel (construct + ensure_portable) must accept a
+        // page path with a 5-byte multibyte component without panicking.
+        for raw in ["notes/abcé.md", "notes/a😀.md", "notes/ab€.md"] {
+            let path = PagePath::new(raw).expect("valid non-ASCII path");
             assert!(
                 path.ensure_portable().is_ok(),
                 "{raw:?} is portable and must stay writable"
@@ -805,11 +894,46 @@ mod portable_page_path_tests {
     /// not break on one bad row.
     #[test]
     fn existing_non_portable_pages_remain_constructible() {
-        for raw in ["CON.md", "notes/a|b.md", "notes/trailing./x.md"] {
+        for raw in [
+            "CON.md",
+            "notes/a|b.md",
+            "notes/trailing./x.md",
+            ".git/config",
+            "notes/.git/sub.md",
+            "notes/git~1/foo.md",
+        ] {
             assert!(
                 PagePath::new(raw).is_ok(),
                 "{raw:?} must still construct so persisted rows stay readable"
             );
+        }
+    }
+
+    #[test]
+    fn portable_key_collapses_case_and_normalization() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/Alpha.md"),
+            ("Concepts/alpha.md", "concepts/ALPHA.md"),
+            ("concepts/caf\u{00e9}.md", "concepts/cafe\u{0301}.md"),
+            ("concepts/CAF\u{00c9}.md", "concepts/cafe\u{0301}.md"),
+        ] {
+            assert_eq!(
+                portable_page_key(a),
+                portable_page_key(b),
+                "{a:?} and {b:?} are one file on macOS/Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_keeps_distinct_paths_distinct() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/alphabet.md"),
+            ("concepts/alpha.md", "decisions/alpha.md"),
+            ("concepts/nested/a.md", "concepts/a.md"),
+            ("concepts/cafe.md", "concepts/caf\u{00e9}.md"),
+        ] {
+            assert_ne!(portable_page_key(a), portable_page_key(b));
         }
     }
 }

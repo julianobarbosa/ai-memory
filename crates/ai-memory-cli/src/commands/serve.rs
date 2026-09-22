@@ -1,6 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint, run_sweep_with_options,
+    run_lint,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -70,6 +70,98 @@ const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 /// Lock file guarding a data dir against a second `ai-memory serve` (#563).
 const SERVE_LOCK_FILE: &str = ".serve.lock";
 
+/// How long a wait on the shutdown path may run before the drain it is
+/// waiting for is abandoned. axum's graceful shutdown waits for every
+/// in-flight connection and a stateful or SSE MCP client can hold one open
+/// indefinitely, so an unbounded drain is indistinguishable from ignoring the
+/// signal: `docker stop` and `systemctl stop` would still burn their own
+/// grace period and finish with SIGKILL (#699). Each wait is bounded on its
+/// own, so a stop can take a small multiple of this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// The signals that stop a running server, listened for on both transports.
+///
+/// Installed before the transport starts. The server runs as PID 1 under
+/// `docker run` (no init shim), and for PID 1 the kernel discards any signal
+/// whose handler is not installed — so a SIGTERM arriving during a slow boot
+/// (the pre-migration archive, wiki migrations) must already have a listener
+/// waiting for it. A tokio `Signal` queues a signal received before the first
+/// `recv`, so registering early loses nothing (#699).
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Install the listeners.
+    ///
+    /// A listener that cannot be registered degrades to the remaining one with
+    /// a warning: losing one way to stop the server is bad, refusing to start
+    /// over it is worse.
+    #[cfg(unix)]
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        fn listen(kind: SignalKind, name: &str) -> Option<tokio::signal::unix::Signal> {
+            match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        signal = name,
+                        "cannot listen for this shutdown signal; the server will not stop on it"
+                    );
+                    None
+                }
+            }
+        }
+
+        Self {
+            interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+            terminate: listen(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// Install the listeners. Non-unix has only ctrl-c.
+    #[cfg(not(unix))]
+    fn install() -> Self {
+        Self {}
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(unix)]
+    async fn recv(&mut self) -> &'static str {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
+                "SIGINT"
+            }
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+                "SIGTERM"
+            }
+            // Both registrations failed: there is nothing left to wait for.
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(not(unix))]
+    async fn recv(&mut self) -> &'static str {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "ctrl-c listener failed; the server will not stop on it");
+            std::future::pending::<()>().await;
+        }
+        "ctrl-c"
+    }
+}
+
 /// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
 /// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
 /// when the process exits, so a crashed server never locks the operator out of
@@ -93,19 +185,72 @@ fn holder_info_path(data_dir: &Path) -> std::path::PathBuf {
 /// mount with unreliable locking) must not be stranded. A filesystem that
 /// cannot lock at all only downgrades the guard to a warning — refusing to
 /// start there would be worse than the unguarded risk.
+/// Transient failures `open`/`try_lock_exclusive` can raise on a healthy but
+/// loaded machine: fd exhaustion (EMFILE per-process, ENFILE system-wide) and
+/// interrupted syscalls (EINTR). These deserve a short retry. A `WouldBlock`
+/// (another server already holds the lock, classified by
+/// `is_drain_lock_busy_error`) is deliberately excluded — that is the correct
+/// "someone else owns it" refusal and must surface immediately, never retried.
+fn is_transient_serve_lock_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        // EMFILE (per-process fd limit) / ENFILE (system-wide fd limit).
+        const EMFILE: i32 = 24;
+        const ENFILE: i32 = 23;
+        if code == EMFILE || code == ENFILE {
+            return true;
+        }
+    }
+    false
+}
+
 fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     let path = data_dir.join(SERVE_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening serve lock {}", path.display()))?;
     use fs2::FileExt as _;
-    match file.try_lock_exclusive() {
+
+    // Open the file and take the exclusive flock under a short bounded retry
+    // for transient errors only. A loaded machine (parallel test runs, an fd
+    // storm) can bounce `open` with EMFILE/ENFILE or interrupt the lock call
+    // with EINTR; a real server must not hard-fail on that. Mirrors
+    // `acquire_drain_lock`'s bounded ~25ms backoff. A `WouldBlock` (another
+    // holder) is never retried here — it falls through to the refusal path.
+    const SERVE_LOCK_ACQUIRE_ATTEMPTS: u32 = 5;
+    const SERVE_LOCK_ACQUIRE_BACKOFF: Duration = Duration::from_millis(25);
+    let mut attempt: u32 = 0;
+    let (file, lock_result) = loop {
+        attempt += 1;
+        let retriable = attempt < SERVE_LOCK_ACQUIRE_ATTEMPTS;
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if retriable && is_transient_serve_lock_error(&err) => {
+                std::thread::sleep(SERVE_LOCK_ACQUIRE_BACKOFF);
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("opening serve lock {}", path.display()));
+            }
+        };
+        match file.try_lock_exclusive() {
+            Err(err) if retriable && is_transient_serve_lock_error(&err) => {
+                std::thread::sleep(SERVE_LOCK_ACQUIRE_BACKOFF);
+                continue;
+            }
+            result => break (file, result),
+        }
+    };
+
+    match lock_result {
         Ok(()) => {
             // Informational only: the flock is the guard, and this names the
             // holder in a later refusal message. Best-effort, and written to
@@ -701,13 +846,72 @@ async fn run_session_consolidation_worker(
     }
 }
 
+/// Wraps [`tokio::net::TcpListener`] to enable TCP keepalive on every
+/// accepted connection.
+///
+/// Without this, a hook client whose peer dies without sending FIN (laptop
+/// sleep, a VPN/Tailscale flap, an abrupt kill) leaves its socket
+/// `ESTABLISHED` forever: the OS default is keepalive off, so the fd is
+/// never reclaimed. Over days that leaks one fd per dead peer until
+/// `accept()` starts failing with `EMFILE` and the healthcheck breaks (#792).
+/// Keepalive makes the kernel probe idle connections and close ones whose
+/// peer no longer answers.
+///
+/// This is built on axum's own [`axum::serve::ListenerExt::tap_io`] rather
+/// than a hand-rolled `impl axum::serve::Listener`. A hand-rolled newtype
+/// was tried first: it compiles as a `Listener`, but
+/// `into_make_service_with_connect_info::<SocketAddr>()` additionally needs
+/// `SocketAddr: Connected<IncomingStream<'_, L>>`, and axum only ships that
+/// impl for its own `TcpListener` and for `TapIo<L, F>` (generically, for any
+/// `L: Listener`) — never for an arbitrary third-party `L`. Implementing
+/// `Connected` ourselves is blocked by the orphan rule: neither `Connected`,
+/// `SocketAddr`, nor `IncomingStream` (a plain, non-fundamental axum type) is
+/// local to this crate. `tap_io` is the extension point axum actually
+/// provides for exactly this "touch every accepted `Io`" case, and it keeps
+/// `ConnectInfo` (real peer `SocketAddr`) working for free.
+fn keepalive_listener(
+    listener: tokio::net::TcpListener,
+    keepalive_secs: u64,
+) -> axum::serve::TapIo<
+    tokio::net::TcpListener,
+    impl FnMut(&mut tokio::net::TcpStream) + Send + 'static,
+> {
+    // `None` when `tcp_keepalive_secs = 0` (keepalive disabled) — pass
+    // accepted sockets through unmodified.
+    let keepalive = (keepalive_secs > 0).then(|| {
+        let idle = Duration::from_secs(keepalive_secs);
+        socket2::TcpKeepalive::new()
+            .with_time(idle)
+            .with_interval(idle)
+    });
+    axum::serve::ListenerExt::tap_io(listener, move |stream: &mut tokio::net::TcpStream| {
+        let Some(keepalive) = keepalive.as_ref() else {
+            return;
+        };
+        let sock_ref = socket2::SockRef::from(&*stream);
+        if let Err(error) = sock_ref.set_tcp_keepalive(keepalive) {
+            // Guard, don't panic (runtime paths never unwrap/expect): a
+            // platform or socket-state quirk here should not take down the
+            // connection, just leave it without the reaping this wrapper
+            // exists to provide.
+            tracing::warn!(%error, "failed to set TCP keepalive on accepted connection");
+        }
+    })
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
 /// Returns an error if the store cannot be opened, the watcher cannot
 /// install, or the transport setup fails.
 pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
+    // Before anything slow: boot takes the pre-migration archive and runs the
+    // wiki migrations, and a signal arriving in that window has to be caught
+    // rather than fall through to the default disposition (#699).
+    let mut shutdown = ShutdownSignals::install();
+
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
     // Validation runs before binding so a misconfigured origin is caught early.
@@ -733,8 +937,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
         .with_context(|| "taking the pre-migration safety backup")?;
 
-    let store = Store::open(&config.data_dir)
+    let mut store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
+    // Every reader handle below is cloned from this one, so the opt-in
+    // ranking signals are set once, here, and inherited everywhere.
+    store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
     // is a prefix-match catch-all. That means the $HOME and filesystem-root
@@ -872,6 +1080,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -890,6 +1099,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    // Share the tool router's last-activity clock with the B3 dream scheduler so
+    // it can tell an idle box from a busy one and cancel a run on the operator's
+    // return.
+    let activity_clock = server.activity_clock();
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
         config.auto_improve.clone(),
@@ -899,16 +1112,61 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.dream,
+        activity_clock,
     )
     .await;
 
     match args.transport {
         TransportKind::Stdio => {
             info!("MCP server ready on stdio (Ctrl-C to stop)");
-            let service = server.serve(stdio()).await?;
-            service.waiting().await?;
+            // `serve` resolves only once a client has completed the MCP
+            // `initialize` handshake, so the signal races the handshake as
+            // well as the session that follows it: a Ctrl-C before any client
+            // connected is the exact state a launched-but-unused server sits
+            // in, and until #699 nothing here listened for one at all.
+            let service = tokio::select! {
+                service = server.serve(stdio()) => Some(service?),
+                signal = shutdown.recv() => {
+                    info!(signal, "shutdown signal received before a client connected; stopping");
+                    None
+                }
+            };
+            if let Some(service) = service {
+                // Take the token before `waiting` consumes the service:
+                // stopping the transport is the only way out of that await.
+                let stop = service.cancellation_token();
+                let mut waiting = std::pin::pin!(service.waiting());
+                let signal = tokio::select! {
+                    result = &mut waiting => {
+                        result?;
+                        None
+                    }
+                    signal = shutdown.recv() => Some(signal),
+                };
+                if let Some(signal) = signal {
+                    info!(
+                        signal,
+                        "shutdown signal received; stopping the stdio transport"
+                    );
+                    stop.cancel();
+                    // A signal is a normal stop, so nothing below turns it
+                    // into a failing exit — but neither does it wait forever.
+                    match tokio::time::timeout(SHUTDOWN_GRACE, waiting).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "stdio transport ended abnormally during shutdown");
+                        }
+                        Err(_) => tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "stdio transport did not stop within the shutdown grace period; exiting anyway"
+                        ),
+                    }
+                }
+            }
         }
         TransportKind::Http => {
+            seed_active_project_fallback(&store.reader, &active_project).await;
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let (session_consolidation_notify, session_consolidation_task) =
@@ -1065,6 +1323,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -1199,6 +1458,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
             )?;
             let router = machine
+                .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
@@ -1285,24 +1545,60 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
+            let listener = keepalive_listener(listener, config.tcp_keepalive_secs);
             let shutdown_cancel = cancel.clone();
-            let serve_result = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("ctrl-c received; shutting down");
-                shutdown_cancel.cancel();
-            })
-            .await;
+            let serve_result = {
+                let serve = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let signal = shutdown.recv().await;
+                    info!(signal, "shutdown signal received; draining");
+                    shutdown_cancel.cancel();
+                })
+                .into_future();
+                let mut serve = std::pin::pin!(serve);
+                // Bound the drain. axum waits for every in-flight connection
+                // to close, and a stateful or SSE MCP client never closes one
+                // on its own — without this the shutdown outlives the
+                // supervisor's own patience and ends in SIGKILL (#699).
+                tokio::select! {
+                    result = &mut serve => Some(result),
+                    () = async {
+                        cancel.cancelled().await;
+                        tokio::time::sleep(SHUTDOWN_GRACE).await;
+                    } => {
+                        tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "connections still open past the shutdown grace period; exiting anyway"
+                        );
+                        None
+                    }
+                }
+            };
             cancel.cancel();
-            if let Some(task) = session_consolidation_task
-                && let Err(error) = task.await
-            {
-                tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+            if let Some(task) = session_consolidation_task {
+                // Bounded like the drain above. The worker can be parked in
+                // `claim_session_consolidation` or `release_session_consolidation`,
+                // neither of which races the cancellation, behind the
+                // single-writer actor's queue — an unbounded join here would
+                // sit outside the shutdown bound entirely (#699).
+                match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                    }
+                    Err(_) => tracing::warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "SessionEnd consolidation worker did not stop within the shutdown \
+                         grace period; exiting anyway"
+                    ),
+                }
             }
-            serve_result?;
+            if let Some(serve_result) = serve_result {
+                serve_result?;
+            }
         }
     }
     Ok(())
@@ -1318,6 +1614,8 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    activity_clock: ai_memory_consolidate::ActivityClock,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1328,11 +1626,23 @@ async fn start_maintenance_scheduler(
     let lint_interval_secs = settings.lint_interval_secs;
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
+    // A3 cold-cluster dedup targets the running server's configured embedder
+    // coordinate; with no embedder it is `None`, making A3 a clean no-op even
+    // when the flag is set (there are no stored vectors to cluster).
+    let dedup_embedding = embedder
+        .as_ref()
+        .map(|e| ai_memory_consolidate::EmbeddingCoord {
+            provider: e.provider().to_string(),
+            model: e.model().to_string(),
+            dim: e.dim(),
+        });
+
     let mut tasks = Vec::new();
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
+        let dedup_embedding = dedup_embedding.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -1358,6 +1668,7 @@ async fn start_maintenance_scheduler(
                     let writer = writer.clone();
                     let wiki = wiki.clone();
                     let decay = decay;
+                    let dedup_embedding = dedup_embedding.clone();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_sweep_tick(
@@ -1367,6 +1678,8 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.compact_cold_episodic,
+                            decay.cold_cluster_dedup(dedup_embedding),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -1379,6 +1692,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            compacted = outcome.compacted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
@@ -1567,6 +1881,7 @@ async fn start_maintenance_scheduler(
                 ai_memory_consolidate::ExperienceConfig {
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
+                    entropy_filter: scheduler.experience_entropy_filter,
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -1620,6 +1935,41 @@ async fn start_maintenance_scheduler(
         info!("auto-improve scheduler enabled but no LLM provider is configured; job not started");
     }
 
+    // B2/B3/B4 — the opt-in LLM dream pass. OFF by default; it starts only when
+    // `[dream] enabled` is set AND a provider AND an embedder are configured (a
+    // provider-less store keeps the zero-LLM A3 path, invariant #13). It never
+    // contends with live work: it runs only after `idle_window_secs` of quiet and
+    // cancels the moment activity resumes (invariant #5, cancellable + bounded).
+    if dream.enabled {
+        match (llm.clone(), dedup_embedding.clone()) {
+            (Some(llm), Some(embedding)) => {
+                let reader = reader.clone();
+                let wiki = wiki.clone();
+                let activity_clock = activity_clock.clone();
+                let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                tasks.push(tokio::spawn(async move {
+                    run_dream_scheduler_loop(
+                        reader,
+                        wiki,
+                        llm,
+                        decay,
+                        dream,
+                        embedding,
+                        activity_clock,
+                        interval,
+                    )
+                    .await;
+                }));
+            }
+            (None, _) => info!(
+                "dream pass enabled but no LLM provider is configured; job not started (the zero-LLM A3 path is unaffected)"
+            ),
+            (_, None) => info!(
+                "dream pass enabled but no embedder is configured; job not started (nothing to cluster)"
+            ),
+        }
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
@@ -1628,17 +1978,121 @@ async fn start_maintenance_scheduler(
     tasks
 }
 
+/// The B3 dream scheduler loop: on its interval, run the dream pass across every
+/// scope ONLY when the operator has been idle for the configured window, and
+/// cancel the in-flight run the moment activity resumes. A cheap watcher task
+/// flips the shared [`ai_memory_consolidate::DreamCancel`] when the activity
+/// clock advances past the run's start; `run_dream_pass` polls it between
+/// clusters.
+#[allow(clippy::too_many_arguments)]
+async fn run_dream_scheduler_loop(
+    reader: ReaderPool,
+    wiki: Wiki,
+    llm: Arc<dyn LlmProvider>,
+    decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    embedding: ai_memory_consolidate::EmbeddingCoord,
+    activity_clock: ai_memory_consolidate::ActivityClock,
+    interval: std::time::Duration,
+) {
+    /// How often the cancel watcher samples the activity clock during a run.
+    const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    let cfg = dream.dream_config(Some(embedding));
+    let decay_params = decay.decay_params();
+    loop {
+        tokio::time::sleep(interval).await;
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        if !ai_memory_consolidate::dream_idle_ready(&cfg, activity_clock.last_activity_us(), now_us)
+        {
+            continue;
+        }
+
+        // Cancel-on-activity: snapshot the last activity, then spawn a watcher
+        // that flips the cancel as soon as the clock moves past that snapshot.
+        let cancel = ai_memory_consolidate::DreamCancel::new();
+        let run_start_activity = activity_clock.last_activity_us();
+        let watcher = {
+            let cancel = cancel.clone();
+            let activity_clock = activity_clock.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(DREAM_ACTIVITY_POLL).await;
+                    if activity_clock.last_activity_us() > run_start_activity {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let scopes = match reader.list_all_scopes().await {
+            Ok(scopes) => scopes,
+            Err(error) => {
+                tracing::warn!(%error, "dream scheduler: could not list scopes; skipping tick");
+                watcher.abort();
+                continue;
+            }
+        };
+        let mut merged = 0usize;
+        let mut superseded = 0usize;
+        let mut cancelled = false;
+        for scope in scopes {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            match ai_memory_consolidate::run_dream_pass(
+                &reader,
+                &wiki,
+                Some(llm.as_ref()),
+                scope.workspace_id,
+                scope.project_id,
+                &decay_params,
+                decay.breadth_weight,
+                &cfg,
+                &cancel,
+                false,
+            )
+            .await
+            {
+                Ok(report) => {
+                    merged += report.clusters_merged;
+                    superseded += report.pages_superseded;
+                    cancelled |= report.cancelled;
+                }
+                Err(error) => tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    %error,
+                    "dream pass failed for scope"
+                ),
+            }
+        }
+        watcher.abort();
+        info!(
+            merged,
+            superseded,
+            cancelled,
+            elapsed_ms = started.elapsed().as_millis(),
+            "dream pass tick completed"
+        );
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    compacted: usize,
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
     errors: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -1646,6 +2100,8 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1654,7 +2110,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_options(
+        match ai_memory_consolidate::run_sweep_with_hygiene(
             reader,
             writer,
             Some(wiki),
@@ -1663,6 +2119,8 @@ async fn run_scheduled_sweep_tick(
             decay,
             breadth_weight,
             retention,
+            compact_cold_episodic,
+            dedup.clone(),
             false,
         )
         .await
@@ -1670,6 +2128,11 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
+                outcome.compacted += report
+                    .compacted
+                    .iter()
+                    .filter(|page| page.compacted)
+                    .count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
@@ -1719,6 +2182,10 @@ async fn run_scheduled_lint_tick(
                 dry_run: false,
                 use_llm: false,
                 decay_lambda,
+                // The automatic scheduled lint stays rule-based: the A5
+                // contradiction detector is on for the user-invoked
+                // `memory_lint` / admin lint, not the background sweep.
+                embedding: None,
             },
         )
         .await
@@ -2106,6 +2573,22 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
+/// Liveness probe for process supervisors.
+///
+/// Unauthenticated on purpose: launchd, systemd and `HEALTHCHECK` have no
+/// bearer token, and the answer ("this process is listening") is already
+/// observable by connecting to the port. It reads nothing and reports no
+/// store, provider or auth state.
+///
+/// Without it the only live signal is `GET /mcp` answering 405, which is an
+/// accident of method routing rather than a contract a supervisor can rely on.
+fn healthz_router() -> axum::Router {
+    axum::Router::new().route(
+        "/healthz",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+    )
+}
+
 fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
     router.layer(axum::middleware::from_fn_with_state(
         Arc::new(allowed_hosts),
@@ -2136,6 +2619,60 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     allowed_hosts.iter().any(|allowed| {
         host.eq_ignore_ascii_case(allowed) || host_without_port(host).eq_ignore_ascii_case(allowed)
     })
+}
+
+/// Seed the read-side active-project fallback from the most recently active
+/// project already on disk.
+///
+/// The pointer lives only in process memory, so restarting the daemon
+/// mid-session drops it. An unscoped read then resolves through the baked
+/// default scope and answers zero counts for a project holding thousands of
+/// observations — through the SUCCESS path, with nothing in the log, so
+/// neither the agent nor the operator can tell it apart from a genuinely
+/// empty project (#678). Failing such a read closed is not the fix: a keyed
+/// miss is also the normal shape of the pre-publish window (hooks are
+/// fire-and-forget) and of TTL/cap eviction, both of which must keep
+/// degrading gracefully.
+///
+/// So make the degraded answer a real one. The seed lands in a slot only READS
+/// consult: a keyed hit still wins, an unscoped write from an unrecognized
+/// caller still fails closed rather than being attributed to a reconstructed
+/// project, and the first hook event publishes straight over it. The recency
+/// bound is the pointer's own per-key TTL: activity older than that would have
+/// aged out of a live pointer anyway. Non-fatal — a server that cannot read
+/// this starts exactly as it does today.
+async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &ActiveProject) {
+    if active_project.get().is_some() {
+        return;
+    }
+    let ttl_us = i64::try_from(active_project.per_key_ttl().as_micros()).unwrap_or(i64::MAX);
+    let since = jiff::Timestamp::now()
+        .as_microsecond()
+        .saturating_sub(ttl_us);
+    match reader.most_recently_active_scope(since).await {
+        Ok(Some((workspace_id, project_id))) => {
+            active_project.seed_read_fallback(workspace_id, project_id);
+            let workspace = reader
+                .workspace_name_by_id(workspace_id)
+                .await
+                .ok()
+                .flatten();
+            let project = reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .ok()
+                .flatten();
+            info!(
+                workspace = workspace.as_deref().unwrap_or("<unknown>"),
+                project = project.as_deref().unwrap_or("<unknown>"),
+                "seeded active-project fallback from the last recorded activity"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "active-project fallback seed skipped (non-fatal)");
+        }
+    }
 }
 
 fn host_without_port(host: &str) -> &str {
@@ -2190,11 +2727,70 @@ mod tests {
         }
     }
 
+    /// Assert `acquire_serve_lock` returned a real held lock, panicking with
+    /// the concrete cause otherwise. The bare `.unwrap()...is_some()` collapsed
+    /// a transient `Err` (EMFILE/ENFILE/EINTR under parallel fd pressure) or an
+    /// `Ok(None)` downgrade into an un-actionable flake; this turns the next
+    /// occurrence into a one-line errno diagnosis while still requiring the
+    /// lock to be genuinely held.
+    fn assert_serve_lock_held(result: Result<Option<ServeLock>>) -> ServeLock {
+        match result {
+            Ok(Some(lock)) => lock,
+            Ok(None) => panic!(
+                "acquire_serve_lock downgraded to an unguarded start (Ok(None)) although no other holder exists in this test"
+            ),
+            Err(err) => panic!("acquire_serve_lock failed: {err:?}"),
+        }
+    }
+
+    /// Acquire the serve lock after a prior holder was released, tolerating the
+    /// brief window in which a just-released `flock` can still report busy when
+    /// the release and the re-acquire race in the *same* process under heavy
+    /// parallel test load. This asserts the guarantee that actually matters — a
+    /// released lock is not *permanently* held — rather than instant
+    /// availability; a real server releases on process exit, so production never
+    /// hits this same-process window (and `acquire_serve_lock` rightly never
+    /// retries a genuine `WouldBlock`). Still requires the lock to be genuinely
+    /// acquired within the window, and panics with the concrete cause otherwise.
+    fn acquire_released_serve_lock(dir: &Path) -> ServeLock {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match acquire_serve_lock(dir, false) {
+                Ok(Some(lock)) => return lock,
+                other => {
+                    if std::time::Instant::now() >= deadline {
+                        return assert_serve_lock_held(other);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_retriable_but_a_busy_lock_is_not() {
+        use std::io::{Error, ErrorKind};
+        // EINTR is transient and cross-platform via ErrorKind::Interrupted.
+        assert!(is_transient_serve_lock_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        #[cfg(unix)]
+        {
+            // EMFILE / ENFILE fd exhaustion is transient.
+            assert!(is_transient_serve_lock_error(&Error::from_raw_os_error(24)));
+            assert!(is_transient_serve_lock_error(&Error::from_raw_os_error(23)));
+        }
+        // A contended lock (WouldBlock) is the "someone else owns it" signal:
+        // it is busy, never transient, and must not be retried away.
+        let busy = Error::from(ErrorKind::WouldBlock);
+        assert!(!is_transient_serve_lock_error(&busy));
+        assert!(crate::commands::hook_spool::is_drain_lock_busy_error(&busy));
+    }
+
     #[test]
     fn second_server_on_the_same_data_dir_is_refused_and_names_the_holder() {
         let dir = TempDir::new().unwrap();
-        let first = acquire_serve_lock(dir.path(), false).unwrap();
-        assert!(first.is_some());
+        let _first = assert_serve_lock_held(acquire_serve_lock(dir.path(), false));
         let err = acquire_serve_lock(dir.path(), false)
             .unwrap_err()
             .to_string();
@@ -2211,7 +2807,7 @@ mod tests {
     #[test]
     fn force_starts_unguarded_while_the_holder_keeps_the_lock() {
         let dir = TempDir::new().unwrap();
-        let _first = acquire_serve_lock(dir.path(), false).unwrap();
+        let _first = assert_serve_lock_held(acquire_serve_lock(dir.path(), false));
         assert!(acquire_serve_lock(dir.path(), true).unwrap().is_none());
         // --force bypasses the refusal, not the holder: a plain attempt still sees it.
         assert!(acquire_serve_lock(dir.path(), false).is_err());
@@ -2225,7 +2821,11 @@ mod tests {
             // Dropping the holder is what process exit does to the flock: the
             // leftover .serve.lock file must not outlive the lock it named.
         }
-        assert!(acquire_serve_lock(dir.path(), false).unwrap().is_some());
+        // Under heavy parallel `cargo test --workspace` load the just-released
+        // flock can momentarily still report busy in this same process; retry
+        // briefly so the assertion checks "not permanently locked out" rather
+        // than instant availability.
+        let _ = acquire_released_serve_lock(dir.path());
     }
 
     #[test]
@@ -2797,6 +3397,8 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -2841,6 +3443,8 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -2931,6 +3535,180 @@ mod tests {
                 }))
             })
         }
+    }
+
+    /// #678: the pointer is process memory, so `systemctl restart` mid-session
+    /// drops it. An unscoped read then resolved through the baked default scope
+    /// and reported zero counts for a project holding thousands of observations,
+    /// through the success path. Seeding the shared slot from the last recorded
+    /// activity makes that degraded answer a real one.
+    #[tokio::test]
+    async fn a_restart_seeds_the_active_project_fallback_from_the_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        // The baked default scope: empty, and where the bug parked every read.
+        let scratch = store
+            .writer
+            .get_or_create_project(workspace_id, "scratch", None)
+            .await
+            .unwrap();
+        let worked_in = store
+            .writer
+            .get_or_create_project(workspace_id, "real-project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: worked_in,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: worked_in,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "the session that outlived the daemon".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        // A pointer as empty as it is one instruction after a restart.
+        let active_project = ActiveProject::new();
+        seed_active_project_fallback(&store.reader, &active_project).await;
+        assert_eq!(
+            active_project.seeded(),
+            Some((workspace_id, worked_in)),
+            "the seed must name the project the last activity landed in"
+        );
+        assert_eq!(
+            active_project.get(),
+            None,
+            "a reconstruction is not a publish: the shared slot stays empty"
+        );
+
+        // The live session's keyed entry died with the process, so its read
+        // misses the map — and must now degrade to real data, not to `scratch`.
+        let actor = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some(session_id.to_string()),
+        };
+        let resolved = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.as_tuple(),
+            (workspace_id, worked_in),
+            "an unscoped read after a restart must not silently answer for the baked default"
+        );
+
+        // ...while an unscoped WRITE from a caller the pointer cannot place is
+        // untouched by the seed: it resolves exactly where it did before, so a
+        // page is never attributed to a project reconstructed from a session
+        // that is not this caller's.
+        let written = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project)
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.as_tuple(),
+            (workspace_id, scratch),
+            "the seed must not retarget unscoped writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_never_overwrites_a_pointer_a_hook_already_published() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let published = store
+            .writer
+            .get_or_create_project(workspace_id, "published", None)
+            .await
+            .unwrap();
+        // Activity in a DIFFERENT project, or the seed no-ops and this test
+        // passes with the guard deleted.
+        let elsewhere = store
+            .writer
+            .get_or_create_project(workspace_id, "elsewhere", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: elsewhere,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: elsewhere,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "activity the seed would otherwise reach for".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        let active_project = ActiveProject::new();
+        active_project.set(workspace_id, published);
+        seed_active_project_fallback(&store.reader, &active_project).await;
+
+        assert_eq!(
+            active_project.get(),
+            Some((workspace_id, published)),
+            "a live pointer outranks anything the DB remembers"
+        );
+        assert_eq!(
+            active_project.seeded(),
+            None,
+            "no seed is taken while a real publish already stands"
+        );
     }
 
     #[tokio::test]
@@ -3079,6 +3857,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -3110,6 +3889,8 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            false,
+            ai_memory_consolidate::ColdClusterDedup::default(),
         )
         .await
         .unwrap();
@@ -3504,7 +4285,8 @@ mod tests {
                 require_dual_auth,
             )))
             .merge(web.public)
-            .merge(ai_memory_web::favicon_router());
+            .merge(ai_memory_web::favicon_router())
+            .merge(healthz_router());
 
         // Mutation captured: dropping any host-owned route merge lets the root SPA
         // wildcard return its HTML shell instead of the reserved route response.
@@ -3532,6 +4314,21 @@ mod tests {
                 "{path} must reach its authenticated host route"
             );
         }
+
+        // A supervisor probing liveness sends no bearer token, so /healthz has to
+        // answer 200 with auth configured — and it is a host-owned route like the
+        // ones above, so the SPA wildcard must not serve its shell here either.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
 
         let api = router
             .clone()
@@ -3665,6 +4462,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4047,6 +4845,44 @@ mod tests {
                 "https://b.example.com",
                 "https://c.example.com"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_enables_socket_keepalive_when_configured() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 60);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled when tcp_keepalive_secs > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_disables_socket_keepalive_when_idle_is_zero() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 0);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            !sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must stay off when tcp_keepalive_secs = 0"
         );
     }
 }

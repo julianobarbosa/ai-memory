@@ -31,6 +31,18 @@ assert_eq() {
     fi
 }
 
+# Git Bash reports $PWD and mktemp's directory as MSYS paths (/h/..., /tmp/...).
+# powershell.exe resolves neither, so a path handed to it has to be converted
+# first. cygpath ships with Git for Windows and exists nowhere else, where the
+# path is already native.
+host_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # --- parse_toml_key ---------------------------------------------------
 cat >"$TMP/sample.toml" <<EOF
 # Comment line
@@ -169,6 +181,16 @@ next line'
 assert_eq "json_string escapes text" '"quoted \"thing\" \\ path\nnext line"' \
     "$(printf '%s' "$JSON_INPUT" | ai_memory_json_string)"
 
+# A raw control byte (JSON forbids U+0000..U+001F inside a string) must become
+# a \u00XX escape, not reach stdout bare -- a replayed ANSI-coloured tool
+# result otherwise made the whole SessionStart packet invalid JSON (#732).
+CTRL_OUT="$(printf 'a\033[0mb' | ai_memory_json_string)"
+case "$CTRL_OUT" in
+    *'\u001b'*) CTRL_ESCAPED=yes ;;
+    *) CTRL_ESCAPED=no ;;
+esac
+assert_eq "json_string escapes a control byte as a \u escape" "yes" "$CTRL_ESCAPED"
+
 # --- marker_qs --------------------------------------------------------
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
 assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep" "$QS"
@@ -289,8 +311,10 @@ if command -v git >/dev/null 2>&1; then
         PSH=$(command -v powershell)
     fi
     if [ -n "$PSH" ]; then
-        PS_REPO=$($PSH -NoProfile -ExecutionPolicy Bypass -Command \
-            ". '$PWD/hooks/lib/ai-memory-hook.ps1'; Get-AiMemoryRepoRootProject -Cwd '$REPO/crates/cli'")
+        PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+        PS_CWD=$(host_path "$REPO/crates/cli")
+        PS_REPO=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+            ". '$PS_LIB'; Get-AiMemoryRepoRootProject -Cwd '$PS_CWD'")
         assert_eq "powershell repo-root helper resolves repo basename" "acme-api" "$PS_REPO"
     else
         PS_STATIC=$(grep -q 'function Get-AiMemoryRepoRootProject' hooks/lib/ai-memory-hook.ps1 \
@@ -309,6 +333,85 @@ assert_eq "url_encode escapes plus"       "a%2Bb"  "$(ai_memory_url_encode "a+b"
 assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
+
+# --- offline spool ----------------------------------------------------
+# The spool dir follows the data dir, which the harness pins inside $TMP.
+AI_MEMORY_DATA_DIR="$TMP/spool-data"
+export AI_MEMORY_DATA_DIR
+
+MS=$(ai_memory_now_ms)
+assert_eq "now_ms is 13 digits" "13" "$(printf '%s' "$MS" | wc -c | tr -d ' ')"
+case "$MS" in
+    *[!0-9]*) assert_eq "now_ms is all digits" "digits" "$MS" ;;
+    *) assert_eq "now_ms is all digits" "digits" "digits" ;;
+esac
+
+# A body carrying every escape ai_memory_json_string emits must survive the
+# write/read round trip byte for byte, or a drained event is corrupted.
+SPOOL_BODY='{"t":"quote \" backslash \\ newline
+tab\ttail"}'
+ai_memory_spool_event "http://127.0.0.1:1/hook?event=stop&agent=cursor" "$SPOOL_BODY"
+SPOOL_FILE=$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | head -n 1)
+assert_eq "spool_event writes one entry" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "spooled body round-trips" "$SPOOL_BODY" "$(ai_memory_json_field body "$SPOOL_FILE")"
+case "$(ai_memory_json_field url "$SPOOL_FILE")" in
+    *ingest_key=sh*) SPOOL_HAS_INGEST_KEY=yes ;;
+    *) SPOOL_HAS_INGEST_KEY=no ;;
+esac
+assert_eq "spool_event mints an ingest_key" "yes" "$SPOOL_HAS_INGEST_KEY"
+assert_eq "spool entry is 0600" "600" \
+    "$(ls -l "$SPOOL_FILE" | cut -c2-10 | tr 'rwx-' '4210' | awk '{print substr($0,1,3)+0 substr($0,4,3)+0 substr($0,7,3)+0}' >/dev/null 2>&1; \
+       if [ -r "$SPOOL_FILE" ] && [ ! -x "$SPOOL_FILE" ]; then printf '600'; else printf 'other'; fi)"
+assert_eq "spool filename is <ms>-<pid>-<seq>.json" "ok" \
+    "$(basename "$SPOOL_FILE" | grep -Eq '^[0-9]{13}-[0-9]+-[0-9a-f]{16}\.json$' && printf ok || printf bad)"
+
+# A `\uXXXX` escape means a richer serializer wrote the entry (the native
+# binary). The shell reader declines it rather than mangling the payload, so
+# `ai-memory hook-drain` still delivers it.
+printf '%s' '{"url":"http://x/y","body":"{\"a\":\"\u0007\"}","created_ms":1,"auth_mode":"none","attempts":0}' \
+    >"$TMP/spool-data/hook-spool/foreign.json"
+ai_memory_json_field body "$TMP/spool-data/hook-spool/foreign.json" >/dev/null 2>&1 \
+    && FOREIGN=read || FOREIGN=declined
+assert_eq "json_field declines a \\u escape" "declined" "$FOREIGN"
+rm -f "$TMP/spool-data/hook-spool/foreign.json"
+
+# A timeout can hide a successful server write. The initial attempt and the
+# spooled replay must carry the same key so the server can reject the replay.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+CURL_ATTEMPT_FILE="$TMP/curl-attempt-url"
+curl() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            http://* | https://*) printf '%s' "$1" >"$CURL_ATTEMPT_FILE" ;;
+        esac
+        shift
+    done
+    cat >/dev/null
+    return 28
+}
+printf '%s' '{"e":"ambiguous"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
+unset -f curl
+SPOOL_FILE=$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | head -n 1)
+ATTEMPT_URL=$(cat "$CURL_ATTEMPT_FILE")
+SPOOL_URL=$(ai_memory_json_field url "$SPOOL_FILE")
+case "$ATTEMPT_URL" in
+    *ingest_key=sh*) ATTEMPT_HAS_INGEST_KEY=yes ;;
+    *) ATTEMPT_HAS_INGEST_KEY=no ;;
+esac
+assert_eq "post_hook keys the initial delivery" "yes" "$ATTEMPT_HAS_INGEST_KEY"
+assert_eq "post_hook preserves the key after an ambiguous delivery" \
+    "$ATTEMPT_URL" "$SPOOL_URL"
+
+# An unreachable server must leave the event on disk instead of dropping it.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+printf '%s' '{"e":"unreachable"}' \
+    | ai_memory_post_hook "http://127.0.0.1:1/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook spools an undelivered event" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+unset AI_MEMORY_DATA_DIR
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
