@@ -44,6 +44,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::path_sanitize::slugify_page_path;
+
 /// Rough characters-per-token estimate used for budget enforcement.
 /// 4 is the standard heuristic for English prose (cl100k, gpt-4
 /// tokenizer family). Don't rely on it for billing math — it's
@@ -1434,42 +1436,6 @@ fn insert_bootstrap_page(
     pages_by_path.insert(page.path.clone(), page);
 }
 
-/// Filename characters Windows refuses, mirroring
-/// `ai_memory_core::ids`'s reserved-char set, plus `\` — `PagePath::new`
-/// already rejects a literal backslash anywhere in the raw path (it reads as
-/// a separator), so a component containing one must be cleaned before
-/// `PagePath::new` ever sees it, not after.
-const PATH_ILLEGAL_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*', '\\'];
-
-/// Clean a model-produced page path so it survives `PagePath::new` and
-/// `ensure_portable`.
-///
-/// The LLM sometimes echoes free text — a conventional-commit subject like
-/// `build(sandbox): orchestrate` — straight into a page path. That passes
-/// `PagePath::new` (deliberately tolerant; see its doc comment) but fails
-/// `ensure_portable`, which `Wiki::apply_batch` enforces atomically: one bad
-/// path there aborts every page in the batch, not just its own (#847).
-/// Replace every Windows-illegal character and ASCII control byte in each
-/// `/`-separated component with `-`, keeping the `dir/subdir/name.md` shape
-/// intact so the model's intended layout survives.
-fn slugify_page_path(raw: &str) -> String {
-    raw.split('/')
-        .map(|segment| {
-            segment
-                .chars()
-                .map(|c| {
-                    if PATH_ILLEGAL_CHARS.contains(&c) || (c as u32) < 0x20 {
-                        '-'
-                    } else {
-                        c
-                    }
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 // --------------------------------------------------------------------
 // Manifest rendering
 // --------------------------------------------------------------------
@@ -2365,22 +2331,9 @@ mod tests {
     // Windows-illegal path sanitization (#847)
     // ----------------------------------------------------------------
 
-    #[test]
-    fn slugify_page_path_replaces_illegal_chars_and_keeps_slashes() {
-        assert_eq!(
-            slugify_page_path("concepts/build(sandbox): orchestrate the run.md"),
-            "concepts/build(sandbox)- orchestrate the run.md"
-        );
-        assert_eq!(
-            slugify_page_path("a/b<c>d:e\"f|g?h*i\\j.md"),
-            "a/b-c-d-e-f-g-h-i-j.md"
-        );
-        assert_eq!(
-            slugify_page_path("concepts/clean-path.md"),
-            "concepts/clean-path.md",
-            "an already-portable path must be left unchanged"
-        );
-    }
+    // `slugify_page_path` itself is unit-tested alongside its definition in
+    // `crate::path_sanitize`; this remaining test exercises the bootstrap
+    // write loop's use of it end to end.
 
     /// A batch with one page whose path contains a Windows-illegal `:`
     /// (copied verbatim from a conventional-commit subject, e.g.

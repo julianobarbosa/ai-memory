@@ -58,7 +58,12 @@ None of the competitors below has more than one or two of these; none has all.
 | **Letta / MemOS** | **No** if you're building your agent *on* Letta; **yes** if you only wanted your existing coding agent to remember | Additive memory under your existing harness, zero-LLM, no runtime adoption | The ADE + agent-framework machinery (which you don't need unless building on Letta) |
 | **Honcho** (Plastic Labs) | **No — different problem.** It models the *human* (theory-of-mind peer representations); we remember the *project* | If you (mis)used it for coding continuity: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no mandatory LLM egress | Its user-psychology reasoning engine (Deriver/Dreamer/Dialectic), published user-recall benchmarks, managed cloud — none of which a coding-memory user needs |
 | **LiquidLM** (solo-built hosted memory API, Supermemory camp) | **Weak — different job.** It's a cloud "second brain" with multimodal RAG; we're automatic, file-first coding memory | Data ownership (markdown+git, no opaque cloud), zero-LLM default, single-binary self-host, automatic hook capture, per-project team sharing, no API/subscription spend | Its multimodal ingestion (video/audio/PDF/Office), polished web app + grounded chat, managed hosting, GitHub-sync connector, and out-of-the-box rerank |
-| **Mem0/Zep for apps; OpenViking, Supermemory, LiquidLM, Honcho** | different buyer (app/user personalization, hosted context DB / RAG-as-a-service, user-modeling) — **not migration targets** | — | — |
+| **Engram** (self-hosted coding-agent store, issue #810) | **Yes** — the closest newcomer to our lane | Files-as-truth git-markdown wiki (vs SQLite-as-truth + git-synced compressed chunks), **automatic lifecycle-hook capture** (vs agent-driven `mem_*` MCP saves), typed claim-once handoffs + cross-project messaging, multi-user page sharing, published numbers | Engram's zero-config Go binary is equally lean; you give up its managed Cloud replication add-on. A near-tie on posture — the switch is capture model + wiki-vs-rows, not moat depth |
+| **EverOS** (file-first sibling, issue #810) | **Yes** for zero-LLM/single-binary/team; **no** if you want its LanceDB vector tier or user-track modeling | Zero-LLM default (EverOS's minimal tier still needs an LLM for the core flow), one self-contained binary (vs a Python stack), cross-harness lifecycle capture, typed handoffs/messaging, published numbers | EverOS's LanceDB vector index, its first-class user `episodes/profile` track, and its packaged offline "memory evolution" UX |
+| **memU** (LLM-wiki + skill distillation, issue #810) | **Partly** — same file-first instinct, different default | Zero-LLM capture/retrieval by default (memU's distill flow is LLM-required), one binary (vs Python + sidecars patching host instruction files), MCP + hooks, git-versioned truth | memU's turnkey **skill-distillation-into-Markdown** packaging and its hosted cloud (memu.so). Our nearest equivalent is the opt-in experience/auto-improve pass, not a one-command skill distiller |
+| **Caura** (governed fleet memory, issue #810) | **No — different buyer** (org-scale multi-agent governance) | If you (mis)used it for one project: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no LLM egress | Its **fleet-governance layer** — org/team/agent visibility scopes and **four cross-fleet trust tiers** — which ai-memory does **not** match (see honest gaps); plus its managed platform and self-reported LoCoMo/LongMemEval numbers |
+| **TencentDB Agent Memory** (proxy fan-in server, issue #810) | **Mostly no — different capture model** | Hook/MCP capture into a file-first wiki you own (vs a base-URL proxy intercepting traffic), zero-LLM default, one binary vs a Node three-service stack, typed handoffs | Its zero-code proxy integration and its **CodeGraph** codebase index (adjacent code-intelligence we don't do). Note: needs no Tencent DB (SQLite default) — the name misleads |
+| **Mem0/Zep for apps; OpenViking, Supermemory, LiquidLM, Honcho, Caura** | different buyer (app/user personalization, hosted context DB / RAG-as-a-service, user-modeling, org-scale fleet governance) — **not migration targets** | — | — |
 
 Net: the premise holds where it should. For a **self-hosted, multi-harness,
 team, zero-LLM, data-ownership** coding-memory use case, ai-memory does the basics
@@ -176,6 +181,16 @@ implemented without a separate decision.** Ordered by leverage.
    (now 54 / 130); `comparison.md` attributes agentmemory's `0.967` to
    LongMemEval-S when it's their in-house `coding-agent-life-v1` (the like-for-like
    LongMemEval-S is 0.952 vs our 0.823).
+8. **Fleet-scale trust governance — a real gap vs Caura (issue #810).** Our
+   multi-user story is per-project (`pages shared, batons owned`, invariant #16)
+   with a root→DB-user→OIDC auth ladder and an audit log — deliberately
+   project-scoped. Caura adds an axis we do not have: org/team/agent visibility
+   scopes plus **four cross-fleet trust tiers** governing read/write/delete across
+   hundreds of agents, with per-write PII flagging. This is genuinely off-mission
+   for file-first coding memory (it belongs to the org-fleet buyer), so the honest
+   move is to **say so, not to chase it** — but it should not be waved away as
+   "we already do multi-user." We do project multi-user; we do not do fleet
+   governance.
 
 ## Bottom line
 

@@ -59,12 +59,17 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Closest sibling (fact-row twin) | doobidoo/mcp-memory-service | SQLite(+vec), local ONNX, hook capture, typed edges, honest numbers | What ai-memory would be if it chose fact-rows over wiki **pages** |
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
+| File-first wiki (LLM-leaning) | **memU**, **EverOS** | Markdown source of truth + derived vector/SQLite(+LanceDB) indexes; offline consolidation; skill distillation from session history | LLM-required for the core capture/distill flow (no zero-LLM default); Python multi-service + a hosted-cloud option, vs one self-contained zero-LLM binary; memU patches host instruction files rather than exposing a git-diffable wiki |
+| Self-hosted coding-agent store | **Engram** | Single Go binary, SQLite+FTS5, MCP stdio, project-scoped, `mem_session_summary` handoffs, git-sync across machines | Structured rows the agent saves through MCP tools (SQLite is the truth, git-syncs compressed chunks), not a hand-editable git-markdown wiki captured automatically from lifecycle hooks |
+| Governed multi-agent / fleet memory | **Caura** | Shared fleet memory: agent/team/org visibility scopes, four trust tiers, audit log, PII flagging, contradiction/supersession, auto knowledge graph | Fleet-governance-first on Postgres+pgvector (LLM extraction), hosted option; ai-memory optimizes one project's git-backed wiki with `pages shared, batons owned`, not org-scale fleet governance |
+| Shared memory server (proxy fan-in) | **TencentDB Agent Memory** | One proxy in front of many harnesses distills chats/docs/code into Chat Memory / Skill / Wiki / CodeGraph assets | Proxy base-URL interception, not MCP or OS lifecycle hooks; despite the name it needs no Tencent DB product (SQLite by default); a Node three-service stack vs one file-first binary |
 
 ## Maturity and maintenance
 
 This is a crowded, fast-moving field, and it is only fair to say so: **every tool
 compared here is actively maintained** (as of 2026-09-18, all had commits within
-the last ~10 days — none stale, none archived). Raw GitHub popularity, though,
+the last ~10 days — none stale, none archived; the five new-entrant rows below
+were verified 2026-09-22). Raw GitHub popularity, though,
 tracks funding and app-developer reach more than coding-agent fitness — the
 star leaders are the app-personalization and hosted-context players (a different
 buyer), while the tools closest to ai-memory's file-first, self-hosted,
@@ -78,12 +83,17 @@ coding-continuity niche are smaller by design.
 | Cognee | 30.8k | 2026-09-15 | active |
 | Supermemory | 30.1k | 2026-08-17 | active |
 | agentmemory | 28.6k | 2026-08-16 | active |
+| TencentDB Agent Memory | 27.2k | v2.0.1 (2026-08-25) | active |
 | Letta | 24.8k | 2026-05-14 | active (releases lag code) |
 | Hindsight | 23.9k | 2026-09-14 | active |
+| memU | 14.4k | v1.5.1 (2026-03-23) | active (releases lag code) |
+| EverOS | 13.1k | v1.3.1 (2026-09-08) | active |
 | Honcho | 7.2k | tag v3.2.0 | active |
+| Engram | 6.8k | v2.0.0 (2026-09-18) | active |
 | basic-memory | 4.0k | 2026-08-25 | active |
 | mcp-memory-service | 2.0k | 2026-09-14 | active |
 | LangMem | 1.7k | PyPI-only | active |
+| Caura | 0.5k | backend-v3.17.2 (2026-09-19) | active |
 | LiquidLM | closed-source | `@liquidlm/cli` 0.1.5 (2026-09-17) | active (young, solo) |
 
 Full figures, sources, and per-tool caveats: [`research-2026-landscape.md`](research-2026-landscape.md#popularity-and-maintenance-signal-as-of-2026-09-18).
@@ -205,6 +215,42 @@ operator turns it on.
   extraction depth and their published headline accuracy numbers; you gain no
   vendor lock-in, no required API spend, and per-project team sharing rather
   than strict per-bank isolation.
+- **From Engram (self-hosted coding-agent store):** the closest operational
+  sibling among the newcomers — a single self-hosted binary, SQLite+FTS5, MCP,
+  project scope, and session-summary handoffs. The switch is Engram's
+  agent-saved structured rows (the agent calls `mem_*` MCP tools; SQLite is the
+  truth, git-syncing compressed chunks) → ai-memory's automatic lifecycle-hook
+  capture compiled into a hand-editable git-markdown **wiki**, plus typed
+  claim-once handoffs, cross-project messaging, and multi-user page sharing. You
+  keep a keyless, offline, single-binary posture; you give up (for now) Engram's
+  managed Cloud replication add-on.
+- **From memU / EverOS (file-first, LLM-leaning):** you keep markdown as the
+  source of truth, but ai-memory's core capture, retrieval, and summaries run
+  **zero-LLM by default** rather than requiring a provider for the capture/
+  distill flow, and ship as one binary instead of a Python multi-service stack.
+  memU's skill-distillation and EverOS's offline consolidation map onto
+  ai-memory's [experience pass](experience.md) + auto-improve loop; EverOS's
+  SQLite+LanceDB derived indexes map onto ai-memory's derived SQLite/FTS5(+local
+  embeddings). You give up (for now) memU's turnkey skill-distillation packaging
+  and hosted cloud, and EverOS's LanceDB vector tier.
+- **From Caura (governed multi-agent fleet memory):** different buyer. Caura
+  optimizes org-scale fleet governance — agent/team/org visibility scopes, four
+  trust tiers, an audit log, PII flagging — on Postgres+pgvector with LLM
+  extraction. ai-memory shares the multi-agent/multi-user goal but at
+  *project* scope (`pages shared, batons owned`, invariant #16) with a
+  self-hosted auth ladder and audit log, not fleet-wide trust tiers. If you need
+  cross-fleet trust governance across hundreds of agents, that is Caura's lane,
+  not ours; if you want file-first, zero-LLM, single-binary project memory, it is
+  ours. (Caura's trust-tier governance is an honest capability we do not match —
+  see [`competitive-parity.md`](competitive-parity.md).)
+- **From TencentDB Agent Memory (proxy fan-in server):** you trade a Node
+  three-service proxy that intercepts each harness's API base URL (distilling
+  Chat Memory / Skill / Wiki / CodeGraph assets) for a file-first binary that
+  captures through OS lifecycle hooks and stores git-versioned markdown you own.
+  Despite the name, TencentDB Agent Memory needs no Tencent database (SQLite by
+  default). You give up its zero-code proxy integration and its CodeGraph code
+  index (an adjacent, codebase-intelligence feature ai-memory does not do); you
+  gain hook capture, a git-markdown wiki, typed handoffs, and zero-LLM operation.
 
 ## Where we're behind, or different by choice
 

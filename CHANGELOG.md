@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape preserved) before validation, so the run and its other pages
   survive; a path `ensure_portable` still rejects after sanitizing is
   skipped with a warning instead of failing the batch. (#847)
+- Per-session consolidation (`consolidate_session_multi`) had the same
+  Windows-illegal-path defect as `ai-memory bootstrap` (#847): an
+  LLM-produced page path containing a character like `:` passed the
+  deliberately tolerant `PagePath::new` and only failed later at
+  `ensure_portable` inside the atomic wiki write batch, losing every other
+  page from that session's consolidation run. The path is now sanitized
+  the same way bootstrap's is, consistently across rule-routing, per-user
+  slot placement, and the session-anchor comparison, before validation;
+  a path `ensure_portable` still rejects after sanitizing is skipped with
+  a warning instead of failing the batch. (#848)
 - The Windows release checksum (`ai-memory-windows-x86_64.zip.sha256`) is now
   written with a LF terminator instead of CRLF. `Out-File`'s Windows line
   ending made `sha256sum -c` fail with `No such file or directory` — the CR

@@ -22,6 +22,7 @@ pub mod entropy_filter;
 pub mod experience;
 pub mod keep_tokens;
 pub mod lint;
+mod path_sanitize;
 pub mod projection;
 pub mod sweep;
 pub mod types;
