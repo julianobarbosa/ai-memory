@@ -19,6 +19,14 @@ else
 fi
 
 echo "building AIMemoryMenu"
+# SwiftUI @State needs libSwiftUIMacros; Command Line Tools alone do not ship it.
+XCODE_DEVELOPER="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+if [[ ! -d "$XCODE_DEVELOPER/Platforms/MacOSX.platform" ]]; then
+  echo "error: install Xcode or set DEVELOPER_DIR to Xcode.app/Contents/Developer" >&2
+  exit 1
+fi
+export DEVELOPER_DIR="$XCODE_DEVELOPER"
+
 swift build "${SWIFT_FLAGS[@]}" --package-path "$COMPANION"
 BIN_PATH="$(swift build "${SWIFT_FLAGS[@]}" --package-path "$COMPANION" --show-bin-path)"
 
