@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod api_credentials;
 mod auto_improve;
+pub mod belief;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -36,43 +37,50 @@ pub use fts_query::prepare_fts5_query;
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
-    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS, ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
+    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
+    AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, RejectAutoImproveProposal,
+    SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport,
+    artifact_path_for,
 };
+pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use decay::{
-    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    retention_score_with_breadth, salience_after_feedback,
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
+    lambda_from_half_life_days, retention_score, retention_score_with_breadth,
+    salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
     EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, backfill_entity_index, purge_session, record_embed_failure,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeSessionSummary,
+    PurgeSummary, ReorgSummary, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
-    BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
-    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
-    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
-    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
+    ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
+    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
+    GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
+    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
-    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
-    lookup_global_scope, resolve_many_existing_scopes,
+    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
+    WORKSPACE_PROJECT_PAIR_REQUIRED, create_explicit_scope, create_global_scope,
+    lookup_existing_scope, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -151,6 +159,16 @@ impl Store {
                 "entity index backfilled from existing frontmatter"
             );
         }
+
+        // Chunked, resumable, WAL-bounded backfill of page ingestion windows
+        // (reshaped V62, #776). V62 now adds `valid_from`/`valid_to` and their
+        // index as cheap DDL; this reconstructs the same windows the original
+        // in-migration backfill produced, but in bounded batches with a WAL
+        // checkpoint between each instead of one multi-hour transaction. Runs
+        // single-threaded here, before the writer actor spawns, so it completes
+        // before the server accepts traffic. A store already backfilled (every
+        // page has a non-NULL `valid_from`) is a fast no-op.
+        ops::backfill_page_windows(&mut conn)?;
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
@@ -783,20 +801,26 @@ mod tests {
         assert_eq!(update.target_body_sha256_at_stage, Some(latest_hash));
         assert_eq!(update.target_updated_at_at_stage, Some(latest_updated));
 
+        // A Create whose target already exists is a create/update
+        // misclassification (ordinary LLM error), not corrupt state: it is
+        // skipped, not fatal, so the run still records. See
+        // `a_create_on_an_existing_page_is_skipped_not_fatal`.
+        let misclassified = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/update.md",
+                    AutoImproveProposalOperation::Create,
+                    "bad",
+                )],
+            ))
+            .await
+            .unwrap();
         assert!(
-            store
-                .writer
-                .stage_auto_improve_run(stage_input(
-                    ws,
-                    proj,
-                    vec![proposal(
-                        "notes/update.md",
-                        AutoImproveProposalOperation::Create,
-                        "bad"
-                    )],
-                ))
-                .await
-                .is_err()
+            misclassified.proposal_ids.is_empty(),
+            "the misclassified create is skipped, not staged"
         );
 
         let out_of_scope_session = SessionId::new();
@@ -2348,6 +2372,7 @@ mod tests {
                 0,
                 1,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2546,6 +2571,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2835,6 +2861,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2857,6 +2884,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2924,6 +2952,7 @@ mod tests {
                 2,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3002,6 +3031,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3060,6 +3090,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3099,6 +3130,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3125,6 +3157,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -4059,6 +4092,149 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].session_id, candidates[0].session_id);
         assert_eq!(remaining[0].ended_at, same_ended_at);
+    }
+
+    // #833: a claim is the scheduler's in-flight marker, but the only writer was
+    // `INSERT OR IGNORE` — nothing ever removed or expired a row. A review that
+    // failed left the claim behind with no `auto_improve_runs` row, and the
+    // candidate query excludes on the claim alone, so the session was dropped
+    // from every future tick with no operator-visible state.
+    #[tokio::test]
+    async fn auto_improve_failed_claim_is_retried_then_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        // Every attempt but the last releases the session back to the queue.
+        for attempt in 1..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
+            let candidates = store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "session should still be a candidate before attempt {attempt}"
+            );
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidates[0].session_id,
+                        candidates[0].ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+            // In flight: not a candidate while the review is running.
+            assert!(
+                store
+                    .reader
+                    .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "an in-flight claim must not be handed out twice"
+            );
+            let attempts = store
+                .writer
+                .record_auto_improve_claim_failure(
+                    ws,
+                    proj,
+                    session,
+                    "error decoding response body",
+                )
+                .await
+                .unwrap();
+            assert_eq!(attempts, attempt);
+        }
+
+        // The final failure parks the session instead of looping forever.
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        store
+            .writer
+            .claim_auto_improve_scheduler_session(ws, proj, session, candidates[0].ended_at)
+            .await
+            .unwrap();
+        let attempts = store
+            .writer
+            .record_auto_improve_claim_failure(
+                ws,
+                proj,
+                session,
+                "create proposal target already exists",
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an exhausted claim stays parked rather than spinning every tick"
+        );
+
+        // ...and it is visible, which a bare claim never was.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, session);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some("create proposal target already exists")
+        );
     }
 
     #[tokio::test]
@@ -6704,7 +6880,7 @@ mod tests {
         // as_of between v1 and v2: the superseded version answers.
         let then_hits = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between), false)
             .await
             .unwrap();
         assert_eq!(then_hits.len(), 1, "{then_hits:?}");
@@ -6720,6 +6896,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -6729,7 +6906,7 @@ mod tests {
         // And before v1 existed: nothing was known.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1), false)
             .await
             .unwrap();
         assert!(before.is_empty(), "{before:?}");
@@ -6839,7 +7016,8 @@ mod tests {
                 .unwrap()
         );
 
-        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let mut db =
+            rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
         let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
             .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
             .unwrap()
@@ -6853,7 +7031,10 @@ mod tests {
         assert!(live[2].2.is_none(), "latest stays open");
         assert!(live[3].2.is_some(), "tombstone is closed");
 
-        // Replay the actual migration against the pre-V62 schema.
+        // Golden equivalence: strip the windows, replay the reshaped V62 DDL
+        // and the chunked boot backfill, and assert it reconstructs exactly
+        // the windows the live write path produced. A tiny batch forces the
+        // multi-batch resume path over this fixture.
         db.execute_batch(
             "DROP INDEX idx_pages_validity; \
              ALTER TABLE pages DROP COLUMN valid_from; \
@@ -6864,6 +7045,7 @@ mod tests {
             "../migrations/V62__page_ingestion_windows.sql"
         ))
         .unwrap();
+        ops::backfill_page_windows_in_batches(&mut db, 2).unwrap();
         let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
             .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
             .unwrap()
@@ -6882,7 +7064,7 @@ mod tests {
     /// Pre-V62 reorg/move retirements kept their instant only at link grain.
     #[test]
     fn v62_backfill_preserves_retired_link_windows() {
-        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE pages (
                 id INTEGER PRIMARY KEY, workspace_id INTEGER, project_id INTEGER,
@@ -6903,6 +7085,7 @@ mod tests {
             "../migrations/V62__page_ingestion_windows.sql"
         ))
         .unwrap();
+        ops::backfill_page_windows(&mut db).unwrap();
         // Reorg and move keep [100,300); missing evidence falls back;
         // a sibling scope's live page stays open; the decay marker wins.
         for (id, expected) in [
@@ -7200,7 +7383,7 @@ mod tests {
         // window opened at the version's creation.
         let later = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1), false)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
@@ -7243,7 +7426,15 @@ mod tests {
         // Before retirement: visible.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(retired_at - 1000),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "{before:?}");
@@ -7257,6 +7448,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -7594,6 +7786,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();

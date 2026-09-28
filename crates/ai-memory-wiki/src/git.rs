@@ -150,7 +150,12 @@ impl GitAdapter {
             Some(path)
         };
         // The watcher reports git's own writes too; never stage them.
-        if rel.is_some_and(|rel| rel.starts_with(".git")) {
+        // Also ignore any path that contains a git-reserved component.
+        if rel.is_some_and(|rel| {
+            rel.components().any(|c| {
+                ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy())
+            })
+        }) {
             return;
         }
         let mut written = self.written();
@@ -621,6 +626,13 @@ fn stage_paths(
     paths: &BTreeSet<PathBuf>,
 ) -> Result<usize, git2::Error> {
     for rel in paths {
+        if rel
+            .components()
+            .any(|c| ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy()))
+        {
+            warn!(path = %rel.display(), "skipping invalid git path with git-reserved component");
+            continue;
+        }
         let abs = root.join(rel);
         if abs.is_dir() {
             let spec = slash_path(rel);
@@ -1048,6 +1060,9 @@ mod tests {
         adapter.mark_written(Path::new(".git/logs/HEAD"));
         adapter.mark_written(&root.join(".git/index"));
         adapter.mark_written(Path::new(".git"));
+        adapter.mark_written(Path::new("ws/proj/.git/config"));
+        adapter.mark_written(&root.join("ws/proj/.git/hooks/pre-commit"));
+        adapter.mark_written(Path::new("ws/proj/git~1/config"));
         assert!(adapter.written_paths().is_empty());
     }
 

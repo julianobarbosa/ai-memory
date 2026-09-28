@@ -2,6 +2,8 @@
 //! test harness (see the `integration` module in `src/lib.rs`), so they cost
 //! no extra binary; a new file must be declared below.
 
+mod copilot_embedder;
+mod copilot_provider;
 mod extra_headers_on_the_wire;
 mod fallback_provider;
 mod openai_compat_embedder;

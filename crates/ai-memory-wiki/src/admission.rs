@@ -88,6 +88,15 @@ pub enum AdmissionOp {
     HandoffAccept,
     /// A pending handoff is being discarded.
     HandoffCancel,
+    /// A cross-project message is being sent into a recipient project's inbox
+    /// (V64). Carries the RECIPIENT workspace/project (the crossing point); no
+    /// page path, since messages live in their own table. Lets a per-operator
+    /// admission webhook see and refuse prompt-derived text crossing projects.
+    MessageSend,
+    /// A cross-project message is being popped (consumed) from an inbox.
+    MessagePop,
+    /// Pending cross-project messages are being cancelled by their sender.
+    MessageCancel,
 }
 
 impl AdmissionOp {
@@ -106,6 +115,9 @@ impl AdmissionOp {
             AdmissionOp::HandoffBegin => "handoff_begin",
             AdmissionOp::HandoffAccept => "handoff_accept",
             AdmissionOp::HandoffCancel => "handoff_cancel",
+            AdmissionOp::MessageSend => "message_send",
+            AdmissionOp::MessagePop => "message_pop",
+            AdmissionOp::MessageCancel => "message_cancel",
         }
     }
 }

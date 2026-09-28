@@ -1237,6 +1237,21 @@ validation is identical in every dialect — only the advertised schema changes.
 | `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
 | `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
 
+`install-mcp` appends the first two itself for the clients whose upstream is
+fixed. For any other client, pass the dialect explicitly:
+
+```bash
+ai-memory install-mcp --client command-code --flavor gemini --apply
+```
+
+This is an operator choice rather than another per-client default because a
+client like Command Code or OpenCode fronts several models: it needs the Gemini
+dialect only when routed to Vertex, and pinning it there for everyone would
+narrow the advertised schema for models that never had the problem. `--flavor`
+overrides a client's built-in default rather than stacking a second marker, and
+`uninstall` matches every marker on every client, so an entry pinned this way is
+still removed.
+
 The Gemini dialect exists because `schemars` renders every optional tool
 argument as a nullable union:
 

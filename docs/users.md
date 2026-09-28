@@ -679,11 +679,29 @@ the bearer authenticates, attribution flows from the token's owner
 
 ## Limitations
 
-- **No per-page RBAC.** Every authenticated user sees every page in
-  the workspace. All `/admin/*` endpoints are still root-only in
-  multi-user mode. If you need data isolation, run separate
-  ai-memory servers (per-user data dirs) and front them with a reverse
-  proxy.
+- **Accounts are not a tenancy boundary.** Authentication tells the server
+  *who* is asking; nothing decides *what* they may read. Every authenticated
+  user sees every page in every project in **every workspace on the server** —
+  not just the one they are working in. A server holds many workspaces
+  (`projects.workspace_id` references `workspaces(id)`), but `users` carries no
+  workspace, project or repository reference and there is no grant, ACL or
+  membership table anywhere in the schema, so there is nothing for a read to be
+  checked against. Two accounts created minutes apart, sharing nothing but the
+  server, can each read the other's projects in full — including via
+  `memory_query`, which searches across scopes. All `/admin/*` endpoints are
+  still root-only in multi-user mode.
+
+  This is working as designed for the single-operator and homelab cases
+  ai-memory targets today. **If one server would hold work for more than one
+  team, that is not a supported configuration yet.** Run separate ai-memory
+  servers (per-user data dirs) behind a reverse proxy instead. Per-project
+  authorization is tracked in
+  [#708](https://github.com/akitaonrails/ai-memory/issues/708).
+
+- **No per-page RBAC *within* a project.** This one is deliberate and separate
+  from the above: pages are shared inside a project because multi-session and
+  multi-user collaboration is a core capability. `pages.author_id` is
+  attribution, never a read filter.
 - **Native keys are not passwords.** `user add-human` never issues an `aim_`
   secret; `api-key add` never issues a login session. The deprecated `user add`
   command is the exception: it issues one compatibility token backed by the
@@ -701,6 +719,8 @@ the bearer authenticates, attribution flows from the token's owner
   bearer / native `aim_` keys / web sessions, and `/admin/*` stays root-only unless a gateway
   translates accepted OIDC auth into upstream auth that ai-memory accepts.
   ai-memory still has one shared wiki per server and no
-  per-page RBAC. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
+  per-page RBAC — and, per the first bullet above, no per-project
+  authorization either: an accepted OIDC identity can read every project on
+  the server. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.

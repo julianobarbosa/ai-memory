@@ -12,6 +12,21 @@ evaluates TTL expiry at T while the entity leg ignores it (see
 `docs/temporal.md` "one asymmetry"); changing the entity leg's rule
 would alter existing behaviour and is out of scope.*
 
+*Follow-up (#776): V62 originally backfilled both windows in one
+in-migration transaction, which on a large store (a 242 GB DB was
+reported) ran for hours and grew the WAL to roughly the database size
+before the server could accept traffic. V62 is now DDL-only (the two
+columns + `idx_pages_validity`); the backfill moved to a chunked,
+resumable, WAL-bounded boot-path step (`ops::backfill_page_windows`,
+invoked from `Store::open` next to the entity-index backfill) that
+reproduces the identical end state in bounded batches, checkpoints the
+WAL (`TRUNCATE`) between each, logs progress, resumes rather than
+restarts if interrupted, and no-ops on a store already backfilled. The
+in-place reshape changes V62's checksum, so the migration runner now
+tolerates a divergent checksum on an already-applied migration
+(`abort_divergent = false`, `abort_missing` unchanged) so
+correctly-migrated stores still open.*
+
 ## 1. The problem, and why entity-link windows are not enough
 
 `docs/temporal.md` (bi-temporal-lite, 2.0 item 4) answers "what did we know

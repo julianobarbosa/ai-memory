@@ -21,7 +21,7 @@ use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::json;
 
-use crate::cli::{InstallMcpArgs, McpClient};
+use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::bearer_header_value;
@@ -665,12 +665,42 @@ fn flavored_mcp_url(server_url: &str, flavor: &str) -> String {
     format!("{url}{separator}{marker}")
 }
 
-pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
-    flavored_mcp_url(server_url, "moonshot")
+/// Every marker `install-mcp` can write. `uninstall` walks this so an entry
+/// installed with `--flavor` is still matched by URL; adding a flavor without
+/// adding it here would leave those entries behind.
+pub(crate) const FLAVOR_MARKERS: [&str; 3] = ["moonshot", "bedrock", "gemini"];
+
+/// [`flavored_mcp_url`] for a marker already in hand — what `uninstall` needs
+/// to rebuild each candidate URL form without knowing the flavor type.
+pub(crate) fn flavored_mcp_url_for_marker(server_url: &str, marker: &str) -> String {
+    flavored_mcp_url(server_url, marker)
 }
 
-pub(crate) fn bedrock_flavored_mcp_url(server_url: &str) -> String {
-    flavored_mcp_url(server_url, "bedrock")
+/// The dialect a client always needs, from its name alone. Only clients with a
+/// single fixed upstream appear here — Kimi Code is Moonshot, Kiro is Bedrock.
+/// A client that fronts several models has no answer here and needs `--flavor`.
+fn client_default_flavor(client: McpClient) -> Option<&'static str> {
+    match client {
+        McpClient::KimiCode => Some("moonshot"),
+        McpClient::KiroCli => Some("bedrock"),
+        _ => None,
+    }
+}
+
+/// The URL to write into the client config: the endpoint plus whichever
+/// `?flavor=` marker applies. An explicit `--flavor` wins over the client's
+/// built-in default, which is safe in one direction only by construction —
+/// every flavor is at least as permissive as any default, so an override can
+/// relax the advertised schema but never tighten it past what the client needs.
+pub(crate) fn flavored_url_for(args: &InstallMcpArgs, server_url: &str) -> String {
+    match args
+        .flavor
+        .map(SchemaFlavor::marker)
+        .or_else(|| client_default_flavor(args.client))
+    {
+        Some(marker) => flavored_mcp_url(server_url, marker),
+        None => server_url.to_string(),
+    }
 }
 
 /// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
@@ -680,7 +710,12 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
     // `run()` resolves the URL before dispatch; the fallback only fires for
     // direct callers (tests, uninstall re-render) that skip that step.
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    // The flavor marker is a `tools/list` concern, so it belongs on the URL a
+    // client fetches schemas from. `mcp-bridge` is not that: it is our own
+    // process, and it re-derives its endpoint, so it keeps the bare URL.
+    let flavored = flavored_url_for(args, base_url);
+    let server_url = flavored.as_str();
     let mut entry = serde_json::Map::new();
     match args.client {
         McpClient::ClaudeCode => {
@@ -689,7 +724,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("command".into(), json!("ai-memory"));
                 entry.insert(
                     "args".into(),
-                    json!(["mcp-bridge", "--server-url", server_url]),
+                    json!(["mcp-bridge", "--server-url", base_url]),
                 );
                 if let Some(token) = &args.auth_token {
                     entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
@@ -753,13 +788,13 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // Kimi Code treats an entry with `url` and no `transport`
             // field as streamable-HTTP; `transport` is only for legacy
             // SSE endpoints.
-            entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
         }
         McpClient::KiroCli => {
-            entry.insert("url".into(), json!(bedrock_flavored_mcp_url(server_url)));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1442,6 +1477,7 @@ mod tests {
             apply: false,
             config_file: None,
             session_aware: false,
+            flavor: None,
         }
     }
 
@@ -1454,6 +1490,7 @@ mod tests {
             apply: false,
             config_file: None,
             session_aware: false,
+            flavor: None,
         }
     }
 
@@ -2340,6 +2377,93 @@ mod tests {
     /// Pin the append rules: `?` on a bare endpoint, `&` with an existing
     /// query, never duplicate an existing marker.
     #[test]
+    fn an_explicit_flavor_pins_a_client_the_installer_cannot_infer() {
+        // The issue-735 shape: Command Code fronts several models, so its name
+        // says nothing about the upstream. Routed to Vertex it needs the Gemini
+        // dialect, and before --flavor there was no installer path to it.
+        let mut args = args_for(McpClient::CommandCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.flavor = Some(SchemaFlavor::Gemini);
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(
+            entry["url"].as_str().unwrap(),
+            "https://memory.example/mcp?flavor=gemini"
+        );
+    }
+
+    #[test]
+    fn a_client_without_a_fixed_upstream_stays_unflavored_by_default() {
+        let mut args = args_for(McpClient::CommandCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(entry["url"].as_str().unwrap(), "https://memory.example/mcp");
+    }
+
+    #[test]
+    fn an_explicit_flavor_replaces_the_clients_built_in_default() {
+        // Kimi Code defaults to moonshot. Asking for gemini must not stack a
+        // second marker: the server maxes over every pair, so both would work,
+        // but the installed URL would carry a dialect the operator did not pick.
+        let mut args = args_for(McpClient::KimiCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.flavor = Some(SchemaFlavor::Gemini);
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(
+            entry["url"].as_str().unwrap(),
+            "https://memory.example/mcp?flavor=gemini"
+        );
+    }
+
+    #[test]
+    fn the_session_aware_bridge_keeps_the_unflavored_url() {
+        // `mcp-bridge` is our own process, not a schema consumer. Handing it a
+        // flavored URL would push the marker through to the server on every
+        // bridged request, narrowing schemas for a client that never asked.
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.session_aware = true;
+        args.flavor = Some(SchemaFlavor::Gemini);
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        let bridge_args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            bridge_args,
+            vec!["mcp-bridge", "--server-url", "https://memory.example/mcp"]
+        );
+    }
+
+    #[test]
+    fn every_flavor_marker_is_one_the_server_recognizes() {
+        // The server matches `flavor=` values exactly. A marker the CLI can
+        // write but the server does not match would install a URL that silently
+        // serves upstream schemas — the exact failure --flavor exists to avoid.
+        for flavor in [
+            SchemaFlavor::Moonshot,
+            SchemaFlavor::Bedrock,
+            SchemaFlavor::Gemini,
+        ] {
+            assert!(
+                FLAVOR_MARKERS.contains(&flavor.marker()),
+                "{:?} writes marker {:?}, which uninstall does not know",
+                flavor,
+                flavor.marker()
+            );
+        }
+    }
+
+    #[test]
     fn moonshot_flavored_mcp_url_appends_marker_idempotently() {
         for (input, expected) in [
             (
@@ -2364,22 +2488,26 @@ mod tests {
                 "http://homelab:49374/mcp?note=flavor=moonshot&flavor=moonshot",
             ),
         ] {
-            assert_eq!(moonshot_flavored_mcp_url(input), expected, "input: {input}");
+            assert_eq!(
+                flavored_mcp_url_for_marker(input, "moonshot"),
+                expected,
+                "input: {input}"
+            );
         }
     }
 
     #[test]
     fn bedrock_flavored_mcp_url_appends_marker_idempotently() {
         assert_eq!(
-            bedrock_flavored_mcp_url("https://memory.example/mcp"),
+            flavored_mcp_url_for_marker("https://memory.example/mcp", "bedrock"),
             "https://memory.example/mcp?flavor=bedrock"
         );
         assert_eq!(
-            bedrock_flavored_mcp_url("https://memory.example/mcp?token=x"),
+            flavored_mcp_url_for_marker("https://memory.example/mcp?token=x", "bedrock"),
             "https://memory.example/mcp?token=x&flavor=bedrock"
         );
         assert_eq!(
-            bedrock_flavored_mcp_url("https://memory.example/mcp?flavor=bedrock"),
+            flavored_mcp_url_for_marker("https://memory.example/mcp?flavor=bedrock", "bedrock"),
             "https://memory.example/mcp?flavor=bedrock"
         );
     }

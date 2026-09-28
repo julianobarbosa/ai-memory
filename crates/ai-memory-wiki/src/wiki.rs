@@ -50,6 +50,12 @@ pub struct ReindexSummary {
     /// (#701) — the same case one level down, for a purge whose page-file
     /// removal did not complete.
     pub skipped_purged_sessions: usize,
+    /// Pages skipped because another page in the same scope differs from them
+    /// only by case or Unicode normalization. A wiki authored on a
+    /// case-sensitive filesystem can hold such a pair; indexing both is what
+    /// the write guard now refuses, and one bad pair must not fail the whole
+    /// rebuild.
+    pub skipped_collisions: usize,
 }
 
 /// The session a page belongs to, for paths that name one.
@@ -1394,6 +1400,7 @@ impl Wiki {
             .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
 
         let path = detail.summary.target_path.clone();
+        path.ensure_portable()?;
         let mut frontmatter = serde_json::json!({
             "kind": detail.summary.kind,
             "title": detail.summary.title,
@@ -1709,8 +1716,22 @@ impl Wiki {
                     summary.skipped_purged_sessions += 1;
                     continue;
                 }
-                self.reindex_page(ws, proj, path).await?;
-                summary.pages += 1;
+                match self.reindex_page(ws, proj, path).await {
+                    Ok(_) => summary.pages += 1,
+                    Err(WikiError::Store(ai_memory_store::StoreError::PagePathCollides {
+                        requested,
+                        existing,
+                    })) => {
+                        tracing::warn!(
+                            path = %requested,
+                            existing = %existing,
+                            "skipping page: it differs from an already-indexed page only by case \
+                             or Unicode normalization, so both cannot coexist on macOS/Windows",
+                        );
+                        summary.skipped_collisions += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(summary)
@@ -1809,6 +1830,11 @@ impl Wiki {
     pub async fn apply_batch(&self, requests: Vec<WritePageRequest>) -> WikiResult<Vec<PageId>> {
         if requests.is_empty() {
             return Ok(Vec::new());
+        }
+        // Reject any path that cannot be materialised and checkpointed on every
+        // supported platform, before anything is written.
+        for req in &requests {
+            req.path.ensure_portable()?;
         }
         // Pre-compute markdown for each request. Filesystem work happens only
         // after the mutation guard + project/workspace validation below.
@@ -2856,6 +2882,138 @@ mod tests {
                 .ends_with('Z')
         );
         assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
+    }
+
+    /// Refused on every platform, not only the case-insensitive ones: the
+    /// wiki is synced between them, so what it accepts cannot depend on the
+    /// filesystem underneath.
+    #[tokio::test]
+    async fn a_case_only_path_variant_cannot_destroy_an_existing_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "concepts/alpha.md",
+            "the original alpha body",
+            serde_json::json!({"title": "Alpha"}),
+        ))
+        .await
+        .unwrap();
+
+        let collision = wiki
+            .write_page(req(
+                ws,
+                proj,
+                "concepts/Alpha.md",
+                "a different page entirely",
+                serde_json::json!({"title": "Alpha Upper"}),
+            ))
+            .await;
+
+        let err = collision.expect_err("case-only variant must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("concepts/alpha.md") && msg.contains("concepts/Alpha.md"),
+            "the error must name both pages so the caller can act on it: {msg}"
+        );
+        let raw =
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("concepts/alpha.md")).unwrap();
+        assert!(
+            raw.contains("the original alpha body"),
+            "the existing page's file must survive the refused write: {raw}"
+        );
+    }
+
+    /// The same collision through Unicode normalization rather than case.
+    #[tokio::test]
+    async fn an_nfd_path_variant_cannot_destroy_its_nfc_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let nfc = "concepts/caf\u{00e9}.md";
+        let nfd = "concepts/cafe\u{0301}.md";
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            nfc,
+            "the composed page body",
+            serde_json::json!({"title": "Cafe NFC"}),
+        ))
+        .await
+        .unwrap();
+
+        let collision = wiki
+            .write_page(req(
+                ws,
+                proj,
+                nfd,
+                "a different page entirely",
+                serde_json::json!({"title": "Cafe NFD"}),
+            ))
+            .await;
+
+        assert!(
+            collision.is_err(),
+            "a decomposed variant of an existing composed path must be refused"
+        );
+        let raw = std::fs::read_to_string(wiki.project_root(ws, proj).join(nfc)).unwrap();
+        assert!(
+            raw.contains("the composed page body"),
+            "the existing page's file must survive the refused write: {raw}"
+        );
+    }
+
+    /// The guard must not turn page paths into case-insensitive keys.
+    #[tokio::test]
+    async fn distinct_paths_are_unaffected_by_the_collision_guard() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        for path in [
+            "concepts/alpha.md",
+            "concepts/alphabet.md",
+            "concepts/nested/alpha.md",
+            "decisions/alpha.md",
+        ] {
+            wiki.write_page(req(ws, proj, path, "body", serde_json::json!({})))
+                .await
+                .unwrap_or_else(|e| panic!("{path} must be accepted: {e}"));
+        }
+
+        // A rewrite is a supersede, not a collision.
+        wiki.write_page(req(
+            ws,
+            proj,
+            "concepts/alpha.md",
+            "revised body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
     }
 
     /// An unchanged rewrite must emit byte-identical markdown: the
@@ -4968,6 +5126,7 @@ mod tests {
                 0,
                 5,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -5685,5 +5844,66 @@ mod tests {
             store.reader.session_project_ids(sid).await.unwrap(),
             Some((ws, dst))
         );
+    }
+
+    #[tokio::test]
+    async fn write_page_and_apply_batch_refuse_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+
+        for bad in [
+            "CON.md",
+            "notes/aux.md",
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+        ] {
+            let bad_path = PagePath::new(bad).unwrap();
+            let write_err = wiki
+                .write_page(req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    write_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "write_page should refuse {bad:?}, got: {write_err}"
+            );
+
+            let batch_err = wiki
+                .apply_batch(vec![req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                )])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    batch_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "apply_batch should refuse {bad:?}, got: {batch_err}"
+            );
+
+            assert!(
+                !wiki.abs_path(ws, proj, &bad_path).exists(),
+                "file for {bad:?} must not be written to disk"
+            );
+        }
     }
 }

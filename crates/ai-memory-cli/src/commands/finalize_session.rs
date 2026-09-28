@@ -88,6 +88,12 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         finalized.push(session.session_id.clone());
     }
 
+    // Agents with hook-maintained session state (ZCode: no SessionEnd event)
+    // keep a stored id in `<data_dir>/hook-state/<agent>-session-id`; once the
+    // session is finalized server-side, the stored id must go too, or the next
+    // agent session would inherit the closed id.
+    super::hook::clear_session_id(&config.data_dir, agent);
+
     print_report(args, workspace, project, agent, finalized)
 }
 

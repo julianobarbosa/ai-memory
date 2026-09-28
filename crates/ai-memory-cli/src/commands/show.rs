@@ -226,6 +226,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             executable: None,
             yolo: args.yolo,
             fresh: args.fresh,
+            no_autowire: false,
             harness: Some(harness),
             native_args: args.native_args,
         },

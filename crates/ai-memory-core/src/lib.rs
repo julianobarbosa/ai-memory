@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
@@ -42,7 +43,7 @@ pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
 pub use active_project::{
     ActiveProject, ActiveProjectLookup, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES,
-    DEFAULT_PER_KEY_TTL, MidSessionRouting,
+    DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
@@ -56,8 +57,12 @@ pub use handoff::{
 };
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
-    ManagedRunId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId,
-    WorkspaceId, WorkstreamId,
+    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
+    UserId, WorkspaceId, WorkstreamId, is_git_reserved_component, portable_page_key,
+};
+pub use message::{
+    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
+    UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{

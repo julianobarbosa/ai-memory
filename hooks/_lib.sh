@@ -460,13 +460,30 @@ ai_memory_auth_header_file() {
     [ -r "$_amhf" ] && printf '%s' "$_amhf"
 }
 
+# Mint the key before the first POST so an ambiguous delivery and its spool
+# replay carry the same identity. The server can then discard a replay whose
+# original response was lost after the observation committed.
+ai_memory_ingest_key() {
+    _amrnd=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$_amrnd" ] || _amrnd=$(printf '%s%s' "$(date +%s 2>/dev/null || printf '0')" "$$")
+    printf 'sh%s' "$_amrnd"
+}
+
+ai_memory_url_with_ingest_key() {
+    case "$1" in
+        *\?ingest_key=* | *\&ingest_key=*) printf '%s' "$1" ;;
+        *\?*) printf '%s&ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+        *) printf '%s?ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+    esac
+}
+
 ai_memory_post_hook() {
-    _amurl="$1"
+    _amurl=$(ai_memory_url_with_ingest_key "$1")
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
-            -w '%{http_code}' -X POST "$1" \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
             --data-binary @- 2>/dev/null) || _amcode=000
@@ -474,13 +491,13 @@ ai_memory_post_hook() {
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
         _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
-            -w '%{http_code}' -X POST "$1" \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
             --data-binary @- 2>/dev/null) || _amcode=000
     else
         _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
-            -w '%{http_code}' -X POST "$1" \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null) || _amcode=000
     fi
@@ -494,10 +511,12 @@ ai_memory_post_hook() {
 
 # GET "$1" with the same auth-header rules as `ai_memory_post_hook`.
 # Used by `session-start.sh` to pull the cross-agent handoff before
-# the resuming agent's first prompt. 1s budget — slightly more
-# generous than POST because the result is *synchronously* fed to
-# stdout (and prepended to the agent's context), so we want to avoid
-# truncating a handoff that was almost ready.
+# the resuming agent's first prompt. 1s budget — deliberately more
+# generous than the 0.2s POST budget because this is *not* a
+# fire-and-forget path: the result is synchronously fed to stdout and
+# prepended to the agent's context, so cutting it to the invariant-5
+# budget would truncate the handoff that continuity depends on.
+# Invariant 5 governs fire-and-forget capture, not this read.
 ai_memory_get_handoff() {
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
@@ -516,12 +535,54 @@ ai_memory_get_handoff() {
 # handoff in hookSpecificOutput.additionalContext).
 ai_memory_json_string() {
     awk '
-        BEGIN { printf "\"" }
+        # BusyBox awk applies backslash processing to a gsub REPLACEMENT
+        # string; gawk, mawk and one-true-awk pass it through literally. Every
+        # replacement below carries a backslash, so on BusyBox all four escapes
+        # were silently no-ops (#733): a backslash stayed bare, a quote stayed
+        # bare, and -- not in the report, but the same root cause -- \t and \r
+        # collapsed to the letters "t" and "r", corrupting content rather than
+        # only breaking the framing.
+        #
+        # Detect the behaviour once instead of guessing at it, and pre-double
+        # the replacements where they will be halved. Done with gsub rather
+        # than a split/concat loop on purpose: concatenating per occurrence is
+        # quadratic in the value length, which is the cost #727 was about.
+        BEGIN {
+            probe = "X"; gsub(/X/, "\\\\", probe)
+            if (length(probe) == 1) {
+                busybox = 1
+                BS = "\\\\\\\\"; QT = "\\\\\""; TB = "\\\\t"; CR = "\\\\r"
+                UP = "\\\\u"
+            } else {
+                busybox = 0
+                BS = "\\\\"; QT = "\\\""; TB = "\\t"; CR = "\\r"
+                UP = "\\u"
+            }
+            # JSON forbids a raw control character (U+0000..U+001F) inside a
+            # string, but the four gsubs above only cover backslash, quote, tab
+            # and CR — so a replayed tool result carrying e.g. an ANSI colour
+            # escape (0x1b) reached stdout unescaped and Claude Code rejected
+            # the whole SessionStart packet as invalid JSON (#732). Build a
+            # \u00XX escape for every other control byte once; newline (0x0a) is
+            # never inside a record, it is the record separator handled below.
+            nc = 0
+            for (c = 1; c < 32; c++) {
+                if (c == 9 || c == 10 || c == 13) continue
+                cc[++nc] = sprintf("%c", c)
+                cr[nc] = sprintf("%s%04x", UP, c)
+            }
+            printf "\""
+        }
         {
-            gsub(/\\/, "\\\\")
-            gsub(/"/, "\\\"")
-            gsub(/\t/, "\\t")
-            gsub(/\r/, "\\r")
+            gsub(/\\/, BS)
+            gsub(/"/, QT)
+            gsub(/\t/, TB)
+            gsub(/\r/, CR)
+            # After the backslash gsub, so the backslashes these introduce are
+            # not doubled. Each control byte is a literal (none is a regex
+            # metacharacter), and the pass is linear, not the per-char loop #727
+            # replaced.
+            for (k = 1; k <= nc; k++) gsub(cc[k], cr[k])
             printf "%s%s", sep, $0
             sep = "\\n"
         }
@@ -573,27 +634,14 @@ ai_memory_spool_token() {
         | head -n 1 | tr -d '\r\n'
 }
 
-# Idempotency key minted ONCE at spool time and baked into the URL, so this
-# bundle's drain and a concurrent `ai-memory hook-drain` cannot double-ingest.
-ai_memory_ingest_key() {
-    _amrnd=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
-    [ -n "$_amrnd" ] || _amrnd=$(printf '%s%s' "$(date +%s 2>/dev/null || printf '0')" "$$")
-    printf 'sh%s' "$_amrnd"
-}
-
 # Persist one undelivered event. Best-effort on top of best-effort capture:
 # every failure path returns 0 so a hook never fails because of the spool.
 ai_memory_spool_event() {
-    _amsurl="$1"
+    _amsurl=$(ai_memory_url_with_ingest_key "$1")
     _amsbody="$2"
     _amsdir=$(ai_memory_spool_dir)
     mkdir -p "$_amsdir" 2>/dev/null || return 0
     chmod 700 "$_amsdir" 2>/dev/null || true
-    case "$_amsurl" in
-        *ingest_key=*) ;;
-        *\?*) _amsurl="$_amsurl&ingest_key=$(ai_memory_ingest_key)" ;;
-        *) _amsurl="$_amsurl?ingest_key=$(ai_memory_ingest_key)" ;;
-    esac
     _amstok=$(ai_memory_spool_token)
     _amsnow=$(ai_memory_now_ms)
     AI_MEMORY_SPOOL_SEQ=$((${AI_MEMORY_SPOOL_SEQ:-0} + 1))
@@ -621,10 +669,31 @@ ai_memory_spool_event() {
 }
 
 # Read one top-level string field out of a spool entry, undoing the escapes
-# `ai_memory_json_string` produces. Scans left to right, which is the only
-# correct way to find the closing quote. An entry carrying a `\uXXXX` escape
-# was written by a richer serializer (the native binary); this prints nothing
-# for it so the caller leaves it to `ai-memory hook-drain`.
+# `ai_memory_json_string` produces. The regex is the JSON string grammar, so
+# the match ends at the first quote that is not escaped, which is the only
+# correct way to find the end. `match` itself cannot fail — the pattern accepts
+# the empty string — so the terminator check on the line after it is what
+# rejects an unterminated value, and dropping that line drops the check. An
+# entry carrying a `\uXXXX` escape was written by a richer serializer (the
+# native binary); this prints nothing for it so the caller leaves it to
+# `ai-memory hook-drain`.
+#
+# Nothing accumulates: each segment goes straight to stdout. Appending into a
+# string that grows to the whole value costs time quadratic in the number of
+# appends, and that holds whether the step is one character or one
+# escaped-backslash pair — a 2.2 MB entry of `grep` output over source, where
+# every literal backslash is a pair, cost 36 s a pass that way under
+# one-true-awk. A drain pass reads every entry three times and one detached
+# pass starts behind every delivery that succeeds, so the cost is paid over
+# and over.
+#
+# Splitting on the escaped-backslash pairs first is what makes the unescaping
+# safe: no segment can contain one, so inside a segment every backslash starts
+# a real escape and no placeholder byte is needed, which keeps a raw control
+# byte in the value (`ai_memory_json_string` does not escape those)
+# round-tripping untouched. Validation is a pass of its own so that a declined
+# value prints nothing at all — a partial read must never look like a whole
+# one to `ai_memory_drain_spool`, which reads the field through `|| continue`.
 ai_memory_json_field() {
     awk -v key="$1" '
         { text = text (NR > 1 ? "\n" : "") $0 }
@@ -632,27 +701,21 @@ ai_memory_json_field() {
             needle = "\"" key "\":\""
             start = index(text, needle)
             if (start == 0) exit 1
-            i = start + length(needle)
-            out = ""
-            while (i <= length(text)) {
-                c = substr(text, i, 1)
-                if (c == "\\") {
-                    e = substr(text, i + 1, 1)
-                    if (e == "n") out = out "\n"
-                    else if (e == "t") out = out "\t"
-                    else if (e == "r") out = out "\r"
-                    else if (e == "\"") out = out "\""
-                    else if (e == "\\") out = out "\\"
-                    else if (e == "/") out = out "/"
-                    else exit 1
-                    i += 2
-                    continue
-                }
-                if (c == "\"") { printf "%s", out; exit 0 }
-                out = out c
-                i += 1
+            rest = substr(text, start + length(needle))
+            match(rest, /^(\\.|[^"\\])*/)
+            if (substr(rest, RSTART + RLENGTH, 1) != "\"") exit 1
+            parts = split(substr(rest, RSTART, RLENGTH), seg, /\\\\/)
+            for (i = 1; i <= parts; i++)
+                if (seg[i] ~ /\\[^ntr"\/]/) exit 1
+            for (i = 1; i <= parts; i++) {
+                gsub(/\\n/, "\n", seg[i])
+                gsub(/\\t/, "\t", seg[i])
+                gsub(/\\r/, "\r", seg[i])
+                gsub(/\\"/, "\"", seg[i])
+                gsub(/\\\//, "/", seg[i])
+                printf "%s%s", (i == 1 ? "" : "\\"), seg[i]
             }
-            exit 1
+            exit 0
         }
     ' "$2"
 }

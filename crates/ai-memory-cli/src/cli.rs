@@ -33,6 +33,15 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// Check capture coverage: compare local harness session stores for this
+    /// project against what the server captured, and warn when a harness ran
+    /// here recently but has no captured sessions (its hook is likely missing).
+    Doctor(DoctorArgs),
+    /// One-time import of this project's existing local harness session history
+    /// into a brand-new (empty) ai-memory store, so installing hooks
+    /// mid-project doesn't start amnesiac. No-op once the store has any
+    /// sessions unless `--force`.
+    Backfill(BackfillArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
@@ -47,6 +56,9 @@ pub enum Command {
     Resume(ResumeArgs),
     /// List open cross-agent handoffs so a stale one can be cancelled by id.
     Handoffs(HandoffsArgs),
+    /// Send, list, pop, or cancel cross-project agent messages (a directed,
+    /// claim-once mailbox between two projects — see `docs/agent-messaging.md`).
+    Message(MessageArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Rename a managed workstream in the current checkout. Metadata only:
@@ -243,6 +255,12 @@ pub struct RunArgs {
     /// resuming or adopting an existing harness session.
     #[arg(long)]
     pub fresh: bool,
+    /// Skip the one-time auto-install of this harness's ai-memory hooks + MCP.
+    /// Auto-wire is on by default so a managed launch captures without a manual
+    /// `install-hooks`/`install-mcp` step; pass this (or set
+    /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
+    #[arg(long)]
+    pub no_autowire: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses. Any value
     /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also
@@ -436,6 +454,110 @@ pub struct HandoffsArgs {
     /// REQUIRED by `--expire-all`.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `message`.
+#[derive(Debug, Args)]
+pub struct MessageArgs {
+    /// Cross-project message action to run.
+    #[command(subcommand)]
+    pub command: MessageCommand,
+}
+
+/// Subcommands for `message`.
+#[derive(Debug, Subcommand)]
+pub enum MessageCommand {
+    /// Drop a message into another project's inbox.
+    Send(MessageSendArgs),
+    /// List pending messages in this project's mailbox.
+    List(MessageListArgs),
+    /// Claim (pop) exactly one pending message from this project's inbox.
+    Pop(MessagePopArgs),
+    /// Retract still-pending messages this project has sent.
+    Cancel(MessageCancelArgs),
+}
+
+/// Arguments for `message send`.
+#[derive(Debug, Args)]
+pub struct MessageSendArgs {
+    /// Recipient workspace.
+    #[arg(long)]
+    pub to_workspace: String,
+    /// Recipient project.
+    #[arg(long)]
+    pub to_project: String,
+    /// Optional one-line subject.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// Message body. Omitted reads the full body from stdin.
+    pub body: Option<String>,
+    /// Sender workspace (defaults to the resolved scope).
+    #[arg(long)]
+    pub from_workspace: Option<String>,
+    /// Sender project (defaults to the resolved scope).
+    #[arg(long)]
+    pub from_project: Option<String>,
+    /// Emit JSON instead of a human confirmation.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message list`.
+#[derive(Debug, Args)]
+pub struct MessageListArgs {
+    /// Workspace to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// List sent, still-cancellable mail instead of the inbox.
+    #[arg(long)]
+    pub outbox: bool,
+    /// Maximum messages to list.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=200))]
+    pub limit: u16,
+    /// Emit JSON instead of the human listing.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message pop`.
+#[derive(Debug, Args)]
+pub struct MessagePopArgs {
+    /// Workspace to pop from (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to pop from (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Pop this specific message instead of the oldest pending one.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Emit JSON instead of the human rendering.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message cancel`.
+#[derive(Debug, Args)]
+pub struct MessageCancelArgs {
+    /// Workspace to cancel from (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to cancel from (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Cancel this specific message.
+    #[arg(long, conflicts_with = "all")]
+    pub id: Option<String>,
+    /// Cancel every pending message this project has sent. Requires exactly
+    /// one of `--id` or `--all`.
+    #[arg(long, conflicts_with = "id")]
+    pub all: bool,
+    /// Emit JSON instead of a human confirmation.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1257,6 +1379,61 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+/// Arguments for `backfill`.
+#[derive(Debug, Args)]
+pub struct BackfillArgs {
+    /// Workspace name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Import only this one harness-native session id instead of every local
+    /// session for the project.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Import even when the store already has sessions. Off by default: the
+    /// automatic path is a one-time bootstrap of an empty project only.
+    #[arg(long)]
+    pub force: bool,
+    /// Report what would be imported without importing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Import at most this many of the newest local sessions.
+    #[arg(long, default_value_t = 25)]
+    pub max_sessions: usize,
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+    /// Suppress the human summary line (used by the automatic SessionStart
+    /// trigger, which runs detached).
+    #[arg(long)]
+    pub quiet: bool,
+    /// Internal: this run was spawned by the SessionStart trigger. Honors the
+    /// `backfill_on_start` opt-out and records that the automatic bootstrap has
+    /// been attempted for this checkout. Not for interactive use.
+    #[arg(long, hide = true)]
+    pub auto: bool,
+}
+
+/// Arguments for `doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Workspace name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// A local harness session counts as "recent" if it was updated within
+    /// this many days. Set to 0 to consider every on-disk session recent.
+    #[arg(long, default_value_t = 30)]
+    pub since_days: u32,
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `audit-contamination`.
 #[derive(Debug, Args)]
 pub struct AuditContaminationArgs {
@@ -1624,6 +1801,41 @@ pub struct FinalizeSessionArgs {
     pub json: bool,
 }
 
+/// Tool-schema dialect to pin into the installed MCP URL, as the server's
+/// `?flavor=` marker (docs/mcp-install.md → Schema dialects for strict
+/// upstreams). `install-mcp` already picks one for the clients whose upstream
+/// is fixed — Kimi Code is always Moonshot, Kiro is always Bedrock — but a
+/// client that fronts several models cannot be pinned by its name alone. A
+/// Command Code or OpenCode install routed to Vertex needs `gemini`; the same
+/// client on another model does not, and forcing it there would narrow the
+/// advertised schema for no reason. So this stays an explicit operator choice.
+///
+/// Every variant is at least as permissive as each client's built-in default,
+/// so passing one can only relax the advertised schema further, never tighten
+/// it below what the client already needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchemaFlavor {
+    /// Drop root-level `anyOf`/`oneOf`/`allOf` (Moonshot).
+    Moonshot,
+    /// Same rewrite, for Bedrock-backed clients.
+    Bedrock,
+    /// The above, plus nullable unions collapsed to a single `type` plus
+    /// `nullable: true` (Gemini / Vertex).
+    #[value(alias = "vertex")]
+    Gemini,
+}
+
+impl SchemaFlavor {
+    /// The `flavor=` query value the server matches in `restricted_schema_flavor`.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Moonshot => "moonshot",
+            Self::Bedrock => "bedrock",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
 /// MCP client to render configuration for. Includes both the
 /// hook-capable agents (Claude Code / Codex / OpenCode — same MCP
 /// surface, also covered by `install-hooks`) and the MCP-only
@@ -1754,6 +1966,8 @@ pub enum LlmProviderChoice {
     OpenaiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
     OpenaiOauth,
+    /// Reuse Codex CLI authentication and delegated refresh.
+    Codex,
     /// GitHub Copilot Chat backend.
     Copilot,
     /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
@@ -1965,6 +2179,9 @@ pub struct LlmTestArgs {
     /// Prompt to send.
     #[arg(long)]
     pub prompt: String,
+    /// Request a small JSON-schema response instead of plain text.
+    #[arg(long)]
+    pub structured: bool,
     /// Base URL override (required for openai-compat).
     #[arg(long)]
     pub base_url: Option<String>,
@@ -2202,6 +2419,13 @@ pub struct InstallMcpArgs {
     /// `[auto_scope] mode = "per_session"` for concurrent Claude Code sessions.
     #[arg(long)]
     pub session_aware: bool,
+    /// Pin the tool-schema dialect in the installed MCP URL, for a client
+    /// whose upstream 400s on the schemas ai-memory advertises by default.
+    /// Needed when the client fronts several models and its name alone does
+    /// not say which — a Command Code or OpenCode install routed to Vertex
+    /// wants `gemini`. Kimi Code and Kiro already get theirs; this overrides.
+    #[arg(long, value_enum)]
+    pub flavor: Option<SchemaFlavor>,
 }
 
 /// Arguments for the internal Claude Code session-aware MCP bridge.
@@ -3438,6 +3662,28 @@ mod tests {
         assert!(matches!(args.provider, LlmProviderChoice::AnthropicOauth));
         assert_eq!(args.model, "claude-sonnet-4-6");
         assert_eq!(args.prompt, "ping");
+    }
+
+    #[test]
+    fn llm_test_codex_structured_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "llm-test",
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--prompt",
+            "ping",
+            "--structured",
+        ])
+        .unwrap();
+
+        let Command::LlmTest(args) = cli.command else {
+            panic!("expected llm-test command");
+        };
+        assert!(matches!(args.provider, LlmProviderChoice::Codex));
+        assert!(args.structured);
     }
 
     #[test]

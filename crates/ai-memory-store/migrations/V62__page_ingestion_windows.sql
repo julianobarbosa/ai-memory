@@ -5,42 +5,40 @@
 -- grain: `valid_from` is the version's own `created_at`; `valid_to` is the
 -- superseding version's `created_at` (NULL while the version is latest).
 --
--- Additive like V56: two nullable columns + index + one-shot backfill. No
--- row is deleted or rewritten beyond the two new columns, and re-running
--- the UPDATEs converges on the same values. Like every refinery step, an
--- older binary fails closed on the migrated store (DataSchemaAhead) —
--- rollback is the boot-path pre-migration snapshot (serve.rs, #633), not
--- a downgrade read. No per-migration gate beyond the standard refinery
--- step, matching V56-V61.
+-- DDL-only by design (issue #776). This migration used to backfill the two
+-- windows in a single in-migration transaction (`UPDATE pages SET
+-- valid_from = created_at`, plus the two `valid_to` supersession rules).
+-- On a large store that one transaction ran for hours and grew the WAL to
+-- roughly the size of the database, with no progress and no way to bound
+-- it — refinery runs a migration as one transaction before the server
+-- accepts traffic. The backfill now lives in a chunked, resumable,
+-- WAL-bounded boot-path step (`ops::backfill_page_windows`, invoked from
+-- `Store::open`), which reproduces the identical end state (`valid_from =
+-- created_at`; `valid_to` per the two rules below) in bounded batches with
+-- a checkpoint between each. A store that already applied the ORIGINAL V62
+-- has these columns fully populated; the boot step detects that (no page
+-- has a NULL `valid_from`) and is a fast no-op. Such stores recorded the
+-- original migration's checksum, so the runner tolerates this reshape via
+-- `set_abort_divergent(false)` (see `migrations::run`).
 --
 -- `valid_to`, not `superseded_at`: `pages.superseded_at` already means
 -- the V03 decay-tombstone eviction marker (written exactly when
 -- `supersedes IS NULL`), so reusing the name would conflate "evicted by
 -- the forget sweep" with "replaced by a newer version".
+--
+-- The boot backfill reproduces exactly these rules over every page whose
+-- `valid_from` is still NULL:
+--   * `valid_from` = the version's own `created_at`.
+--   * Ordinary supersession: `valid_to` = the earliest successor's
+--     `created_at` (MIN over pages whose `supersedes` is this page).
+--   * Successor-less retirement (is_latest = 0, no successor): `valid_to`
+--     = COALESCE(superseded_at, MIN(entity_page_links.superseded_at),
+--     updated_at) — decay marker, then the existing link-window close,
+--     then the updated_at fallback.
+--   * A latest version with no successor stays open (`valid_to` NULL).
 
 ALTER TABLE pages ADD COLUMN valid_from INTEGER;
 ALTER TABLE pages ADD COLUMN valid_to INTEGER;
-
-UPDATE pages SET valid_from = created_at;
-
--- Ordinary supersession: close at the earliest successor's birth.
-UPDATE pages SET valid_to = (
-    SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id
-) WHERE EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);
-
--- Successor-less retirements (decay tombstones, graveyard merges,
--- move-regenerate rows — the V58 class): close at the decay eviction
--- marker when present, else the existing link-window close. Reorg and
--- move-regenerate recorded their retirement there without updating the
--- page's updated_at. Only fall back to updated_at when neither grain
--- retained the retirement instant. Latest versions stay open.
-UPDATE pages SET valid_to = COALESCE(
-    superseded_at,
-    (SELECT MIN(l.superseded_at) FROM entity_page_links l WHERE l.page_id = pages.id),
-    updated_at
-)
-WHERE is_latest = 0 AND valid_to IS NULL
-  AND NOT EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);
 
 -- The as_of window scan over page versions: (scope, window) probes ride
 -- this, mirroring idx_entity_page_links_validity at link grain.

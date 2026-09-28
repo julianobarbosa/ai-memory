@@ -394,6 +394,7 @@ impl Tier {
 /// report rather than deleting anything — an agent's judgement lowers
 /// confidence, it does not destroy memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(extend("type" = "string"))]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackKind {
     /// The page answered the question it surfaced for.

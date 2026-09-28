@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId,
-    NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId,
-    PagePath, ProjectId, Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
+    ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
+    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
+    SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -247,6 +248,24 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    InsertMessage {
+        message: NewAgentMessage,
+        reply: oneshot::Sender<StoreResult<MessageId>>,
+    },
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    PopMessage {
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Retract still-pending outbox messages a project has sent.
+    CancelMessages {
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
     /// mash-up pages. Executed in one transaction for atomicity.
@@ -582,6 +601,13 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    RecordAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
     },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
@@ -1283,6 +1309,66 @@ impl WriterHandle {
             workspace_id,
             project_id,
             owner_filter,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    ///
+    /// Fails when the recipient inbox is already at
+    /// [`crate::ops::MAX_PENDING_INBOX_MESSAGES`] pending.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_message(&self, message: NewAgentMessage) -> StoreResult<MessageId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertMessage { message, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    ///
+    /// With `specific_id`, pops that message; otherwise the oldest pending one.
+    /// Returns `None` when nothing matched or another session claimed it first —
+    /// the body must not reach the agent on `None`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn pop_message(
+        &self,
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<Option<AgentMessage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PopMessage {
+            claim,
+            specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Retract still-pending outbox messages a project has sent. With
+    /// `specific_id`, cancels just that one; otherwise every pending message
+    /// this project sent. Returns how many were cancelled.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn cancel_messages(
+        &self,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CancelMessages {
+            from_workspace_id,
+            from_project_id,
+            specific_id,
             reply: tx,
         })
         .await?;
@@ -2424,6 +2510,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a failed scheduled review, releasing the session's claim for
+    /// another attempt and returning the new attempt count. Returns `0` when the
+    /// session holds no claim, which is the manual path.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn record_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -2893,6 +3004,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &owner_filter,
                 );
                 send_or_warn(reply, result, "cancel_handoff");
+            }
+            WriteCmd::InsertMessage { message, reply } => {
+                let result = ops::insert_message(&mut conn, &message);
+                send_or_warn(reply, result, "insert_message");
+            }
+            WriteCmd::PopMessage {
+                claim,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::pop_message(&mut conn, &claim, specific_id);
+                send_or_warn(reply, result, "pop_message");
+            }
+            WriteCmd::CancelMessages {
+                from_workspace_id,
+                from_project_id,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::cancel_messages(
+                    &mut conn,
+                    &from_workspace_id,
+                    &from_project_id,
+                    specific_id,
+                );
+                send_or_warn(reply, result, "cancel_messages");
             }
             WriteCmd::Reorg {
                 workspace_id,
@@ -3433,6 +3570,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::RecordAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::record_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "record_auto_improve_claim_failure");
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);

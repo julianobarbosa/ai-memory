@@ -72,8 +72,16 @@ knowledge is a project. Each project dir gets a generated `index.md`
 (frontmatter `okf_version: "0.2"`, body = directory listing). The
 existing `_meta.md` scope manifest is unchanged — it is ai-memory's
 identity record; `index.md` is the OKF-facing description. Nothing in
-the current tree writes `index.md` or `log.md` (verified), so the
-reserved names are free. `log.md` is not adopted: git is the log.
+the current tree writes `index.md`, so that reserved name is free.
+`log.md` is not adopted: git is the log.
+
+The hooks *do* write a raw per-month event ledger at the project root
+(`log-YYYY-MM.md` — `## [ts] event | title` lines, no frontmatter). It
+is capture, not a concept file, so the export drops it exactly as it
+drops `log.md`, and the conformance gate never sees it (#748). The
+exclusion is content-gated, the same way the migration scan's is
+(#669): an ordinary page that happens to be named `log-2026-09.md`
+still ships in the bundle and still has to declare a `type`.
 
 ## Enforcement: one choke point
 

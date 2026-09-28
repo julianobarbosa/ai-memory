@@ -8,13 +8,15 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
+use crate::CodexProvider;
+use crate::CopilotEmbedder;
 use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
-use crate::auth::{AuthRequirement, ProviderAuth};
+use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
@@ -33,6 +35,8 @@ pub enum ProviderChoice {
     OpenAiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
     OpenAiOAuth,
+    /// Codex CLI-owned auth with refresh delegated to `codex app-server`.
+    Codex,
     /// GitHub Copilot Chat backend.
     Copilot,
     /// Anthropic Messages API via a Claude-subscription OAuth token.
@@ -52,6 +56,7 @@ impl ProviderChoice {
             Self::Gemini => "gemini",
             Self::OpenAiCompat => "openai-compat",
             Self::OpenAiOAuth => "openai-oauth",
+            Self::Codex => "codex",
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
@@ -75,6 +80,7 @@ impl ProviderChoice {
                 env_var: "LLM_API_KEY",
             },
             Self::OpenAiOAuth => AuthRequirement::OpenAiOAuthToken,
+            Self::Codex => AuthRequirement::CodexAuthFile,
             Self::Copilot => AuthRequirement::CopilotToken,
             Self::AnthropicOAuth => AuthRequirement::AnthropicOAuthToken,
             Self::OpenCode => AuthRequirement::RequiredApiKey {
@@ -152,6 +158,9 @@ pub enum EmbedderChoice {
     /// manually; docs/local-embeddings.md).
     #[cfg(feature = "local-embeddings")]
     Local,
+    /// GitHub Copilot's OpenAI-compatible `/embeddings` endpoint. Reuses the
+    /// Copilot OAuth login (no separate API key).
+    Copilot,
 }
 
 impl EmbedderChoice {
@@ -166,6 +175,7 @@ impl EmbedderChoice {
             Self::OpenAiCompat => "openai-compat",
             #[cfg(feature = "local-embeddings")]
             Self::Local => "local",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -187,6 +197,9 @@ pub struct EmbedderConfig {
     pub base_url: Option<String>,
     /// `<data_dir>/models/` root, required by the `local` provider.
     pub models_dir: Option<std::path::PathBuf>,
+    /// Resolved Copilot auth, required by the `copilot` provider. `None`
+    /// for every other provider.
+    pub copilot_auth: Option<CopilotAuth>,
     /// True when no provider was configured and `local` was chosen as
     /// the 2.0 default. Best-effort semantics: a defaulted embedder
     /// that cannot fetch or load its model degrades to no-embedder with
@@ -247,6 +260,12 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             })?;
             Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
         }
+        EmbedderChoice::Copilot => {
+            let auth = config.copilot_auth.ok_or_else(|| {
+                LlmError::NotConfigured("copilot embedding provider requires Copilot auth".into())
+            })?;
+            Arc::new(CopilotEmbedder::new(auth, config.model, config.dim)?)
+        }
     };
     Ok(arc)
 }
@@ -276,6 +295,7 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),
         (EmbedderChoice::OpenAiCompat, _) => None,
+        (EmbedderChoice::Copilot, _) => Some(crate::copilot::COPILOT_DEFAULT_EMBED_DIM),
     }
 }
 
@@ -384,6 +404,15 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Codex => {
+            let auth = config.auth.require_codex_auth()?;
+            Ok(Arc::new(
+                CodexProvider::new(auth, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
+            ))
+        }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
             Ok(Arc::new(
@@ -485,6 +514,11 @@ mod tests {
         assert_eq!(
             ProviderChoice::OpenAiOAuth.auth_requirement(),
             AuthRequirement::OpenAiOAuthToken
+        );
+        assert_eq!(ProviderChoice::Codex.name(), "codex");
+        assert_eq!(
+            ProviderChoice::Codex.auth_requirement(),
+            AuthRequirement::CodexAuthFile
         );
         assert_eq!(
             ProviderChoice::Copilot.auth_requirement(),

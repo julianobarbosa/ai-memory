@@ -196,10 +196,12 @@ async fn run_loop(
     }
 }
 
-/// Inside the wiki's own git directory: neither indexed nor reported.
+/// Inside the wiki's own git directory or any nested git metadata: neither indexed nor reported.
 fn is_git_internal(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root)
-        .is_ok_and(|rel| rel.starts_with(".git"))
+    path.strip_prefix(root).is_ok_and(|rel| {
+        rel.components()
+            .any(|c| ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy()))
+    })
 }
 
 async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent) {
@@ -924,13 +926,24 @@ mod tests {
         let git_log = wiki.root().join(".git/logs/HEAD");
         std::fs::create_dir_all(git_log.parent().unwrap()).unwrap();
         std::fs::write(&git_log, "ref\n").unwrap();
+        let nested_git = proj_dir.join(".git/config");
+        std::fs::create_dir_all(nested_git.parent().unwrap()).unwrap();
+        std::fs::write(&nested_git, "config\n").unwrap();
         let gone = proj_dir.join("gone.md");
 
         for (kind, path) in [
             (EventKind::Create(notify::event::CreateKind::File), &ledger),
             (EventKind::Modify(notify::event::ModifyKind::Any), &git_log),
+            (
+                EventKind::Create(notify::event::CreateKind::File),
+                &nested_git,
+            ),
             (EventKind::Remove(notify::event::RemoveKind::File), &gone),
             (EventKind::Remove(notify::event::RemoveKind::File), &git_log),
+            (
+                EventKind::Remove(notify::event::RemoveKind::File),
+                &nested_git,
+            ),
         ] {
             let event = notify_debouncer_full::DebouncedEvent::new(
                 notify::Event::new(kind).add_path(path.clone()),
@@ -944,7 +957,9 @@ mod tests {
         assert!(reported.contains(&rel(&ledger)), "{reported:?}");
         assert!(reported.contains(&rel(&gone)), "{reported:?}");
         assert!(
-            !reported.iter().any(|p| p.starts_with(".git")),
+            !reported
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
             "{reported:?}"
         );
     }

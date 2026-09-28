@@ -7,6 +7,20 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+**`ai-memory run` is the preferred way to start a harness — "if in doubt, run
+with ai-memory."** Beyond session continuity, the first time it launches a given
+harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
+not already wired, so capture and recall work without a separate `install-hooks`
+/ `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
+nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
+one-time per harness + binary version, preserves unrelated user config, runs
+before the harness starts so it picks up the fresh hooks, and is best-effort —
+if an install fails it warns and still launches. Harnesses without installer
+support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
+it off with `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
+`run_autowire = false` in config; manual `install-hooks` / `install-mcp` remain
+available for harnesses you never launch through `run`.
+
 The launcher resolves its executable name through `PATH` directly — it does
 not go through an interactive shell, so a `claude` defined only as a shell
 `alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude
@@ -385,6 +399,14 @@ environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
 `KIRO_HOME`, and `GROK_HOME`.
+Export these in the environment `ai-memory run` itself sees — not only inside a
+harness wrapper script. `ai-memory run` resolves the native session directory
+(and installs hooks) from its own environment; if the harness writes its
+transcript under a custom `CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see,
+the two disagree and the native transcript import fails. When you use per-account
+config directories, set the variable before invoking `ai-memory run` (or in the
+same wrapper that also runs it), so hook installation and native-session
+resolution agree.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -561,6 +583,13 @@ previous launcher can finish; if another harness is genuinely still running,
 the conflict remains and concurrent writers are still rejected. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+Before the child starts, `Ctrl+C` at the native-session chooser cancels the
+acquired run and exits without requiring Enter or adopting the selected session.
+The launcher waits for the server's cancellation response. A request error is
+reported and leaves the lease to expire within its normal 90-second window;
+a server that accepts the request but never responds can still keep the launcher
+waiting. Heartbeats have stopped, so the lease itself still expires.
 
 While the harness or native-session selector is open, a temporary server outage
 produces one short notice instead of printing every failed heartbeat. The

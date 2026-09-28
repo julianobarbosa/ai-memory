@@ -949,9 +949,14 @@ pub(crate) fn build_profile_payload(
         "claude-code",
         None,
         None,
+        false,
     )
 }
 
+// A hook-render builder that threads several independent render inputs (profile,
+// paths, agent, scope strategy, capture opt-in); grouping them into a struct
+// would not make the one call path clearer than the named parameters do.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_profile_payload_for_agent(
     profile: &HookProfile,
     emit_root: &Path,
@@ -960,6 +965,7 @@ pub(crate) fn build_profile_payload_for_agent(
     agent: &str,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    capture_assistant: bool,
 ) -> serde_json::Value {
     build_hook_payload(
         profile.events,
@@ -972,7 +978,8 @@ pub(crate) fn build_profile_payload_for_agent(
             agent,
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_capture_assistant(capture_assistant),
     )
 }
 
