@@ -27,7 +27,7 @@ use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
 
 /// Conservative per-request input cap for OpenAI-compatible embedding APIs
 /// (8192 token server limit; we stay well below with head truncation).
-const OPENAI_EMBED_MAX_TOKENS: usize = 5000;
+pub(crate) const OPENAI_EMBED_MAX_TOKENS: usize = 5000;
 
 /// Provider-agnostic embedding API.
 ///
@@ -118,7 +118,7 @@ struct OpenAiEmbeddingDatum {
 }
 
 /// Parse OpenAI-compatible embedding responses, including OpenRouter error bodies.
-fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>> {
+pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
         status,
         body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),

@@ -79,6 +79,13 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
         summary.workspaces,
         config.data_dir.join("wiki").display(),
     );
+    if summary.skipped_collisions > 0 {
+        println!(
+            "skipped {} page(s) whose path differs from an indexed page only by case or Unicode \
+             normalization (they cannot coexist on macOS/Windows); the log names each pair",
+            summary.skipped_collisions,
+        );
+    }
     Ok(())
 }
 
@@ -122,6 +129,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

@@ -162,6 +162,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             executable: None,
             yolo: args.yolo,
             fresh: args.fresh,
+            no_autowire: false,
             harness,
             native_args: Vec::new(),
         },

@@ -3,6 +3,8 @@
 //! Every file the wiki owns is written via a tmp + rename + fsync dance.
 //! Two payoffs: a crash mid-write never produces a torn file, and the
 //! watcher skips its own writes by the `.ai-memory-tmp.` filename prefix.
+// The write primitive itself; every reporting wrapper is built on it.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
 use std::io::Write;

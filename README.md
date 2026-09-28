@@ -53,6 +53,26 @@ ai-memory is what's on the other side of those walls.
   uses **zero LLM calls**: capture, search, and handoffs all work with no
   API key at all.
 
+- **It ages gracefully, without an LLM.** Memory decays on a schedule you
+  can tune per tier, and the memory you actually use decays *slower* — open a
+  page, search it, or reach it through a link and it earns its keep. When
+  episodic notes go cold they can be compacted down to their durable facts
+  (file paths, error codes, decisions) instead of dropped, near-duplicates
+  collapse into one, and likely contradictions get flagged — all with **zero
+  API calls**. Nothing is hard-deleted: the original stays in git and the
+  version chain (`restore-page` brings it back). Access-weighted retention is
+  always on because it can only ever keep memory *longer*; the parts that
+  rewrite or drop content (compaction, dedup, per-tier curves) stay off by
+  default until you turn them on.
+
+- **And it can dream, if you let it.** Point it at an LLM and an opt-in
+  background pass will, while you're idle, rewrite whole clusters of cold
+  notes into single coherent pages — cancelling the moment you come back to
+  work. It never deletes a source (the pre-merge versions stay reachable),
+  it's off by default, and it's gated on a recall eval before it could ever
+  become default behavior. The zero-LLM path above is what runs unless you
+  ask for more.
+
 - **It tells you the truth about itself.** One self-contained binary.
   Purge commands that say exactly what "deleted" means. A measured write
   ceiling (~700/s) instead of a guessed one. An audit log of every
@@ -113,9 +133,53 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Pool | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
+| Muse Code | MCP-only |
 | Hermes Agent | Community |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
+
+## Coming from another tool?
+
+Most agent-memory tools optimize one thing — extracting atomic facts per turn,
+a temporal knowledge graph, an agent-editable memory OS, or a hosted context
+API. ai-memory optimizes something different: a **git-backed markdown wiki as
+the source of truth**, with a derived index for retrieval, captured
+automatically from lifecycle hooks, shared across agents, machines, and people,
+and working with **zero LLM calls by default**. Here's what carries over from
+each, and what you gain:
+
+| Coming from… | What's similar | What you gain |
+|---|---|---|
+| **Mem0 / fact extractors** (LangMem) | Automatic per-turn capture | Memory compiles into readable **pages** you own and edit, not opaque fact rows; retrieval fuses FTS + entity + graph (+ optional vectors), not vector-only |
+| **Zep / Graphiti** (temporal KG) | Temporal reasoning, typed relations | Bi-temporal-lite (`as_of`, version-filtered search) and typed edges without standing up a graph database — on one binary |
+| **mcp-memory-service** (closest sibling) | SQLite + local embeddings, hook capture, typed edges, honest numbers — and, on 2.4, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
+| **basic-memory** (file-first sibling) | Markdown-on-disk as the source of truth | Automatic lifecycle capture and a derived FTS/entity/graph index on top, cross-agent handoffs, and multi-user sharing built in |
+| **Claude Code built-in memory** | "Remember my project" convenience, zero setup | Synced across machines and agents, searchable, team-capable, and captures tool lifecycle — not a per-laptop `MEMORY.md` |
+| **Hindsight / OpenViking** (hosted, LLM-required) | Living pages / document memory with a background consolidation loop — and, on 2.4, belief-strength confidence plus an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in files you own; per-project team sharing instead of strict per-bank isolation; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
+| **Supermemory / LiquidLM** (hosted memory API) | A managed second brain with automatic ingestion | Git-versioned markdown you own, no required API spend, offline operation, and per-project team sharing — ai-memory remembers *this repo*, not a general vault |
+
+The consistent theme: **files you own** (git-backed markdown), a **zero-LLM
+default**, **one self-contained binary**, **cross-agent + cross-machine + team**
+sharing, **automatic lifecycle capture**, and **typed, claim-once handoffs**.
+Opt-in features (LLM consolidation, vector search, the "dream" consolidation
+pass, belief-strength in ranking) stay opt-in — and the zero-LLM aging path
+(per-tier decay, extractive compaction, dedup, contradiction flagging,
+access-weighted retention) works with no API key at all.
+
+**Built on the shoulders of:** the
+[Karpathy LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+(compile-not-retrieve),
+[agentmemory](https://github.com/rohitg00/agentmemory) (this project is its Rust
+successor), [basic-memory](https://github.com/basicmachines-co/basic-memory)
+(markdown-on-disk truth),
+[cognee](https://github.com/topoteretes/cognee) (pipeline composition and
+triplet embeddings),
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (the
+self-improvement loop), and [A-MEM](https://arxiv.org/abs/2502.12110)
+(Zettelkasten-style atomic notes).
+
+The full, fair rundown — where each approach wins, where ai-memory differs, the
+published benchmark — is in [How ai-memory compares](docs/comparison.md).
 
 ## Quick start
 
@@ -144,6 +208,37 @@ ai-memory install-hooks --agent claude-code --apply
 System service installs use `/var/lib/ai-memory` and `/etc/ai-memory/` via the
 packaged unit. Full user-service, system-service, auth, and provider setup is in
 [`docs/install.md#arch-linux-native-packages-aur`](docs/install.md#arch-linux-native-packages-aur).
+
+### macOS (menu bar app)
+
+A self-contained `.app` that bundles the native `ai-memory` binary and
+`hooks/` tree, starts the existing LaunchAgent, and opens `/web`,
+`ai-memory status`, and `config.toml` from the menu bar. Wiki, SQLite,
+config, and models stay in `~/Library/Application Support/ai-memory`, so
+replacing the app is an update — it does not rewrite that tree.
+
+Needs a Rust toolchain and Xcode / Swift 6 (same as a source build):
+
+```bash
+git clone https://github.com/akitaonrails/ai-memory
+cd ai-memory
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra (no Dock icon). When the status item is green, wire an
+agent with the bundled binary:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Prebuilt tarball and launchd-without-the-app paths:
+[`docs/macos.md`](docs/macos.md). Companion details:
+[`companions/ai-memory-macos`](companions/ai-memory-macos).
 
 ### Docker
 
@@ -218,8 +313,9 @@ wrapper automatically uses Podman when Docker is not installed. Set
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
-On macOS, the native release binary is also supported and recommended when you
-do not need Docker; see [`docs/macos.md`](docs/macos.md).
+On macOS the native binary is the recommended path when you do not need
+Docker — either the [menu bar app](#macos-menu-bar-app) above or a
+[release tarball / launchd agent](docs/macos.md).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support
@@ -231,14 +327,23 @@ works out of the box: the "current project" pointer is isolated per caller
 by default (v1.39+). See [`docs/auto-scope.md`](docs/auto-scope.md) for the
 optional session-aware Claude Code bridge and the details.
 
-Managed workstreams are optional and add cross-harness *session* continuity
-on top of shared memory:
+**If in doubt, start your harness with `ai-memory run`.** It is the preferred
+way to launch: the first time it runs a harness it auto-installs that harness's
+ai-memory hooks + MCP if they are missing (so capture and recall just work —
+no separate `install-hooks`/`install-mcp` step to forget), it wires the right
+project scope by construction, and it adds cross-harness *session* continuity on
+top of shared memory. Everything is idempotent and one-time per harness.
 
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
 ai-memory continue           # resume the newest managed checkout
 ```
+
+Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
+`AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
+`install-hooks` / `install-mcp` (e.g. for a harness you never launch through
+`ai-memory run`).
 
 `ai-memory uninstall --apply` removes everything ai-memory installed,
 and only what it installed. Install commands are idempotent and write
@@ -285,13 +390,17 @@ paths or invert to allowlist mode.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+[`docs/https-via-proxy.md`](docs/https-via-proxy.md). For data-flow,
+identity/SSO, and offline-install questions specifically, see
+[`DATA_HANDLING.md`](DATA_HANDLING.md), [`docs/sso.md`](docs/sso.md), and
+[`docs/airgapped-install.md`](docs/airgapped-install.md).
 
 ## LLM providers
 
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
-OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode (Go and Zen), and
+OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini,
+OpenCode (Go and Zen), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in
@@ -321,50 +430,44 @@ diagram, crate breakdown, schema notes, and invariants.
 
 ## Docs
 
+### For users
+
 | File | What it is |
 |---|---|
-| [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
-| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
-| [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
+| [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a project rule, import an existing knowledge base, get two agents/repos working together. Start here. |
+| [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine walkthrough. |
+| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
-| [`docs/macos.md`](docs/macos.md) | macOS install paths: native release binary (recommended), source build, the Docker wrapper, hook-platform notes, and current macOS limitations. |
-| [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and current hook/MCP harness caveats. |
+| [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
+| [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes, handoff-injection limits, and community bridge guidance. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
-| [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield `aim_` migration. |
-| [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |
-| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix for state-touching commands, per-project disk layout (how isolation actually works), checkpoint-based page recovery, and operator workflows for "fresh start", "snapshot before risky op", "drop one project", and rebuilding SQLite from wiki files. |
-| [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and implementation plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer), without widening core ai-memory. |
-| [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
-| [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md) | Proposed opt-in fallback-chain design for transient LLM-provider failures; not yet a supported configuration surface. |
+| [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
+| [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
+| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
+| [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
+| [`docs/security.md`](docs/security.md) | The full security model. |
+| [`docs/support-matrix.md`](docs/support-matrix.md) | The full agent/platform matrix with notes. |
+| [`docs/use-cases.md`](docs/use-cases.md) | Scenario walkthroughs. |
+| [`DATA_HANDLING.md`](DATA_HANDLING.md) | **Data-flow reference for security/legal review.** What's stored, what's local-only, the two opt-in external paths, and how deletion/retention work. |
+| [`docs/sso.md`](docs/sso.md) | Enterprise identity: the OIDC device-auth flow, its scope, and how to front the server with an OIDC-aware gateway. |
+| [`docs/airgapped-install.md`](docs/airgapped-install.md) | Offline/air-gapped install: self-contained build, checksum-verified release binaries, and offline local embedding models. |
+| [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) | Upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore. |
+| [`docs/benchmarks/`](docs/benchmarks/README.md) | Published retrieval-quality numbers with provenance, reproducible from the in-repo harness. |
+| [`docs/okf.md`](docs/okf.md) | The wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping. |
+
+### For contributors
+
+| File | What it is |
+|---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
-| Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee deep-dives, lessons-learned from upstream issues. |
-- [`docs/support-matrix.md`](docs/support-matrix.md) - the full agent/platform matrix with notes.
-- [`docs/use-cases.md`](docs/use-cases.md) - scenario walkthroughs.
-- [`docs/llm-providers.md`](docs/llm-providers.md) - provider configuration.
-- [`docs/security.md`](docs/security.md) - the full security model.
-- [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
-- [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
-- [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
-- [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
-- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and `as_of` time-travel queries.
-- [`docs/local-embeddings.md`](docs/local-embeddings.md) - in-process embeddings with no API key (`embedding_provider = "local"`).
-- [`docs/experience.md`](docs/experience.md) - the opt-in cross-session abstraction pass: knowledge visible only across trajectories.
-- [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.
-- [`docs/benchmarks/`](docs/benchmarks/README.md) - published retrieval-quality numbers with provenance, reproducible from the in-repo harness.
-
-## Influences and prior art
-
-- **[Karpathy LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)** - the compile-not-retrieve pattern.
-- **[agentmemory](https://github.com/rohitg00/agentmemory)** - most of the right ideas; this project is the Rust successor.
-- **[basic-memory](https://github.com/basicmachines-co/basic-memory)** - the markdown-on-disk source-of-truth model.
-- **[cognee](https://github.com/topoteretes/cognee)** - pipeline composition and triplet embeddings.
-- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** - the self-improvement loop: post-turn review, approval gates, and curator boundaries.
-- **[A-MEM](https://arxiv.org/abs/2502.12110)** - Zettelkasten-style atomic notes with link evolution.
+| [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer). |
+| [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 
 ## License
 

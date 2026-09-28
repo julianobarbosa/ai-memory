@@ -9,6 +9,11 @@ on GitHub. You will receive a response within 7 days. If the issue is confirmed
 we will aim to release a patch within 30 days and credit you in the changelog
 (unless you prefer to remain anonymous).
 
+If you cannot use GitHub's private advisory flow (e.g. your organization's
+vendor-security process requires a named point of contact independent of a
+GitHub account), open an issue asking for an alternate contact channel and a
+maintainer will follow up; do not put vulnerability details in that issue.
+
 ## Threat model
 
 ai-memory is a **single-tenant workstation/homelab service**. It supports

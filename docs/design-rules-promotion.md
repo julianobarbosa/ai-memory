@@ -1,7 +1,8 @@
-# Design: Promoting Memory into Governed AGENTS.md Rules (2.1)
+# Design: Promoting Memory into Governed AGENTS.md Rules
 
-*Status: design, targeting the `release/2.1` line. Not implemented yet — this
-is the balance research the feature needs before code.*
+*Status: design proposal — not implemented. (Originally scoped against the 2.1
+line; that and 2.2 shipped without it, so it is un-targeted and still open —
+this is the balance research the feature needs before code.)*
 
 ## 1. The idea, and the trap
 

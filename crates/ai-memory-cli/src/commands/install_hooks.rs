@@ -105,6 +105,70 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// True when `~/.cursor/hooks.json` already registers a native ai-memory hook
+/// declared `--agent cursor`.
+///
+/// The Cursor CLI also runs the commands in Claude Code's settings, so on a
+/// host with both installs every Cursor event reaches `ai-memory hook` twice:
+/// once as `--agent cursor` and once as `--agent claude-code` carrying
+/// `cursor_version`. The hook uses this to drop the second copy (#721).
+/// Unreadable or malformed files count as "not installed" so the Claude Code
+/// path keeps capturing Cursor sessions on hosts without Cursor's own hooks.
+pub(crate) fn cursor_native_hooks_installed() -> bool {
+    cursor_hooks_path().is_ok_and(|path| cursor_native_hooks_installed_in(&path))
+}
+
+const MAX_CURSOR_HOOKS_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn cursor_native_hooks_installed_in(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_CURSOR_HOOKS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .any(|entry| is_ai_memory_hook_entry(entry) && declares_cursor_agent(entry))
+        })
+}
+
+fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
+    if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+        return args
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "cursor");
+    }
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            let tokens: Vec<&str> = command
+                .split_whitespace()
+                .map(|t| t.trim_matches(['"', '\'']))
+                .collect();
+            tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "cursor")
+                || tokens.contains(&"--agent=cursor")
+                || command.contains("agent=cursor")
+        })
+}
+
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -348,13 +412,30 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let persisted = if args.apply
         && let Some(token) = auth_token_owned.as_deref()
     {
-        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
-            format!(
-                "storing the hook auth token under {}",
-                config.data_dir.display()
-            )
-        })?;
-        true
+        // A failure here must NOT abort the whole install (#743-audit F5). The
+        // common case is a docker-wrapper run where `data_dir` is `/data`, a
+        // named volume the container user cannot write — and which the HOST
+        // hooks would not read from anyway (they look under the host's
+        // `~/.local/share/ai-memory`). Aborting left the operator with no hooks
+        // and no capture. Fall back to embedding the credential the pre-#552 way
+        // (into the rendered hook config/env) so the hooks still authenticate,
+        // and warn loudly about the reduced protection and how to get the secure
+        // path back.
+        match crate::config::store_hook_auth_token(&config.data_dir, token) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
+                     embedding it in the rendered hook config instead so capture still works. \
+                     The token is then readable in that file / process argv. To keep it out \
+                     (recommended), install with a writable host data dir — e.g. \
+                     `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper — \
+                     or a native `ai-memory` binary.",
+                    config.data_dir.display()
+                );
+                false
+            }
+        }
     } else {
         false
     };
@@ -414,6 +495,20 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
              agents may use their prompt hook to deliver handoff context, so removing it could \
              break cross-agent continuity."
         );
+    }
+    // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
+    // is no negative flag, so a re-run without `--capture-assistant` (notably the
+    // `ai-memory run` auto-wire, which always passes it off) must NOT silently
+    // downgrade a user who had enabled assistant capture. An explicit
+    // `--capture-assistant` still forces it on; this only fills in the unset case
+    // from what is already installed. Gated to the agents where assistant capture
+    // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    if args.apply
+        && !args.capture_assistant
+        && capture_assistant_allowed(args.agent)
+        && existing_capture_assistant_opt_in(&args)
+    {
+        args.capture_assistant = true;
     }
     if args.apply {
         // #446: settle the capture failure mode before any agent-specific
@@ -790,6 +885,54 @@ fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
     )
 }
 
+/// Whether the currently-installed config for this agent already bakes the
+/// `--capture-assistant` opt-in. Used to preserve that opt-in across a bare
+/// re-apply (e.g. `ai-memory run` auto-wire) instead of dropping it. Only the
+/// agents where assistant capture is allowed (Claude Code, Codex) reach here,
+/// and both write the nested-hooks JSON shape.
+fn existing_capture_assistant_opt_in(args: &InstallHooksArgs) -> bool {
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_capture_assistant)
+        .unwrap_or(false)
+}
+
+/// `Some(true|false)` when `existing` is a recognizable ai-memory install and
+/// whether its Stop command carries `--capture-assistant`; `None` when it is not
+/// an ai-memory install at all (so there is nothing to preserve).
+fn baked_capture_assistant(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let mut saw_ai_memory = false;
+    let mut has_marker = false;
+    for entries in hooks.values().filter_map(serde_json::Value::as_array) {
+        for entry in entries {
+            // Nested (`hooks:[{command}]`) or flat (`{command}`) shape.
+            let nested = entry.get("hooks").and_then(serde_json::Value::as_array);
+            let commands: Vec<&str> = match nested {
+                Some(inner) => inner
+                    .iter()
+                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
+                    .collect(),
+                None => entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+            for command in commands {
+                if hook_command_is_ours(command) {
+                    saw_ai_memory = true;
+                    if command.contains("--capture-assistant") {
+                        has_marker = true;
+                    }
+                }
+            }
+        }
+    }
+    saw_ai_memory.then_some(has_marker)
+}
+
 /// Read the config file `--apply` will update for the selected agent.
 fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
     let path = if let Some(path) = &args.config_file {
@@ -1139,6 +1282,14 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["context_servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here. Muse
+        // Code's hook surface is documented, but its SessionStart output
+        // contract is not, so no lifecycle integration claims it yet.
+        McpClient::Muse => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp_servers", "ai-memory"],
+            "url",
+        )),
     }
 }
 
@@ -1173,7 +1324,7 @@ fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<Pat
         .find(|path| path.exists())
 }
 
-fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
+pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),
@@ -1465,11 +1616,14 @@ fn overlay_kiro_cli_event_hooks(
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
 /// Whether `--capture-assistant` may take effect for this agent + platform
-/// (#196): Claude Code on a native hook platform only. Any other agent or a
-/// script-fallback platform cannot honor the opt-in, so the installer bails
-/// instead of enabling it silently.
+/// (#196, #743): Claude Code and Codex on a native hook platform. Both carry
+/// `last_assistant_message` on their `Stop` payload (see
+/// `ai_memory_hooks::assistant_capture`). Any other agent or a script-fallback
+/// platform cannot honor the opt-in, so the installer bails instead of enabling
+/// it silently.
 fn capture_assistant_allowed(agent: AgentChoice) -> bool {
-    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+    matches!(agent, AgentChoice::ClaudeCode | AgentChoice::Codex)
+        && local_hook_policy_v1_supported()
 }
 
 fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
@@ -1801,6 +1955,8 @@ fn apply_to_command_code_settings_with_staged(
         "command-code",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Command Code is refused by `capture_assistant_allowed`; never bake it.
+        false,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -1917,6 +2073,10 @@ fn apply_to_codex_settings_with_staged(
         "codex",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Codex Stop carries last_assistant_message (#743); bake the opt-in when
+        // asked. `capture_assistant_allowed` already gated it, so this only bakes
+        // on a native path.
+        args.capture_assistant,
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -1962,6 +2122,7 @@ fn merge_codex_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    capture_assistant: bool,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
     // to Claude Code's matcher + nested hooks form — the event list
@@ -1974,6 +2135,7 @@ fn merge_codex_hooks(
         "codex",
         Some(data_dir),
         project_strategy,
+        capture_assistant,
     );
     merge_codex_payload(payload, config_path)
 }
@@ -2050,7 +2212,58 @@ fn apply_to_cursor_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    warn_unrecognized_ai_memory_hooks(&path);
     Ok(())
+}
+
+/// Warn about hook entries that mention ai-memory but are not recognised as
+/// ours, e.g. a wrapper shim that injects `cwd` before calling the binary.
+/// `install-hooks` keeps those beside the native entries it adds, so every
+/// event would then be captured twice (#721). Best effort: never fails apply.
+fn warn_unrecognized_ai_memory_hooks(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    for (event, command) in unrecognized_ai_memory_hook_entries(&root) {
+        eprintln!(
+            "# warning: {} `{event}` hook `{command}` mentions ai-memory but is not an \
+             ai-memory hook entry, so it was kept beside the native one and the event \
+             may be captured twice. Remove it if it wraps ai-memory.",
+            path.display()
+        );
+    }
+}
+
+fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(hooks) = root.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (event, entries) in hooks {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries.iter().filter(|e| !is_ai_memory_hook_entry(e)) {
+            let handlers = entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(|| vec![entry], |inner| inner.iter().collect());
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("ai-memory") || lower.contains("ai_memory") {
+                    found.push((event.clone(), command.to_string()));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn merge_cursor_hooks(
@@ -2069,6 +2282,7 @@ fn merge_cursor_hooks(
         "cursor",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2161,6 +2375,7 @@ fn merge_gemini_hooks(
         "gemini-cli",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2968,9 +3183,16 @@ const AiMemoryOpencode2: Plugin = {
             ?? event?.location?.directory ?? directory;
           if (type === "session.created") {
             const id = data?.sessionID ?? data?.id ?? info?.id;
+            const parentID = info?.parentID ?? data?.parentID;
             startSession(id, data?.location?.directory ?? loc, {
               title: data?.title ?? info?.title,
               projectID: data?.projectID ?? info?.projectID,
+              // Subagent sessions carry a parentID; forward it as the `agent_id`
+              // marker so drop_subagent_captures works on OpenCode 2 too (#755).
+              // Root sessions have no parentID and must stay unmarked.
+              ...(typeof parentID === "string" && parentID
+                ? { agent_id: parentID }
+                : {}),
             });
           }
           if (type === "session.idle") {
@@ -3630,6 +3852,13 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         startSession(id, cwd, {{
           title: info.title,
           projectID: info.projectID,
+          // A subagent session carries a parentID; forward it as the `agent_id`
+          // subagent marker so `drop_subagent_captures` can recognize (and drop)
+          // OpenCode subagent sessions too (#755). A root session has no
+          // parentID — never mark it, or every session looks like a subagent.
+          ...(typeof info.parentID === "string" && info.parentID
+            ? {{ agent_id: info.parentID }}
+            : {{}}),
         }});
       }}
       if (event?.type === "session.idle") {{
@@ -4114,12 +4343,14 @@ const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
 const HOOK_REQUEST_TIMEOUT_MS = 200;
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
 const hookQueue: HookQueueItem[] = [];
 let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
 let hookDraining = false;
+let hookDrainPromise: Promise<void> | undefined;
 
 function sleep(ms: number): Promise<void> {{
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -4129,16 +4360,37 @@ function scheduleHookFlush(): void {{
   if (hookFlushTimer) return;
   hookFlushTimer = setTimeout(() => {{
     hookFlushTimer = undefined;
-    void drainHookQueue();
+    void requestHookDrain();
   }}, HOOK_FLUSH_INTERVAL_MS);
   hookFlushTimer.unref?.();
+}}
+
+function requestHookDrain(): Promise<void> {{
+  if (!hookDrainPromise) {{
+    hookDrainPromise = drainHookQueue().finally(() => {{
+      hookDrainPromise = undefined;
+      if (hookQueue.length > 0) void requestHookDrain();
+    }});
+  }}
+  return hookDrainPromise;
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([requestHookDrain(), disposeDrainTimeout()]);
 }}
 
 function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
   if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
   hookQueue.push({{ event, url, payload }});
   if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
-    void drainHookQueue();
+    void requestHookDrain();
   }} else {{
     scheduleHookFlush();
   }}
@@ -4169,7 +4421,6 @@ async function drainHookQueue(): Promise<void> {{
     }}
   }} finally {{
     hookDraining = false;
-    if (hookQueue.length > 0) void drainHookQueue();
   }}
 }}
 
@@ -4402,9 +4653,10 @@ export default function AiMemoryExtension(api: any): void {{
     postHook("stop", sessionPayload(ctx));
   }});
 
-  api.on("session_shutdown", (_event: any, ctx: any) => {{
+  api.on("session_shutdown", async (_event: any, ctx: any) => {{
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
+    await drainHookQueueForDispose();
   }});
 }}
 "#,
@@ -5731,12 +5983,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn capture_assistant_allowed_only_for_claude_native() {
+    fn capture_assistant_allowed_only_for_claude_and_codex_native() {
         use crate::cli::AgentChoice::*;
-        // Every non-Claude agent is rejected regardless of platform (#196): the
-        // opt-in cannot take effect for them, so the installer must bail.
+        // Every agent that cannot honor the opt-in is rejected regardless of
+        // platform (#196): the installer must bail rather than enable it silently.
         for agent in [
-            Codex,
             CommandCode,
             Cursor,
             GeminiCli,
@@ -5759,9 +6010,14 @@ mod tests {
                 "{agent:?} must not allow --capture-assistant"
             );
         }
-        // Claude Code tracks the native-platform gate exactly.
+        // Claude Code and Codex (#743) both carry last_assistant_message on Stop
+        // and track the native-platform gate exactly.
         assert_eq!(
             capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+        assert_eq!(
+            capture_assistant_allowed(Codex),
             local_hook_policy_v1_supported()
         );
     }
@@ -7732,6 +7988,133 @@ model = "gpt-5"
         );
     }
 
+    /// F5 (docker-wrapper audit), the regression guard: when the bearer
+    /// *cannot* be persisted under the data dir, `--apply` must still install
+    /// working hooks by embedding the credential inline instead of aborting the
+    /// whole install with no hooks at all.
+    ///
+    /// The real case is the docker wrapper: `data_dir` is `/data`, a container
+    /// volume the host hooks never read from and that the container user often
+    /// cannot write. Before this fix a persist failure hard-aborted, leaving the
+    /// operator with neither the secure path nor any capture at all.
+    #[test]
+    fn apply_falls_back_to_inline_bearer_when_persisting_fails() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        // Make ONLY the secret write fail — like a data dir the installer cannot
+        // write the token into — while leaving hook staging (which writes under
+        // `<data_dir>/hooks/`) fully working: pre-create the `<data_dir>/auth-token`
+        // path as a *directory*, so `write_secret`'s file open returns EISDIR.
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("FALLBACK-BEARER-F5".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: a persist failure must not abort the install.
+        run(&config, args).expect("apply must not abort when the bearer cannot be persisted");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            rendered.contains("FALLBACK-BEARER-F5"),
+            "the bearer must be embedded inline so the hooks still authenticate: {rendered}"
+        );
+
+        // It genuinely took the fallback, not the secure path: nothing persisted.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir),
+            None,
+            "the token must not have been persisted in the failure case"
+        );
+    }
+
+    fn claude_apply_args(
+        settings: &std::path::Path,
+        hooks_dir: &std::path::Path,
+        capture_assistant: bool,
+    ) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            capture_assistant,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(settings.to_path_buf()),
+            hooks_dir: Some(hooks_dir.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// Regression for the auto-wire capture-downgrade (post-audit S1): a bare
+    /// `--apply` without `--capture-assistant` — exactly what `ai-memory run`
+    /// auto-wire issues — must PRESERVE a user's existing assistant-capture
+    /// opt-in, not silently strip it.
+    ///
+    /// Unix-gated: `--capture-assistant` is baked onto the native Stop command on
+    /// POSIX-native platforms; the Windows Claude command form does not carry the
+    /// flag in its rendered JSON, so there is nothing to drop or preserve there.
+    /// The preserve logic itself (`baked_capture_assistant`) has no platform
+    /// branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, true)).expect("first install");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "the explicit opt-in must be baked on the first install"
+        );
+
+        // A bare re-apply (the auto-wire shape: capture_assistant = false).
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("bare re-apply");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a bare re-apply must preserve the existing --capture-assistant opt-in"
+        );
+    }
+
+    /// The preserve logic must not false-positive: a fresh install without the
+    /// flag stays off.
+    #[test]
+    fn a_fresh_install_without_the_flag_leaves_assistant_capture_off() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("fresh install");
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a fresh install without the flag must not enable assistant capture"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
@@ -7978,6 +8361,11 @@ model = "gpt-5"
         assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
+        // #755: a subagent session must forward its parentID as the `agent_id`
+        // marker (so drop_subagent_captures recognizes it), and only when the
+        // parentID is a real string (a root session stays unmarked).
+        assert!(plugin.contains("agent_id: info.parentID"));
+        assert!(plugin.contains("typeof info.parentID === \"string\""));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
@@ -8069,6 +8457,11 @@ model = "gpt-5"
         assert!(!plugin.contains("Plugin.define({"));
         assert!(plugin.contains("const AiMemoryOpencode2: Plugin = {"));
         assert!(plugin.contains("export default AiMemoryOpencode2;"));
+        // #755: subagent sessions forward parentID as the `agent_id` marker,
+        // only when it is a real string (root sessions stay unmarked).
+        assert!(plugin.contains("const parentID = info?.parentID ?? data?.parentID"));
+        assert!(plugin.contains("agent_id: parentID"));
+        assert!(plugin.contains("typeof parentID === \"string\""));
         // Beta hooks, verified against `@opencode-ai/plugin@beta`.
         assert!(plugin.contains("ctx.event.subscribe"));
         assert!(plugin.contains("ctx.session.hook(\"prompt\""));
@@ -8362,6 +8755,22 @@ model = "gpt-5"
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
         assert!(extension.contains("url.searchParams.set(\"project\", repoProject)"));
+        // #676: pi/omp await session_shutdown's dispose flush instead of
+        // returning immediately, so the runtime teardown that follows a sync
+        // handler no longer kills the in-flight session-end fetch.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("let hookDrainPromise: Promise<void> | undefined;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("api.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("api.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     #[test]
@@ -8793,6 +9202,20 @@ model = "gpt-5"
         assert!(!extension.contains(".omp"));
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
+        // #676: the pi string-transform (api.on( -> pi.on() must still
+        // produce an async session_shutdown handler that awaits the bounded
+        // dispose flush, mirroring the omp source it derives from.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("pi.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     // Windows 11 + Git Bash support matters for regulated enterprise setups
@@ -8906,6 +9329,81 @@ model = "gpt-5"
     }
 
     #[test]
+    fn cursor_native_hooks_detection_requires_an_ai_memory_cursor_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        assert!(!cursor_native_hooks_installed_in(&path), "missing file");
+
+        fs::write(&path, "not json").unwrap();
+        assert!(!cursor_native_hooks_installed_in(&path), "malformed file");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"sessionStart":[
+                {"command":"/opt/third-party","args":["--agent","cursor"]},
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cursor_native_hooks_installed_in(&path),
+            "third-party or non-cursor entries do not count"
+        );
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","stop","--agent","cursor","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(cursor_native_hooks_installed_in(&path), "exec form");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory hook --event stop --agent cursor --server-url http://h"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            cursor_native_hooks_installed_in(&path),
+            "command-string form"
+        );
+    }
+
+    #[test]
+    fn unrecognized_ai_memory_hook_entries_flags_wrappers_only() {
+        let root = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"command": "/usr/bin/ai-memory", "args": ["hook", "--event", "session-start", "--agent", "cursor", "--server-url", "http://h"]},
+                    {"command": "~/bin/ai-memory-cwd-shim.sh session-start"},
+                    {"command": "/opt/other-tool --flag"}
+                ],
+                "stop": [
+                    {"matcher": "", "hooks": [{"command": "/home/u/.local/ai_memory_wrap stop"}]}
+                ]
+            }
+        });
+        let found = unrecognized_ai_memory_hook_entries(&root);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "sessionStart".to_string(),
+                    "~/bin/ai-memory-cwd-shim.sh session-start".to_string()
+                ),
+                (
+                    "stop".to_string(),
+                    "/home/u/.local/ai_memory_wrap stop".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn cursor_apply_is_idempotent() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
@@ -8983,6 +9481,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -8998,6 +9497,65 @@ model = "gpt-5"
         assert!(
             parsed["hooks"]["SessionEnd"].is_array(),
             "SessionEnd is wired for Codex since Codex CLI 0.145.0"
+        );
+    }
+
+    /// #743: with `--capture-assistant`, the Codex Stop command carries the
+    /// `--capture-assistant` flag (and only Stop does); without it, no command
+    /// does. Mirrors the native-command bake asserted for Claude Code.
+    #[test]
+    fn codex_bakes_capture_assistant_flag_on_stop_only_when_opted_in() {
+        fn stop_and_start_commands(capture: bool) -> (String, String) {
+            let hooks_tmp = TempDir::new().unwrap();
+            stub_scripts(
+                hooks_tmp.path(),
+                &[
+                    "session-start.sh",
+                    "user-prompt-submit.sh",
+                    "pre-tool-use.sh",
+                    "post-tool-use.sh",
+                    "pre-compact.sh",
+                    "stop.sh",
+                    "session-end.sh",
+                ],
+            );
+            let config_tmp = TempDir::new().unwrap();
+            let config_path = config_tmp.path().join("hooks.json");
+            merge_codex_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                config_tmp.path(),
+                None,
+                &config_path,
+                capture,
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let cmd = |event: &str| {
+                parsed["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (cmd("Stop"), cmd("SessionStart"))
+        }
+
+        let (stop_on, start_on) = stop_and_start_commands(true);
+        assert!(
+            stop_on.contains("--capture-assistant"),
+            "opted-in Codex Stop must bake --capture-assistant: {stop_on}"
+        );
+        assert!(
+            !start_on.contains("--capture-assistant"),
+            "only Stop carries the flag, not SessionStart: {start_on}"
+        );
+
+        let (stop_off, _) = stop_and_start_commands(false);
+        assert!(
+            !stop_off.contains("--capture-assistant"),
+            "without the opt-in no command carries the flag: {stop_off}"
         );
     }
 
@@ -9033,6 +9591,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 

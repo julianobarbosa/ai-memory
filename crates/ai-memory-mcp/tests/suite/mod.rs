@@ -4,20 +4,30 @@
 
 mod common;
 
+mod access_reinforcement;
 mod admin_audit_log;
 mod admin_backup;
 mod admin_bootstrap;
 mod admin_move;
 mod admin_move_session;
 mod admin_phase3;
+mod admin_provider_error_logging;
 mod admin_purge;
 mod admin_read_page;
 mod admin_rename;
 mod admin_status_search;
 mod admin_write_page;
+mod agent_messages_briefing;
+mod agent_messages_tools;
 mod autoscope_multiuser;
 mod handoff_admission;
 mod handoff_identity;
 mod mcp_stateless_http;
+mod query_answer;
+mod query_pin_first;
+mod query_reasoning;
+mod query_superseded;
+mod read_page_related;
+mod retrieval_via_tools;
 mod slot_identity;
 mod stress_autoscope;

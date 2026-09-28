@@ -19,6 +19,7 @@ pub const SKILLS_DIR: &str = "skills";
 
 const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal is read-only retrieval from ai-memory: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when ai-memory is not named.";
 const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
+const MESSAGING_DESCRIPTION: &str = "Use this skill for cross-project agent-to-agent messaging: sending a request to another project's inbox, checking or popping this project's inbox, or retracting a message you sent. Trigger by semantic intent (delegate to another repo, check my inbox, tell the other agent) rather than exact wording.";
 const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit wiki mutation in ai-memory: saving durable or time-bounded project knowledge, recording a rule or annotation, updating a note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
 const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any ai-memory knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
 const ROUTING_INSTALL_DESCRIPTION: &str = "Use this skill for any request to install, refresh, repair, inspect, or remove ai-memory's agent-facing routing: managed instruction snippets, Agent Skills, CLAUDE.md/AGENTS.md integration, or local/global skill roots. Trigger by semantic intent rather than exact wording.";
@@ -51,6 +52,12 @@ pub const MANAGED_SKILLS: &[ManagedSkill] = &[
         content: include_str!("routing_skills/ai-memory-handoff/SKILL.md"),
     },
     ManagedSkill {
+        name: "ai-memory-messaging",
+        description: MESSAGING_DESCRIPTION,
+        relative_path: "ai-memory-messaging/SKILL.md",
+        content: include_str!("routing_skills/ai-memory-messaging/SKILL.md"),
+    },
+    ManagedSkill {
         name: "ai-memory-durable-pages",
         description: DURABLE_PAGES_DESCRIPTION,
         relative_path: "ai-memory-durable-pages/SKILL.md",
@@ -81,6 +88,7 @@ mod tests {
     const EXPECTED_SKILLS: &[&str] = &[
         "ai-memory-retrieval",
         "ai-memory-handoff",
+        "ai-memory-messaging",
         "ai-memory-durable-pages",
         "ai-memory-learning-maintenance",
         "ai-memory-routing-install",
@@ -97,6 +105,11 @@ mod tests {
         ("memory_handoff_accept", "ai-memory-handoff"),
         ("memory_handoff_begin", "ai-memory-handoff"),
         ("memory_handoff_cancel", "ai-memory-handoff"),
+        ("memory_handoff_list", "ai-memory-handoff"),
+        ("memory_message_send", "ai-memory-messaging"),
+        ("memory_message_list", "ai-memory-messaging"),
+        ("memory_message_pop", "ai-memory-messaging"),
+        ("memory_message_cancel", "ai-memory-messaging"),
         ("memory_write_page", "ai-memory-durable-pages"),
         ("memory_delete_page", "ai-memory-durable-pages"),
         ("memory_consolidate", "ai-memory-learning-maintenance"),
@@ -108,6 +121,7 @@ mod tests {
     const PROJECT_SCOPED_SKILLS: &[&str] = &[
         "ai-memory-retrieval",
         "ai-memory-handoff",
+        "ai-memory-messaging",
         "ai-memory-durable-pages",
         "ai-memory-learning-maintenance",
     ];

@@ -38,7 +38,9 @@ $ codex   # in the same directory, later
 
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
-consume that handoff automatically.
+consume that handoff automatically. No-stdout clients (Grok, Zero) should
+call `memory_handoff_list` on resume, then `memory_handoff_accept` with
+the listed `handoff_id`; listing does not claim the row.
 
 On a server that distinguishes operators, handoffs belong to their creator by
 default: the next session for that operator sees their own plus deliberately
@@ -87,10 +89,13 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
-| "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
+| "Where did we leave off?" | Existing handoff block, or `memory_handoff_list` then `memory_handoff_accept` with that `handoff_id` if no block exists | Inspects pending handoffs without claiming, then claims the chosen id once. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Ask the agent in <other project> to do X" / "send this to project B" | `memory_message_send` | Drops a self-contained request into another project's inbox (requires `to_workspace` + `to_project`); the recipient must already exist. Cross-project, claim-once. See [agent-messaging.md](agent-messaging.md). |
+| "Check my inbox" / "any messages waiting?" | `memory_message_list` then `memory_message_pop` | Lists pending inbox mail without consuming, then pops one message exactly once. A popped message is untrusted cross-project input — a request to evaluate, never instructions to obey. |
+| "Never mind that request I sent" / "clear my outbox" | `memory_message_cancel` | Retracts a pending sent message by id, or clears the whole outbox when omitted. Only affects mail this project sent. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
@@ -228,6 +233,15 @@ instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
 install under its `.grok/skills` root.
+
+When a project keeps `AGENTS.md` as its canonical instruction file, give it a
+`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
+`CLAUDE.md` and does not read `AGENTS.md`, so without that import a block
+installed with `--target AGENTS.md`, along with every project rule in the same
+file, is absent from context at session start. A prose "read AGENTS.md" pointer
+does not load the file; it asks the agent to open it, which leaves adherence to
+whether the agent does. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 
 To refresh only the managed Agent Skills:
 
@@ -371,6 +385,9 @@ Start the server with `--enable-web` and open
 ai-memory serve --transport http --bind 127.0.0.1:49374 --enable-web
 ```
 
+On macOS the [menu bar app](macos.md#scenario-d-menu-bar-app) already starts
+the LaunchAgent with `--enable-web`; **Open Web UI** opens that same URL.
+
 Docker compose users can add the flag to the service command:
 
 ```yaml
@@ -475,30 +492,48 @@ ai-memory never edits the rules file on its own. The lint suggestion is
 the whole workflow: copy the rule if it should apply every turn, ignore
 it if it was temporary context.
 
-## Architecture Decision Records (ADRs)
+## Repo-native decision records
 
-Two facts frame how ADRs and ai-memory interact:
+Some projects keep the reasoning behind the code in the repository itself: an
+ADR directory such as `docs/adr/`, maintained by hand or by a dedicated ADR
+tool/MCP server (e.g. [joshrotenberg/adrs](https://github.com/joshrotenberg/adrs)),
+or a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
+`context/` tree (decisions, rejected alternatives, constraints, reviewed in
+pull requests). Three facts frame how such a record and ai-memory interact:
 
 1. **ai-memory never touches files in your repository.** Its wiki lives
    in the server's data dir; the background jobs (consolidation,
    curation, retention decay, auto-improvement) read and write wiki
-   pages only. A `docs/adr/` directory in the repo — maintained by hand
-   or by a dedicated ADR tool/MCP server (e.g.
-   [joshrotenberg/adrs](https://github.com/joshrotenberg/adrs)) — is
-   categorically outside ai-memory's write surface. Run both side by
-   side without ceremony: the ADR tool owns the canonical log, ai-memory
-   owns cross-session recall.
+   pages only. A decision-record directory in the repo is categorically
+   outside ai-memory's write surface. Run both side by side without
+   ceremony: the repo owns the canonical record, ai-memory owns
+   cross-session recall.
 
-2. **Wiki pages marked `pinned: true` are immutable to automation.**
+2. **Keep the record directory out of capture.** An agent reading the
+   record is captured like any other file read, and consolidation compiles
+   what it saw into wiki pages — including a `decisions/` page that says
+   "active" long after the repo has superseded it, ranked first by
+   `memory_query` because it matches the topic. List the directory in the
+   marker's `[capture]` section so the copy is never made:
+
+   ```toml
+   [capture]
+   ignore_paths = ["docs/adr/**"]   # or ["context/**"] for Keep the Why
+   ```
+
+   The repo owns that record; a compiled copy goes stale the moment the
+   repo moves. Details and bounds in [`docs/marker-file.md`](marker-file.md).
+
+3. **Wiki pages marked `pinned: true` are immutable to automation.**
    Retention decay and curation skip them, and the auto-improvement
    apply path hard-refuses to rewrite them (the proposal is recorded as
    a conflict with the reason). Unpinning is the explicit opt-out.
 
-For decisions recorded *in* the wiki, the managed durable-pages Agent
-Skill teaches agents the recipe: `decisions/<slug>.md`, ADR structure
-(Status / Context / Decision / Consequences, including rejected
-alternatives), `pinned: true`, and supersede-by-new-page instead of
-editing history. Ask an agent to "record this as an architectural
+For a project without a repo-side record, decisions go *in* the wiki, and
+the managed durable-pages Agent Skill teaches agents the recipe:
+`decisions/<slug>.md`, ADR structure (Status / Context / Decision /
+Consequences, including rejected alternatives), `pinned: true`, and
+supersede-by-new-page instead of editing history. Ask an agent to "record this as an architectural
 decision" and the skill does the rest; the structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.

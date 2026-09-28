@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId,
-    NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId,
-    PagePath, ProjectId, Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
+    ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
+    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
+    SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -81,6 +82,11 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    PurgedSessionIds {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<Vec<SessionId>>>,
     },
     RecordBootstrapChunk {
         fingerprint: String,
@@ -243,6 +249,24 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    InsertMessage {
+        message: NewAgentMessage,
+        reply: oneshot::Sender<StoreResult<MessageId>>,
+    },
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    PopMessage {
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Retract still-pending outbox messages a project has sent.
+    CancelMessages {
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
     /// mash-up pages. Executed in one transaction for atomicity.
     Reorg {
@@ -309,6 +333,14 @@ pub(crate) enum WriteCmd {
     },
     StoreEmbeddingBatch {
         embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    StoreAbstractEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    DeleteAbstractEmbedding {
+        page_id: PageId,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     DeleteStalePageEmbeddings {
@@ -570,6 +602,13 @@ pub(crate) enum WriteCmd {
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    RecordAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -760,6 +799,29 @@ impl WriterHandle {
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Session ids tombstoned by `purge_session` in this scope. The wiki
+    /// reindex consults these so a purge whose page-file removal did not
+    /// complete cannot be undone by the next pass (#701). Loaded once per
+    /// directory per pass, not once per page. Routed through the writer actor
+    /// for the same reason [`Self::scope_is_purged`] is.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn purged_session_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgedSessionIds {
             workspace_id,
             project_id,
             reply: tx,
@@ -1253,6 +1315,66 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    ///
+    /// Fails when the recipient inbox is already at
+    /// [`crate::ops::MAX_PENDING_INBOX_MESSAGES`] pending.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_message(&self, message: NewAgentMessage) -> StoreResult<MessageId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertMessage { message, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    ///
+    /// With `specific_id`, pops that message; otherwise the oldest pending one.
+    /// Returns `None` when nothing matched or another session claimed it first —
+    /// the body must not reach the agent on `None`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn pop_message(
+        &self,
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<Option<AgentMessage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PopMessage {
+            claim,
+            specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Retract still-pending outbox messages a project has sent. With
+    /// `specific_id`, cancels just that one; otherwise every pending message
+    /// this project sent. Returns how many were cancelled.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn cancel_messages(
+        &self,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CancelMessages {
+            from_workspace_id,
+            from_project_id,
+            specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Store (or replace) the embedding for one page (M9).
     ///
     /// # Errors
@@ -1289,6 +1411,38 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Store or replace a batch of L0 abstract embeddings
+    /// (`page_abstract_embeddings`) in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_abstract_embeddings(
+        &self,
+        embeddings: Vec<EmbeddingWrite>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreAbstractEmbeddingBatch {
+            embeddings,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Remove a page's L0 abstract embedding row (`page_abstract_embeddings`),
+    /// if any. Called when a page is rewritten without its frontmatter
+    /// `abstract:` so the abstract stream never ranks a line the page no
+    /// longer carries.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn delete_abstract_embedding(&self, page_id: PageId) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteAbstractEmbedding { page_id, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1534,6 +1688,11 @@ impl WriterHandle {
     /// named workspace and project is [`StoreError::NotFound`] and nothing is
     /// deleted. See [`ops::purge_session`] for what is and is not removed —
     /// in particular, handoffs this session *accepted* are left alone.
+    ///
+    /// Server callers must go through `Wiki::purge_session` instead, which
+    /// holds the wiki mutation guard across this deletion and the page-file
+    /// cleanup. Calling this directly commits the rows with no guard, so a
+    /// watcher reindex can reinsert the page before the file is removed (#653).
     ///
     /// # Errors
     /// [`StoreError::NotFound`] when the session is absent from that scope,
@@ -2351,6 +2510,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a failed scheduled review, releasing the session's claim for
+    /// another attempt and returning the new attempt count. Returns `0` when the
+    /// session holds no claim, which is the manual path.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn record_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -2550,6 +2734,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
                 send_or_warn(reply, result, "scope_is_purged");
+            }
+            WriteCmd::PurgedSessionIds {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::purged_session_ids(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "purged_session_ids");
             }
             WriteCmd::RecordBootstrapChunk {
                 fingerprint,
@@ -2813,6 +3005,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "cancel_handoff");
             }
+            WriteCmd::InsertMessage { message, reply } => {
+                let result = ops::insert_message(&mut conn, &message);
+                send_or_warn(reply, result, "insert_message");
+            }
+            WriteCmd::PopMessage {
+                claim,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::pop_message(&mut conn, &claim, specific_id);
+                send_or_warn(reply, result, "pop_message");
+            }
+            WriteCmd::CancelMessages {
+                from_workspace_id,
+                from_project_id,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::cancel_messages(
+                    &mut conn,
+                    &from_workspace_id,
+                    &from_project_id,
+                    specific_id,
+                );
+                send_or_warn(reply, result, "cancel_messages");
+            }
             WriteCmd::Reorg {
                 workspace_id,
                 plan,
@@ -2933,6 +3151,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StoreEmbeddingBatch { embeddings, reply } => {
                 let result = ops::store_embeddings(&mut conn, &embeddings);
                 send_or_warn(reply, result, "store_embeddings");
+            }
+            WriteCmd::StoreAbstractEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_abstract_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_abstract_embeddings");
+            }
+            WriteCmd::DeleteAbstractEmbedding { page_id, reply } => {
+                let result = ops::delete_abstract_embedding(&mut conn, &page_id);
+                send_or_warn(reply, result, "delete_abstract_embedding");
             }
             WriteCmd::DeleteStalePageEmbeddings {
                 workspace_id,
@@ -3345,6 +3571,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
             }
+            WriteCmd::RecordAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::record_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "record_auto_improve_claim_failure");
+            }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
@@ -3457,6 +3699,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 

@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod api_credentials;
 mod auto_improve;
+pub mod belief;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -24,6 +25,7 @@ mod migrations;
 mod ops;
 pub mod password;
 mod reader;
+mod retrieval_tuning;
 mod scope;
 mod session_consolidation;
 pub mod users;
@@ -35,42 +37,50 @@ pub use fts_query::prepare_fts5_query;
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
-    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS, ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
+    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
+    AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, RejectAutoImproveProposal,
+    SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport,
+    artifact_path_for,
 };
+pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use decay::{
-    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    retention_score_with_breadth, salience_after_feedback,
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
+    lambda_from_half_life_days, retention_score, retention_score_with_breadth,
+    salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
     EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, backfill_entity_index, purge_session, record_embed_failure,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeSessionSummary,
+    PurgeSummary, ReorgSummary, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
-    BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
-    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
-    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
-    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts,
-    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
+    ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
+    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
+    GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
+    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
+pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
-    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
-    lookup_global_scope, resolve_many_existing_scopes,
+    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
+    WORKSPACE_PROJECT_PAIR_REQUIRED, create_explicit_scope, create_global_scope,
+    lookup_existing_scope, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -150,6 +160,16 @@ impl Store {
             );
         }
 
+        // Chunked, resumable, WAL-bounded backfill of page ingestion windows
+        // (reshaped V62, #776). V62 now adds `valid_from`/`valid_to` and their
+        // index as cheap DDL; this reconstructs the same windows the original
+        // in-migration backfill produced, but in bounded batches with a WAL
+        // checkpoint between each instead of one multi-hour transaction. Runs
+        // single-threaded here, before the writer actor spawns, so it completes
+        // before the server accepts traffic. A store already backfilled (every
+        // page has a non-NULL `valid_from`) is a fast no-op.
+        ops::backfill_page_windows(&mut conn)?;
+
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
         Ok(Self {
@@ -196,8 +216,9 @@ mod tests {
     use ai_memory_core::{
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
-        ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
-        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind, WorkstreamId,
+        ObservationId, ObservationKind, PageEvidence, PageEvidenceKind, PageId, PagePath,
+        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -244,6 +265,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -779,20 +801,26 @@ mod tests {
         assert_eq!(update.target_body_sha256_at_stage, Some(latest_hash));
         assert_eq!(update.target_updated_at_at_stage, Some(latest_updated));
 
+        // A Create whose target already exists is a create/update
+        // misclassification (ordinary LLM error), not corrupt state: it is
+        // skipped, not fatal, so the run still records. See
+        // `a_create_on_an_existing_page_is_skipped_not_fatal`.
+        let misclassified = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/update.md",
+                    AutoImproveProposalOperation::Create,
+                    "bad",
+                )],
+            ))
+            .await
+            .unwrap();
         assert!(
-            store
-                .writer
-                .stage_auto_improve_run(stage_input(
-                    ws,
-                    proj,
-                    vec![proposal(
-                        "notes/update.md",
-                        AutoImproveProposalOperation::Create,
-                        "bad"
-                    )],
-                ))
-                .await
-                .is_err()
+            misclassified.proposal_ids.is_empty(),
+            "the misclassified create is skipped, not staged"
         );
 
         let out_of_scope_session = SessionId::new();
@@ -1921,14 +1949,14 @@ mod tests {
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
         let app_brief = store
             .reader
-            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -2344,6 +2372,7 @@ mod tests {
                 0,
                 1,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2542,6 +2571,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2831,6 +2861,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2853,6 +2884,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2887,6 +2919,8 @@ mod tests {
         let via = target_details.graph_via.as_ref().unwrap();
         assert_eq!(via.seed_path, "source.md");
         assert_eq!(via.direction, "outgoing");
+        // P3: a plain `references` link carries no typed edge kind.
+        assert_eq!(via.edge.as_deref(), None);
 
         for (hit, details) in [(source_hit, source_details), (target_hit, target_details)] {
             let authority = details.authority.unwrap();
@@ -2918,6 +2952,7 @@ mod tests {
                 2,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2949,6 +2984,207 @@ mod tests {
             !target_vector_hit.snippet.is_empty(),
             "a vector-ranked hit must carry a snippet, got {:?}",
             target_vector_hit.snippet
+        );
+    }
+
+    /// P3 (docs/design-hindsight-borrowings.md): a typed edge (`fixes`) is
+    /// surfaced as the graph_via `edge` kind in explain. Ranking is untouched;
+    /// only the explanation names why the neighbour was reached.
+    #[tokio::test]
+    async fn graph_via_reports_the_typed_edge_kind() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "target.md", "neighbor-only content"))
+            .await
+            .unwrap();
+        let mut source = sample_page(ws, proj, "source.md", "needle source content");
+        source.links = vec![ai_memory_core::LinkTarget {
+            workspace: None,
+            project: None,
+            path: PagePath::new("target.md").unwrap(),
+            relation: Some(ai_memory_core::Relation::Fixes),
+        }];
+        store.writer.upsert_page(source).await.unwrap();
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (_, target_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .expect("the fixes-linked neighbour must surface via the graph stream");
+        let via = target_details
+            .graph_via
+            .as_ref()
+            .expect("target reached via the graph stream");
+        assert_eq!(via.seed_path, "source.md");
+        assert_eq!(
+            via.edge.as_deref(),
+            Some("fixes"),
+            "the typed edge kind must be reported in explain"
+        );
+    }
+
+    /// P2 (docs/design-hindsight-borrowings.md §3), ship scope for 2.2.0:
+    /// evidence is substrate + explain surfacing ONLY. `hybrid_search_explained`
+    /// reports `evidence_count`, but citing a page from two distinct sessions
+    /// must not move the default (non-explained) path's ranking at all —
+    /// same hit order, same `rank` scores, before and after evidence accrues.
+    #[tokio::test]
+    async fn hybrid_search_explained_reports_evidence_count_without_moving_default_ranking() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let page_a = sample_page(ws, proj, "a.md", "evidence probe alpha content");
+        let page_b = sample_page(ws, proj, "b.md", "evidence probe beta content");
+        store.writer.upsert_page(page_a.clone()).await.unwrap();
+        store.writer.upsert_page(page_b).await.unwrap();
+
+        let query = || "evidence probe".to_string();
+        let baseline = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let baseline_paths: Vec<&str> = baseline.iter().map(|h| h.path.as_str()).collect();
+        let baseline_ranks: Vec<f64> = baseline.iter().map(|h| h.rank).collect();
+
+        // Cite `a.md` from two distinct sessions. The body/frontmatter are
+        // byte-identical each time, so this hits the content short-circuit
+        // (ops::upsert_page_in_tx) — same page id, no new version, nothing
+        // that could feed `fused`/`authority` changes — and only the
+        // `page_evidence` rows accrue.
+        let mut with_evidence = page_a.clone();
+        with_evidence.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-1".into(),
+        }];
+        store
+            .writer
+            .upsert_page(with_evidence.clone())
+            .await
+            .unwrap();
+        with_evidence.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-2".into(),
+        }];
+        store.writer.upsert_page(with_evidence).await.unwrap();
+
+        let after = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let after_paths: Vec<&str> = after.iter().map(|h| h.path.as_str()).collect();
+        let after_ranks: Vec<f64> = after.iter().map(|h| h.rank).collect();
+        assert_eq!(
+            baseline_paths, after_paths,
+            "evidence must not reorder hits"
+        );
+        assert_eq!(
+            baseline_ranks, after_ranks,
+            "evidence must not change the rank score on the default path"
+        );
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let (_, a_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "a.md")
+            .unwrap();
+        let (_, b_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "b.md")
+            .unwrap();
+        assert_eq!(
+            a_details.evidence_count,
+            Some(2),
+            "two distinct sessions cited a.md"
+        );
+        assert_eq!(
+            b_details.evidence_count,
+            Some(0),
+            "b.md has no evidence rows — explained still reports Some(0), not None"
+        );
+        // Explain must still agree with the default path's own ordering.
+        let explained_paths: Vec<&str> =
+            explained.iter().map(|(hit, _)| hit.path.as_str()).collect();
+        assert_eq!(
+            after_paths, explained_paths,
+            "explain must not change ranking"
         );
     }
 
@@ -3066,7 +3302,10 @@ mod tests {
             })
             .unwrap();
         for col in [&title, &body] {
-            assert!(col.contains("[REDACTED]"), "expected scrub in: {col}");
+            assert!(
+                col.contains("[REDACTED:bearer_token]"),
+                "expected scrub in: {col}"
+            );
             assert!(
                 !col.contains("abcdef0123"),
                 "secret reached disk unscrubbed: {col}"
@@ -3855,6 +4094,149 @@ mod tests {
         assert_eq!(remaining[0].ended_at, same_ended_at);
     }
 
+    // #833: a claim is the scheduler's in-flight marker, but the only writer was
+    // `INSERT OR IGNORE` — nothing ever removed or expired a row. A review that
+    // failed left the claim behind with no `auto_improve_runs` row, and the
+    // candidate query excludes on the claim alone, so the session was dropped
+    // from every future tick with no operator-visible state.
+    #[tokio::test]
+    async fn auto_improve_failed_claim_is_retried_then_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        // Every attempt but the last releases the session back to the queue.
+        for attempt in 1..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
+            let candidates = store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "session should still be a candidate before attempt {attempt}"
+            );
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidates[0].session_id,
+                        candidates[0].ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+            // In flight: not a candidate while the review is running.
+            assert!(
+                store
+                    .reader
+                    .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "an in-flight claim must not be handed out twice"
+            );
+            let attempts = store
+                .writer
+                .record_auto_improve_claim_failure(
+                    ws,
+                    proj,
+                    session,
+                    "error decoding response body",
+                )
+                .await
+                .unwrap();
+            assert_eq!(attempts, attempt);
+        }
+
+        // The final failure parks the session instead of looping forever.
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        store
+            .writer
+            .claim_auto_improve_scheduler_session(ws, proj, session, candidates[0].ended_at)
+            .await
+            .unwrap();
+        let attempts = store
+            .writer
+            .record_auto_improve_claim_failure(
+                ws,
+                proj,
+                session,
+                "create proposal target already exists",
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an exhausted claim stays parked rather than spinning every tick"
+        );
+
+        // ...and it is visible, which a bare claim never was.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, session);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some("create proposal target already exists")
+        );
+    }
+
     #[tokio::test]
     async fn auto_improve_scheduler_claim_is_unique_across_store_instances() {
         let tmp = TempDir::new().unwrap();
@@ -4230,7 +4612,7 @@ mod tests {
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -4304,6 +4686,112 @@ mod tests {
         );
     }
 
+    /// P4 (docs/design-hindsight-borrowings.md §5): `settled_first` is
+    /// opt-in and additive. `false` (the default) leaves `settled` empty
+    /// and every other field of the snapshot untouched; `true` populates
+    /// it with the project's `rule`/`decision` pages, ordered by evidence
+    /// count then recency, and excludes every other kind.
+    #[tokio::test]
+    async fn briefing_settled_first_orders_by_evidence_then_recency() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "settled-test", None)
+            .await
+            .unwrap();
+
+        let mut decision_a = sample_page(ws, proj, "decisions/decision-a.md", "body a");
+        decision_a.evidence = vec![
+            PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: "session-1".into(),
+            },
+            PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: "session-2".into(),
+            },
+        ];
+        store.writer.upsert_page(decision_a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "_rules/rule-a.md", "body rule"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Written last (and with zero evidence), so among the two
+        // zero-evidence pages this one must sort first on recency.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "decisions/decision-b.md", "body b"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/plain-note.md", "body note"))
+            .await
+            .unwrap();
+
+        let unchanged = store
+            .reader
+            .briefing_for_project(ws, proj, 10, ai_memory_core::OwnerFilter::Any, false)
+            .await
+            .unwrap();
+        assert!(
+            unchanged.settled.is_empty(),
+            "settled_first=false must leave settled empty"
+        );
+        assert_eq!(unchanged.recent_pages.len(), 4);
+
+        let settled_first = store
+            .reader
+            .briefing_for_project(ws, proj, 10, ai_memory_core::OwnerFilter::Any, true)
+            .await
+            .unwrap();
+        let settled_paths: Vec<&str> = settled_first
+            .settled
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            settled_paths,
+            vec![
+                "decisions/decision-a.md",
+                "decisions/decision-b.md",
+                "_rules/rule-a.md",
+            ],
+            "expected evidence-count-then-recency order: {settled_paths:?}"
+        );
+        assert!(
+            !settled_paths.contains(&"notes/plain-note.md"),
+            "a plain note must not appear in settled"
+        );
+        assert_eq!(settled_first.settled[0].evidence_count, 2);
+        assert_eq!(settled_first.settled[1].evidence_count, 0);
+        assert_eq!(settled_first.settled[2].evidence_count, 0);
+        assert_eq!(settled_first.settled[0].kind, "decision");
+        assert_eq!(settled_first.settled[2].kind, "rule");
+        // Every other field is identical to the settled_first=false snapshot.
+        assert_eq!(
+            settled_first.recent_pages.len(),
+            unchanged.recent_pages.len()
+        );
+        assert_eq!(
+            settled_first.counts.pages_latest,
+            unchanged.counts.pages_latest
+        );
+    }
+
     #[tokio::test]
     async fn page_meta_returns_metadata_for_existing_page() {
         let tmp = TempDir::new().unwrap();
@@ -4331,6 +4819,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         };
         store.writer.upsert_page(page).await.unwrap();
 
@@ -6391,7 +6880,7 @@ mod tests {
         // as_of between v1 and v2: the superseded version answers.
         let then_hits = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between), false)
             .await
             .unwrap();
         assert_eq!(then_hits.len(), 1, "{then_hits:?}");
@@ -6407,6 +6896,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -6416,10 +6906,426 @@ mod tests {
         // And before v1 existed: nothing was known.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1), false)
             .await
             .unwrap();
         assert!(before.is_empty(), "{before:?}");
+    }
+
+    /// Issue #656 (Phase A): every version row carries its ingestion
+    /// window — `valid_from` is the version's own `created_at`,
+    /// `valid_to` is the superseding version's `created_at`, NULL while
+    /// the version is latest.
+    #[tokio::test]
+    async fn page_windows_follow_supersession() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let v1_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/db.md", "we use postgres"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let v2_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/db.md", "we use sqlite"))
+            .await
+            .unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let window = |id: PageId| {
+            db.query_row(
+                "SELECT valid_from, valid_to, created_at FROM pages WHERE id = ?1",
+                rusqlite::params![id.as_bytes()],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let (v1_from, v1_to, v1_created) = window(v1_id);
+        let (v2_from, v2_to, v2_created) = window(v2_id);
+        assert_eq!(v1_from, Some(v1_created), "valid_from opens at birth");
+        assert_eq!(
+            v1_to,
+            Some(v2_created),
+            "supersede closes the outgoing window at the new version's birth"
+        );
+        assert_eq!(v2_from, Some(v2_created));
+        assert_eq!(v2_to, None, "latest version's window stays open");
+    }
+
+    /// The V62 backfill reconstructs the same page windows the write
+    /// path produces: `valid_from` from each version's `created_at`,
+    /// `valid_to` from the earliest superseding version, NULL for
+    /// latest; successor-less retirements close at
+    /// the decay marker, existing link close, or updated_at fallback.
+    #[tokio::test]
+    async fn v62_backfill_reconstructs_page_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        for body in ["v1", "v2", "v3"] {
+            store
+                .writer
+                .upsert_page(sample_page(ws, proj, "notes/x.md", body))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        // A successor-less retirement: decay-tombstoned, never replaced.
+        let tomb_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/old.md", "stale"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .soft_delete_for_decay_if_latest(
+                    ws,
+                    proj,
+                    PagePath::new("notes/old.md").unwrap(),
+                    tomb_id
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut db =
+            rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Three chain versions (two closed, one open) + one tombstone.
+        assert_eq!(live.len(), 4);
+        assert!(live[0].2.is_some() && live[1].2.is_some());
+        assert!(live[2].2.is_none(), "latest stays open");
+        assert!(live[3].2.is_some(), "tombstone is closed");
+
+        // Golden equivalence: strip the windows, replay the reshaped V62 DDL
+        // and the chunked boot backfill, and assert it reconstructs exactly
+        // the windows the live write path produced. A tiny batch forces the
+        // multi-batch resume path over this fixture.
+        db.execute_batch(
+            "DROP INDEX idx_pages_validity; \
+             ALTER TABLE pages DROP COLUMN valid_from; \
+             ALTER TABLE pages DROP COLUMN valid_to;",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
+        .unwrap();
+        ops::backfill_page_windows_in_batches(&mut db, 2).unwrap();
+        let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(backfilled.len(), 4);
+        for (i, (live_row, back_row)) in live.iter().zip(backfilled.iter()).enumerate() {
+            assert_eq!(live_row.0, back_row.0, "row {i} page id");
+            assert_eq!(live_row.1, back_row.1, "row {i} valid_from");
+            assert_eq!(live_row.2, back_row.2, "row {i} valid_to");
+        }
+    }
+
+    /// Pre-V62 reorg/move retirements kept their instant only at link grain.
+    #[test]
+    fn v62_backfill_preserves_retired_link_windows() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pages (
+                id INTEGER PRIMARY KEY, workspace_id INTEGER, project_id INTEGER,
+                created_at INTEGER, updated_at INTEGER, superseded_at INTEGER,
+                supersedes INTEGER, is_latest INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);
+             INSERT INTO pages VALUES
+                (1,1,1,100,100,NULL,NULL,0),
+                (2,1,1,100,100,NULL,NULL,0),
+                (3,1,1,100,150,NULL,NULL,0),
+                (4,2,2,100,100,NULL,NULL,1),
+                (5,1,1,100,100,350,NULL,0);
+             INSERT INTO entity_page_links VALUES
+                (1,300),(1,300),(2,300),(4,300),(5,100);",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
+        .unwrap();
+        ops::backfill_page_windows(&mut db).unwrap();
+        // Reorg and move keep [100,300); missing evidence falls back;
+        // a sibling scope's live page stays open; the decay marker wins.
+        for (id, expected) in [
+            (1, Some(300)),
+            (2, Some(300)),
+            (3, Some(150)),
+            (4, None),
+            (5, Some(350)),
+        ] {
+            let window: (i64, Option<i64>) = db
+                .query_row(
+                    "SELECT valid_from, valid_to FROM pages WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(window, (100, expected), "page {id}");
+        }
+        for (instant, expected) in [(99, 0), (100, 2), (200, 2), (299, 2), (300, 0)] {
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM pages WHERE id IN (1,2)
+                 AND valid_from <= ?1 AND (valid_to IS NULL OR valid_to > ?1)",
+                    [instant],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "instant {instant}");
+        }
+    }
+
+    /// Issue #656 acceptance: `postgres → sqlite → postgres` (+ revert).
+    /// `as_of` inside the middle window returns that version via the
+    /// entity stream AND via version-filtered FTS — the middle version
+    /// deliberately carries no entities, so the entity leg alone would
+    /// miss it. The default query path is unchanged.
+    #[tokio::test]
+    async fn as_of_fuses_entity_and_fts_at_t() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut v1 = sample_page(ws, proj, "notes/db.md", "we use postgres");
+        v1.entities = vec!["postgres".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let t_first = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+        // Entity-less on purpose: only the FTS leg can find this.
+        let v2_id = store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "notes/db.md",
+                "we migrated to sqlite",
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let t_middle = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+        let mut v3 = sample_page(ws, proj, "notes/db.md", "we moved back to postgres");
+        v3.entities = vec!["postgres".into()];
+        let v3_id = store.writer.upsert_page(v3).await.unwrap();
+        assert_ne!(v1_id, v2_id);
+        assert_ne!(v2_id, v3_id);
+
+        // First window, entity-phrased: both streams agree on v1.
+        let first = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "postgres".into(), 10, t_first, true)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].0.id, v1_id);
+        let details = first[0].1.as_ref().expect("explain=true");
+        assert!(details.entity_rank.is_some(), "entity leg: {details:?}");
+        assert!(details.fts_rank.is_some(), "FTS leg: {details:?}");
+
+        // Middle window, entity-less version: the FTS leg carries it.
+        let middle = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "sqlite".into(), 10, t_middle, true)
+            .await
+            .unwrap();
+        assert_eq!(middle.len(), 1, "{middle:?}");
+        assert_eq!(middle[0].0.id, v2_id);
+        let details = middle[0].1.as_ref().expect("explain=true");
+        assert_eq!(details.entity_rank, None, "no entities: {details:?}");
+        assert!(details.fts_rank.is_some(), "FTS leg: {details:?}");
+
+        // Middle window, retired entity: v1 is dead, v3 unborn.
+        let gone = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "postgres".into(), 10, t_middle, false)
+            .await
+            .unwrap();
+        assert!(gone.is_empty(), "{gone:?}");
+
+        // Default path unchanged: latest only.
+        let now_default = store
+            .reader
+            .search_pages_for_project(ws, proj, "postgres".into(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(now_default.len(), 1);
+        assert_eq!(now_default[0].id, v3_id);
+        let sqlite_default = store
+            .reader
+            .search_pages_for_project(ws, proj, "sqlite".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(sqlite_default.is_empty(), "{sqlite_default:?}");
+    }
+
+    /// V58-style control at page grain: the decay retire path closes
+    /// the page window in the same transaction, so `as_of` after the
+    /// eviction cannot resurrect the tombstone. Reopening the window
+    /// (the bug V58 repaired at link grain) makes the same query find
+    /// it again — proving the close is what holds the guarantee.
+    #[tokio::test]
+    async fn decay_close_keeps_as_of_from_resurrecting() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut page = sample_page(ws, proj, "notes/legacy.md", "legacy token alpha");
+        page.entities = vec!["alpha".into()];
+        let page_id = store.writer.upsert_page(page).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        assert!(
+            store
+                .writer
+                .soft_delete_for_decay_if_latest(
+                    ws,
+                    proj,
+                    PagePath::new("notes/legacy.md").unwrap(),
+                    page_id
+                )
+                .await
+                .unwrap()
+        );
+        let after = jiff::Timestamp::now().as_microsecond();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let valid_to: Option<i64> = db
+            .query_row(
+                "SELECT valid_to FROM pages WHERE id = ?1",
+                rusqlite::params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(valid_to.is_some(), "retire path must close the page window");
+
+        let buried = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "alpha".into(), 10, after, false)
+            .await
+            .unwrap();
+        assert!(buried.is_empty(), "{buried:?}");
+
+        // Control: the V58-class bug (window left open) resurrects it.
+        db.execute(
+            "UPDATE pages SET valid_to = NULL WHERE id = ?1",
+            rusqlite::params![page_id.as_bytes()],
+        )
+        .unwrap();
+        let resurrected = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "alpha".into(), 10, after, false)
+            .await
+            .unwrap();
+        assert_eq!(resurrected.len(), 1, "open window must answer again");
+        assert_eq!(resurrected[0].0.id, page_id);
+    }
+
+    /// Deletion stays deletion: a removed page leaves no rows behind,
+    /// so `as_of` has nothing to return — the timeline does not survive
+    /// an explicit delete (docs/temporal.md).
+    #[tokio::test]
+    async fn purge_destroys_page_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut page = sample_page(ws, proj, "notes/gone.md", "ephemeral token beta");
+        page.entities = vec!["beta".into()];
+        store.writer.upsert_page(page).await.unwrap();
+        let before = jiff::Timestamp::now().as_microsecond();
+        let found = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "beta".into(), 10, before, false)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("notes/gone.md").unwrap(), None)
+            .await
+            .unwrap();
+        let after = jiff::Timestamp::now().as_microsecond();
+        for instant in [before, after] {
+            let hits = store
+                .reader
+                .search_pages_for_project_at(ws, proj, "beta".into(), 10, instant, false)
+                .await
+                .unwrap();
+            assert!(hits.is_empty(), "t={instant}: {hits:?}");
+        }
     }
 
     /// End to end: a page written with only `tags` (no explicit
@@ -6477,7 +7383,7 @@ mod tests {
         // window opened at the version's creation.
         let later = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1), false)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
@@ -6520,7 +7426,15 @@ mod tests {
         // Before retirement: visible.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(retired_at - 1000),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "{before:?}");
@@ -6534,6 +7448,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -6871,6 +7786,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();

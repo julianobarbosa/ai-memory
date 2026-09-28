@@ -6,6 +6,7 @@
 //! kicks in automatically.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{
@@ -16,6 +17,7 @@ use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, project_observations};
 use crate::types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
@@ -62,6 +64,50 @@ impl From<serde_json::Error> for ConsolidatorError {
 
 /// Result alias used by the consolidator.
 pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
+
+/// Maximum attempts (initial + retries) for one consolidation LLM call.
+const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
+/// Fixed, short delay between consolidation retries. Deliberately not
+/// tenacity-style escalating backoff — see the cognee #2840 lesson in
+/// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
+const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Run one consolidation structured call with a short, bounded retry.
+///
+/// A provider answering `429`, any `5xx`, or dropping the connection used to
+/// end the consolidation after a single attempt: over MCP the operator saw an
+/// opaque internal error and had to re-issue the whole call by hand. A couple
+/// of seconds apart, one more identical request rides out those windows.
+/// Deterministic failures — auth, schema, a malformed-request `4xx`, an
+/// unparseable or truncated body — are not retried: the retry would burn
+/// another expensive call and hit the same wall.
+async fn complete_structured_with_retry<T>(
+    llm: &(dyn LlmProvider + 'static),
+    request: ChatRequest,
+    operation_id: ai_memory_llm::LlmOperationId,
+    retry_delay: Duration,
+) -> Result<T, LlmError>
+where
+    T: serde::de::DeserializeOwned + schemars::JsonSchema + Send + 'static,
+{
+    let mut attempt = 1;
+    loop {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                warn!(
+                    attempt,
+                    max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
+                    error = %e,
+                    "consolidation hit a transient LLM error; retrying shortly",
+                );
+                tokio::time::sleep(retry_delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Karpathy-style single-page consolidator. Holds handles to the
 /// store, wiki, and LLM provider so it can be reused across many
@@ -191,8 +237,13 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            session_id.into(),
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -213,6 +264,10 @@ impl Consolidator {
                 }),
                 author_id,
                 actor,
+                evidence: vec![ai_memory_core::PageEvidence {
+                    kind: ai_memory_core::PageEvidenceKind::Session,
+                    source_id: session_id.to_string(),
+                }],
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -404,6 +459,7 @@ impl Consolidator {
                 // surfaced from here, so no owner scoping applies.
                 ai_memory_core::OwnerFilter::Any,
                 &visibility,
+                false,
             )
             .await?;
         let mut slots = Vec::with_capacity(briefing.slots.len());
@@ -485,8 +541,13 @@ impl Consolidator {
             provider = self.llm.name(),
             "consolidating session (multi-page)",
         );
-        let batch: ConsolidatedBatch =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let batch: ConsolidatedBatch = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            session_id.into(),
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
@@ -497,6 +558,10 @@ impl Consolidator {
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
             }
+            req.evidence = vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }];
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -554,6 +619,19 @@ impl Consolidator {
                     path = %req.path.as_str(),
                     "skipped invariant slot update: the stored slot is marked \
                      slot_kind=invariant and this update does not declare one",
+                );
+                continue;
+            }
+            // Final guard for whatever `slugify_page_path` in `build_update`
+            // can't fix (dot-segments, reserved DOS device names, `.git`,
+            // ...), mirroring bootstrap's #847 fix: skip this one page
+            // rather than let `Wiki::apply_batch`'s atomic `ensure_portable`
+            // check abort every other page in the batch (#848).
+            if let Err(e) = req.path.ensure_portable() {
+                warn!(
+                    path = %req.path.as_str(),
+                    error = %e,
+                    "skipped consolidation page update: path is not portable",
                 );
                 continue;
             }
@@ -625,7 +703,17 @@ fn build_update(
         let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
-        upd.path.clone()
+        // The LLM sometimes echoes free text straight into a page path (a
+        // conventional-commit subject like `build(sandbox): orchestrate`).
+        // That passes `PagePath::new` (deliberately tolerant) but fails
+        // `ensure_portable`, which `Wiki::apply_batch` enforces atomically —
+        // one bad path there would abort every page in this batch, not just
+        // its own (#848, same class as bootstrap's #847). Sanitize before
+        // `PagePath::new` so every downstream use of `path` (rule routing
+        // already produces a safe slug above, slot placement, and the
+        // `req.path == anchor` comparison in `consolidate_session_multi`)
+        // sees this one, consistent, sanitized value.
+        slugify_page_path(&upd.path)
     };
     let path = PagePath::new(final_path)?;
     let tier = upd.tier;
@@ -699,6 +787,7 @@ fn build_update(
         }),
         author_id,
         actor: actor.clone(),
+        evidence: Vec::new(),
     };
     let outcome = ConsolidationOutcome {
         path,
@@ -1411,6 +1500,7 @@ mod tests {
     use super::*;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
@@ -1907,6 +1997,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -2405,6 +2496,163 @@ mod tests {
         }
     }
 
+    /// Which failure a [`FlakyLlm`] raises before it starts answering.
+    #[derive(Clone, Copy)]
+    enum ScriptedFailure {
+        /// A provider `503`: transient, so the retry must absorb it.
+        Transient,
+        /// An expired credential: deterministic, so a retry cannot help.
+        Deterministic,
+    }
+
+    /// Fails as scripted for its first `failures` structured calls, then
+    /// answers `response`, counting every attempt.
+    struct FlakyLlm {
+        calls: AtomicUsize,
+        failures: usize,
+        failure: ScriptedFailure,
+        response: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyLlm {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures {
+                return Err(match self.failure {
+                    ScriptedFailure::Transient => LlmError::Provider {
+                        status: 503,
+                        body: "This model is currently experiencing high demand.".into(),
+                    },
+                    ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
+                });
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    fn scripted_page() -> serde_json::Value {
+        serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        })
+    }
+
+    /// A briefly overloaded provider must not end the consolidation: the
+    /// retry absorbs it and the caller still gets the page.
+    #[tokio::test]
+    async fn a_transient_provider_failure_is_retried() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: 2, // fails twice, answers on the 3rd (= the budget)
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("a transient failure that clears within the budget must succeed");
+
+        assert_eq!(page.title, "Queue decision");
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            3,
+            "should have retried twice"
+        );
+    }
+
+    /// An outage that outlasts the budget gives up instead of retrying
+    /// forever, and reports the provider error it actually saw.
+    #[tokio::test]
+    async fn a_transient_provider_failure_gives_up_after_the_budget() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX, // never clears
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let err = complete_structured_with_retry::<ConsolidatedPage>(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("a persistently transient failure must eventually give up");
+
+        assert!(err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            CONSOLIDATION_LLM_MAX_ATTEMPTS as usize,
+            "must stop at the attempt budget, not retry forever"
+        );
+    }
+
+    /// A deterministic failure is not retried, and a consolidation whose
+    /// completion never arrives writes no page.
+    #[tokio::test]
+    async fn a_deterministic_provider_failure_is_not_retried_and_writes_no_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let llm = Arc::new(FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX,
+            failure: ScriptedFailure::Deterministic,
+            response: scripted_page(),
+        });
+
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an auth error must fail the consolidation");
+
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic error must fail on the first call, no retries"
+        );
+        assert!(
+            page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
+            "a failed consolidation must not write a page"
+        );
+    }
+
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
         wiki.write_page(WritePageRequest {
             workspace_id: ws,
@@ -2418,6 +2666,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2510,6 +2759,50 @@ mod tests {
         }
     }
 
+    /// P2 (docs/design-hindsight-borrowings.md §3): the single-page
+    /// consolidation write cites the session it consolidated as evidence,
+    /// in the same transaction as the page upsert — purely rule-based, no
+    /// LLM involvement in the citation itself.
+    #[tokio::test]
+    async fn single_page_consolidation_records_session_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        });
+
+        let outcome = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page_id = outcome.page_id.unwrap();
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let rows: Vec<(String, String)> = db
+            .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+            .unwrap()
+            .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("session".to_string(), session.to_string())]);
+    }
+
     /// The multi-page provider path uses the same provenance contract for its
     /// canonical session anchor, while non-session pages remain outside item 1
     /// of #494.
@@ -2540,7 +2833,7 @@ mod tests {
             ]
         });
 
-        Consolidator::new(
+        let outcomes = Consolidator::new(
             store.reader.clone(),
             store.writer.clone(),
             wiki.clone(),
@@ -2569,6 +2862,111 @@ mod tests {
             .unwrap();
         assert!(concept.frontmatter.get("agent").is_none());
         assert!(concept.frontmatter.get("session_id").is_none());
+
+        // P2 (docs/design-hindsight-borrowings.md §3): unlike the anchor-only
+        // `session_id`/`agent` frontmatter stamp above, EVERY page a batch
+        // produces cites the session that produced it as evidence.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        for outcome in &outcomes {
+            let page_id = outcome.page_id.unwrap();
+            let rows: Vec<(String, String)> = db
+                .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+                .unwrap()
+                .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![("session".to_string(), session.to_string())],
+                "path {} must cite the batch's session as evidence",
+                outcome.path.as_str()
+            );
+        }
+    }
+
+    /// A batch with one page whose LLM-produced path contains a
+    /// Windows-illegal `:` (copied verbatim from a conventional-commit
+    /// subject, e.g. `build(sandbox): orchestrate`) must not abort the whole
+    /// run: `build_update` sanitizes the path in place (same class of fix as
+    /// bootstrap's #847) and the batch's sibling valid page survives. Before
+    /// the fix, the bad path passed `PagePath::new` (deliberately tolerant)
+    /// and only failed later at `ensure_portable` inside `Wiki::apply_batch`,
+    /// which is atomic — one bad page there lost every page in the batch
+    /// (#848).
+    #[tokio::test]
+    async fn batch_with_illegal_char_path_is_sanitized_not_aborted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "rationale": "one bad path, one good",
+            "updates": [
+                {
+                    "path": "concepts/build(sandbox): orchestrate the run.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Bad path page",
+                    "body_markdown": "Bad path body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/good.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Good path page",
+                    "body_markdown": "Good path body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a sanitizable bad path must not fail (or abort) the whole batch");
+
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "both pages, including the sanitized one, must be written"
+        );
+
+        let sanitized_path = outcomes
+            .iter()
+            .find(|o| o.path.as_str().starts_with("concepts/build"))
+            .expect("the offending page must still be written, under a sanitized path")
+            .path
+            .clone();
+        assert!(
+            !sanitized_path.as_str().contains(':'),
+            "the sanitized path must not contain the Windows-illegal `:`: {}",
+            sanitized_path.as_str()
+        );
+        assert!(
+            sanitized_path.ensure_portable().is_ok(),
+            "the sanitized path must pass the portability check"
+        );
+
+        let good = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
+            .unwrap();
+        assert_eq!(good.frontmatter["title"], "Good path page");
+
+        let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
+        assert_eq!(bad.frontmatter["title"], "Bad path page");
     }
 
     /// A batch whose single update targets `path` — the model chooses this
@@ -3184,6 +3582,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3193,7 +3592,7 @@ mod tests {
             .await
             .expect("page body becomes instructions");
         assert!(from_page.contains("Prefer the `infra` tag."));
-        assert!(from_page.contains("[REDACTED]"));
+        assert!(from_page.contains("[REDACTED:api_key]"));
         assert!(!from_page.contains("deadbeef"));
         assert!(
             from_page.chars().count() <= MAX_PROJECT_INSTRUCTIONS_CHARS,
@@ -3220,6 +3619,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3252,6 +3652,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

@@ -46,14 +46,21 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
 ///
-/// Closed table: only `ClaudeCode + Stop` is supported today. Extend
-/// deliberately — a new entry opts an agent/event into capture and MUST have its
-/// field name present in [`ASSISTANT_MESSAGE_FIELDS`] so the strip covers it
-/// (enforced by `closed_table_fields_are_all_stripped`).
+/// Closed table: `ClaudeCode + Stop` and `Codex + Stop` are supported today.
+/// Extend deliberately — a new entry opts an agent/event into capture and MUST
+/// have its field name present in [`ASSISTANT_MESSAGE_FIELDS`] so the strip
+/// covers it (enforced by `closed_table_fields_are_all_stripped`).
+///
+/// Codex's `Stop` hook payload carries `last_assistant_message` (verified on
+/// codex-cli 0.154.0, #743) — the same spelling Claude Code uses, so no new
+/// entry in [`ASSISTANT_MESSAGE_FIELDS`] is needed. Codex has no `SubagentStop`
+/// in its supported event vocabulary, so only `(Codex, Stop)` is added.
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {
-        (AgentKind::ClaudeCode, HookEvent::Stop) => Some("last_assistant_message"),
+        (AgentKind::ClaudeCode, HookEvent::Stop) | (AgentKind::Codex, HookEvent::Stop) => {
+            Some("last_assistant_message")
+        }
         _ => None,
     }
 }
@@ -216,10 +223,10 @@ pub fn strip_assistant_message_raw(raw: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// Only `ClaudeCode + Stop` is a capture candidate; every other agent/event
-    /// pair across the full agent surface must return `None`.
+    /// Only `ClaudeCode + Stop` and `Codex + Stop` are capture candidates; every
+    /// other agent/event pair across the full agent surface must return `None`.
     #[test]
-    fn only_claude_stop_is_a_capture_candidate() {
+    fn only_claude_and_codex_stop_are_capture_candidates() {
         let events = [
             HookEvent::SessionStart,
             HookEvent::UserPrompt,
@@ -236,7 +243,8 @@ mod tests {
         ];
         for agent in AgentKind::ALL {
             for event in events {
-                let expected = agent == AgentKind::ClaudeCode && event == HookEvent::Stop;
+                let expected = matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
+                    && event == HookEvent::Stop;
                 assert_eq!(
                     assistant_message_field(agent, event).is_some(),
                     expected,
@@ -337,7 +345,10 @@ mod tests {
         assert!(out.captured);
         let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
         assert!(!excerpt.contains(&secret), "secret survived: {excerpt}");
-        assert!(excerpt.contains("[REDACTED]"), "not redacted: {excerpt}");
+        assert!(
+            excerpt.contains("[REDACTED:aws_key]"),
+            "not redacted: {excerpt}"
+        );
     }
 
     #[test]
@@ -372,12 +383,24 @@ mod tests {
 
     #[test]
     fn client_transform_ignores_non_candidate_agent_event() {
-        // Non-Claude agent: raw field still stripped defensively, no protocol.
+        // A non-candidate (agent, event): a candidate agent on a non-Stop event.
+        // The raw field is still stripped defensively, and no protocol is spliced.
         let mut raw = serde_json::json!({ "last_assistant_message": "hi" });
-        let out = transform_for_client(&mut raw, AgentKind::Codex, HookEvent::Stop);
+        let out = transform_for_client(&mut raw, AgentKind::Codex, HookEvent::PostToolUse);
         assert!(!out.captured);
         assert!(raw.get("last_assistant_message").is_none());
         assert!(raw.get(ASSISTANT_MARKER_KEY).is_none());
+    }
+
+    #[test]
+    fn client_transform_captures_codex_stop() {
+        // Codex Stop is now a candidate (#743): the assistant excerpt is captured
+        // and the raw field removed, same as Claude Code.
+        let mut raw = serde_json::json!({ "last_assistant_message": "codex done" });
+        let out = transform_for_client(&mut raw, AgentKind::Codex, HookEvent::Stop);
+        assert!(out.captured);
+        assert!(raw.get("last_assistant_message").is_none());
+        assert!(raw.get(ASSISTANT_MARKER_KEY).is_some());
     }
 
     #[test]

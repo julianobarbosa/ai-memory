@@ -46,14 +46,67 @@ Recommended defaults:
 | `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
+| `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `opencode` | `claude-sonnet-4-6` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
 starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
 lands in the same `ai-memory-data` volume as the server.
+
+`codex` is independent from `openai-oauth`: it never copies credentials into
+ai-memory's data directory and never reads a refresh token or ID token. It
+reads only `tokens.access_token` and `tokens.account_id` from
+`$CODEX_HOME/auth.json`, or from the platform home's `.codex/auth.json` when
+`CODEX_HOME` is unset or empty. Each request reloads the file. A first 401 may
+trigger one serialized `codex app-server --stdio` recovery followed by one
+retry; further 401 responses fail with a reauthentication hint. Override the
+binary with `AI_MEMORY_CODEX_EXECUTABLE` when `codex` is not on `PATH`.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=codex
+export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
+export AI_MEMORY_LLM_REASONING_EFFORT=medium
+ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+Codex credential storage mode `file` is supported. `auto` works only when its
+effective credential is present in `auth.json`; keyring-only and ephemeral
+credentials are not read and produce an actionable missing-auth-file error.
+Docker is not configured automatically: the Codex executable, `CODEX_HOME`,
+and its credential file must all exist in the same container/environment as
+ai-memory.
+
+`opencode` talks to OpenCode's gateway with the `sk-...` key from
+`opencode.ai/auth`, read from `OPENCODE_API_KEY` only; it does not fall back
+to `LLM_API_KEY`. It defaults to the **Go** endpoint,
+`https://opencode.ai/zen/go/v1`: a subscription with a per-model monthly
+allowance rather than per-token billing. Set
+`AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` (or `llm_base_url` in
+`config.toml`) for **Zen**'s pay-per-token catalogue. Model ids are per
+catalogue and written plainly (`mimo-v2.5`, `glm-5.3-flash`), not in the
+`opencode-go/<model>` form OpenCode's own client config uses. The built-in
+default is `claude-sonnet-4-6`; Go ids such as `mimo-v2.5` or `glm-5.3-flash`
+come from `AI_MEMORY_LLM_MODEL`, so set it to an id the endpoint you chose
+serves. `gpt-5.6-luna` is sent through the Responses endpoint;
+every other model uses Chat Completions. The provider sends the
+`x-opencode-session` correlation header OpenCode asks for, one id per logical
+operation, and its own `User-Agent`; `AI_MEMORY_LLM_HEADERS` overrides
+either. `AI_MEMORY_LLM_REASONING_EFFORT` and `AI_MEMORY_LLM_TIMEOUT_SECS`
+apply as for every other provider. `AI_MEMORY_LLM_PROVIDER` / `llm_provider`
+also accept the historical aliases `opencode-zen` and `opencode_zen` for the
+same provider (`llm-test --provider` takes only `opencode`); the endpoint is
+chosen by the base URL, not the alias.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=opencode
+export AI_MEMORY_LLM_MODEL=mimo-v2.5
+ai-memory llm-test --provider opencode --model mimo-v2.5 --prompt "Reply with OK"
+```
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
@@ -72,7 +125,7 @@ rule.
 
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
-[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
+[the warning in `docs/install.md`](install.md#anthropic-via-claude-subscription-oauth).**
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
@@ -80,12 +133,19 @@ uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 > [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`,
-> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
-> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
-> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
-> model is plenty and is much easier on subscription rate limits. Save the
-> high-effort thinking models for your coding agent.
+> **For the OAuth/subscription backends, prefer a small, fast model** via
+> `AI_MEMORY_LLM_MODEL` where the backend lets you choose one. ai-memory's LLM
+> work (consolidation, lint, explore) is summarisation, not hard reasoning, so a
+> Haiku/mini-class model is plenty and is much easier on subscription rate
+> limits. Save the high-effort thinking models for your coding agent. Per backend:
+> - `anthropic-oauth`: set `claude-haiku-4-5`.
+> - `openai-oauth` / `codex`: leave the provider default (`gpt-5.5`). The
+>   Codex/ChatGPT backend only accepts a small server-defined set of model ids
+>   and rejects others (e.g. `gpt-5-mini`) with a deterministic 400, so do not
+>   override the model here.
+> - `copilot`: a mini-class id such as `gpt-5-mini` may work, but Copilot's
+>   accepted model set is unverified — check before relying on it, and fall back
+>   to the default if the endpoint rejects your choice.
 
 > [!TIP]
 > **OpenAI-compatible structured output is schema-constrained by default.**
@@ -135,24 +195,36 @@ hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
 Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector retrieval in addition to FTS5 + entity +
-graph-neighbor retrieval. `openai-compat` targets self-hosted engines
-(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
+`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,
+`openai-compat`, or `copilot` when you want vector retrieval in addition to
+FTS5 + entity + graph-neighbor retrieval. `openai-compat` targets self-hosted
+engines (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
 `AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
 embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
-embeddings can run on a different provider than the LLM. Both the FTS-only and
+embeddings can run on a different provider than the LLM. Because the two
+endpoints are independent, `AI_MEMORY_LLM_BASE_URL` redirects only the LLM;
+set `AI_MEMORY_EMBEDDING_BASE_URL` as well or embedding traffic still goes to
+the embedding provider's default endpoint. Both the FTS-only and
 hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.
+
+`AI_MEMORY_EMBEDDING_PROVIDER=copilot` reuses the same Copilot OAuth login as
+the `copilot` LLM provider (`ai-memory auth login copilot` or
+`COPILOT_GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`) — no separate API key.
+It defaults to model `text-embedding-3-small`, dim 1536, and calls Copilot's
+`/embeddings` endpoint following the same OpenAI-compatible contract Copilot
+documents for chat. That endpoint's exact shape is not covered by a live
+test against Copilot here; treat it as needing a real-Copilot smoke test
+before relying on it in production.
 
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
 sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 384-dim), with the model fetched once into `<data_dir>/models/` under
 pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
 
-See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
+See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
-[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+[`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

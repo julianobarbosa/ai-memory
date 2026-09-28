@@ -4,8 +4,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use ai_memory_core::{
@@ -23,6 +21,7 @@ use ai_memory_workstream::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
 use crate::commands::{path_util, resolve_scope};
@@ -84,13 +83,39 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
 /// Run one native harness from an explicit checkout without changing the
 /// parent process's working directory.
 pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    run_from_with_wiring(
+        config,
+        args,
+        cwd,
+        &super::run_autowire::WireOverrides::default(),
+    )
+    .await
+}
+
+/// [`run_from`] with the autowire path injections supplied explicitly.
+///
+/// Production callers use [`run_from`], which passes
+/// [`WireOverrides::default()`](super::run_autowire::WireOverrides) so the
+/// installers resolve their real per-agent paths — behavior is byte-identical to
+/// the inlined call this replaced. The overrides exist only so the `run` →
+/// autowire → child-spawn seam can be exercised without writing to the
+/// developer's real `$HOME`, mirroring the `ensure_wired` / `ensure_wired_with`
+/// split.
+pub(super) async fn run_from_with_wiring(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<i32> {
     let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     let force_fresh = args.fresh || trailing_fresh;
+    let no_autowire = args.no_autowire || trailing_no_autowire;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -139,8 +164,8 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         new_workstream: args.new_workstream,
         lease_owner: lease_owner(),
     };
-    let interrupted_before_spawn = Arc::new(AtomicBool::new(false));
-    let interrupt_task = tokio::spawn(capture_interrupts(Arc::clone(&interrupted_before_spawn)));
+    let interrupted_before_spawn = CancellationToken::new();
+    let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
     let prepared = prepare_managed_run(&endpoint, &prepare)
         .await
         .context("opening managed workstream; the agent was not started");
@@ -175,7 +200,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             }
         };
     }
-    if interrupted_before_spawn.load(Ordering::SeqCst) {
+    if interrupted_before_spawn.is_cancelled() {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
@@ -214,6 +239,14 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
+    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
+    // here, so managed launch "just works" for capture and recall without a
+    // manual install step. One-time, idempotent, best-effort (it never blocks or
+    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
+    // Runs before the child spawns so the harness picks up the fresh hooks.
+    if config.run_autowire && !no_autowire {
+        super::run_autowire::ensure_wired_with(config, harness, wire_overrides);
+    }
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
@@ -285,6 +318,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
                         candidates,
                         &endpoint,
                         &run_path,
+                        &interrupted_before_spawn,
                     )
                     .await
                 );
@@ -383,7 +417,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         plan.args
             .extend([OsString::from("--rules"), OsString::from(context)]);
     }
-    if interrupted_before_spawn.load(Ordering::SeqCst) {
+    if interrupted_before_spawn.is_cancelled() {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
@@ -544,9 +578,9 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
     Ok(exit_code)
 }
 
-async fn capture_interrupts(interrupted: Arc<AtomicBool>) {
+async fn capture_interrupts(interrupted: CancellationToken) {
     while tokio::signal::ctrl_c().await.is_ok() {
-        interrupted.store(true, Ordering::SeqCst);
+        interrupted.cancel();
     }
 }
 
@@ -774,6 +808,12 @@ fn remove_wrapper_yolo(args: &mut Vec<OsString>) -> bool {
 fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--fresh"));
+    args.len() != before
+}
+
+fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--no-autowire"));
     args.len() != before
 }
 
@@ -1027,7 +1067,7 @@ fn write_private(path: &Path, content: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn native_home(config: &Config) -> Option<PathBuf> {
+pub(crate) fn native_home(config: &Config) -> Option<PathBuf> {
     config
         .home_dir
         .as_deref()
@@ -1041,39 +1081,61 @@ async fn choose_native_session_interactive(
     candidates: Vec<NativeSessionCandidate>,
     endpoint: &ServerEndpoint,
     run_path: &str,
+    interrupted: &CancellationToken,
 ) -> Result<io::Result<Option<String>>> {
-    let mut chooser = tokio::task::spawn_blocking(move || {
+    let chooser = tokio::task::spawn_blocking(move || {
         let stdin = io::stdin();
-        let stderr = io::stderr();
+        let mut stderr = io::stderr();
         choose_native_session(
             harness,
             &workstream_name,
             &candidates,
             &mut stdin.lock(),
-            &mut stderr.lock(),
+            // Keep stderr available to report cancellation while stdin is blocked.
+            &mut stderr,
             SystemTime::now(),
         )
     });
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
-    let mut heartbeat_health = HeartbeatHealth::default();
-    let selection = loop {
-        tokio::select! {
-            result = &mut chooser => {
-                break result.context("waiting for the native session choice")?;
-            }
-            _ = heartbeat.tick() => {
-                let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
-            }
+    wait_for_native_session_choice(chooser, endpoint, run_path, interrupted).await
+}
+
+async fn wait_for_native_session_choice(
+    mut chooser: tokio::task::JoinHandle<io::Result<Option<String>>>,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    interrupted: &CancellationToken,
+) -> Result<io::Result<Option<String>>> {
+    tokio::select! {
+        biased;
+        _ = interrupted.cancelled() => {
+            // A running stdin read cannot be aborted. The CLI runtime's bounded
+            // shutdown lets the process exit after the caller cancels the lease.
+            chooser.abort();
+            Err(anyhow!("managed run interrupted before the agent started"))
         }
-    };
-    send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
-        .await
-        .context(
-            "renewing the managed workstream after session selection; the agent was not started",
-        )?;
-    Ok(selection)
+        result = async {
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            let mut heartbeat_health = HeartbeatHealth::default();
+            let selection = loop {
+                tokio::select! {
+                    result = &mut chooser => {
+                        break result.context("waiting for the native session choice")?;
+                    }
+                    _ = heartbeat.tick() => {
+                        let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
+                    }
+                }
+            };
+            send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
+                .await
+                .context(
+                    "renewing the managed workstream after session selection; the agent was not started",
+                )?;
+            Ok(selection)
+        } => result,
+    }
 }
 
 fn choose_native_session(
@@ -1383,7 +1445,8 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
 mod tests {
     use std::ffi::{OsStr, OsString};
     use std::io::Cursor;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ai_memory_core::{ManagedRunId, WorkstreamId};
     use axum::Router;
@@ -1394,6 +1457,121 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    #[tokio::test(start_paused = true)]
+    async fn native_session_choice_interrupt_does_not_wait_for_input() {
+        let interrupted = CancellationToken::new();
+        let signal = interrupted.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.cancel();
+        });
+        let chooser = tokio::spawn(std::future::pending());
+        let abort = chooser.abort_handle();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:1".into()), None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/unused", &interrupted),
+        )
+        .await;
+        abort.abort();
+
+        let error = result
+            .expect("Ctrl-C must not wait for a line of stdin")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted before the agent started")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_session_choice_preserves_an_earlier_interrupt() {
+        let interrupted = CancellationToken::new();
+        interrupted.cancel();
+        let chooser = tokio::spawn(std::future::pending());
+        let abort = chooser.abort_handle();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:1".into()), None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/unused", &interrupted),
+        )
+        .await;
+        abort.abort();
+
+        assert!(
+            result
+                .expect("an earlier Ctrl-C must remain observable")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_session_choice_still_renews_before_returning_selection() {
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = heartbeats.clone();
+        let app = Router::new().route(
+            "/run/heartbeat",
+            post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::NO_CONTENT }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ServerEndpoint::from_pair(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chooser = tokio::spawn(async { Ok(Some("selected-session".into())) });
+        let selected =
+            wait_for_native_session_choice(chooser, &endpoint, "/run", &CancellationToken::new())
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(selected.as_deref(), Some("selected-session"));
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_session_choice_interrupt_cancels_a_stalled_heartbeat() {
+        let interrupted = CancellationToken::new();
+        let signal = interrupted.clone();
+        let app = Router::new().route(
+            "/run/heartbeat",
+            post(move || {
+                signal.cancel();
+                std::future::pending::<StatusCode>()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ServerEndpoint::from_pair(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chooser = tokio::spawn(async { Ok(None) });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/run", &interrupted),
+        )
+        .await;
+        server.abort();
+
+        let error = result
+            .expect("Ctrl-C must also cancel an in-flight heartbeat")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted before the agent started")
+        );
+    }
 
     /// `show` filters its harness menu with this, so a false positive would
     /// offer an agent that cannot start.
@@ -1997,6 +2175,25 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_no_autowire_parses_before_or_after_the_harness() {
+        // Before the harness: clap binds it as the wrapper flag.
+        let cli = Cli::try_parse_from(["ai-memory", "run", "--no-autowire", "kimi"]).unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.no_autowire);
+
+        // After the harness: trailing_var_arg swallows it into native_args, so it
+        // must be extracted rather than forwarded to the harness (which would
+        // reject an unknown flag).
+        let mut trailing = ["--no-autowire", "--model", "opus"]
+            .map(OsString::from)
+            .to_vec();
+        assert!(remove_wrapper_no_autowire(&mut trailing));
+        assert_eq!(trailing, ["--model", "opus"].map(OsString::from));
+    }
+
+    #[test]
     fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
@@ -2182,5 +2379,152 @@ mod tests {
         assert_eq!(paths[0], "/existing.md");
         let packet = paths[1].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(packet).unwrap(), "managed packet");
+    }
+
+    /// The `ai-memory run` -> autowire -> child-spawn seam: driving the launcher
+    /// entry point (`run_from_with_wiring`) must run auto-wire *before* the child
+    /// starts, so the harness's ai-memory hooks + MCP are installed and the
+    /// per-(agent, version) sentinel is written as a side effect of `run` itself.
+    /// The autowire path injections keep it off the developer's real `$HOME`, the
+    /// child is a harmless `exit 0` script launched in passthrough mode
+    /// (`--version`), and a mock server stands in for the workstream endpoints, so
+    /// nothing here needs a real editor, network, or LLM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_entry_point_autowires_the_harness_before_spawning_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        // Mock workstream server: prepare a run, accept the finish. Passthrough
+        // launches never link a session, so these two routes are all `run_from`
+        // touches over the wire.
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        // A harmless child the launcher can actually spawn: exits 0 immediately,
+        // so the run completes without a real harness.
+        let script = repo.path().join("harmless-harness");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Injected autowire targets — the whole point of the override seam is that
+        // wiring never resolves (and writes to) the developer's real `$HOME`.
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, r#"{"existingUserKey":"keep me"}"#).unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, r#"{"existingMcpKey":"keep me too"}"#).unwrap();
+
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = true;
+
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+        };
+        let args = || RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script.clone()),
+            yolo: false,
+            fresh: false,
+            no_autowire: false,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--version")],
+        };
+
+        let exit = run_from_with_wiring(&config, args(), repo.path(), &overrides)
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0, "the harmless child exits 0");
+
+        // Auto-wire ran through the `run` entry point: hooks + MCP were installed
+        // into the injected targets, and the sentinel recording the attempt exists.
+        let hooks_json = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            hooks_json.contains("existingUserKey"),
+            "unrelated user settings must be preserved: {hooks_json}"
+        );
+        assert!(
+            hooks_json.contains("ai-memory") || hooks_json.contains("ai_memory"),
+            "run must auto-install the ai-memory hook before spawning: {hooks_json}"
+        );
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        assert!(
+            mcp_json.contains("existingMcpKey"),
+            "unrelated MCP config must be preserved: {mcp_json}"
+        );
+        assert!(
+            mcp_json.contains("ai-memory"),
+            "run must auto-install the ai-memory MCP server before spawning: {mcp_json}"
+        );
+        let sentinels = std::fs::read_dir(data.path().join("autowire-state"))
+            .expect("autowire-state dir created by the run")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            sentinels
+                .iter()
+                .any(|name| name.starts_with("claude-code-")),
+            "run must record the per-agent autowire sentinel: {sentinels:?}"
+        );
+
+        // A second launch is gated by that sentinel: the seam is idempotent, so
+        // neither config file is rewritten.
+        let before_hooks = std::fs::read(&settings).unwrap();
+        let before_mcp = std::fs::read(&mcp).unwrap();
+        run_from_with_wiring(&config, args(), repo.path(), &overrides)
+            .await
+            .expect("second managed passthrough run completes");
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            before_hooks,
+            "a gated re-launch must not rewrite hook config"
+        );
+        assert_eq!(
+            std::fs::read(&mcp).unwrap(),
+            before_mcp,
+            "a gated re-launch must not rewrite MCP config"
+        );
+
+        server.abort();
     }
 }

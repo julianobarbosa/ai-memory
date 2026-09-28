@@ -193,6 +193,36 @@ pub enum ActiveProjectLookup {
     Unset,
 }
 
+/// Outcome of [`ActiveProject::read_pointer`]: the read-path answer and the
+/// source that gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPointer {
+    /// The caller's own keyed entry.
+    Session(WorkspaceId, ProjectId),
+    /// The process-wide slot — whichever project published last. What a
+    /// caller with no coordinate reads, and every caller in `single` mode.
+    SharedSlot(WorkspaceId, ProjectId),
+    /// The startup seed (#678), standing in until the first hook event.
+    StartupSeed(WorkspaceId, ProjectId),
+    /// The caller carries a coordinate that matched no live hook session.
+    Mismatch,
+    /// No pointer information exists for this caller.
+    Unset,
+}
+
+impl ReadPointer {
+    /// The resolved ids, if any source gave one.
+    #[must_use]
+    pub fn ids(self) -> Option<(WorkspaceId, ProjectId)> {
+        match self {
+            Self::Session(workspace_id, project_id)
+            | Self::SharedSlot(workspace_id, project_id)
+            | Self::StartupSeed(workspace_id, project_id) => Some((workspace_id, project_id)),
+            Self::Mismatch | Self::Unset => None,
+        }
+    }
+}
+
 impl ActiveProjectLookup {
     fn from_single(slot: Option<(WorkspaceId, ProjectId)>) -> Self {
         match slot {
@@ -365,6 +395,23 @@ pub struct ActiveProject {
     /// Never reset: an install that once had hook activity is not hookless
     /// again just because entries aged out of the TTL map.
     ever_keyed: Arc<AtomicBool>,
+    /// A startup reconstruction of the shared slot, consulted by READS only.
+    ///
+    /// The pointer is process memory, so a restart mid-session empties it and
+    /// unscoped reads answered for the baked default scope — zero counts for a
+    /// project full of observations, through the success path (#678). `serve`
+    /// fills this slot at startup from the most recently active project on
+    /// disk so those reads degrade to real data instead.
+    ///
+    /// It is deliberately NOT the single slot. A seeded value is a
+    /// reconstruction, not an observed publish: writing it to `single` would
+    /// make [`Self::lookup_for`] answer `Resolved` for every caller until the
+    /// first hook event lands, including one whose coordinate matches nothing
+    /// — and an unscoped write would then be attributed to a project the
+    /// caller never named, possibly another operator's. That is exactly the
+    /// misfiling the `Mismatch`/`Unset` split exists to prevent, so the write
+    /// path never sees this slot.
+    seeded: Arc<RwLock<Option<(WorkspaceId, ProjectId)>>>,
 }
 
 impl Default for ActiveProject {
@@ -405,6 +452,7 @@ impl ActiveProject {
             single_default_global: Arc::new(RwLock::new(false)),
             per_actor: Arc::new(RwLock::new(PerActorMap::new(ttl, max_entries))),
             ever_keyed: Arc::new(AtomicBool::new(false)),
+            seeded: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -413,6 +461,18 @@ impl ActiveProject {
     #[must_use]
     pub fn mode(&self) -> ActiveProjectMode {
         self.mode
+    }
+
+    /// The effective TTL of a per-key entry, after the zero-means-default
+    /// normalization the backing map applies.
+    ///
+    /// `serve` uses it as the recency bound when it seeds the single-slot
+    /// fallback from disk at startup (#678): activity older than this would
+    /// have aged out of the live pointer anyway, so it must not come back
+    /// through the restart path either.
+    #[must_use]
+    pub fn per_key_ttl(&self) -> Duration {
+        self.per_actor.read().unwrap_or_else(|e| e.into_inner()).ttl
     }
 
     /// Publish the project the agent is currently active in. Called by the
@@ -520,6 +580,50 @@ impl ActiveProject {
         }
     }
 
+    /// Read-path resolution: [`Self::get_for`], plus the startup seed for a
+    /// caller the pointer holds no information about.
+    ///
+    /// Only [`ActiveProjectLookup::Unset`] consults the seed — the state a
+    /// fresh process is in before the first hook event lands, which is
+    /// precisely the restart window that made `memory_status` answer an empty
+    /// default (#678). A [`ActiveProjectLookup::Mismatch`] still resolves to
+    /// nothing: hooks are live there and this coordinate matched none of them,
+    /// so the caller's own default is the honest answer.
+    ///
+    /// Reads only. The write path stays on [`Self::lookup_for`] so an unscoped
+    /// write from an unrecognized caller keeps failing closed instead of being
+    /// attributed to a project reconstructed from someone else's history.
+    #[must_use]
+    pub fn get_for_read(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
+        self.read_pointer(actor).ids()
+    }
+
+    /// Read-path resolution with its provenance: the same answer as
+    /// [`Self::get_for_read`], plus which of the pointer's sources gave it.
+    ///
+    /// A keyed entry is evidence about *this* caller; the shared slot and the
+    /// startup seed are not — they hold whichever project published last, or
+    /// was active last on disk. Reporting that difference is what lets a caller
+    /// see it was answered about someone else's project (#757).
+    #[must_use]
+    pub fn read_pointer(&self, actor: &ActorKey) -> ReadPointer {
+        match self.lookup_traced(actor) {
+            (ActiveProjectLookup::Resolved(workspace_id, project_id), true) => {
+                ReadPointer::Session(workspace_id, project_id)
+            }
+            (ActiveProjectLookup::Resolved(workspace_id, project_id), false) => {
+                ReadPointer::SharedSlot(workspace_id, project_id)
+            }
+            (ActiveProjectLookup::Unset, _) => match self.read_seeded() {
+                Some((workspace_id, project_id)) => {
+                    ReadPointer::StartupSeed(workspace_id, project_id)
+                }
+                None => ReadPointer::Unset,
+            },
+            (ActiveProjectLookup::Mismatch, _) => ReadPointer::Mismatch,
+        }
+    }
+
     /// Same resolution as [`Self::get_for`], but says *why* it failed.
     ///
     /// `get_for` collapses two very different outcomes into `None`, which is fine
@@ -530,19 +634,29 @@ impl ActiveProject {
     /// information at all, which has always used the default and must keep doing so.
     #[must_use]
     pub fn lookup_for(&self, actor: &ActorKey) -> ActiveProjectLookup {
+        self.lookup_traced(actor).0
+    }
+
+    /// [`Self::lookup_for`], plus whether a `Resolved` answer came from the
+    /// caller's own keyed entry (`true`) or from the shared slot (`false`).
+    fn lookup_traced(&self, actor: &ActorKey) -> (ActiveProjectLookup, bool) {
+        let shared = |slot| (ActiveProjectLookup::from_single(slot), false);
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
-            return ActiveProjectLookup::from_single(self.read_single());
+            return shared(self.read_single());
         }
 
         let scoped = self.scoped_key(actor);
         if scoped.is_empty() {
-            return ActiveProjectLookup::from_single(self.read_single());
+            return shared(self.read_single());
         }
 
         let now = Instant::now();
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
         if let Some((workspace_id, project_id)) = guard.get(&scoped, now) {
-            return ActiveProjectLookup::Resolved(workspace_id, project_id);
+            return (
+                ActiveProjectLookup::Resolved(workspace_id, project_id),
+                true,
+            );
         }
 
         // A keyed miss means one of two very different things.
@@ -564,14 +678,14 @@ impl ActiveProject {
                 session_id: None,
             };
             if guard.get(&identity_only, now).is_some() {
-                return ActiveProjectLookup::Mismatch;
+                return (ActiveProjectLookup::Mismatch, false);
             }
         }
         drop(guard);
         if self.ever_keyed.load(Ordering::Relaxed) {
-            return ActiveProjectLookup::Mismatch;
+            return (ActiveProjectLookup::Mismatch, false);
         }
-        ActiveProjectLookup::from_single(self.read_single())
+        shared(self.read_single())
     }
 
     /// Whether the actor opted this session into `default_global` recall (via
@@ -618,6 +732,11 @@ impl ActiveProject {
         *guard
     }
 
+    fn read_seeded(&self) -> Option<(WorkspaceId, ProjectId)> {
+        let guard = self.seeded.read().unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
     fn write_single_default_global(&self, value: bool) {
         let mut guard = self
             .single_default_global
@@ -647,6 +766,24 @@ impl ActiveProject {
         self.read_single()
     }
 
+    /// Publish the read-side startup seed (#678). Called once by `serve`,
+    /// from the project the database says was active most recently.
+    ///
+    /// Touches neither the single slot nor the per-key map, so it cannot make
+    /// an unscoped write resolve anywhere new; see the `seeded` field for why
+    /// that separation is load-bearing. A real publish supersedes it for every
+    /// caller the moment the first hook event arrives.
+    pub fn seed_read_fallback(&self, workspace_id: WorkspaceId, project_id: ProjectId) {
+        let mut guard = self.seeded.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((workspace_id, project_id));
+    }
+
+    /// The startup seed, if one was published.
+    #[must_use]
+    pub fn seeded(&self) -> Option<(WorkspaceId, ProjectId)> {
+        self.read_seeded()
+    }
+
     /// Forget the active project. Called after an admin operation invalidates
     /// the published pointer (e.g. a `move-project` whose copy-purge path
     /// gives the project a NEW id, so the old pointer no longer resolves).
@@ -657,6 +794,10 @@ impl ActiveProject {
             let mut guard = self.single.write().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
+        {
+            let mut guard = self.seeded.write().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
         guard.entries.clear();
     }
@@ -665,8 +806,8 @@ impl ActiveProject {
     /// the project id. Used after a lossless cross-workspace move where the
     /// project row survives and only its workspace changes.
     pub fn retarget_project_workspace(&self, project_id: ProjectId, workspace_id: WorkspaceId) {
-        {
-            let mut guard = self.single.write().unwrap_or_else(|e| e.into_inner());
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
             if let Some((ws, proj)) = guard.as_mut()
                 && *proj == project_id
             {
@@ -679,8 +820,8 @@ impl ActiveProject {
 
     /// Clear every active entry whose project id matches `project_id`.
     pub fn clear_project(&self, project_id: ProjectId) {
-        {
-            let mut guard = self.single.write().unwrap_or_else(|e| e.into_inner());
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
             if guard.map(|(_, proj)| proj) == Some(project_id) {
                 *guard = None;
             }
@@ -691,8 +832,8 @@ impl ActiveProject {
 
     /// Clear every active entry whose workspace id matches `workspace_id`.
     pub fn clear_workspace(&self, workspace_id: WorkspaceId) {
-        {
-            let mut guard = self.single.write().unwrap_or_else(|e| e.into_inner());
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
             if guard.map(|(ws, _)| ws) == Some(workspace_id) {
                 *guard = None;
             }
@@ -704,7 +845,9 @@ impl ActiveProject {
     /// Whether any live active entry references `project_id`.
     #[must_use]
     pub fn contains_project(&self, project_id: ProjectId) -> bool {
-        if self.read_single().map(|(_, proj)| proj) == Some(project_id) {
+        if self.read_single().map(|(_, proj)| proj) == Some(project_id)
+            || self.read_seeded().map(|(_, proj)| proj) == Some(project_id)
+        {
             return true;
         }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
@@ -714,7 +857,9 @@ impl ActiveProject {
     /// Whether any live active entry references `workspace_id`.
     #[must_use]
     pub fn contains_workspace(&self, workspace_id: WorkspaceId) -> bool {
-        if self.read_single().map(|(ws, _)| ws) == Some(workspace_id) {
+        if self.read_single().map(|(ws, _)| ws) == Some(workspace_id)
+            || self.read_seeded().map(|(ws, _)| ws) == Some(workspace_id)
+        {
             return true;
         }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
@@ -785,6 +930,95 @@ mod tests {
 
     fn ids(_n: u8) -> (WorkspaceId, ProjectId) {
         (WorkspaceId::new(), ProjectId::new())
+    }
+
+    /// #678: the startup seed serves reads, and ONLY reads.
+    ///
+    /// Seeding the single slot instead would make this same lookup answer
+    /// `Resolved` for an actor that never published — `ever_keyed` is false for
+    /// the whole window between a restart and the first hook event — and
+    /// `resolve_write_args` consumes `Resolved` directly. A foreign caller's
+    /// unscoped write would then be attributed to whichever project the
+    /// database remembered, which is the misfiling #564 closed.
+    #[test]
+    fn a_seeded_fallback_serves_reads_without_placing_a_foreign_actor() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.seed_read_fallback(ws, proj);
+        let stranger = key_actor("bob", "s-bob-never-published");
+
+        assert_eq!(
+            ap.lookup_for(&stranger),
+            ActiveProjectLookup::Unset,
+            "the write path must still see no pointer for this caller"
+        );
+        assert_eq!(
+            ap.get_for(&stranger),
+            None,
+            "the seed is not a publish, so `get_for` must not report one"
+        );
+        assert_eq!(
+            ap.get_for_read(&stranger),
+            Some((ws, proj)),
+            "the read path degrades to the seed instead of an empty default"
+        );
+        assert_eq!(
+            ap.get(),
+            None,
+            "the shared publish slot stays empty until a hook fills it"
+        );
+    }
+
+    /// A keyed hit outranks the seed, and a real publish supersedes it for
+    /// every caller — the seed is only ever the answer of last resort.
+    #[test]
+    fn a_published_pointer_outranks_the_seed() {
+        let ap = per_actor();
+        let (ws, seeded_proj) = ids(1);
+        let (_, own_proj) = ids(2);
+        ap.seed_read_fallback(ws, seeded_proj);
+
+        let alice = key_actor("alice", "s-alice");
+        ap.set_for(&alice, ws, own_proj, false);
+        assert_eq!(ap.get_for_read(&alice), Some((ws, own_proj)));
+
+        // And once anything is keyed, a stranger is a mismatch again: hooks are
+        // live, so the honest answer is the caller's own default, not the seed.
+        let stranger = key_actor("bob", "s-bob");
+        assert_eq!(ap.lookup_for(&stranger), ActiveProjectLookup::Mismatch);
+        assert_eq!(ap.get_for_read(&stranger), None);
+    }
+
+    /// An admin op that invalidates the pointer must reach the seed too, or a
+    /// purged project keeps answering reads from a slot nothing can clear.
+    #[test]
+    fn invalidations_reach_the_seed() {
+        let (ws, proj) = ids(1);
+        let (other_ws, _) = ids(2);
+        let stranger = key_actor("bob", "s-bob");
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        assert!(ap.contains_project(proj));
+        assert!(ap.contains_workspace(ws));
+        ap.clear_project(proj);
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.clear_workspace(ws);
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.clear();
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        // A lossless cross-workspace move keeps the project and moves it.
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.retarget_project_workspace(proj, other_ws);
+        assert_eq!(ap.get_for_read(&stranger), Some((other_ws, proj)));
     }
 
     /// The scenario the default must not break: one operator, one harness, and
@@ -1524,5 +1758,46 @@ mod tests {
                 "seed={seed:#x}: fresh post-expiry write must round-trip"
             );
         }
+    }
+
+    /// #757: `read_pointer` answers exactly what `get_for_read` does, and says
+    /// which source answered — a keyed hit is about this caller, the shared
+    /// slot and the seed are not.
+    #[test]
+    fn read_pointer_reports_the_source_of_each_answer() {
+        let (ws, seeded_proj) = ids(1);
+        let (_, own_proj) = ids(2);
+        let alice = key_actor("alice", "s-alice");
+        let stranger = key_actor("bob", "s-bob");
+
+        let ap = per_actor();
+        assert_eq!(ap.read_pointer(&stranger), ReadPointer::Unset);
+
+        ap.seed_read_fallback(ws, seeded_proj);
+        assert_eq!(
+            ap.read_pointer(&stranger),
+            ReadPointer::StartupSeed(ws, seeded_proj)
+        );
+
+        ap.set_for(&alice, ws, own_proj, false);
+        assert_eq!(ap.read_pointer(&alice), ReadPointer::Session(ws, own_proj));
+        assert_eq!(ap.read_pointer(&stranger), ReadPointer::Mismatch);
+        assert_eq!(
+            ap.read_pointer(&empty_actor()),
+            ReadPointer::SharedSlot(ws, own_proj),
+            "a caller with no coordinate reads whichever project published last"
+        );
+
+        for actor in [&alice, &stranger, &empty_actor()] {
+            assert_eq!(ap.read_pointer(actor).ids(), ap.get_for_read(actor));
+        }
+
+        let single = ActiveProject::with_mode(ActiveProjectMode::Single);
+        single.set_for(&alice, ws, own_proj, false);
+        assert_eq!(
+            single.read_pointer(&alice),
+            ReadPointer::SharedSlot(ws, own_proj),
+            "single mode has no keyed entries, even for the publisher"
+        );
     }
 }
