@@ -502,7 +502,7 @@ that touch the relevant area.
    ≤200 ms; server returns 202 immediately or 429 when saturated.
    (agentmemory #221 / #143.)
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
-   has no other constructor than `sanitize()`. (design-decisions §14.)
+   has no other constructor than `Sanitized::new()`. (design-decisions §14.)
    The opt-in assistant/Stop excerpt (#196) enters through this same
    boundary: the client sanitizes it before it reaches the wire, and the
    server re-scrubs it here with its configured patterns before the write.
@@ -530,8 +530,9 @@ that touch the relevant area.
     read env vars directly. Token-backed providers receive explicit
     auth-file paths / env-derived token material through that boundary,
     then own provider-specific refresh and persistence.
-15. **Tracing subscribers explicitly filter their own module.**
-    No feedback loops. (agentmemory #519.)
+15. **Tracing subscribers filter the log-writer crate.** The default
+    filter pins `tracing_appender=warn`, so the file appender cannot feed
+    its own output back into the subscriber. (agentmemory #519.)
 
 ## Configuration (`config.toml`)
 
