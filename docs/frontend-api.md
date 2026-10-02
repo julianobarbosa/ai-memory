@@ -35,7 +35,16 @@
   (DNS-rebinding guard).
 
 The custom SPA shell and its static assets are public so the login screen can
-load. Its data routes remain protected. Start with:
+load. Its data routes remain protected. When `--web-ui-dir` is **absent**, the
+builtin wiki exposes public `GET {web_slug}/login` and
+`GET {web_slug}/change-password` HTML pages that call the same `/auth/*`
+endpoints; navigational browser GETs to protected wiki routes redirect there
+instead of returning bare JSON 401/403. `/api/v1` stays JSON either way.
+The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
+lists pending auto-improvement proposals and posts approve and reject to the
+existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
+403 page, not the change-password redirect. Start
+with:
 
 ```http
 GET /auth/me
@@ -89,19 +98,17 @@ All endpoints are `GET` unless noted. Paths under `/api/v1/`.
 GET /api/v1/workspaces
 ```
 
-**Response:** `{ "workspaces": [WorkspaceSummary, …] }`
+**Response:** a bare JSON array, `[WorkspaceSummary, …]`
 
 ```json
-{
-  "workspaces": [
-    {
-      "workspace_name": "default",
-      "project_count": 3,
-      "page_count": 412,
-      "last_updated": "2026-05-28T14:02:11.123Z"
-    }
-  ]
-}
+[
+  {
+    "workspace_name": "default",
+    "project_count": 3,
+    "page_count": 412,
+    "last_updated": "2026-05-28T14:02:11.123Z"
+  }
+]
 ```
 
 `last_updated` is `null` for an empty workspace.
@@ -113,19 +120,17 @@ GET /api/v1/projects                  # all projects across all workspaces
 GET /api/v1/projects?workspace=NAME   # projects in one workspace
 ```
 
-**Response:** `{ "projects": [ProjectSummary, …] }`
+**Response:** a bare JSON array, `[ProjectSummary, …]`
 
 ```json
-{
-  "projects": [
-    {
-      "workspace_name": "default",
-      "project_name": "ai-memory",
-      "page_count": 138,
-      "last_updated": "2026-05-28T14:02:11.123Z"
-    }
-  ]
-}
+[
+  {
+    "workspace_name": "default",
+    "project_name": "ai-memory",
+    "page_count": 138,
+    "last_updated": "2026-05-28T14:02:11.123Z"
+  }
+]
 ```
 
 ### 4.3 Pages (list)
@@ -134,20 +139,18 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
 GET /api/v1/workspaces/{workspace}/projects/{project}/pages
 ```
 
-**Response:** `{ "pages": [PageSummary, …] }`
+**Response:** a bare JSON array, `[PageSummary, …]`
 
 ```json
-{
-  "pages": [
-    {
-      "path": "decisions/0007-db.md",
-      "title": "Standardised on Postgres",
-      "kind": "decision",
-      "tier": "semantic",
-      "updated_at": "2026-05-27T09:12:00.000Z"
-    }
-  ]
-}
+[
+  {
+    "path": "decisions/0007-db.md",
+    "title": "Standardised on Postgres",
+    "kind": "decision",
+    "tier": "semantic",
+    "updated_at": "2026-05-27T09:12:00.000Z"
+  }
+]
 ```
 
 `404` if the workspace or project doesn't exist.
@@ -176,7 +179,7 @@ links + back-links.
   "updated_at": "2026-05-28T11:04:33.123Z",
   "supersedes": null,
   "frontmatter": { "tags": ["adr"], "pinned": true },
-  "body": "# Standardised on Postgres\n\n…",
+  "body_markdown": "# Standardised on Postgres\n\n…",
   "links":     [ { "path": "concepts/db-rules.md", "title": "DB rules", "kind": "rule" } ],
   "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "session" } ]
 }
@@ -209,20 +212,20 @@ Content-Type: application/json
 }
 ```
 
-**Response:** `{ "hits": [PageHit, …] }`
+**Response:** a bare JSON array, `[SearchHit, …]`
 
 ```json
-{
-  "hits": [
-    {
-      "id": "01928d27-…",
-      "path": "concepts/karpathy-wiki.md",
-      "title": "Karpathy LLM Wiki pattern",
-      "snippet": "Andrej <mark>Karpathy</mark>'s LLM wiki design …",
-      "rank": -8.4
-    }
-  ]
-}
+[
+  {
+    "workspace": "default",
+    "project": "ai-memory",
+    "path": "concepts/karpathy-wiki.md",
+    "title": "Karpathy LLM Wiki pattern",
+    "kind": "concept",
+    "snippet": "Andrej <mark>Karpathy</mark>'s LLM wiki design …",
+    "rank": -8.4
+  }
+]
 ```
 
 Rules:
@@ -252,19 +255,17 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
 `rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
 `note`, respectively. Other paths fall back to `fact`.
 
-**Response:** `{ "pages": [BriefingPage, …] }`
+**Response:** a bare JSON array, `[BriefingPage, …]`
 
 ```json
-{
-  "pages": [
-    {
-      "path": "sessions/2026-05-28.md",
-      "title": "Session 2026-05-28",
-      "kind": "session",
-      "updated_at": "2026-05-28T14:02:11.123Z"
-    }
-  ]
-}
+[
+  {
+    "path": "sessions/2026-05-28.md",
+    "title": "Session 2026-05-28",
+    "kind": "session",
+    "updated_at": "2026-05-28T14:02:11.123Z"
+  }
+]
 ```
 
 ### 4.7 Briefing (structured snapshot)

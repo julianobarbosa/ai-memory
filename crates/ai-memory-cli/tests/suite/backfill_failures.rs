@@ -45,7 +45,6 @@ async fn import_failures_are_errors_in_human_json_and_quiet_modes() {
         for mode in ["human", "json", "quiet"] {
             let data = tempfile::tempdir().unwrap();
             let mut cmd = crate::e2e_support::hermetic(env!("CARGO_BIN_EXE_ai-memory"));
-            cmd.env_remove("CODEX_HOME");
             cmd.current_dir(&cwd)
                 .env("AI_MEMORY_HOME", home.path())
                 .env("AI_MEMORY_DATA_DIR", data.path())

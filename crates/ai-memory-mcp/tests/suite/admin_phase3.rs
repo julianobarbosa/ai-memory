@@ -47,6 +47,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -316,6 +318,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_a,
             workspace_id: ws,
             project_id: scratch,
@@ -329,6 +332,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_a,
                 workspace_id: ws,
                 project_id: scratch,
@@ -348,6 +352,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_b,
             workspace_id: ws,
             project_id: scratch,
@@ -361,6 +366,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_b,
                 workspace_id: ws,
                 project_id: scratch,

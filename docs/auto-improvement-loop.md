@@ -344,6 +344,7 @@ min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
 max_patchable_pages = 8
+patchable_page_prefixes = ["_rules/", "procedures/"]
 max_patchable_body_chars = 8000
 max_edits_per_proposal = 5
 max_edit_content_chars = 4000
@@ -364,6 +365,35 @@ interval_secs = 3600          # 0 disables background review only
 max_sessions_per_tick = 1       # per project; ticks process projects sequentially
 min_session_age_secs = 600
 ```
+
+### Which pages the reviewer can actually read
+
+`patchable_page_prefixes` decides which folders' **page bodies** are sent to the
+reviewer. Everything else in the project reaches it through the recent-page list
+as a single line — path, title, kind, updated_at — with no content.
+
+That matters because the reviewer cannot avoid duplicating what it cannot read.
+A project that keeps its invariants in `decisions/` or `gotchas/`, with no
+`_rules/` pages at all, sends **no page bodies**, and the model will keep
+proposing rules that are already written down — often with high confidence,
+because the claim really is well evidenced by the session.
+
+The default is the historical pair, so existing installations are unchanged. Add
+the folders where your durable knowledge actually lives:
+
+```toml
+patchable_page_prefixes = ["_rules/", "procedures/", "decisions/", "gotchas/"]
+```
+
+Prefixes are matched against the start of the page path and should end with `/`,
+so `decisions/` does not also match `decisions-archive/`. An empty list disables
+page-body context entirely; an empty string in the list is ignored rather than
+matching every page.
+
+Note that `max_patchable_pages` still bounds how many of the matching pages are
+sent, and the recent-page list they are drawn from is ordered by recency, so a
+project with heavy `sessions/` churn may still crowd out durable pages.
+
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
 background review. `[auto_improve] require_approval` controls whether validated
@@ -429,6 +459,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `ai-memory pending-writes diff <id>` | Show markdown diff. |
 | `ai-memory pending-writes approve <id>` | Apply through the normal wiki mutation path. |
 | `ai-memory pending-writes reject <id>` | Discard proposal with audit trail. |
+| `GET {web_slug}/pending` | Root-only browser page. It lists pending proposals across all projects, with a project filter and a sort. Approve and reject post to the `/admin/pending-writes/{id}/approve\|reject` routes with the session cookie and the CSRF header. |
 
 Pending proposals should be visible as markdown under `_pending/auto-improve/`
 so humans can review them in the wiki/Obsidian workflow. SQLite can still hold

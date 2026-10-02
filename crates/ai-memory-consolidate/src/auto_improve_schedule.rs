@@ -662,6 +662,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: before_startup_init,
                     workspace_id: ws,
                     project_id,
@@ -692,6 +693,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: ws,
                     project_id,
@@ -829,6 +831,7 @@ mod tests {
             store
                 .writer
                 .begin_session(ai_memory_core::NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: ws,
                     project_id: project,
@@ -955,6 +958,7 @@ mod tests {
         store
             .writer
             .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: project,
@@ -1074,6 +1078,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -1088,6 +1093,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,

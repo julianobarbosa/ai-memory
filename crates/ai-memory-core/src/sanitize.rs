@@ -343,13 +343,51 @@ impl<T> Sanitized<T> {
 
 impl Sanitized<NewObservation> {
     /// Apply the privacy strip to an observation's title + body, then enforce
-    /// the universal durable-body ceiling after redaction.
+    /// the universal durable-body ceiling and the title display cap after
+    /// redaction.
+    ///
+    /// Scrub-then-truncate, for both fields, in that order. Truncating first
+    /// (as `ai-memory-hooks::payload` used to do for `title_hint`, before
+    /// #980) can cut a secret in half before the sanitizer ever sees it: the
+    /// stored prefix is often too short to match a pattern, so the fragment
+    /// lands in the title unredacted. Scrubbing first also means a
+    /// `[REDACTED:…]` marker is already in place before the length cap runs,
+    /// same as the body.
     #[must_use]
     pub fn new(mut obs: NewObservation, sanitizer: &Sanitizer) -> Self {
-        obs.title = sanitizer.scrub(&obs.title);
+        obs.title = truncate_for_title(&sanitizer.scrub(&obs.title));
         obs.body =
             truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
         Self(obs)
+    }
+}
+
+/// Cap a (single-line) title to at most 80 displayed characters, appending an
+/// ellipsis when the input is longer. Applied by [`Sanitized::new`] to
+/// `NewObservation::title` — after redaction, not before, so a secret that
+/// straddles the cutoff is never stored half-redacted (see #980). Callers
+/// that build a title hint upstream of sanitization (`ai-memory-hooks`) must
+/// reduce it to a single line themselves; this function does not strip
+/// newlines, mirroring [`truncate_utf8_bytes`], which does not either.
+///
+/// Known cosmetic gap: running after redaction fixes the security bug
+/// (the secret itself is already gone by the time this runs), but a plain
+/// char-count cutoff can still land inside a `[REDACTED:…]` marker the
+/// scrubber just inserted, truncating it to something like `[REDACTE…`. A
+/// title long enough to need this cap, ending in a marker, reproduces it
+/// (see the `issue_980_user_prompt_title_is_sanitized_before_truncated` test
+/// in `ai-memory-hooks::router`, which observes exactly this). Left
+/// unhandled deliberately: no secret material leaks, and centering the cap
+/// on marker boundaries would add real complexity for a display nicety.
+#[must_use]
+pub fn truncate_for_title(s: &str) -> String {
+    const MAX: usize = 80;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let mut buf: String = s.chars().take(MAX - 1).collect();
+        buf.push('…');
+        buf
     }
 }
 
@@ -808,6 +846,7 @@ mod tests {
     #[test]
     fn observation_round_trip() {
         let raw = NewObservation {
+            occurred_at: None,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
@@ -826,6 +865,7 @@ mod tests {
     #[test]
     fn observation_boundary_caps_after_sanitizing_without_splitting_utf8() {
         let raw = NewObservation {
+            occurred_at: None,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
@@ -849,6 +889,47 @@ mod tests {
         assert!(scrubbed.body.contains("[truncated"));
     }
 
+    /// Regression for #980: a secret matched only by an operator's
+    /// `[sanitize] extra_patterns` rule must be redacted in the title even
+    /// when the raw title is long enough to need the 80-char cap — proving
+    /// `Sanitized::new` scrubs `title` before truncating it, the same order
+    /// the body already used. See `issue_980_user_prompt_title_is_sanitized_
+    /// before_truncated` in `ai-memory-hooks::router` for the full pipeline
+    /// (payload extraction -> router -> here) this guards end to end.
+    #[test]
+    fn title_is_scrubbed_before_the_80_char_cap_runs() {
+        let sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"CANARY-[0-9]{20,}".to_string()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("CANARY-{}", "9".repeat(25));
+        let raw = NewObservation {
+            occurred_at: None,
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: format!("{} {secret}", "x".repeat(70)),
+            body: String::new(),
+            importance: 5,
+        };
+        let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
+        assert!(
+            !scrubbed.title.contains(&secret),
+            "raw secret survived scrub+cap: {:?}",
+            scrubbed.title
+        );
+        assert!(
+            scrubbed.title.contains("REDACT"),
+            "title lost all trace of redaction: {:?}",
+            scrubbed.title
+        );
+        assert!(scrubbed.title.chars().count() <= 80);
+    }
+
     #[test]
     fn utf8_truncation_reserves_the_ellipsis_inside_the_cap() {
         let truncated = truncate_utf8_bytes("abcééé", 7);
@@ -856,6 +937,46 @@ mod tests {
         assert_eq!(truncated.len(), 6);
         assert_eq!(truncate_utf8_bytes("unchanged", 9), "unchanged");
         assert!(truncate_utf8_bytes("large", 2).is_empty());
+    }
+
+    /// Moved from `ai-memory-hooks::payload` (see #980): the char-count cap
+    /// and ellipsis behaviour are unchanged from the original
+    /// `payload::truncate_for_title`, only *where* and *when* it runs moved.
+    #[test]
+    fn title_truncation_caps_at_80_chars_with_ellipsis() {
+        let short = "a short title";
+        assert_eq!(truncate_for_title(short), short);
+
+        let exactly_80 = "x".repeat(80);
+        assert_eq!(truncate_for_title(&exactly_80), exactly_80);
+
+        let long = "x".repeat(200);
+        let truncated = truncate_for_title(&long);
+        assert_eq!(truncated.chars().count(), 80);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(&truncated[..79], &"x".repeat(79));
+    }
+
+    /// Char-count truncation must never split a multi-byte code point, even
+    /// though it counts *characters*, not bytes, unlike [`truncate_utf8_bytes`].
+    #[test]
+    fn title_truncation_is_utf8_safe_on_multibyte_input() {
+        // 100 é's (each 2 bytes in UTF-8): a byte-oriented cap at 80 would
+        // risk landing mid-codepoint; a char-oriented cap never can.
+        let input = "é".repeat(100);
+        let truncated = truncate_for_title(&input);
+        assert_eq!(truncated.chars().count(), 80);
+        assert!(truncated.ends_with('…'));
+        // Every remaining char before the ellipsis is a complete `é`.
+        assert!(
+            truncated[..truncated.len() - '…'.len_utf8()]
+                .chars()
+                .all(|c| c == 'é')
+        );
+        // The string is valid UTF-8 by construction (it's a `String`), but
+        // assert the byte length is exactly what 79 `é`s + one `…` costs,
+        // as a belt-and-suspenders check that nothing was sliced mid-byte.
+        assert_eq!(truncated.len(), 79 * 'é'.len_utf8() + '…'.len_utf8());
     }
 
     #[test]

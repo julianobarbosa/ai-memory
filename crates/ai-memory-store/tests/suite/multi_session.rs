@@ -17,10 +17,14 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, IdentityKey, NewHandoff, NewPage, NewSession,
-    OwnerFilter, PagePath, ProjectId, SessionId, Tier, WorkspaceId, owner_stamp,
+    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
+    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
+    owner_stamp,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
+    WorkstreamSelection,
+};
 
 fn operator(name: &str) -> String {
     IdentityKey::User(name.into()).storage_key()
@@ -52,6 +56,7 @@ async fn open_session(
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id,
             workspace_id: ws,
             project_id: proj,
@@ -109,7 +114,7 @@ async fn one_operators_page_is_readable_by_another_in_the_same_project() {
     // Carol's read of the same project: no owner coordinate involved.
     let hits = store
         .reader
-        .search_pages("SQLite".to_string(), 10)
+        .search_pages("SQLite".to_string(), 10, None)
         .await
         .unwrap();
 
@@ -128,6 +133,74 @@ async fn one_operators_page_is_readable_by_another_in_the_same_project() {
         .unwrap()
         .expect("the page resolves by path for any reader");
     assert!(body.body.contains("We picked SQLite"));
+}
+
+/// The stronger form of the collaboration guarantee: the existing sibling
+/// test writes with `author_id: None`, so it cannot tell an "authored pages
+/// are private" regression from a genuine bug — a filter keyed on the
+/// caller's identity would happily let a NULL-authored page through. This
+/// stamps a real, non-null `author_id` (operator A) and asserts operator B —
+/// a *different* identity, reading with no owner coordinate at all, exactly
+/// as `search_pages_for_project` and `page_body_by_ids` are shaped — still
+/// sees the page in full, through both the search path and the direct-body
+/// path. `pages.author_id` is attribution, never a read filter.
+#[tokio::test]
+async fn an_authored_page_is_readable_by_a_different_operator_via_search_and_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let operator_a = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "operator-a".into(),
+                name: Some("Operator A".into()),
+                email: Some("operator-a@example.com".into()),
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(NewPage {
+            author_id: Some(operator_a),
+            ..page(
+                ws,
+                proj,
+                "decisions/0002.md",
+                "Chose SQLite Again",
+                "We picked SQLite for the derived index, authored by operator A.",
+            )
+        })
+        .await
+        .unwrap();
+
+    // Operator B's read: no owner coordinate passed anywhere, because none of
+    // these signatures accept one — that absence IS the invariant.
+    let hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "SQLite Again".to_string(), 10, None)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.path.as_str() == "decisions/0002.md"),
+        "an authored page must be visible to a different operator's search; \
+         got {:?}",
+        hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>()
+    );
+
+    let body = store
+        .reader
+        .page_body_by_ids(ws, proj, "decisions/0002.md")
+        .await
+        .unwrap()
+        .expect("a different operator can still resolve the page by path");
+    assert!(body.body.contains("authored by operator A"));
 }
 
 /// Two harnesses editing the same page keep both versions.
@@ -357,4 +430,687 @@ async fn an_owned_handoff_stays_with_its_owner_while_pages_stay_shared() {
         "carol must not be able to accept a baton owned by {}",
         operator("alice")
     );
+}
+
+/// Grok reuses one session id across a SessionEnd→restart, so
+/// `accept_handoff` must reopen an already-ended receiver session instead of
+/// rejecting it (#840) — but only *after* the exactly-once claim guard, so the
+/// resurrection can never become a way to steal an already-taken baton.
+#[tokio::test]
+async fn accept_reopens_an_ended_receiver_session_but_keeps_claim_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::Grok,
+            to_agent: None,
+            from_session_id: None,
+            summary: "resume after restart".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Grok,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    // The same Grok session id: opened, then ended (SessionEnd), then reused
+    // when the conversation restarts and calls its first tool.
+    let grok = open_session(&store, ws, proj, AgentKind::Grok).await;
+    store.writer.end_session(grok, None).await.unwrap();
+
+    let claimed = store.writer.accept_handoff(accept(grok)).await.unwrap();
+    assert!(
+        claimed,
+        "an ended session that reuses its id must be able to accept the handoff"
+    );
+
+    // The receiver row was reopened (ended_at cleared), not left a corpse.
+    let grok_bytes = grok.as_bytes().to_vec();
+    let ended_at: Option<i64> = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                rusqlite::params![grok_bytes],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        ended_at.is_none(),
+        "accepting a handoff must reopen the ended receiver session"
+    );
+
+    // Claim-once still holds: a *different* session cannot steal the baton the
+    // reopened session already took, even though the loser is wide open.
+    let loser = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let stolen = store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            handoff_id: id,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::Codex,
+            accepting_session: Some(loser),
+            accepting_user: None,
+            owner_filter: OwnerFilter::Any,
+            receiving_cwd: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !stolen,
+        "the resurrection path must not let a second session steal an accepted baton"
+    );
+}
+
+/// Parallel live sessions in one directory each own a turn-checkpoint baton.
+/// One session's checkpoint, and a receiver claiming it, must leave the other
+/// live session's baton open: before this held, every completed turn retired
+/// the other sessions' batons and the survivor went to whoever started next.
+#[tokio::test]
+async fn parallel_live_sessions_keep_their_own_checkpoint_batons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let baton = |session: SessionId, summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: Some(session),
+        from_agent: AgentKind::OpenCode,
+        to_agent: None,
+        cwd: Some("/repo".into()),
+        summary: summary.into(),
+        open_questions: Vec::new(),
+        next_steps: Vec::new(),
+        files_touched: Vec::new(),
+        owner_user: None,
+    };
+    let alpha = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let beta = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let alpha_baton = store
+        .writer
+        .checkpoint_session_handoff(baton(alpha, "alpha"))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let beta_baton = store
+        .writer
+        .checkpoint_session_handoff(baton(beta, "beta"))
+        .await
+        .unwrap()
+        .unwrap();
+    let state = |id| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .handoff_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state
+        }
+    };
+    assert_eq!(state(alpha_baton).await, HandoffState::Open);
+
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let claimed = store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            handoff_id: beta_baton,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::OpenCode,
+            accepting_session: Some(receiver),
+            accepting_user: None,
+            owner_filter: OwnerFilter::Any,
+            receiving_cwd: Some("/repo".into()),
+        })
+        .await
+        .unwrap();
+    assert!(claimed);
+    assert_eq!(
+        state(alpha_baton).await,
+        HandoffState::Open,
+        "claiming one live session's baton must not sweep another's"
+    );
+
+    // Once alpha ends, its baton is an ordinary SessionEnd baton again and the
+    // same-cwd supersession applies to it.
+    store.writer.end_session(alpha, None).await.unwrap();
+    let gamma = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    store
+        .writer
+        .checkpoint_session_handoff(baton(gamma, "gamma"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state(alpha_baton).await, HandoffState::Expired);
+}
+
+/// Automatic delivery re-checks the source inside the claim, and the claim's
+/// sweep retires batons of quiet (abandoned) open sessions while sparing one
+/// still in use. The selection runs on a reader before the writer claims, so
+/// a source can resume in between; and OpenCode sessions that never end would
+/// otherwise leave one open baton each, surfacing older conversations one by
+/// one to later sessions.
+#[tokio::test]
+async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let mut batons = Vec::new();
+    // Checkpoint order, oldest first: busy, abandoned, quiet.
+    for summary in ["busy", "abandoned", "quiet"] {
+        let session = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: summary.into(),
+                    importance: 5,
+
+                    occurred_at: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .checkpoint_session_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(session),
+                from_agent: AgentKind::OpenCode,
+                to_agent: None,
+                cwd: Some("/repo".into()),
+                summary: summary.into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        batons.push((session, id));
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let [
+        (_, busy),
+        (abandoned_session, abandoned),
+        (quiet_session, quiet),
+    ] = batons[..]
+    else {
+        unreachable!()
+    };
+    // Only "busy" captured anything in the last hour.
+    let hour_ago = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)).as_microsecond();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    for session in [abandoned_session, quiet_session] {
+        conn.execute(
+            "UPDATE observations SET created_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![hour_ago, session.as_bytes()],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let claim = |handoff_id, receiver| HandoffAcceptance {
+        handoff_id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::OpenCode,
+        accepting_session: Some(receiver),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: Some("/repo".into()),
+    };
+    let state = |id| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .handoff_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state
+        }
+    };
+
+    // Selected earlier, but its source is in use by the time of the claim.
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let raced = store
+        .writer
+        .accept_startup_context(Some(claim(busy, receiver)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(!raced.handoff_accepted, "a source in use keeps its baton");
+    assert_eq!(state(busy).await, HandoffState::Open);
+
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let delivered = store
+        .writer
+        .accept_startup_context(Some(claim(quiet, receiver)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(delivered.handoff_accepted);
+    assert_eq!(
+        state(abandoned).await,
+        HandoffState::Expired,
+        "an older baton of a quiet open session is superseded"
+    );
+    assert_eq!(
+        state(busy).await,
+        HandoffState::Open,
+        "a session in use keeps its baton even when it is older"
+    );
+}
+
+/// Two workstreams launched at once in one checkout each get a managed run.
+/// A session one run's child links marks that run only: the other run's
+/// status must neither report it nor count as linked, or its launcher would
+/// import the other launch's transcript.
+#[tokio::test]
+async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let prepare = |name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run(prepare("alpha"))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run(prepare("beta"))
+        .await
+        .unwrap();
+    assert_ne!(alpha.workstream_id, beta.workstream_id);
+    let status = async |run| {
+        let status = store.reader.managed_run_status(run).await.unwrap().unwrap();
+        (status.native_session_id, status.native_session_linked)
+    };
+
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(beta.run_id, AgentKind::Codex, "native-beta")
+            .await
+            .unwrap()
+    );
+    assert_eq!(status(alpha.run_id).await, (None, false));
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
+    );
+
+    // Control: alpha's own link marks alpha, and leaves beta as it was.
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(alpha.run_id, AgentKind::Codex, "native-alpha")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        status(alpha.run_id).await,
+        (Some("native-alpha".into()), true)
+    );
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
+    );
+}
+
+/// Stale-run recovery is a scoped, owned, single-candidate operation. The
+/// controls prove that the same candidate is usable once every boundary
+/// matches, while foreign owners/projects and a second linker cannot take it.
+#[tokio::test]
+async fn stale_codex_run_recovery_cannot_cross_project_owner_or_session_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id,
+        repo_fingerprint: format!("repo-{project_id}"),
+        worktree_fingerprint: format!("worktree-{project_id}"),
+        cwd: format!("/repo/{project_id}"),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+
+    let stale = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "stale"), Some(alice.clone()))
+        .await
+        .unwrap();
+    assert!(store.writer.cancel_managed_run(stale.run_id).await.unwrap());
+    let current = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "current"), Some(alice.clone()))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .prepare_workstream_run_owned(prepare(other_proj, "foreign"), Some(alice.clone()))
+        .await
+        .unwrap();
+
+    let recover = |project_id, owner: Option<String>, native: &'static str| {
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: stale.run_id,
+                workspace_id: ws,
+                project_id,
+                cwd: format!("/repo/{project_id}"),
+                agent: AgentKind::Codex,
+                native_session_id: native.into(),
+                owner_user: owner,
+            })
+    };
+    assert_eq!(
+        recover(proj, Some(bob), "native-bob").await.unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a second operator must not see Alice's candidate"
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: stale.run_id,
+                workspace_id: ws,
+                project_id: proj,
+                cwd: "/repo/a-different-worktree".into(),
+                agent: AgentKind::Codex,
+                native_session_id: "native-other-worktree".into(),
+                owner_user: Some(alice.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a run in another checkout cwd must not be adopted"
+    );
+    assert_eq!(
+        recover(other_proj, Some(alice.clone()), "native-foreign")
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Adopted(foreign.run_id),
+        "the same owner may recover only the candidate in the named project"
+    );
+    assert_eq!(
+        recover(proj, Some(alice.clone()), "native-alice")
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Adopted(current.run_id)
+    );
+    assert_eq!(
+        recover(proj, Some(alice), "native-thief").await.unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a linked run cannot be rebound by a racing SessionStart"
+    );
+    let current_status = store
+        .reader
+        .managed_run_status(current.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current_status.native_session_id.as_deref(),
+        Some("native-alice")
+    );
+}
+
+/// Forced lease recovery is deliberately narrower than project write access:
+/// the same operator can recover their own abandoned launcher, while another
+/// operator in the same project cannot evict it. The old run becomes terminal
+/// in the same transaction that creates the replacement.
+#[tokio::test]
+async fn force_unlock_replaces_only_the_same_operators_active_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |lease_owner: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::Current,
+        lease_owner: lease_owner.into(),
+    };
+
+    let abandoned = store
+        .writer
+        .prepare_workstream_run_owned(prepare("alice:1"), Some(alice.clone()))
+        .await
+        .unwrap();
+    let refused = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("bob:2"), Some(bob), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, StoreError::WorkstreamBusy(_)));
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "a refused cross-owner takeover must leave the original lease active"
+    );
+
+    let replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("alice:3"), Some(alice.clone()), true)
+        .await
+        .unwrap();
+    assert_ne!(replacement.run_id, abandoned.run_id);
+    assert!(
+        !store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "the replaced run must be terminal"
+    );
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(replacement.run_id)
+            .await
+            .unwrap(),
+        "the replacement is the sole live control"
+    );
+
+    let solo = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("solo".into()),
+                ..prepare("solo:1")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let solo_replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::Named("solo".into()),
+                ..prepare("solo:2")
+            },
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(solo_replacement.run_id, solo.run_id);
+}
+
+/// Two launches in one repository are a real possibility when the operator
+/// uses separate named workstreams. Recovery must refuse to guess between
+/// them, and an active foreign id must not be treated as a stale trigger.
+#[tokio::test]
+async fn stale_codex_run_recovery_fails_closed_on_ambiguity_and_active_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app", None)
+        .await
+        .unwrap();
+    let owner = operator("alice");
+    let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id,
+        repo_fingerprint: format!("repo-{project_id}"),
+        worktree_fingerprint: format!("worktree-{project_id}"),
+        cwd: format!("/repo/{project_id}"),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "alpha"), Some(owner.clone()))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "beta"), Some(owner.clone()))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .prepare_workstream_run_owned(prepare(other_proj, "foreign"), Some(owner.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: ai_memory_core::ManagedRunId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                cwd: format!("/repo/{proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-ambiguous".into(),
+                owner_user: Some(owner.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Ambiguous
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: alpha.run_id,
+                workspace_id: ws,
+                project_id: other_proj,
+                cwd: format!("/repo/{other_proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-cross-project".into(),
+                owner_user: Some(owner.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused,
+        "an active run with a mismatched boundary must not trigger adoption"
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: foreign.run_id,
+                workspace_id: ws,
+                project_id: other_proj,
+                cwd: format!("/repo/{other_proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-control".into(),
+                owner_user: Some(owner),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(foreign.run_id)
+    );
+    for run_id in [alpha.run_id, beta.run_id] {
+        assert!(
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none()
+        );
+    }
 }

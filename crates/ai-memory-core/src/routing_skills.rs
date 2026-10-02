@@ -14,6 +14,8 @@ pub const AGENTS_SKILL_DIR: &str = ".agents";
 pub const DEVIN_SKILL_DIR: &str = ".devin";
 /// Grok Build CLI Agent Skill directory below a project or home root.
 pub const GROK_SKILL_DIR: &str = ".grok";
+/// Hermes Agent Skill directory below a project or home root.
+pub const HERMES_SKILL_DIR: &str = ".hermes";
 /// Leaf directory that contains individual Agent Skill directories.
 pub const SKILLS_DIR: &str = "skills";
 

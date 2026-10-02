@@ -21,13 +21,19 @@
 //! This crate does not read process environment directly; server configuration
 //! is resolved once by `ai-memory-cli` and threaded in as typed state.
 
+pub mod antigravity;
 mod assistant_capture;
 pub mod capture_policy;
+mod grants;
 pub mod log;
 pub mod payload;
 pub mod router;
 pub mod synth;
 pub mod workstream;
+
+pub use antigravity::{
+    MAX_ANTIGRAVITY_OUTPUT_BYTES, enrich_antigravity_step_output, is_output_eligible,
+};
 
 // Re-export the sanitizer types from core so callers that grew up
 // pointing at this crate's `sanitize` module keep working.
@@ -41,7 +47,7 @@ pub use assistant_capture::{
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
     CaptureProtocol, CaptureSource, ExtractionState, PolicyState, ToolFamily,
-    repository_admits_capture,
+    describe_invalid_capture_config, repository_admits_capture,
 };
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,

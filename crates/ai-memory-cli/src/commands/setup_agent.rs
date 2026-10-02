@@ -9,14 +9,16 @@
 //!
 //! `setup-agent` bundles the extract + render into one command:
 //!
-//!     docker run --rm \
-//!       -v "$HOME/.ai-memory:/host" \
-//!       akitaonrails/ai-memory:latest \
-//!       setup-agent \
-//!         --agent claude-code \
-//!         --to /host/hooks \
-//!         --host-prefix "$HOME/.ai-memory/hooks" \
-//!         --auth-token "$TOKEN"
+//! ```text
+//! docker run --rm \
+//!   -v "$HOME/.ai-memory:/host" \
+//!   akitaonrails/ai-memory:latest \
+//!   setup-agent \
+//!     --agent claude-code \
+//!     --to /host/hooks \
+//!     --host-prefix "$HOME/.ai-memory/hooks" \
+//!     --auth-token "$TOKEN"
+//! ```
 //!
 //! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.{sh,ps1}` into
 //!    `/host/hooks/claude-code/` (which on the host is
@@ -80,6 +82,12 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     }
     if matches!(args.agent, AgentChoice::Zcode) {
         emit_zcode(&args)?;
+        return Ok(());
+    }
+    // Hermes also runs the native `hook` command directly (no shell), so there
+    // are no scripts to stage — setup-agent prints the YAML block instead.
+    if matches!(args.agent, AgentChoice::Hermes) {
+        emit_hermes(&args)?;
         return Ok(());
     }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
@@ -174,7 +182,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Omp
         | AgentChoice::Openclaw
         | AgentChoice::Zero
-        | AgentChoice::Zcode => {
+        | AgentChoice::Zcode
+        | AgentChoice::Hermes => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -240,6 +249,35 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
     println!("#       sessions with `ai-memory finalize-session --agent zcode`.");
     println!();
     println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks:` block for `~/.hermes/config.yaml` (the follow-up to
+/// #623, where Hermes was accepted for capture/storage but had no installer).
+/// No scripts are staged: Hermes splits the configured `command` itself and
+/// runs the ai-memory binary directly with the JSON payload on stdin. The
+/// binary must be reachable on the host that runs Hermes — for docker-wrapper
+/// setups install the native binary or point `command` at the wrapper.
+fn emit_hermes(args: &SetupAgentArgs) -> Result<()> {
+    let block = crate::commands::render_shared::build_hermes_hooks_yaml(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    println!("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml");
+    println!("# The `command` must be an ai-memory binary reachable on the host that");
+    println!("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from");
+    println!("# that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat the config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Hermes splits each `command` with shlex.split and runs it with");
+    println!("#       no shell, so the generated line is argv, not a shell command.");
+    println!("# NOTE: tool observations only — session lifecycle stays with the");
+    println!("#       ai-memory memory-provider plugin.");
+    println!();
+    println!("{block}");
     Ok(())
 }
 
@@ -545,12 +583,12 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
     if let Some(exe) = exe {
         // Release tarball: `hooks/` sits in the same dir as the binary.
         if let Some(dir) = exe.parent() {
-            v.push(dir.join("hooks").join(sub));
+            v.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
         // Repo-local fallback for `cargo run setup-agent` during dev:
         // target/<profile>/<bin> → repo root.
         if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-            v.push(root.join("hooks").join(sub));
+            v.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
     }
     v

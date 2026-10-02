@@ -14,7 +14,10 @@
 //! (sessions/observations/handoffs) are dropped by the purge.
 
 use super::common::{post, spawn_capture_hook};
-use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, Sanitized,
+    Sanitizer, SessionId, Tier,
+};
 use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
@@ -49,6 +52,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -80,6 +85,8 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -453,6 +460,8 @@ async fn move_project_carries_source_embedding() {
         embedder: Some(embedder),
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -585,6 +594,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid,
             workspace_id: src_ws,
             project_id: src_proj,
@@ -598,6 +608,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid,
                 workspace_id: src_ws,
                 project_id: src_proj,
@@ -744,6 +755,8 @@ async fn true_move_notifies_admission_with_destination_names() {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -800,6 +813,8 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         embedder: Some(embedder),
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -1029,6 +1044,8 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -1527,6 +1544,8 @@ async fn true_move_aborts_when_admission_rejects() {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -1624,6 +1643,8 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -1738,6 +1759,8 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -1965,6 +1988,743 @@ async fn delete_workspace_unknown_is_404() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A preview must report the same counts a confirmed delete right after it
+/// then produces — every numeric field plus `workstream_ids`, not a
+/// hand-picked subset — and must not touch the database row, the wiki
+/// directory, or a managed workstream's raw segment directory in the
+/// meantime (a regression that made preview call
+/// `remove_workstream_segment_storage` would fail the raw-dir assertions
+/// below). Mirrors
+/// `purge_project_dry_run_reports_the_same_counts_the_confirmed_purge_will`
+/// one level up, at workspace granularity.
+#[tokio::test]
+async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_will() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("victim")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "proj", None)
+        .await
+        .unwrap();
+    let page_id = state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/a.md".to_string()).unwrap(),
+            frontmatter: json!({"title": "notes/a.md"}),
+            body: "body".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("notes/a.md".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "obs".into(),
+                body: "obs body".into(),
+                importance: 5,
+
+                occurred_at: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: Some(sid),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .store_embeddings(vec![ai_memory_store::EmbeddingWrite {
+            page_id,
+            vector_bytes: vec![0u8; 4],
+            provider: "test".into(),
+            model: "model".into(),
+            dim: 1,
+        }])
+        .await
+        .unwrap();
+
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id: ws,
+            project_id: proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .cancel_managed_run(prepared.run_id)
+            .await
+            .unwrap()
+    );
+    let raw_dir = tmp
+        .path()
+        .join("raw/workstreams")
+        .join(prepared.workstream_id.to_string());
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::write(raw_dir.join("000001.jsonl"), "event\n").unwrap();
+
+    let ws_dir = state.wiki.root().join(ws.to_string());
+    assert!(
+        ws_dir.exists(),
+        "the workspace directory must exist before either call"
+    );
+    assert!(
+        raw_dir.exists(),
+        "the raw workstream segment directory must exist before either call"
+    );
+
+    let preview = post(
+        state.clone(),
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK, "a preview must succeed");
+    let preview_body = body_json(preview).await;
+    assert_eq!(preview_body["dry_run"], true);
+    assert_eq!(preview_body["projects_deleted"], 1);
+    assert_eq!(preview_body["pages_deleted"], 1);
+    assert_eq!(preview_body["sessions_deleted"], 1);
+    assert_eq!(preview_body["observations_deleted"], 1);
+    assert_eq!(preview_body["handoffs_deleted"], 1);
+    assert_eq!(preview_body["embeddings_deleted"], 1);
+    assert_eq!(preview_body["collateral_observations_deleted"], 0);
+    assert_eq!(preview_body["collateral_handoffs_denulled"], 0);
+    assert_eq!(preview_body["workstreams_deleted"], 1);
+    assert_eq!(preview_body["managed_runs_deleted"], 1);
+    assert_eq!(
+        preview_body["workstream_ids"],
+        json!([prepared.workstream_id.to_string()])
+    );
+    assert_eq!(preview_body["files_deleted"], json!([]));
+    assert_eq!(preview_body["files_failed"], json!([]));
+    assert_eq!(preview_body["compacted"], false);
+    assert!(
+        preview_body.get("pre_checkpoint").is_none(),
+        "a preview must not checkpoint the wiki tree"
+    );
+    assert!(
+        preview_body.get("checkpoint").is_none(),
+        "a preview must not checkpoint the wiki tree"
+    );
+
+    // Nothing was touched: the workspace directory, the raw workstream
+    // segment directory, and the workspace row are all still there.
+    assert!(
+        ws_dir.exists(),
+        "a preview must not remove the workspace directory"
+    );
+    assert!(
+        raw_dir.exists(),
+        "a preview must not remove the raw workstream segment directory"
+    );
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "a preview must not delete the workspace row"
+    );
+
+    // The confirmed delete right after it must succeed with the same counts.
+    let confirmed = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true }),
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = body_json(confirmed).await;
+    assert_eq!(
+        confirmed_body.get("dry_run"),
+        None,
+        "a confirmed delete report has no dry_run key"
+    );
+    for field in [
+        "projects_deleted",
+        "pages_deleted",
+        "sessions_deleted",
+        "observations_deleted",
+        "handoffs_deleted",
+        "embeddings_deleted",
+        "collateral_observations_deleted",
+        "collateral_handoffs_denulled",
+        "workstreams_deleted",
+        "managed_runs_deleted",
+        "workstream_ids",
+    ] {
+        assert_eq!(
+            confirmed_body[field], preview_body[field],
+            "the confirmed delete's {field} must match what the preview reported"
+        );
+    }
+    assert!(
+        !ws_dir.exists(),
+        "the confirmed delete must remove the workspace directory"
+    );
+    assert!(
+        !raw_dir.exists(),
+        "the confirmed delete must remove the raw workstream segment directory"
+    );
+}
+
+/// `dry_run` must always win over `force`. A caller must never be able to
+/// combine `dry_run: true` with `force: true` and get a real delete — mirrors
+/// `purge_project_confirm_true_and_dry_run_true_still_only_previews`.
+#[tokio::test]
+async fn delete_workspace_force_true_and_dry_run_true_still_only_previews() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+    let ws = store
+        .reader
+        .find_workspace("victim".into())
+        .await
+        .unwrap()
+        .expect("workspace exists");
+    let ws_dir = state.wiki.root().join(ws.to_string());
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["dry_run"], true,
+        "force: true must not defeat dry_run: true"
+    );
+    assert_eq!(body["projects_deleted"], 1);
+
+    // The only proof that matters: nothing was actually deleted.
+    assert!(
+        ws_dir.exists(),
+        "{{force: true, dry_run: true}} must not delete the workspace directory"
+    );
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "{{force: true, dry_run: true}} must not delete the workspace row"
+    );
+}
+
+/// A non-empty workspace previewed without `force` must still 409, exactly
+/// like the confirmed delete would — the preview promises to describe what a
+/// confirmed call would do, and a confirmed call would refuse here too.
+#[tokio::test]
+async fn delete_workspace_dry_run_refuses_non_empty_without_force() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a non-empty workspace preview without force must still 409"
+    );
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused preview must not remove the workspace"
+    );
+}
+
+/// A non-existent workspace must still 404 on a preview, exactly like the
+/// confirmed delete does.
+#[tokio::test]
+async fn delete_workspace_dry_run_nonexistent_workspace_returns_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "ghost", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A dry run must not dispatch the admission webhook: nothing was decided
+/// yet, so there is nothing for a mirror to act on. Mirrors
+/// `purge_project_dry_run_does_not_dispatch_admission_webhook`.
+#[tokio::test]
+async fn delete_workspace_dry_run_does_not_dispatch_admission_webhook() {
+    let (url, rx) = spawn_capture_hook().await;
+
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeWorkspace],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, chain).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+    assert!(
+        outcome.is_err(),
+        "a dry run must not dispatch the delete-workspace admission webhook"
+    );
+}
+
+/// The mirror of the incident, exercised through the HTTP route: deleting a
+/// workspace also collaterally deletes an observation stamped into a
+/// *different* workspace (because `observations.session_id` cascades
+/// regardless of the observation's own `workspace_id`), and orphans (nulls
+/// the session reference of, without deleting) a handoff that lives in that
+/// other workspace too. Mirrors
+/// `purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage_in_another_project`
+/// one level up, at workspace granularity.
+#[tokio::test]
+async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_damage_in_another_workspace()
+ {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let doomed_ws = store
+        .writer
+        .get_or_create_workspace("doomed")
+        .await
+        .unwrap();
+    let doomed_proj = store
+        .writer
+        .get_or_create_project(doomed_ws, "proj", None)
+        .await
+        .unwrap();
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(other_ws, "proj", None)
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid,
+            workspace_id: doomed_ws,
+            project_id: doomed_proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    // Collateral observation: session lives in `doomed`, observation is
+    // stamped into `other` (a different workspace).
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: other_ws,
+                project_id: other_proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "collateral".into(),
+                body: "collateral body".into(),
+                importance: 5,
+
+                occurred_at: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    // Collateral handoff: lives in `other`, authored by the `doomed` session.
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: other_ws,
+            project_id: other_proj,
+            from_session_id: Some(sid),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "collateral handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let preview = post(
+        state.clone(),
+        "/admin/delete-workspace",
+        json!({ "workspace": "doomed", "force": true, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview_body = body_json(preview).await;
+    assert_eq!(preview_body["collateral_observations_deleted"], 1);
+    assert_eq!(preview_body["collateral_handoffs_denulled"], 1);
+
+    let confirmed = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "doomed", "force": true }),
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = body_json(confirmed).await;
+    assert_eq!(confirmed_body["collateral_observations_deleted"], 1);
+    assert_eq!(confirmed_body["collateral_handoffs_denulled"], 1);
+
+    // `other` survives as a workspace; only the collateral rows are affected.
+    assert!(
+        store
+            .reader
+            .find_workspace("other".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "the other workspace must survive"
+    );
+    assert_eq!(
+        store.reader.status_counts().await.unwrap().observations,
+        0,
+        "the collateral observation in `other` must actually be gone"
+    );
+}
+
+/// Adversarial control: previewing workspace A must never count rows that
+/// live in workspace B, even though both hold a like-named project and B
+/// has its own full set of sessions/observations/handoffs. Also pins the
+/// reverse direction: a session that lives in B but stamps an observation
+/// directly into A must be counted in A's own `observations_deleted` (its
+/// row's own `workspace_id` is A), never in `collateral_observations_deleted`
+/// (which only counts rows whose own `workspace_id` is NOT A) — the two
+/// counts are mutually exclusive by construction (`workspace_id = ?1` vs
+/// `workspace_id != ?1`), so this proves there is no double count either.
+#[tokio::test]
+async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    // Workspace A: the one being previewed.
+    let ws_a = store
+        .writer
+        .get_or_create_workspace("workspace-a")
+        .await
+        .unwrap();
+    let proj_a = store
+        .writer
+        .get_or_create_project(ws_a, "proj", None)
+        .await
+        .unwrap();
+    seed_page(
+        &store,
+        &state.wiki,
+        "workspace-a",
+        "proj",
+        "notes/a.md",
+        "a",
+    )
+    .await;
+    let sid_a = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid_a,
+            workspace_id: ws_a,
+            project_id: proj_a,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_a,
+                workspace_id: ws_a,
+                project_id: proj_a,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "a-own".into(),
+                body: "a's own observation".into(),
+                importance: 5,
+
+                occurred_at: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws_a,
+            project_id: proj_a,
+            from_session_id: Some(sid_a),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "a's own handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    // Workspace B: two projects, its own full set of rows. None of this may
+    // ever be counted for a preview of A.
+    let ws_b = store
+        .writer
+        .get_or_create_workspace("workspace-b")
+        .await
+        .unwrap();
+    let proj_b1 = store
+        .writer
+        .get_or_create_project(ws_b, "proj", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws_b, "proj2", None)
+        .await
+        .unwrap();
+    seed_page(
+        &store,
+        &state.wiki,
+        "workspace-b",
+        "proj",
+        "notes/b.md",
+        "b",
+    )
+    .await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "workspace-b",
+        "proj2",
+        "notes/c.md",
+        "c",
+    )
+    .await;
+    let sid_b = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid_b,
+            workspace_id: ws_b,
+            project_id: proj_b1,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_b,
+                workspace_id: ws_b,
+                project_id: proj_b1,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "b-own".into(),
+                body: "b's own observation".into(),
+                importance: 5,
+
+                occurred_at: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws_b,
+            project_id: proj_b1,
+            from_session_id: Some(sid_b),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "b's own handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    // Reverse-direction case: B's session stamps an observation directly
+    // into A (own `workspace_id` = A). Must count as A's own, not collateral.
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_b,
+                workspace_id: ws_a,
+                project_id: proj_a,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "cross".into(),
+                body: "stamped into a by b's session".into(),
+                importance: 5,
+
+                occurred_at: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "workspace-a", "force": true, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["projects_deleted"], 1,
+        "must count only workspace-a's own project, not workspace-b's two"
+    );
+    assert_eq!(body["pages_deleted"], 1);
+    assert_eq!(
+        body["sessions_deleted"], 1,
+        "workspace-b's session must not be counted"
+    );
+    assert_eq!(
+        body["observations_deleted"], 2,
+        "a's own observation plus the one stamped into it by b's session"
+    );
+    assert_eq!(
+        body["handoffs_deleted"], 1,
+        "workspace-b's handoff must not be counted"
+    );
+    assert_eq!(
+        body["collateral_observations_deleted"], 0,
+        "the cross-stamped observation belongs to A itself and is not collateral"
+    );
+    assert_eq!(body["collateral_handoffs_denulled"], 0);
+
+    // Control: workspace-b's rows are untouched by the previewed workspace.
+    assert!(
+        store
+            .reader
+            .find_workspace("workspace-b".into())
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

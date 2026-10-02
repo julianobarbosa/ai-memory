@@ -39,7 +39,7 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
-fn encode_segment(segment: &str) -> String {
+pub(crate) fn encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {
@@ -280,6 +280,81 @@ pub(crate) struct SearchView {
 }
 
 // ---------------------------------------------------------------------------
+// pending.html / admin_required.html
+// ---------------------------------------------------------------------------
+
+/// One pending auto-improvement proposal on the triage page.
+pub(crate) struct PendingRow {
+    /// Proposal id; the page posts it to `/admin/pending-writes/{id}/…`.
+    pub id: String,
+    /// Workspace name, sent as the `workspace` query parameter.
+    pub workspace: String,
+    /// Project name, sent as the `project` query parameter.
+    pub project: String,
+    /// `workspace/project`, the filter value and display label.
+    pub scope_label: String,
+    /// Proposal category.
+    pub kind: String,
+    /// `create` or `update`.
+    pub operation: String,
+    /// Target wiki path.
+    pub target_path: String,
+    /// Link to the current page, for proposals that rewrite one.
+    pub target_href: String,
+    /// Proposal title.
+    pub title: String,
+    /// Reviewer confidence as a whole percentage.
+    pub confidence_pct: i64,
+    /// Humanised stage time.
+    pub staged_relative: String,
+    /// `full_page` or `patch`.
+    pub edit_mode: String,
+    /// Why the reviewer proposed this edit.
+    pub rationale: String,
+    /// Full proposed page body, shown as plain text.
+    pub body_markdown: String,
+    /// The target is under `_rules/`, which every agent session loads.
+    pub is_rule: bool,
+    /// The proposal rewrites an existing page.
+    pub rewrites_existing: bool,
+}
+
+/// One `<option>` in a triage-page filter.
+pub(crate) struct SelectOption {
+    /// Submitted value.
+    pub value: String,
+    /// Display text.
+    pub label: String,
+    /// Currently selected.
+    pub selected: bool,
+}
+
+/// View-model for `GET /pending`.
+#[derive(Template)]
+#[template(path = "pending.html")]
+pub(crate) struct PendingView {
+    /// Proposals after the project filter, in the chosen order.
+    pub rows: Vec<PendingRow>,
+    /// Project filter options, the "all projects" option first.
+    pub projects: Vec<SelectOption>,
+    /// Sort options.
+    pub sorts: Vec<SelectOption>,
+    /// Pending proposals across every project, before the filter.
+    pub total: u64,
+    /// Distinct projects with a pending proposal.
+    pub project_count: usize,
+    /// The selection held more pending proposals than the page reads.
+    pub truncated: bool,
+    /// The read cap, shown when `truncated`.
+    pub limit: usize,
+}
+
+/// View-model for a non-root session that opens a root-only page.
+#[derive(Template)]
+#[template(path = "admin_required.html")]
+pub(crate) struct AdminRequiredView {}
+
+// ---------------------------------------------------------------------------
 // not_found.html
 // ---------------------------------------------------------------------------
 
@@ -288,6 +363,27 @@ pub(crate) struct SearchView {
 #[template(path = "not_found.html")]
 pub(crate) struct NotFoundView {}
 
+// ---------------------------------------------------------------------------
+// login.html / change_password.html
+// ---------------------------------------------------------------------------
+
+/// View-model for `GET /login` (public builtin auth page).
+#[derive(Template)]
+#[template(path = "login.html")]
+pub(crate) struct LoginView {
+    /// Sanitised post-login redirect target (absolute path under the wiki root).
+    pub next: String,
+    /// Absolute path to the change-password page (for `must_change_password`).
+    pub change_password_href: String,
+}
+
+/// View-model for `GET /change-password` (public builtin auth page).
+#[derive(Template)]
+#[template(path = "change_password.html")]
+pub(crate) struct ChangePasswordView {
+    /// Sanitised post-change redirect target (absolute path under the wiki root).
+    pub next: String,
+}
 #[cfg(test)]
 mod tests {
     use super::*;

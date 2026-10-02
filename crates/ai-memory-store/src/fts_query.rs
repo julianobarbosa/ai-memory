@@ -6,6 +6,98 @@
 //! exist on the FTS tables. Unknown bare column syntax is neutralised without
 //! discarding deliberate FTS operators such as `OR`.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+/// Built-in English stopwords excluded from bare-query OR-joins when the
+/// operator has not configured `[search.fts] stopwords` at all (issue #953).
+/// Deliberately small and boring: high-document-frequency function words
+/// that carry no retrieval signal but dominate BM25 through term frequency.
+/// This is exactly the list `is_stopword` matched against before the
+/// filter became configurable, so an install that never touches
+/// `[search.fts]` sees byte-identical behaviour.
+pub const DEFAULT_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do",
+    "does", "for", "from", "had", "has", "have", "how", "i", "if", "in", "is", "it", "its", "me",
+    "my", "of", "on", "or", "our", "she", "should", "so", "that", "the", "their", "them", "they",
+    "this", "to", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will",
+    "with", "would", "you", "your",
+];
+
+/// Normalized stopword set used to filter bare natural-language FTS queries
+/// before the OR-join (see [`prepare_fts5_query`]).
+///
+/// Construction folds every entry to lowercase with [`str::to_lowercase`]
+/// (full Unicode case folding, not ASCII-only) so callers never have to
+/// pre-normalize a configured list, and comparison at match time folds the
+/// query token the same way. This matters specifically for the non-English
+/// installs this feature targets: the FTS content index itself is
+/// `unicode61 remove_diacritics 2`, so a page body indexes "É"/"é"/"e" as
+/// the same posting — an ASCII-only fold would make this filter weaker than
+/// the index it feeds, missing a sentence-initial "É" or an all-caps "NÃO"
+/// entirely. Folding does NOT strip diacritics, though: "à" and "a" stay
+/// distinct tokens here (unlike in the content index), because that would
+/// silently change the built-in English default (no accented entries) and
+/// because a stopword list should say precisely which spelling to drop.
+/// Concretely: what matters for this filter is how a query is actually
+/// TYPED, not how wiki content is spelled — content matches through the
+/// diacritic-folded index regardless, but a bare query's raw characters are
+/// all this filter ever sees. A configured list for an accented language
+/// should include both the accented and unaccented forms a user or agent
+/// might type (e.g. Portuguese `"e"` and `"é"`, `"nao"` and `"não"`).
+///
+/// Also note the filter runs on `raw.split_whitespace()` tokens, before any
+/// punctuation handling — an entry never matches a token with attached
+/// punctuation (`"de,"`, `"que?"`), the same limitation the built-in English
+/// list has always had (`"the,"` was never filtered either).
+///
+/// Cheap to clone (an `Arc`-shared set) so it can be threaded through a
+/// `'static` closure (e.g. `ReaderPool::with_conn`) without re-hashing the
+/// list on every search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsStopwords(Arc<HashSet<String>>);
+
+impl FtsStopwords {
+    /// Build from an explicit list of words, already validated by the
+    /// caller (`ai-memory-cli`'s `Config::load` bounds list size and entry
+    /// length for `search.fts.stopwords`, issue #953). Entries are folded
+    /// to lowercase here (see the struct doc for the exact fold) so this is
+    /// the single place normalization happens.
+    #[must_use]
+    pub fn new<I, S>(words: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self(Arc::new(
+            words
+                .into_iter()
+                .map(|w| w.as_ref().to_lowercase())
+                .collect(),
+        ))
+    }
+
+    /// No filtering at all: every token survives the OR-join. This is what
+    /// an explicit `stopwords = []` in `config.toml` selects.
+    #[must_use]
+    pub fn none() -> Self {
+        Self(Arc::new(HashSet::new()))
+    }
+
+    fn contains(&self, lowercased_token: &str) -> bool {
+        self.0.contains(lowercased_token)
+    }
+}
+
+impl Default for FtsStopwords {
+    /// The built-in English list — an absent `[search.fts] stopwords` key
+    /// resolves to this, so behaviour is unchanged for every existing
+    /// install.
+    fn default() -> Self {
+        Self::new(DEFAULT_STOPWORDS.iter().copied())
+    }
+}
+
 /// Sanitize free-text for use in `WHERE pages_fts MATCH ?`.
 ///
 /// Returns an empty string when `raw` is empty/whitespace-only; callers
@@ -18,8 +110,11 @@
 /// `ORDER BY rank`), the best-matching pages still surface first. When the
 /// caller supplies explicit FTS5 syntax (`OR` / `AND` / `NOT` / `NEAR` /
 /// quoted phrases / parens) we preserve it verbatim instead.
+///
+/// `stopwords` is the operator-configured set (default: [`FtsStopwords::default`],
+/// the built-in English list; `FtsStopwords::none()` disables filtering).
 #[must_use]
-pub fn prepare_fts5_query(raw: &str) -> String {
+pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
     let explicit_syntax = raw.contains('"')
         || raw.contains('(')
         || raw.contains(')')
@@ -35,8 +130,12 @@ pub fn prepare_fts5_query(raw: &str) -> String {
         // live: a release-procedure page beaten for a deploy question).
         // Explicit-syntax queries and quoted phrases are untouched, and
         // a query that is ONLY stopwords keeps them all — returning the
-        // user's literal terms beats returning nothing.
-        .filter(|t| explicit_syntax || !is_stopword(t))
+        // user's literal terms beats returning nothing. The active list is
+        // operator-configured (`[search.fts] stopwords`, issue #953): the
+        // built-in English list by default, a custom list for non-English
+        // installs, or none at all. Comparison folds Unicode case (matching
+        // `FtsStopwords`'s own fold) but never strips diacritics.
+        .filter(|t| explicit_syntax || !stopwords.contains(&t.to_lowercase()))
         .flat_map(prepare_fts5_token)
         .collect();
     let tokens = if tokens.is_empty() && !explicit_syntax {
@@ -109,73 +208,6 @@ fn fts5_query_parses(query: &str) -> bool {
             .is_ok()
         })
     })
-}
-
-/// English stopwords excluded from bare-query OR-joins. Deliberately
-/// small and boring: high-document-frequency function words that carry
-/// no retrieval signal but dominate BM25 through term frequency. Words
-/// inside quoted phrases and explicit-operator queries never pass
-/// through this filter.
-fn is_stopword(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "been"
-            | "but"
-            | "by"
-            | "can"
-            | "could"
-            | "did"
-            | "do"
-            | "does"
-            | "for"
-            | "from"
-            | "had"
-            | "has"
-            | "have"
-            | "how"
-            | "i"
-            | "if"
-            | "in"
-            | "is"
-            | "it"
-            | "its"
-            | "me"
-            | "my"
-            | "of"
-            | "on"
-            | "or"
-            | "our"
-            | "she"
-            | "should"
-            | "so"
-            | "that"
-            | "the"
-            | "their"
-            | "them"
-            | "they"
-            | "this"
-            | "to"
-            | "was"
-            | "we"
-            | "were"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "who"
-            | "why"
-            | "will"
-            | "with"
-            | "would"
-            | "you"
-            | "your"
-    )
 }
 
 fn prepare_fts5_token(token: &str) -> Vec<String> {
@@ -252,6 +284,14 @@ fn quote_fts5_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pre-#953 test called `prepare_fts5_query(raw)` against the
+    /// built-in English list; this keeps that call shape so the existing
+    /// test bodies below are unchanged (default list reproduces current
+    /// behaviour exactly).
+    fn prepare_fts5_query(raw: &str) -> String {
+        super::prepare_fts5_query(raw, &FtsStopwords::default())
+    }
 
     /// The engine, not this module, is the judge of validity: every
     /// prepared query must MATCH without error on a real FTS5 table.
@@ -472,5 +512,93 @@ mod tests {
     #[test]
     fn known_columns_are_preserved() {
         assert_eq!(prepare_fts5_query("title:handoff"), "title:handoff");
+    }
+
+    // --- issue #953: configurable stopword list -----------------------
+
+    /// A custom (Portuguese) list filters the words on that list, but never
+    /// touches the English words that are not on it — a Portuguese config
+    /// does not accidentally strip English content out of a mixed-language
+    /// corpus.
+    #[test]
+    fn custom_list_filters_configured_words_not_english_ones() {
+        let pt = FtsStopwords::new([
+            "o", "a", "os", "as", "de", "da", "do", "em", "uma", "um", "com", "para", "que", "se",
+            "no", "na",
+        ]);
+        assert_eq!(
+            super::prepare_fts5_query("o teste de integração", &pt),
+            "teste OR integração"
+        );
+        // English stopwords are untouched by the pt list.
+        assert_eq!(
+            super::prepare_fts5_query("the deploy of the release", &pt),
+            "the OR deploy OR of OR the OR release"
+        );
+    }
+
+    /// `stopwords = []` (`FtsStopwords::none()`) disables filtering
+    /// entirely: every bare token, English or not, survives the OR-join.
+    #[test]
+    fn empty_list_disables_filtering() {
+        let none = FtsStopwords::none();
+        assert_eq!(
+            super::prepare_fts5_query("the of and search", &none),
+            "the OR of OR and OR search"
+        );
+    }
+
+    /// The only-stopwords escape hatch (returning the user's literal terms
+    /// beats returning nothing) holds for a custom list too, not just the
+    /// built-in English one.
+    #[test]
+    fn only_configured_stopwords_query_keeps_its_terms() {
+        let pt = FtsStopwords::new(["o", "a", "de"]);
+        assert_eq!(super::prepare_fts5_query("o a de", &pt), "o OR a OR de");
+    }
+
+    /// Explicit FTS5 syntax bypasses the configured filter exactly as it
+    /// bypasses the default one.
+    #[test]
+    fn explicit_syntax_bypasses_custom_list_too() {
+        let pt = FtsStopwords::new(["o", "de"]);
+        assert_eq!(super::prepare_fts5_query("o AND de", &pt), "o AND de");
+    }
+
+    /// Worked example from the issue / docs: a Portuguese natural-language
+    /// question, filtered against a Portuguese stopword list, keeps only the
+    /// content words (OR-joined) and preserves their accents — the
+    /// stopword comparison is ASCII-lowercase, never diacritic-stripping.
+    #[test]
+    fn portuguese_stopword_list_worked_example() {
+        let pt = FtsStopwords::new([
+            "o", "a", "os", "as", "de", "da", "do", "em", "uma", "um", "com", "para", "que", "se",
+            "no", "na", "e", "é",
+        ]);
+        assert_eq!(
+            super::prepare_fts5_query("o que fazer quando o teste de integração falha no CI", &pt),
+            "fazer OR quando OR teste OR integração OR falha OR CI"
+        );
+    }
+
+    /// Stopword comparison folds full Unicode case (`str::to_lowercase`, not
+    /// ASCII-only) but never strips diacritics. A capitalized or all-caps
+    /// accented query token still matches a lowercase configured entry
+    /// (sentence-initial "É", all-caps "NÃO"), because the content FTS index
+    /// itself is `unicode61 remove_diacritics 2` and this filter would
+    /// otherwise be weaker than the index for exactly the languages this
+    /// feature targets. But an accent is never folded away: "e" and "é"
+    /// stay distinct tokens, so a list must spell out every form a user
+    /// might actually type.
+    #[test]
+    fn stopword_comparison_is_unicode_case_insensitive_but_keeps_diacritics() {
+        let pt = FtsStopwords::new(["é", "não"]);
+        // Sentence-initial capital + accent still matches the lowercase entry.
+        assert_eq!(super::prepare_fts5_query("É teste", &pt), "teste");
+        // An all-caps accented entry in the query also folds and matches.
+        assert_eq!(super::prepare_fts5_query("NÃO teste", &pt), "teste");
+        // "e" (no accent) is a different token entirely and is not filtered
+        // by an "é" entry — diacritics are never stripped, only case is folded.
+        assert_eq!(super::prepare_fts5_query("e teste", &pt), "e OR teste");
     }
 }

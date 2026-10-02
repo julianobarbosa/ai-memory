@@ -76,6 +76,7 @@ serde_json.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
+zip.workspace = true
 jiff.workspace = true
 jsonc-parser.workspace = true
 tokio.workspace = true
@@ -93,6 +94,7 @@ tempfile.workspace = true
 ai-memory-test-support.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
+rusqlite.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -92,15 +92,37 @@ pub fn command_spec(data_dir: &Path, live_token: Option<&str>) -> io::Result<Dra
     })
 }
 
-/// Build `ai-memory --data-dir <dir> backfill --auto --quiet`.
+/// Which server the spawned backfill delivers to: the one the spawning hook
+/// resolved for this event, never whatever the environment points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillTarget<'a> {
+    /// The hook's install-time `--server-url`.
+    ServerUrl(&'a str),
+    /// A server profile the repository's marker selected (#992).
+    Profile(&'a str),
+}
+
+/// Build `ai-memory --data-dir <dir> backfill --auto --quiet` plus the hook's
+/// resolved target.
 ///
 /// The one-time boot backfill of pre-hook local history is potentially long
 /// (it reads native transcripts and imports them), so it runs detached exactly
 /// like the drainer rather than inline in the SessionStart hook's tight budget.
-/// It carries no bearer on its argv or in its environment: `backfill` resolves
-/// auth from config / the persisted hook token itself, and the automatic path
-/// only runs in the loopback single-operator posture where no token is needed.
-pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
+///
+/// The target is passed explicitly because, left to itself, `backfill`
+/// resolves the server from config and the environment: a hook pointed at a
+/// remote server then backfilled into `127.0.0.1` whenever the agent was
+/// launched without `AI_MEMORY_SERVER_URL`. It carries no bearer on its argv
+/// or in its environment: `backfill` reads the persisted hook token, or the
+/// profile's own token, from the data dir.
+pub fn backfill_command_spec(
+    data_dir: &Path,
+    target: BackfillTarget<'_>,
+) -> io::Result<DrainCommandSpec> {
+    let (flag, value) = match target {
+        BackfillTarget::ServerUrl(url) => ("--server-url", url),
+        BackfillTarget::Profile(name) => ("--server-profile", name),
+    };
     Ok(DrainCommandSpec {
         exe: std::env::current_exe()?,
         args: vec![
@@ -109,6 +131,8 @@ pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
             OsString::from("backfill"),
             OsString::from("--auto"),
             OsString::from("--quiet"),
+            OsString::from(flag),
+            OsString::from(value),
         ],
         stderr_log: data_dir.join("logs").join("backfill.log"),
         live_token: None,
@@ -117,8 +141,8 @@ pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
 
 /// Spawn the detached one-time boot backfill without inheriting hook stdio.
 /// Best-effort: a spawn failure must never break session start.
-pub fn spawn_backfill(data_dir: &Path) -> io::Result<()> {
-    let spec = backfill_command_spec(data_dir)?;
+pub fn spawn_backfill(data_dir: &Path, target: BackfillTarget<'_>) -> io::Result<()> {
+    let spec = backfill_command_spec(data_dir, target)?;
     spawn_spec(&spec)
 }
 
@@ -356,6 +380,34 @@ mod tests {
             rendered.iter().any(|a| a == "hook-drain"),
             "still the drain command: {rendered:?}"
         );
+    }
+
+    /// The backfill goes where the hook resolved, and a profile travels as a
+    /// name only — the worker reads its token from the data dir.
+    #[test]
+    fn backfill_carries_the_hooks_target_and_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default =
+            backfill_command_spec(tmp.path(), BackfillTarget::ServerUrl("https://a.example"))
+                .unwrap();
+        assert_eq!(
+            &default.args[2..],
+            [
+                "backfill",
+                "--auto",
+                "--quiet",
+                "--server-url",
+                "https://a.example"
+            ]
+            .map(OsString::from)
+        );
+        let profile = backfill_command_spec(tmp.path(), BackfillTarget::Profile("team-b")).unwrap();
+        assert_eq!(
+            &profile.args[5..],
+            ["--server-profile", "team-b"].map(OsString::from)
+        );
+        assert!(profile.live_token.is_none());
+        assert!(default.live_token.is_none());
     }
 
     /// An absent or empty token carries nothing, so a no-auth deployment does

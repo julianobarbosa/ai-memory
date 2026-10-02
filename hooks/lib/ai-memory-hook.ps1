@@ -42,11 +42,21 @@ function Resolve-AiMemoryCwd {
     return $null
 }
 
+# $HOME (else USERPROFILE) without trailing separators, so the walks can
+# compare it to `Split-Path` output; a root such as `C:\` keeps its own.
+function Get-AiMemoryUserHome {
+    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    if (-not $userHome) { return $userHome }
+    $trimmed = $userHome.TrimEnd([char[]]@('/', '\'))
+    if (-not $trimmed -or $trimmed.EndsWith(':')) { return $userHome }
+    return $trimmed
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
-    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $userHome = Get-AiMemoryUserHome
     $boundary = $null
     if ($userHome) {
         $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
@@ -79,6 +89,41 @@ function Get-AiMemoryMarkerToml {
         $dir = $parent
     }
     return $null
+}
+
+# Whether any marker on the walk from $Cwd (default: the current directory)
+# selects a server profile (`server = ...`, #992). This script fallback cannot
+# route profiles — only native `ai-memory hook` commands can — so a routed
+# repository must emit nothing rather than reach the install-default server.
+# Mirrors the native walk: inside home it stops at home; outside it continues
+# past the checkout root. An unreadable marker counts as a selection.
+function Test-AiMemoryServerRouted {
+    param([string] $Cwd)
+    $dir = if ($Cwd) { $Cwd } else { (Get-Location).Path }
+    $userHome = Get-AiMemoryUserHome
+    $boundary = $null
+    if ($userHome) {
+        $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        if (($dir -eq $userHome) -or $dir.StartsWith($userHomePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $boundary = $userHome
+        }
+    }
+    while ($dir) {
+        $candidate = Join-Path $dir ".ai-memory.toml"
+        if (Test-Path $candidate -PathType Leaf) {
+            try {
+                $text = [IO.File]::ReadAllText($candidate)
+            } catch {
+                return $true
+            }
+            if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
+        }
+        if ($boundary -and $dir -eq $boundary) { return $false }
+        $parent = Split-Path $dir -Parent
+        if (-not $parent -or $parent -eq $dir) { return $false }
+        $dir = $parent
+    }
+    return $false
 }
 
 function Get-AiMemoryTomlKey {
@@ -170,6 +215,90 @@ function Get-AiMemoryRepoRootProject {
     return Split-Path $root -Leaf
 }
 
+# Normalise a git remote URL into a repository identity, or $null when it
+# names no network-reachable repository (a local path, a bare host). Port of
+# `normalize_remote_url` in crates/ai-memory-core/src/repository_identity.rs,
+# checked against the same fixture
+# (crates/ai-memory-core/fixtures/remote_identity_cases.json) so the two
+# cannot drift. Credentials are dropped here, on the host.
+function ConvertTo-AiMemoryRepositoryIdentity {
+    param([string] $Url)
+    if ($null -eq $Url) { return $null }
+    $raw = $Url.Trim()
+    if (-not $raw) { return $null }
+    $scheme = $null
+    $hasScheme = $false
+    $rest = $raw
+    $idx = $raw.IndexOf("://")
+    if ($idx -ge 0) {
+        $hasScheme = $true
+        $scheme = $raw.Substring(0, $idx).ToLowerInvariant()
+        $rest = $raw.Substring($idx + 3)
+    }
+    if ($scheme -eq "file") { return $null }
+    # Credentials: everything up to the LAST `@` before the path.
+    $pathStart = $rest.IndexOf("/")
+    if ($pathStart -lt 0) { $pathStart = $rest.Length }
+    $at = $rest.Substring(0, $pathStart).LastIndexOf("@")
+    $hp = if ($at -ge 0) { $rest.Substring($at + 1) } else { $rest }
+    if ($hasScheme) {
+        $slash = $hp.IndexOf("/")
+        if ($slash -ge 0) {
+            $h = $hp.Substring(0, $slash)
+            $p = $hp.Substring($slash + 1)
+        } else {
+            $h = $hp
+            $p = ""
+        }
+        $colon = $h.LastIndexOf(":")
+        if ($colon -ge 0 -and $h.Substring($colon + 1) -match '^[0-9]*$') {
+            $h = $h.Substring(0, $colon)
+        }
+        if (-not $h -or -not $p) { return $null }
+    } else {
+        # scp-like `host:path`, or a filesystem path: a `:` before any `/`.
+        $colon = $hp.IndexOf(":")
+        if ($colon -lt 0) { return $null }
+        $slash = $hp.IndexOf("/")
+        if ($slash -ge 0 -and $slash -lt $colon) { return $null }
+        $h = $hp.Substring(0, $colon)
+        $p = $hp.Substring($colon + 1)
+        # A one-character host is a Windows drive letter.
+        if ($h.Length -le 1 -or -not $p) { return $null }
+        if ($p.Contains("\")) { return $null }
+    }
+    $id = "$h/$p".ToLowerInvariant().TrimEnd('/')
+    if ($id.EndsWith(".git")) { $id = $id.Substring(0, $id.Length - 4) }
+    $id = $id.TrimEnd('/')
+    while ($id.Contains("//")) { $id = $id.Replace("//", "/") }
+    if (-not $id -or -not $id.Contains("/")) { return $null }
+    return $id
+}
+
+# `&identity=<v>&identity_src=<rung>` for the checkout at $Cwd, or "".
+# Mirrors `repository_identity` in hook_capture.rs: an explicit marker
+# `identity` is sent; a declared `project` outranks the remote and routes by
+# name, so git is not consulted; otherwise the `upstream` remote, else `origin`.
+function Get-AiMemoryIdentityQuery {
+    param([string] $Cwd, [string] $Explicit, [string] $Project)
+    if ($Explicit -and $Explicit.Trim()) {
+        $value = $Explicit.Trim().ToLowerInvariant()
+        return "&identity=$([uri]::EscapeDataString($value))&identity_src=explicit"
+    }
+    if ($Project -and $Project.Trim()) { return "" }
+    if (-not $Cwd) { return "" }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "" }
+    foreach ($name in @("upstream", "origin")) {
+        $url = (& git -C $Cwd config --get "remote.$name.url" 2>$null)
+        if (-not $url) { continue }
+        $value = ConvertTo-AiMemoryRepositoryIdentity -Url ([string]$url)
+        if ($value) {
+            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote"
+        }
+    }
+    return ""
+}
+
 function Get-AiMemoryMarkerQuery {
     param([string] $Cwd)
     if (-not $Cwd) { return "" }
@@ -182,14 +311,19 @@ function Get-AiMemoryMarkerQuery {
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     $projSrc = $null
+    $explicitIdentity = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
         $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
         $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
+        $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
         if ($proj) { $projSrc = "marker" }
     }
+    # Before repo-root can fill $proj: a repo-root name is an inference, while
+    # the identity chain's declared-project rung means a name in the marker.
+    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -206,6 +340,7 @@ function Get-AiMemoryMarkerQuery {
     if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
     if ($projSrc) { $qs += "&project_src=$([uri]::EscapeDataString($projSrc))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
+    $qs += $identityQuery
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
@@ -288,6 +423,40 @@ function Test-AiMemoryAntigravityInitialInvocation {
     }
 }
 
+# Parity with `ai_memory_capture_owned_externally` in hooks/_lib.sh:
+# AI_MEMORY_CAPTURE_OWNER names an external producer of this session's capture
+# events. Non-blank claims ownership; unset, empty and whitespace-only keep
+# capture on. The value is only ever tested, never written to output.
+function Test-AiMemoryCaptureOwnedExternally {
+    return (-not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_CAPTURE_OWNER))
+}
+
+# Parity with `payload_is_subagent` in the native router
+# (`commands/hook.rs`): a subagent/child payload must not take the parent
+# session's handoff. True when any known child-session marker key holds a
+# non-empty string.
+function Test-AiMemorySubagentPayload {
+    param([object] $ParsedPayload)
+    if ($null -eq $ParsedPayload) { return $false }
+    foreach ($Name in @(
+        "subagentType", "subagent_type", "agent_type", "agent_id", "parentSessionId"
+    )) {
+        $Value = $ParsedPayload.$Name
+        if ($Value -is [string] -and $Value.Trim().Length -gt 0) { return $true }
+    }
+    return $false
+}
+
+# Parity with `clip_chars` in the native router: Grok's additionalContext
+# is capped (10 000 chars) so an oversized handoff cannot flood the model
+# context through the script fallback either.
+function Clip-AiMemoryChars {
+    param([string] $Text, [int] $MaxChars)
+    if ($Text.Length -le $MaxChars) { return $Text }
+    $keep = [Math]::Max(0, $MaxChars - 12)
+    return ($Text.Substring(0, $keep) + "`n[truncated]")
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -300,7 +469,10 @@ function Invoke-AiMemoryHook {
         # first prompt — parity with Claude's once-per-SessionStart brief).
         # Later fetches keep the handoff but drop the briefing params so the
         # server does not recompose the brief per prompt.
-        [switch] $BriefingOncePerSession
+        [switch] $BriefingOncePerSession,
+        # Grok PostToolUse: wrap a fetched handoff as additionalContext and
+        # only fetch once per session. Other events must not set this.
+        [switch] $GrokPostTool
     )
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
@@ -317,6 +489,10 @@ function Invoke-AiMemoryHook {
         return
     }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
+    if (Test-AiMemoryServerRouted -Cwd $Cwd) {
+        if ($AntigravityPreInvocationOutput) { [Console]::Out.Write("{}") }
+        return
+    }
     $QS = Get-AiMemoryMarkerQuery -Cwd $Cwd
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"
@@ -331,17 +507,22 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
-    $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
-    try {
-        Invoke-WebRequest `
-            -UseBasicParsing `
-            -TimeoutSec 3 `
-            -Method Post `
-            -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
-            -Headers $Headers `
-            -ContentType "application/json; charset=utf-8" `
-            -Body $BodyBytes | Out-Null
-    } catch {
+    # This POST is the only producer on this path (no spool, no drain here).
+    # Session identity and the handoff/briefing GET below are delivery, so an
+    # external owner leaves them, and the stdout contract, alone.
+    if (-not (Test-AiMemoryCaptureOwnedExternally)) {
+        $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+        try {
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -TimeoutSec 3 `
+                -Method Post `
+                -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
+                -Headers $Headers `
+                -ContentType "application/json; charset=utf-8" `
+                -Body $BodyBytes | Out-Null
+        } catch {
+        }
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
         Clear-AiMemorySessionId -Agent $Agent
@@ -349,6 +530,7 @@ function Invoke-AiMemoryHook {
 
     if ($FetchHandoff) {
         $NativeSessionQS = ""
+        $NativeSessionId = $null
         try {
             $ParsedPayload = $Payload | ConvertFrom-Json
             $NativeSessionId = @(
@@ -362,6 +544,32 @@ function Invoke-AiMemoryHook {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
             }
         } catch {
+        }
+        $Shown = $null
+        if ($GrokPostTool) {
+            if (Test-AiMemorySubagentPayload $ParsedPayload) {
+                # A child session must not accept the parent handoff (and the
+                # GET is destructive), so bail before any fetch. Parity with
+                # the native router and the shell `post-tool-use.sh` gate.
+                [Console]::Out.Write("{}")
+                return
+            }
+            $ShownKey = [string]$NativeSessionId
+            if (-not $ShownKey) {
+                # Stable fallback (parity with the shell bundle's
+                # `cksum("grok:$CWD")`): hash agent+cwd, never the process id —
+                # each hook invocation is a new process, so a `$PID`-keyed
+                # marker would never match and the destructive GET would run
+                # on every tool call.
+                $Sha = [System.Security.Cryptography.SHA256]::Create()
+                $Bytes = $Sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("grok:$Cwd"))
+                $ShownKey = "grok-post-" + (($Bytes | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 16)
+            }
+            $Shown = Get-AiMemoryBriefedFile -Key "post-$ShownKey"
+            if (Test-Path $Shown -PathType Leaf) {
+                [Console]::Out.Write("{}")
+                return
+            }
         }
         # Once-per-session briefing gate. Marker files are created only for
         # repositories that opt in. Prefer the native session id when Kimi
@@ -383,6 +591,14 @@ function Invoke-AiMemoryHook {
                 }
             }
         }
+        if ($GrokPostTool -and -not $BriefQS) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
+        }
+        # A session-start handoff GET carries the `[briefing]` opt-in on every
+        # start, as in the native hook. Kiro keeps its own once-per-session gate.
+        if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
+        }
         try {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
@@ -390,7 +606,15 @@ function Invoke-AiMemoryHook {
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
-                if ($AntigravityPreInvocationOutput) {
+                if ($GrokPostTool) {
+                    $Wrapped = @{
+                        hookSpecificOutput = @{
+                            hookEventName = "PostToolUse"
+                            additionalContext = (Clip-AiMemoryChars ([string]$Response.Content) 10000)
+                        }
+                    }
+                    [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($AntigravityPreInvocationOutput) {
                     $Payload = @{
                         injectSteps = @(@{ ephemeralMessage = $Response.Content })
                     }
@@ -398,13 +622,16 @@ function Invoke-AiMemoryHook {
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput) {
+            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput) {
+            if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
+        }
+        if ($Shown) {
+            Set-AiMemoryBriefed -Path $Shown
         }
         # Mark the session as briefed only AFTER the GET completed —
         # success or error (fail-open: with the server down, re-sending the

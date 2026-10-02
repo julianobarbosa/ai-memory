@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ai_memory_core::{ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_store::{
     BriefingSnapshot, HealthPage, ObservationOrder, ObservationPage, ObservationRecord, PageHit,
-    RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope,
-    resolve_many_existing_scopes,
+    RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope_guarded,
+    resolve_many_existing_scopes_guarded,
 };
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -101,10 +101,13 @@ fn with_no_store(resp: Response) -> Response {
     resp
 }
 
-async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+async fn workspaces_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Result<Response, Response> {
     let workspaces = state
         .reader
-        .list_workspaces_with_stats()
+        .list_workspaces_with_stats(viewer_of(viewer))
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -117,11 +120,15 @@ async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Respon
 /// in different projects, each carrying both endpoints' workspace/project/
 /// path. The UI builds nodes from the endpoints (and may aggregate to a
 /// project-level dependency graph). Global for now; project scoping is a
-/// follow-up query param.
-async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+/// follow-up query param. With authorization on, only edges whose both ends
+/// the viewer may read (#708).
+async fn graph_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Result<Response, Response> {
     let edges = state
         .reader
-        .cross_project_edges(None)
+        .cross_project_edges(None, viewer_of(viewer))
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -132,8 +139,10 @@ async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, R
 
 async fn projects_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Query(query): Query<ProjectListQuery>,
 ) -> Result<Response, Response> {
+    let viewer = viewer_of(viewer);
     let workspace = query
         .workspace
         .as_deref()
@@ -142,10 +151,10 @@ async fn projects_handler(
     let projects = if let Some(workspace) = workspace {
         state
             .reader
-            .list_projects_with_stats_for_workspace(workspace.to_owned())
+            .list_projects_with_stats_for_workspace(workspace.to_owned(), viewer)
             .await
     } else {
-        state.reader.list_projects_with_stats().await
+        state.reader.list_projects_with_stats(viewer).await
     }
     .map_err(internal_error)?;
     Ok(with_cache(
@@ -156,9 +165,10 @@ async fn projects_handler(
 
 async fn pages_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -172,9 +182,13 @@ async fn pages_handler(
 
 async fn page_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: axum::http::HeaderMap,
     Path((workspace, project, path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
+    super::authorize_read(&state, viewer, &workspace, &project)
+        .await
+        .map_err(scope_error_response)?;
     let meta = state
         .reader
         .page_meta(&workspace, &project, &path)
@@ -189,25 +203,43 @@ async fn page_handler(
         .read_page(meta.workspace_id, meta.project_id, &page_path)
         .map_err(|_| not_found("page file not found"))?;
 
-    // ETag is computed over the markdown body PLUS the resolved author
-    // identity (P1.7). Author change without body change (e.g. operator
-    // rotates a token then user A re-writes a previously-anonymous page)
-    // must invalidate the cached response. SHA-256 over a stable
-    // concatenation: body || "\n--\n" || username || "\n" || email.
-    // The "\n--\n" separator prevents `body=foo, user=bar` from hashing
-    // the same as `body=foobar, user=` if either ever happened to slide
-    // empty.
-    let mut hasher = Sha256::new();
-    hasher.update(markdown.body.as_bytes());
-    if let Some(author) = meta.author.as_ref() {
-        hasher.update(b"\n--\n");
-        hasher.update(author.username.as_bytes());
-        hasher.update(b"\n");
-        if let Some(email) = author.email.as_deref() {
-            hasher.update(email.as_bytes());
-        }
-    }
-    let digest = hasher.finalize();
+    let links = state
+        .reader
+        .page_links(
+            meta.workspace_id,
+            meta.project_id,
+            meta.path.clone(),
+            viewer_of(viewer),
+        )
+        .await
+        .map_err(internal_error)?;
+
+    let page = ApiPage {
+        backlinks: links.backlinks,
+        body_markdown: markdown.body,
+        created_at: meta.created_at,
+        frontmatter: markdown.frontmatter,
+        kind: meta.kind,
+        links: links.links,
+        path: meta.path,
+        pinned: meta.pinned,
+        project: meta.project_name,
+        supersedes: meta.supersedes,
+        tier: meta.tier,
+        title: meta.title,
+        updated_at: meta.updated_at,
+        workspace: meta.workspace_name,
+        author: meta.author,
+    };
+    let json = serde_json::to_vec(&page).map_err(internal_error)?;
+
+    // The ETag is a SHA-256 of the JSON this route returns, so it changes
+    // whenever any of it does. It used to cover only the markdown body and
+    // the author (P1.7), but pinning a page, re-tiering or retitling it in
+    // frontmatter, and another page linking to it all change the response
+    // while the body stays byte-identical, and a client revalidating with
+    // the old tag was told 304 and kept the stale page.
+    let digest = Sha256::digest(&json);
     let etag_hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
@@ -217,7 +249,7 @@ async fn page_handler(
     let etag_header = HeaderValue::from_str(&etag_value).expect("sha256 hex is always valid ASCII");
 
     // If-None-Match: if the client sends back the exact ETag we issued,
-    // return 304 with no body (no re-serialisation needed).
+    // return 304 with no body.
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -234,31 +266,15 @@ async fn page_handler(
         return Ok(resp);
     }
 
-    let links = state
-        .reader
-        .page_links(meta.workspace_id, meta.project_id, meta.path.clone())
-        .await
-        .map_err(internal_error)?;
-
     let mut resp = with_cache(
-        Json(ApiPage {
-            backlinks: links.backlinks,
-            body_markdown: markdown.body,
-            created_at: meta.created_at,
-            frontmatter: markdown.frontmatter,
-            kind: meta.kind,
-            links: links.links,
-            path: meta.path,
-            pinned: meta.pinned,
-            project: meta.project_name,
-            supersedes: meta.supersedes,
-            tier: meta.tier,
-            title: meta.title,
-            updated_at: meta.updated_at,
-            workspace: meta.workspace_name,
-            author: meta.author,
-        })
-        .into_response(),
+        (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            json,
+        )
+            .into_response(),
         PAGE_CACHE_MAX_AGE,
     );
     resp.headers_mut().insert(header::ETAG, etag_header);
@@ -267,20 +283,22 @@ async fn page_handler(
 
 async fn search_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request).await
+    search_with_request(&state, request, viewer_of(viewer)).await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request).await
+    search_with_request(&state, request, viewer_of(viewer)).await
 }
 
 // NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
@@ -295,6 +313,7 @@ async fn search_post_handler(
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -317,8 +336,8 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
-    let hits = match scoped_search_mode(state, &request).await? {
-        SearchMode::Global => state.reader.search_pages(term, limit).await,
+    let hits = match scoped_search_mode(state, &request, viewer).await? {
+        SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
         SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
     }
     .map_err(internal_error)?;
@@ -332,6 +351,7 @@ async fn search_with_request(
 async fn scoped_search_mode(
     state: &WebState,
     request: &SearchRequest,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<SearchMode, Response> {
     if !request.scopes.is_empty() {
         if request.scopes.len() > MAX_SEARCH_SCOPES {
@@ -340,7 +360,7 @@ async fn scoped_search_mode(
                 format!("at most {MAX_SEARCH_SCOPES} scopes are allowed"),
             ));
         }
-        let scopes = resolve_scopes(state, &request.scopes).await?;
+        let scopes = resolve_scopes(state, &request.scopes, viewer).await?;
         return Ok(SearchMode::Scoped(scopes));
     }
 
@@ -349,7 +369,8 @@ async fn scoped_search_mode(
         trimmed_opt(request.project.as_deref()),
     ) {
         (Some(workspace), Some(project)) => {
-            let (workspace_id, project_id) = lookup_project(state, workspace, project).await?;
+            let (workspace_id, project_id) =
+                lookup_project(state, workspace, project, viewer).await?;
             Ok(SearchMode::Scoped(vec![ResolvedSearchScope {
                 project_id,
                 workspace_id,
@@ -366,23 +387,30 @@ async fn scoped_search_mode(
 async fn resolve_scopes(
     state: &WebState,
     scopes: &[ApiSearchScope],
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Vec<ResolvedSearchScope>, Response> {
     let names: Vec<_> = scopes
         .iter()
         .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
         .collect();
-    resolve_many_existing_scopes(&state.reader, &names, MAX_SEARCH_SCOPES)
-        .await
-        .map(|scopes| {
-            scopes
-                .into_iter()
-                .map(|scope| ResolvedSearchScope {
-                    workspace_id: scope.workspace_id,
-                    project_id: scope.project_id,
-                })
-                .collect()
-        })
-        .map_err(scope_error_response)
+    resolve_many_existing_scopes_guarded(
+        &state.reader,
+        &names,
+        MAX_SEARCH_SCOPES,
+        viewer,
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await
+    .map(|scopes| {
+        scopes
+            .into_iter()
+            .map(|scope| ResolvedSearchScope {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+            })
+            .collect()
+    })
+    .map_err(scope_error_response)
 }
 
 async fn search_scopes(
@@ -426,10 +454,11 @@ async fn search_scopes(
 
 async fn recent_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let mut pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -442,11 +471,13 @@ async fn recent_handler(
 
 async fn briefing_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let briefing = state
         .reader
         .briefing_for_project(
@@ -463,16 +494,40 @@ async fn briefing_handler(
 
 async fn overview_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path(workspace): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
+    let viewer = viewer_of(viewer);
     let workspace_id = state
         .reader
         .find_workspace(workspace.clone())
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
+
+    // Every aggregate below is narrowed to the repositories the viewer may
+    // read (#708). A workspace holding none of them is refused rather than
+    // answered with an overview of zeros: an empty result would read as
+    // "nothing is happening here", which is the one thing authorization must
+    // never look like. The name was typed by the caller, so saying it exists
+    // tells them nothing the project routes would not.
+    if viewer.is_some()
+        && state
+            .reader
+            .list_projects_with_stats_for_workspace(workspace.clone(), viewer)
+            .await
+            .map_err(internal_error)?
+            .is_empty()
+    {
+        return Err(scope_error_response(ScopeResolutionError::Forbidden(
+            format!(
+                "not authorized for {workspace}: no project in it is readable by this user. \
+                 This is an access problem, not an empty workspace."
+            ),
+        )));
+    }
 
     // Scoped to the requesting actor, like the briefing below and like
     // `project_overview_handler`: an identified caller sees their own baton plus
@@ -485,7 +540,7 @@ async fn overview_handler(
     let owner_filter = owner_filter_for(actor);
     let handoff = match state
         .reader
-        .latest_open_handoff_for_workspace(workspace_id, owner_filter.clone())
+        .latest_open_handoff_for_workspace(workspace_id, owner_filter.clone(), viewer)
         .await
         .map_err(internal_error)?
     {
@@ -510,18 +565,23 @@ async fn overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_workspace(workspace_id, query.limit.clamp(1, 100), owner_filter)
+        .briefing_for_workspace(
+            workspace_id,
+            query.limit.clamp(1, 100),
+            owner_filter,
+            viewer,
+        )
         .await
         .map_err(internal_error)?;
 
     let (stale, duplicates, orphans) = state
         .reader
-        .memory_health_for_workspace(workspace_id)
+        .memory_health_for_workspace(workspace_id, viewer)
         .await
         .map_err(internal_error)?;
     let detail = state
         .reader
-        .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100))
+        .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100), viewer)
         .await
         .map_err(internal_error)?;
     let health = ApiHealth {
@@ -711,12 +771,14 @@ const fn default_handoff_limit() -> usize {
 /// server that *does* authenticate shows to a caller it cannot place.
 async fn handoffs_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<HandoffListQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let handoff_state = match query.state.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(raw.parse::<ai_memory_core::HandoffState>().map_err(|_| {
@@ -775,11 +837,13 @@ async fn handoffs_handler(
 
 async fn project_overview_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let limit = query.limit.clamp(1, 100);
 
     // Same scoping as `overview_handler`; computed once and reused for the
@@ -847,11 +911,13 @@ const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
 async fn sessions_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<SessionListQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let sessions = state
         .reader
         .sessions_for_scope(
@@ -871,11 +937,13 @@ async fn sessions_handler(
 
 async fn session_observations_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, session_id)): Path<(String, String, String)>,
     Query(query): Query<SessionObservationsQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let session_id = session_id.parse::<SessionId>().map_err(|_| {
         json_error(
             StatusCode::BAD_REQUEST,
@@ -991,20 +1059,44 @@ fn cap_body(body: &str, max_chars: usize) -> String {
     out
 }
 
+/// The user whose grants apply to this request, if any do.
+///
+/// [`ai_memory_core::AuthorizedViewer`] is stamped only when an operator has
+/// switched per-repository authorization on, and never for root. `None`
+/// therefore covers every posture that authorizes identically — no auth, auth
+/// without authorization, and the operator — which is what keeps existing
+/// installs behaving exactly as they did before the guard existed.
+fn viewer_of(
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Option<ai_memory_core::UserId> {
+    viewer.map(|axum::Extension(viewer)| viewer.user())
+}
+
+/// Resolve a workspace/project pair the viewer is allowed to read.
+///
+/// Every `/api/v1` route is a GET, so the whole surface needs exactly
+/// [`ai_memory_store::ProjectAccess::Read`] and no caller has to choose a level.
 async fn lookup_project(
     state: &WebState,
     workspace: &str,
     project: &str,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<(WorkspaceId, ProjectId), Response> {
-    lookup_existing_scope(&state.reader, workspace, project)
-        .await
-        .map(ai_memory_store::ResolvedScope::as_tuple)
-        .map_err(|err| match err {
-            ScopeResolutionError::ProjectNotFoundInWorkspace { project, .. } => {
-                not_found(format!("project '{project}' not found"))
-            }
-            other => scope_error_response(other),
-        })
+    lookup_existing_scope_guarded(
+        &state.reader,
+        workspace,
+        project,
+        viewer,
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await
+    .map(ai_memory_store::ResolvedScope::as_tuple)
+    .map_err(|err| match err {
+        ScopeResolutionError::ProjectNotFoundInWorkspace { project, .. } => {
+            not_found(format!("project '{project}' not found"))
+        }
+        other => scope_error_response(other),
+    })
 }
 
 async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSearchHit>, Response> {
@@ -1042,6 +1134,8 @@ fn not_found(message: impl Into<String>) -> Response {
 fn scope_error_response(err: ScopeResolutionError) -> Response {
     if err.is_bad_request() {
         json_error(StatusCode::BAD_REQUEST, err.to_string())
+    } else if err.is_forbidden() {
+        json_error(StatusCode::FORBIDDEN, err.to_string())
     } else if err.is_not_found() {
         json_error(StatusCode::NOT_FOUND, err.to_string())
     } else {

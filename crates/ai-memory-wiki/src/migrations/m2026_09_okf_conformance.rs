@@ -608,6 +608,39 @@ mod tests {
         assert_eq!(parse(&conformed).unwrap().frontmatter["type"], "Note");
     }
 
+    /// A CRLF page already has a frontmatter block; the parser must see it
+    /// so the pass fills that block instead of writing a fresh one above it.
+    /// The duplicate-frontmatter shape is exactly the basic-memory #528 bug
+    /// `markdown.rs` exists to avoid, and this pass is one-shot and in place.
+    #[test]
+    fn conforming_a_crlf_page_does_not_duplicate_its_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let rel = Path::new("w/p/notes/hand-written.md");
+        let abs = tmp.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            "---\r\ntitle: Hand written\r\npinned: true\r\n---\r\n# Hand written\r\n\r\nBody.\r\n",
+        )
+        .unwrap();
+
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        conform_file(&git, rel, &std::collections::HashMap::new()).unwrap();
+
+        let conformed = std::fs::read_to_string(&abs).unwrap();
+        let md = parse(&conformed).unwrap();
+        assert_eq!(
+            md.frontmatter["title"], "Hand written",
+            "the authored frontmatter must survive the pass: {conformed:?}"
+        );
+        assert_eq!(md.frontmatter["pinned"], true);
+        assert_eq!(md.frontmatter["type"], "Note");
+        assert_eq!(
+            md.body, "# Hand written\r\n\r\nBody.\r\n",
+            "the body must not gain a second frontmatter block: {conformed:?}"
+        );
+    }
+
     // ---- #633: the safety archive must be taken BEFORE the DB migration ----
 
     /// The core assertion for #633: the pre-open snapshot captures the DB as it

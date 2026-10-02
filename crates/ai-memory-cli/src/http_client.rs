@@ -138,6 +138,14 @@ impl ServerEndpoint {
         )
     }
 
+    /// Build for a target the spawning hook already resolved: its URL
+    /// (including any mount path, as `install-hooks` rendered it) and the
+    /// bearer it authenticates with. No config or environment is consulted.
+    #[must_use]
+    pub(crate) fn for_hook_target(url: String, token: Option<String>) -> Self {
+        Self::build(Some(url), token, true, None)
+    }
+
     /// Build from an explicit URL + token pair (useful for tests that
     /// cannot safely mutate the process environment).
     ///

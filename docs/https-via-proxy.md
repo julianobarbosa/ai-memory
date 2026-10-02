@@ -457,6 +457,73 @@ separately; see #614.)
 
 ---
 
+## Outbound LLM calls fail behind a TLS-inspecting firewall
+
+The paths above are about clients trusting *ai-memory's* certificate. This
+section is the mirror image: **ai-memory trusting an upstream interceptor** so
+its own outbound LLM/embedding calls succeed.
+
+**Symptom.** Consolidation, lint, or embeddings fail and the logs show
+`invalid peer certificate: UnknownIssuer` on calls to your LLM/embedding
+provider. Your network runs an HTTPS-inspecting proxy (a corporate MITM
+appliance, an inspecting antivirus, a Zscaler/Netskope-style gateway) that
+re-signs TLS with a private interception root the container doesn't trust.
+
+**Why it happens.** ai-memory's HTTP client (reqwest + rustls, built with
+`rustls-tls-native-roots`) trusts the **operating system** certificate store,
+not a bundled root list — it reads the container's `/etc/ssl/certs` and honors
+`SSL_CERT_FILE` / `SSL_CERT_DIR`. The stock image ships only the public Debian
+roots, so the interception root is unknown. `curl` from your host may succeed
+because your host already trusts that root; the container does not.
+
+**Fix.** Give the container a CA bundle that includes the interception root.
+
+1. Export the interception root your gateway presents (from a trusted host),
+   or — better — get it from your IT team, which is the authoritative source:
+
+   ```bash
+   openssl s_client -showcerts -connect api.openai.com:443 </dev/null 2>/dev/null \
+     | openssl x509 -outform PEM > corp-root.crt
+   ```
+
+2. Build a combined bundle = the container's public roots **plus** your root.
+   `SSL_CERT_FILE` *replaces* the default file, so it must contain both:
+
+   ```bash
+   docker run --rm --entrypoint cat ai-memory:latest \
+     /etc/ssl/certs/ca-certificates.crt > ca-bundle.crt
+   cat corp-root.crt >> ca-bundle.crt
+   ```
+
+3. Mount it and point the container at it. Either option works:
+
+   ```yaml
+   # docker-compose.yml — option A: SSL_CERT_FILE
+   services:
+     ai-memory:
+       volumes:
+         - ./ca-bundle.crt:/etc/ai-memory/ca-bundle.crt:ro
+       environment:
+         SSL_CERT_FILE: /etc/ai-memory/ca-bundle.crt
+   ```
+   ```yaml
+   # option B: overwrite the default path, no env var needed
+       volumes:
+         - ./ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+   ```
+
+4. Recreate the container (`docker compose up -d`). The trust store is read at
+   process start, so a running container must be restarted to pick up the
+   change.
+
+**Notes.**
+- Point `SSL_CERT_FILE` at the *combined* bundle, never at the interception
+  root alone — that would drop every public root and break all other TLS.
+- Native (non-Docker) installs: on Linux, install the root system-wide
+  (`update-ca-certificates` / `trust anchor`) or set `SSL_CERT_FILE`; on
+  Windows the client reads the schannel store, so import the root there
+  instead — `SSL_CERT_FILE` does not apply.
+
 ## What ai-memory does to support being behind a proxy
 
 Nothing special — the server intentionally generates no absolute URLs

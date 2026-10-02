@@ -106,6 +106,11 @@ pub struct NewObservation {
     pub body: String,
     /// 1..=10. Default 5.
     pub importance: u8,
+    /// Original event time in microseconds, when known (e.g. backfill
+    /// replaying a transcript's own timestamps). `None` means "now" — the
+    /// store fills it in at write time.
+    #[serde(default)]
+    pub occurred_at: Option<i64>,
 }
 
 /// Materialised view of an observation row.
@@ -154,6 +159,11 @@ pub struct NewSession {
     /// session shared, which is the single-operator behaviour.
     #[serde(default)]
     pub actor_user: Option<String>,
+    /// Original event time in microseconds, when known (e.g. backfill
+    /// replaying a transcript's own timestamps). `None` means "now" — the
+    /// store fills it in at write time.
+    #[serde(default)]
+    pub occurred_at: Option<i64>,
 }
 
 #[cfg(test)]

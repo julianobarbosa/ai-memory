@@ -127,7 +127,9 @@ fn inject_into_head(html: &str, snippet: &str) -> String {
             out.push_str(&html[pos..]);
             return out;
         }
-        cursor += 1;
+        // Step a whole character: slicing `html[cursor..]` inside a
+        // multi-byte one (a UTF-8 BOM, an accented attribute value) panics.
+        cursor += html[cursor..].chars().next().map_or(1, char::len_utf8);
     }
     format!("{snippet}{html}")
 }
@@ -252,6 +254,21 @@ mod web_base_tests {
         assert!(out.contains("<head><base href=\"/wiki/web/\"><meta"));
     }
 
+    /// The scan walks the page byte by byte, and slicing inside a multi-byte
+    /// character panics. A custom SPA `index.html` saved with a UTF-8 BOM,
+    /// or with any non-ASCII text before `<head>`, took `serve
+    /// --web-ui-dir` down at startup.
+    #[test]
+    fn inject_base_href_steps_over_non_ascii_before_head() {
+        let bom = "\u{feff}<!doctype html><html><head><meta charset=\"utf-8\"></head></html>";
+        let out = inject_base_href(bom, "/w/");
+        assert!(out.starts_with('\u{feff}'), "the BOM stays where it was");
+        assert!(out.contains("<head><base href=\"/w/\"><meta"));
+
+        let accent = "<html data-app=\"Mémoire\"><head></head></html>";
+        assert!(inject_base_href(accent, "/w/").contains("<head><base href=\"/w/\"></head>"));
+    }
+
     #[test]
     fn inject_base_href_no_head_prepends() {
         let out = inject_base_href("<html></html>", "/x/");
@@ -291,6 +308,9 @@ pub struct WebMountSpec<'a> {
     /// Normalised base path (`""` or `/<core>`) the whole surface is
     /// nested under; stamped into the `ai-memory-base-path` meta tag.
     pub base_path: &'a str,
+    /// A trusted identity proxy is configured; the root-only pending-writes
+    /// page needs it to decide whether operators are told apart.
+    pub trusted_proxy_identity: bool,
 }
 
 /// Public SPA vs dual-auth wiki/API split.
@@ -302,6 +322,9 @@ pub struct SplitWebRouters {
     pub public: axum::Router,
     /// `/api/v1` plus the builtin wiki when that is the chosen UI.
     pub protected: axum::Router,
+    /// Builtin login / change-password redirect targets. `None` when web is
+    /// disabled or a custom SPA is mounted (no builtin auth pages).
+    pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
 }
 
 /// Split the web surfaces so the host can attach different auth layers.
@@ -318,6 +341,7 @@ pub fn split_web_routers(
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: axum::Router::new(),
+            html_auth: None,
         });
     }
     let api = build_api_router(&reader, &wiki, spec.cors_origins);
@@ -336,11 +360,35 @@ pub fn split_web_routers(
         return Ok(SplitWebRouters {
             public,
             protected: protected_api,
+            html_auth: None,
         });
     }
+    let auth_cfg = Arc::new(crate::HtmlAuthRedirectConfig::from_mount(
+        spec.base_path,
+        spec.web_slug,
+    ));
+    let browser_inject = Arc::new(WebInjectState {
+        base_href: spec.base_href.to_string(),
+        base_path: spec.base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
     Ok(SplitWebRouters {
-        public: axum::Router::new(),
-        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, spec.base_href, mount),
+        public: mount_builtin_public(
+            auth_cfg.clone(),
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        ),
+        protected: mount_builtin_browser(
+            protected_api,
+            crate::WebState::new(reader, wiki)
+                .with_trusted_proxy_identity(spec.trusted_proxy_identity),
+            &slug,
+            mount,
+            browser_inject,
+        ),
+        html_auth: Some(auth_cfg),
     })
 }
 
@@ -430,26 +478,49 @@ fn mount_custom_spa(
     })
 }
 
+/// Mount public builtin auth pages + static assets at `slug`.
+fn mount_builtin_public(
+    auth_cfg: Arc<crate::HtmlAuthRedirectConfig>,
+    slug: &str,
+    base_href: &str,
+    base_path: &str,
+    mount: &str,
+) -> axum::Router {
+    let inject = Arc::new(WebInjectState {
+        base_href: base_href.to_string(),
+        base_path: base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
+    let public = crate::routes::build_public_auth(auth_cfg).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
+    info!(mount, base_href, "builtin public auth pages mounted");
+    if slug.is_empty() {
+        public
+    } else {
+        axum::Router::new().nest(slug, public)
+    }
+}
+
 /// Mount the built-in server-rendered wiki browser at `slug` with
 /// `<base href>` injection middleware. When `slug` is non-empty also
 /// register the trailing-slash → canonical redirect, preserving any
 /// query string the caller passed.
 fn mount_builtin_browser(
     router: axum::Router,
-    reader: ReaderPool,
-    wiki: Wiki,
+    state: crate::WebState,
     slug: &str,
-    base_href: &str,
     mount: &str,
+    inject: Arc<WebInjectState>,
 ) -> axum::Router {
     // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        Arc::new(base_href.to_string()),
-        inject_web_base_href,
-    ));
+    let base_href = inject.base_href.clone();
+    let web_router = crate::routes::build(Arc::new(state)).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         return router.merge(web_router);
@@ -518,12 +589,20 @@ fn custom_spa_router(dir: std::path::PathBuf, injected_index: String) -> axum::R
         .route_service("/{*path}", assets)
 }
 
-/// Response middleware: inject `<base href>` into `text/html` responses from
-/// the built-in server-rendered web browser, so its relative URLs resolve
-/// under the configured `{base_path}{web_slug}` prefix. Non-HTML responses
-/// (static assets, redirects) pass through untouched.
+/// Values injected into every builtin HTML response.
+struct WebInjectState {
+    base_href: String,
+    base_path: String,
+    login_path: String,
+}
+
+/// Response middleware: inject `<base href>` plus auth meta tags into
+/// `text/html` responses from the built-in browser / auth pages, so
+/// relative URLs and logout/login fetch paths resolve under the
+/// configured prefix. Non-HTML responses (static assets, redirects)
+/// pass through untouched.
 async fn inject_web_base_href(
-    State(base_href): State<Arc<String>>,
+    State(inject): State<Arc<WebInjectState>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -554,7 +633,15 @@ async fn inject_web_base_href(
     };
     match std::str::from_utf8(&bytes) {
         Ok(html) => {
-            let injected = inject_base_href(html, &base_href);
+            let with_base = inject_base_href(html, &inject.base_href);
+            let with_path = inject_base_path_meta(&with_base, &inject.base_path);
+            let injected = inject_into_head(
+                &with_path,
+                &format!(
+                    "<meta name=\"ai-memory-login-path\" content=\"{}\">",
+                    escape_attr(&inject.login_path)
+                ),
+            );
             // Stale length from the pre-injection body; let hyper recompute.
             parts.headers.remove(header::CONTENT_LENGTH);
             Response::from_parts(parts, Body::from(injected))
@@ -591,6 +678,7 @@ mod tests {
                 web_slug,
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -991,6 +1079,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1040,6 +1129,52 @@ mod tests {
         assert_eq!(js, "console.log('asset');");
     }
 
+    /// `serve --web-ui-dir` mounts the SPA at startup, so an `index.html`
+    /// saved with a UTF-8 BOM (Notepad's "UTF-8 with BOM", Visual Studio's
+    /// "UTF-8 with signature") panicked the server before it listened.
+    #[tokio::test]
+    async fn custom_spa_index_with_a_bom_mounts_and_is_injected() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "\u{feff}<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+        )
+        .unwrap();
+
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+                trusted_proxy_identity: false,
+            },
+        )
+        .unwrap();
+        let resp = router
+            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains(r#"<base href="/web/"><title>spa</title>"#),
+            "the base href belongs in the head: {html}"
+        );
+    }
+
     /// Regression for the prod 404: with `base_path=""` (host root) the custom
     /// SPA mounts at slug `/web`. `nest("/web", …)` served `/web` and
     /// `/web/<route>` but left the bare trailing-slash root `/web/` unrouted →
@@ -1070,6 +1205,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1128,6 +1264,7 @@ mod tests {
                 web_slug: "/",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1215,6 +1352,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1270,6 +1408,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1314,6 +1453,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();

@@ -113,7 +113,9 @@ pub(crate) fn find_marker(cwd: &str) -> Option<PathBuf> {
 }
 
 fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
-    find_marker_matching(cwd, home, |_| true)
+    find_marker_matching(cwd, home, OutsideHome::StopAtCheckoutRoot, |path| {
+        Some(path.to_path_buf())
+    })
 }
 
 /// Like [`find_marker`], but skips a marker that declares nothing beyond a
@@ -129,34 +131,49 @@ pub(crate) fn find_settings_marker(cwd: &str) -> Option<PathBuf> {
 }
 
 fn find_settings_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
-    find_marker_matching(cwd, home, |path| {
-        std::fs::read_to_string(path).is_ok_and(|text| declares_more_than_capture(&text))
+    find_marker_matching(cwd, home, OutsideHome::StopAtCheckoutRoot, |path| {
+        std::fs::read_to_string(path)
+            .is_ok_and(|text| declares_more_than_capture(&text))
+            .then(|| path.to_path_buf())
     })
 }
 
-/// Shared walk-up-from-`cwd`-toward-`$HOME` used by [`find_marker_with_home`]
-/// and [`find_settings_marker_with_home`]; `matches` decides whether a marker
-/// file found along the way stops the walk (returned) or is skipped in favor
-/// of the next ancestor. The HOME/checkout-root boundary is identical either
-/// way — only which markers count as a stopping point differs.
-fn find_marker_matching(
+/// Where a walk that starts outside `$HOME` stops.
+#[derive(Clone, Copy)]
+enum OutsideHome {
+    /// At the nearest `.git` root, or `cwd` itself outside any checkout.
+    StopAtCheckoutRoot,
+    /// At the filesystem root.
+    WalkToRoot,
+}
+
+/// Shared walk-up-from-`cwd`-toward-`$HOME` used by every marker lookup;
+/// `matches` maps a marker file found along the way to a result that stops
+/// the walk, or `None` to continue to the next ancestor. Inside `$HOME` the
+/// walk stops at `$HOME`; `outside_home` picks the stop for a start outside it.
+fn find_marker_matching<T>(
     cwd: &str,
     home: Option<&Path>,
-    matches: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+    outside_home: OutsideHome,
+    mut matches: impl FnMut(&Path) -> Option<T>,
+) -> Option<T> {
     let start = absolute_normalized(Path::new(cwd));
     let home = home.map(absolute_normalized);
-    let boundary = match home.as_deref() {
-        Some(home) if start.starts_with(home) => Some(home.to_path_buf()),
-        Some(_) => Some(checkout_root(&start).unwrap_or_else(|| start.clone())),
-        None => None,
+    let boundary = match (home.as_deref(), outside_home) {
+        (Some(home), _) if start.starts_with(home) => Some(home.to_path_buf()),
+        (Some(_), OutsideHome::StopAtCheckoutRoot) => {
+            Some(checkout_root(&start).unwrap_or_else(|| start.clone()))
+        }
+        (Some(_), OutsideHome::WalkToRoot) | (None, _) => None,
     };
 
     let mut dir = start.as_path();
     loop {
         let candidate = dir.join(".ai-memory.toml");
-        if candidate.is_file() && matches(&candidate) {
-            return Some(candidate);
+        if candidate.is_file()
+            && let Some(found) = matches(&candidate)
+        {
+            return Some(found);
         }
         if boundary.as_deref() == Some(dir) {
             return None;
@@ -181,11 +198,12 @@ fn find_marker_matching(
 /// the file. That is conservative on purpose: it can only turn a marker INTO
 /// a boundary, never wrongly make one transparent.
 fn declares_more_than_capture(text: &str) -> bool {
-    const QUOTED_KEYS: [&str; 4] = [
+    const QUOTED_KEYS: [&str; 5] = [
         "workspace",
         "project",
         "project_strategy",
         "drop_subagent_captures",
+        "identity",
     ];
     const FLAG_KEYS: [&str; 3] = ["default_global", "inject_on_session_start", "max_chars"];
     QUOTED_KEYS
@@ -194,6 +212,78 @@ fn declares_more_than_capture(text: &str) -> bool {
         || FLAG_KEYS
             .iter()
             .any(|key| parse_flag_in(text, key).is_some())
+        || server_selection_in(text).is_some()
+}
+
+/// A marker's `server = "<profile>"` selection (#992), and the directory of
+/// the marker that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerSelection {
+    /// The raw value, validated later by `server_profiles::ProfileName`;
+    /// `None` when a marker on the walk exists but could not be read, which
+    /// the caller must treat as a refused selection, never as "no selection".
+    pub(crate) name: Option<String>,
+    /// Directory holding the declaring marker, lexically normalized.
+    pub(crate) marker_dir: PathBuf,
+}
+
+/// The nearest marker on the walk from `cwd` that declares `server`.
+///
+/// Deliberately *not* [`find_settings_marker`]'s nearest-marker rule, in two
+/// ways, both of which would otherwise route a profile's capture to the
+/// install-default server:
+///
+/// - Routing is inherited down the tree: a nested marker that sets only
+///   `workspace` must not reset a subdirectory of a profile-routed tree. A
+///   nested marker can only select a different profile, which that
+///   profile's `roots` then have to admit.
+/// - Outside `$HOME` the walk does not stop at the checkout root, so an
+///   organisation-level marker above a repository (`/srv/work/team-b/`,
+///   `/Volumes/…`) still routes it. A marker planted higher up can only name
+///   a profile this operator registered, which `roots` gate once there are
+///   several.
+///
+/// It also fails closed on content: a marker it cannot read is a refused
+/// selection, and a UTF-8 BOM or stray non-UTF-8 byte cannot hide the key.
+///
+/// `home` is the walk boundary inside `$HOME`; the caller passes the one it
+/// also expands `~/` roots against.
+pub(crate) fn find_server_selection(cwd: &str, home: Option<&Path>) -> Option<ServerSelection> {
+    find_marker_matching(cwd, home, OutsideHome::WalkToRoot, |path| {
+        let name = match std::fs::read(path) {
+            Ok(bytes) => Some(server_selection_in(&String::from_utf8_lossy(&bytes))?),
+            Err(_) => None,
+        };
+        Some(ServerSelection {
+            name,
+            marker_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+        })
+    })
+}
+
+/// Line-based like [`parse_key_in`], but it fails closed on shape: a
+/// `server = team-b` without quotes, or an empty `server = ""`, still counts
+/// as a selection (and is then rejected by name validation) instead of being
+/// ignored and silently delivered to the install default. Section headers are
+/// not tracked, so a `server` key under any table is treated the same way.
+fn server_selection_in(text: &str) -> Option<String> {
+    for line in text.lines() {
+        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+        let line = line.trim_start_matches('\u{feff}').trim_start();
+        let Some(rest) = line.strip_prefix("server") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = match value.strip_prefix('"') {
+            Some(quoted) => quoted.split_once('"').map_or(quoted, |(inner, _)| inner),
+            None => value.split('#').next().unwrap_or("").trim(),
+        };
+        return Some(value.to_owned());
+    }
+    None
 }
 
 /// Make `path` absolute and resolve its `.`/`..` components, WITHOUT
@@ -392,6 +482,32 @@ mod tests {
             "a marker above the checkout boundary must not leak in"
         );
         assert!(outer_marker.exists());
+    }
+
+    /// A `$HOME` ending in a separator is the same boundary. The hook scripts
+    /// mirror this.
+    #[test]
+    fn a_trailing_separator_on_home_keeps_the_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("org").join("repo");
+        let plain = home.join("plain");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        let org_marker = write_marker(&home.join("org"), "workspace = \"org\"\n");
+        write_marker(tmp.path(), "workspace = \"above\"\nserver = \"x\"\n");
+        let slashed = PathBuf::from(format!("{}/", home.display()));
+
+        assert_eq!(
+            find_marker_with_home(repo.to_str().unwrap(), Some(&slashed)),
+            Some(org_marker)
+        );
+        assert_eq!(
+            find_marker_with_home(plain.to_str().unwrap(), Some(&slashed)),
+            None,
+            "a marker above home must not leak in"
+        );
+        assert!(find_server_selection(plain.to_str().unwrap(), Some(&slashed)).is_none());
     }
 
     #[test]
@@ -661,5 +777,130 @@ project = "infra" # this is fine
              rather than resolving it to {real_target:?}"
         );
         assert_eq!(normalized, link.join("file.txt"));
+    }
+
+    // ── #992: `server` profile selection ─────────────────────────────────
+
+    #[test]
+    fn server_selection_parses_quoted_bare_and_empty_values() {
+        assert_eq!(
+            server_selection_in("server = \"team-b\" # comment\n").as_deref(),
+            Some("team-b")
+        );
+        assert_eq!(
+            server_selection_in("  server=team-b # comment\n").as_deref(),
+            Some("team-b")
+        );
+        assert_eq!(server_selection_in("server = \"\"\n").as_deref(), Some(""));
+        assert_eq!(
+            server_selection_in("servers = \"x\"\nserver_url = \"y\"\n"),
+            None
+        );
+        assert_eq!(server_selection_in("workspace = \"a\"\n"), None);
+    }
+
+    /// A marker declaring only `server` is a settings boundary like any other
+    /// root-level key; a `[capture]`-only marker stays transparent.
+    #[test]
+    fn a_server_only_marker_is_a_settings_boundary() {
+        assert!(declares_more_than_capture("server = \"team-b\"\n"));
+        assert!(declares_more_than_capture("server = team-b\n"));
+        assert!(!declares_more_than_capture(
+            "[capture]\nignore_paths = [\"x/**\"]\n"
+        ));
+    }
+
+    /// Routing is inherited: a nested marker that sets only `workspace`, or
+    /// only `[capture]`, keeps the ancestor's profile. Without this, a
+    /// sub-project marker would silently send a profile-routed tree to the
+    /// install-default server.
+    #[test]
+    fn nested_markers_without_server_inherit_the_ancestor_selection() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(tmp.path(), "workspace = \"team-b\"\nserver = \"team-b\"\n");
+        let scoped = tmp.path().join("scoped");
+        let capture_only = scoped.join("capture-only");
+        fs::create_dir_all(&capture_only).unwrap();
+        write_marker(&scoped, "workspace = \"other\"\n");
+        write_marker(&capture_only, "[capture]\nignore_paths = [\"x/**\"]\n");
+
+        let selection = find_server_selection(capture_only.to_str().unwrap(), Some(tmp.path()))
+            .expect("the ancestor's selection applies");
+        assert_eq!(selection.name.as_deref(), Some("team-b"));
+        assert_eq!(selection.marker_dir, absolute_normalized(tmp.path()));
+    }
+
+    #[test]
+    fn the_nearest_server_declaration_wins() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(tmp.path(), "server = \"team-a\"\n");
+        let inner = tmp.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "server = \"team-b\"\n");
+
+        let selection = find_server_selection(inner.to_str().unwrap(), Some(tmp.path())).unwrap();
+        assert_eq!(selection.name.as_deref(), Some("team-b"));
+        assert_eq!(selection.marker_dir, absolute_normalized(&inner));
+    }
+
+    #[test]
+    fn no_server_key_anywhere_is_no_selection() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(tmp.path(), "workspace = \"a\"\n");
+        assert_eq!(
+            find_server_selection(tmp.path().to_str().unwrap(), Some(tmp.path())),
+            None
+        );
+    }
+
+    /// Outside `$HOME`, an organisation-level marker above the repository's
+    /// own `.git` still routes it; stopping at the checkout root would send
+    /// the repository to the install default.
+    #[test]
+    fn outside_home_the_walk_reaches_a_marker_above_the_checkout_root() {
+        let tmp = TempDir::new().unwrap();
+        let org = tmp.path().join("org");
+        let repo = org.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        write_marker(&org, "server = \"team-b\"\n");
+        write_marker(&repo, "workspace = \"api\"\n");
+        let elsewhere = tmp.path().join("home");
+
+        let selection = find_server_selection(repo.to_str().unwrap(), Some(&elsewhere)).unwrap();
+        assert_eq!(selection.name.as_deref(), Some("team-b"));
+        assert_eq!(selection.marker_dir, absolute_normalized(&org));
+    }
+
+    /// A BOM or a non-UTF-8 byte must not hide the key.
+    #[test]
+    fn encoding_noise_cannot_hide_a_server_key() {
+        let tmp = TempDir::new().unwrap();
+        for bytes in [
+            b"\xEF\xBB\xBFserver = \"team-b\"\n".as_slice(),
+            b"# caf\xE9\nserver = \"team-b\"\n".as_slice(),
+        ] {
+            fs::write(tmp.path().join(".ai-memory.toml"), bytes).unwrap();
+            let selection =
+                find_server_selection(tmp.path().to_str().unwrap(), Some(tmp.path())).unwrap();
+            assert_eq!(selection.name.as_deref(), Some("team-b"), "{bytes:?}");
+        }
+    }
+
+    /// A marker that exists but cannot be read is a refused selection, not
+    /// "no selection" — it may well declare a profile.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_marker_is_a_refused_selection() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let marker = write_marker(tmp.path(), "server = \"team-b\"\n");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&marker).is_ok() {
+            // Running as root: permissions cannot make the file unreadable.
+            return;
+        }
+        let selection =
+            find_server_selection(tmp.path().to_str().unwrap(), Some(tmp.path())).unwrap();
+        assert_eq!(selection.name, None);
     }
 }

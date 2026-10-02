@@ -72,8 +72,14 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 new_workstream: None,
                 executable: None,
                 yolo: args.yolo,
+                true_yolo: args.true_yolo,
+                jail: None,
+                no_jail: false,
                 fresh: args.fresh,
+                force_unlock: false,
                 no_autowire: false,
+                env: Vec::new(),
+                env_file: None,
                 // Bare mode: `run` resolves the harness that owns the newest
                 // usable session for this workstream.
                 harness: None,

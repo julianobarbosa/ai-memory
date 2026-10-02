@@ -105,6 +105,7 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id,
             workspace_id: ws,
             project_id: proj,
@@ -120,6 +121,7 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id: id,
                     workspace_id: ws,
                     project_id: proj,

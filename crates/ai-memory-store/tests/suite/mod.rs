@@ -3,6 +3,7 @@
 //! no extra binary; a new file must be declared below.
 
 mod access_breadth;
+mod access_mode;
 mod agent_messages;
 mod audit_contamination;
 mod audit_log;
@@ -10,10 +11,14 @@ mod auto_improve_staging;
 mod belief_authority;
 mod client_activity;
 mod fts_drift_status;
+mod fts_stopwords_config;
 mod handoff_ownership;
+mod identity_resolution;
 mod most_recently_active_scope;
 mod multi_session;
 mod pinned_pages;
+mod project_authz;
+mod reclaim_ledger_versions;
 mod related_walk;
 mod retrieval_superseded;
 mod retrieval_tuning_streams;

@@ -248,6 +248,24 @@ pub fn frontmatter_entity_names(frontmatter: &serde_json::Value) -> Vec<String> 
     normalize_entities(merged)
 }
 
+/// The instant a frontmatter `expires_at` value names: an RFC 3339
+/// timestamp, or a bare `YYYY-MM-DD` meaning the end of that day in UTC.
+/// `None` when the value is neither. The wiki's TTL validation and the
+/// OKF `stale_after` derivation both read it, so the two cannot disagree
+/// on when a page expires.
+#[must_use]
+pub fn parse_expires_at_instant(raw: &str) -> Option<Timestamp> {
+    let raw = raw.trim();
+    if let Ok(ts) = raw.parse::<Timestamp>() {
+        return Some(ts);
+    }
+    let date = raw.parse::<jiff::civil::Date>().ok()?;
+    date.at(23, 59, 59, 999_999_000)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()
+        .map(|zoned| zoned.timestamp())
+}
+
 /// A link target discovered in a page body.
 ///
 /// A bare `[[path]]` / `[label](path)` resolves within the source page's

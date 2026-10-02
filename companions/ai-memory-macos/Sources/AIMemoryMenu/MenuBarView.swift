@@ -12,6 +12,17 @@ struct MenuBarView: View {
             .onAppear {
                 Task { await model.poll() }
             }
+        if let error = model.lastError {
+            // Surface the server's own fatal error (e.g. "binding ... Address
+            // already in use") instead of leaving the reason only in
+            // ~/Library/Logs/ai-memory/stderr.log behind a red status item.
+            Text(error)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(12)
+                .frame(maxWidth: 460, alignment: .leading)
+                .disabled(true)
+        }
         ForEach(Array(model.statisticLines.enumerated()), id: \.offset) { _, line in
             Text(line)
                 .font(.system(.body, design: .monospaced))

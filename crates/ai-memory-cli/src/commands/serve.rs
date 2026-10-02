@@ -26,8 +26,11 @@ use ai_memory_mcp::{
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
-use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
+use ai_memory_web::{
+    HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
+    split_web_routers, web_base_href,
+};
+use ai_memory_wiki::{WatcherHandle, Wiki, WikiError, WikiResult, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -609,6 +612,33 @@ fn validate_http_exposure(
     );
 }
 
+/// The operator-facing banner for an exposure that is not [`HttpExposure::Safe`].
+///
+/// Returned as text rather than printed so a test can assert it, and printed at
+/// the call site with `eprintln!` rather than only `tracing::warn!`: the tracing
+/// stderr layer sits behind `EnvFilter`, so `RUST_LOG=error` — or
+/// `log_level = "error"` in the config, which feeds the same filter — silences a
+/// warning whose whole job is to say the server is reachable from the network
+/// without a credential. A security notice a log level can switch off is not a
+/// notice. The structured `tracing::warn!` stays for log collectors.
+fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<String> {
+    match exposure {
+        HttpExposure::Safe => None,
+        HttpExposure::InsecureByOverride => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION because \
+             --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
+             destructive MCP tools."
+        )),
+        HttpExposure::UndeterminedInContainer => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
+             container the bind address cannot show whether this port reaches the network - the \
+             host publish spec decides. Published with `-p 127.0.0.1:49374:49374` you are fine; \
+             published on 0.0.0.0 or a LAN address, anyone on the network can call destructive \
+             MCP tools. Run `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN."
+        )),
+    }
+}
+
 /// Validate the trusted proxy's least-privilege credential and optional stable
 /// root identity before binding the server.
 fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
@@ -942,6 +972,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // Every reader handle below is cloned from this one, so the opt-in
     // ranking signals are set once, here, and inherited everywhere.
     store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    // Same reasoning for the FTS stopword list (issue #953): resolved once
+    // from `[search.fts]` here, then shared by every cloned reader handle.
+    store
+        .reader
+        .set_fts_stopwords(config.search.fts.stopwords());
     let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
@@ -1014,7 +1049,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         // Reader attached unconditionally: admission name-resolution uses it
         // when a chain is configured, and the startup scope-manifest backfill
         // (below) always needs it to enumerate scopes.
-        .with_store_reader(store.reader.clone());
+        .with_store_reader(store.reader.clone())
+        // `[maintenance] reconcile_tombstones_deleted_pages` (#929), read once
+        // by `Config::load` above and threaded through here — the one place
+        // this flag is consulted outside `Config`, per invariant #1.
+        .with_reconcile_tombstones_deleted_pages(
+            config.maintenance.reconcile_tombstones_deleted_pages,
+        );
     // Attach the admission webhook chain (operator-configured via
     // `[[admission_webhooks]]` in config.toml or `AI_MEMORY_ADMISSION_WEBHOOKS__N__*`
     // env vars). Empty config = no chain attached, zero overhead. The store
@@ -1042,12 +1083,41 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
         Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
     }
-    match wiki.ensure_upgrade_baseline_checkpoint() {
-        Ok(Some(oid)) => {
-            tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+    // Pages conformed by an older build carry a date-only OKF `stale_after`
+    // copied from `expires_at`; repair them in place. Idempotent; non-fatal.
+    match wiki.repair_date_only_stale_after().await {
+        Ok((0, 0)) => {}
+        Ok((rows, files)) => tracing::info!(
+            rows,
+            files,
+            "repaired date-only OKF stale_after on existing pages"
+        ),
+        Err(e) => tracing::warn!(error = %e, "OKF stale_after repair failed (non-fatal)"),
+    }
+    let baseline_checkpoint = wiki.ensure_upgrade_baseline_checkpoint();
+    match classify_baseline_checkpoint(&baseline_checkpoint) {
+        BaselineCheckpointLog::Created => {
+            if let Ok(Some(oid)) = &baseline_checkpoint {
+                tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint");
+            }
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
+        BaselineCheckpointLog::Clean => {}
+        // An owner-check failure is silent-but-fatal to the wiki git history:
+        // capture keeps working, but no checkpoint is ever committed, so it
+        // must not hide in a WARN. This is the Windows LocalSystem-service /
+        // user-owned-data-dir case (docs/windows.md Scenario E).
+        BaselineCheckpointLog::OwnerFailure => tracing::error!(
+            error = %baseline_checkpoint.as_ref().err().map(ToString::to_string).unwrap_or_default(),
+            "wiki git commits are failing libgit2's owner check: the wiki repository is not \
+             owned by the account running ai-memory. Run the service AS THE OWNING USER (see \
+             docs/windows.md Scenario E) — capture continues, but no wiki checkpoints will be \
+             committed until this is fixed."
+        ),
+        BaselineCheckpointLog::OtherFailure => {
+            if let Err(e) = &baseline_checkpoint {
+                tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)");
+            }
+        }
     }
 
     // Keep the guard alive for the lifetime of `serve`.
@@ -1081,6 +1151,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
+        .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -1114,6 +1185,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         config.decay,
         config.dream,
         activity_clock,
+        config.contradiction_band_min,
+        config.contradiction_band_max,
     )
     .await;
 
@@ -1291,6 +1364,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 reader: store.reader.clone(),
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
@@ -1306,6 +1380,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     embedder: embedder.clone(),
                     provider_health: provider_health.clone(),
                     decay_params,
+                    contradiction_band_min: config.contradiction_band_min,
+                    contradiction_band_max: config.contradiction_band_max,
                     data_dir: config.data_dir.clone(),
                     db_path: store.db_path().to_path_buf(),
                     bind: bind.clone(),
@@ -1334,6 +1410,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     the users-table lookup, including before the first user is
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
+            store
+                .writer
+                .set_new_project_mode(if config.auth.new_projects_restricted {
+                    ai_memory_store::AccessMode::Restricted
+                } else {
+                    ai_memory_store::AccessMode::Open
+                })
+                .await?;
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
                 .with_secure_cookie(config.auth.secure_cookie);
             let root_user = config
@@ -1455,18 +1539,37 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     web_slug: &args.web_slug,
                     base_href: &base_href,
                     base_path: &base_path,
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 },
             )?;
+            // HTML navigational 401/403 → builtin login / change-password.
+            // Outer layer so it sees dual-auth responses; `/api/v1` stays JSON
+            // (`html_auth_redirect_mw` skips that prefix). Builtin wiki returns
+            // the cfg from split; custom SPA / web-off still builds one so the
+            // layer always has concrete login/change-password targets.
+            let html_auth = web.html_auth.unwrap_or_else(|| {
+                Arc::new(HtmlAuthRedirectConfig::from_mount(
+                    &base_path,
+                    &args.web_slug,
+                ))
+            });
             let router = machine
                 .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    require_dual_auth,
-                )))
+                .merge(
+                    web.protected
+                        .layer(axum::middleware::from_fn_with_state(
+                            auth_state.clone(),
+                            require_dual_auth,
+                        ))
+                        .layer(axum::middleware::from_fn_with_state(
+                            html_auth,
+                            html_auth_redirect_mw,
+                        )),
+                )
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -1512,6 +1615,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
+            // Unconditional: see `exposure_banner` for why this does not ride
+            // on the tracing filter.
+            if let Some(banner) = exposure_banner(exposure, local_addr) {
+                eprintln!("{banner}");
+            }
             if exposure == HttpExposure::InsecureByOverride {
                 tracing::warn!(
                     %local_addr,
@@ -1616,6 +1724,8 @@ async fn start_maintenance_scheduler(
     decay: crate::config::DecaySettings,
     dream: crate::config::DreamSettings,
     activity_clock: ai_memory_consolidate::ActivityClock,
+    contradiction_band_min: f32,
+    contradiction_band_max: f32,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1633,7 +1743,7 @@ async fn start_maintenance_scheduler(
         .as_ref()
         .map(|e| ai_memory_consolidate::EmbeddingCoord {
             provider: e.provider().to_string(),
-            model: e.model().to_string(),
+            model: e.model_identity(),
             dim: e.dim(),
         });
 
@@ -1778,9 +1888,15 @@ async fn start_maintenance_scheduler(
                     let decay_lambda = decay.decay_params().lambda;
                     async move {
                         let started = std::time::Instant::now();
-                        let outcome =
-                            run_scheduled_lint_tick(&reader, &wiki, llm.as_ref(), decay_lambda)
-                                .await?;
+                        let outcome = run_scheduled_lint_tick(
+                            &reader,
+                            &wiki,
+                            llm.as_ref(),
+                            decay_lambda,
+                            contradiction_band_min,
+                            contradiction_band_max,
+                        )
+                        .await?;
                         if outcome.errors > 0 {
                             anyhow::bail!(
                                 "scheduled rule-based lint had {} scope errors",
@@ -2164,6 +2280,8 @@ async fn run_scheduled_lint_tick(
     wiki: &Wiki,
     llm: Option<&Arc<dyn LlmProvider>>,
     decay_lambda: f64,
+    contradiction_band_min: f32,
+    contradiction_band_max: f32,
 ) -> Result<ScheduledLintTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledLintTickOutcome {
@@ -2186,6 +2304,8 @@ async fn run_scheduled_lint_tick(
                 // contradiction detector is on for the user-invoked
                 // `memory_lint` / admin lint, not the background sweep.
                 embedding: None,
+                contradiction_band_min,
+                contradiction_band_max,
             },
         )
         .await
@@ -2275,6 +2395,7 @@ fn auto_improve_review_config_from_settings(
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
         max_patchable_pages: settings.max_patchable_pages,
+        patchable_page_prefixes: settings.patchable_page_prefixes.clone(),
         max_patchable_body_chars: settings.max_patchable_body_chars,
         max_edits_per_proposal: settings.max_edits_per_proposal,
         max_edit_content_chars: settings.max_edit_content_chars,
@@ -2367,11 +2488,15 @@ async fn configure_embedder(
         }
         Err(e) => return Err(e).context("building embedder from config"),
     };
+    // Not `.model()`: the running triple must match what pages are
+    // actually stored under, which a configured document prefix changes.
+    // See `Embedder::model_identity`.
+    let configured_model_identity = embedder.model_identity();
     let mismatch = store
         .reader
         .embedding_meta_for_mismatch(
             embedder.provider().into(),
-            embedder.model().into(),
+            configured_model_identity.clone(),
             embedder.dim(),
         )
         .await?;
@@ -2383,7 +2508,7 @@ async fn configure_embedder(
         tracing::warn!(
             stored = ?mismatch,
             configured_provider = embedder.provider(),
-            configured_model = embedder.model(),
+            configured_model = %configured_model_identity,
             configured_dim = embedder.dim(),
             "stored embeddings use a different (provider, model, dim) than configured; \
              hybrid search ignores stale rows until pages are re-embedded — \
@@ -2481,6 +2606,7 @@ fn configure_consolidator(
         .with_prompt_limits(
             config.consolidation.max_input_tokens,
             config.consolidation.max_output_tokens,
+            config.consolidation.input_token_safety_margin,
         ),
     );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
@@ -2675,6 +2801,31 @@ async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &Acti
     }
 }
 
+/// How a wiki baseline-checkpoint attempt should be surfaced at startup.
+/// Extracted from the logging call so the owner-vs-other classification is
+/// unit-testable without standing up a server: a real LocalSystem-service
+/// owner failure needs a native Windows box, which is out of scope here.
+#[derive(Debug, PartialEq, Eq)]
+enum BaselineCheckpointLog {
+    /// A checkpoint commit was created (INFO).
+    Created,
+    /// Nothing to commit (silent).
+    Clean,
+    /// libgit2 refused on its ownership guard — actionable, logged at ERROR.
+    OwnerFailure,
+    /// Any other failure — non-fatal, logged at WARN as before.
+    OtherFailure,
+}
+
+fn classify_baseline_checkpoint<T>(result: &WikiResult<Option<T>>) -> BaselineCheckpointLog {
+    match result {
+        Ok(Some(_)) => BaselineCheckpointLog::Created,
+        Ok(None) => BaselineCheckpointLog::Clean,
+        Err(WikiError::GitOwner(_)) => BaselineCheckpointLog::OwnerFailure,
+        Err(_) => BaselineCheckpointLog::OtherFailure,
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -2704,6 +2855,41 @@ mod tests {
     use std::pin::Pin;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// An owner-check failure of the startup wiki baseline checkpoint must be
+    /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
+    /// `OtherFailure` that hid it before (#872). A generic error stays
+    /// `OtherFailure`, and the success/clean cases are unchanged — this is the
+    /// seam that decides the log level, so it bites here.
+    ///
+    /// A full native-Windows LocalSystem-service repro (the environment that
+    /// actually raises `code=Owner`) is out of scope; this covers the mapping
+    /// from `WikiError::GitOwner` to the ERROR branch.
+    #[test]
+    fn owner_failure_baseline_checkpoint_is_error_not_warn() {
+        let owner: WikiResult<Option<()>> = Err(WikiError::GitOwner("not owned".into()));
+        assert_eq!(
+            classify_baseline_checkpoint(&owner),
+            BaselineCheckpointLog::OwnerFailure,
+            "owner-check failure must be surfaced at ERROR, not buried in a WARN"
+        );
+
+        let other: WikiResult<Option<()>> = Err(WikiError::Io(std::io::Error::other("disk gone")));
+        assert_eq!(
+            classify_baseline_checkpoint(&other),
+            BaselineCheckpointLog::OtherFailure,
+            "a non-owner failure stays a non-fatal WARN"
+        );
+
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<_, WikiError>(Some(()))),
+            BaselineCheckpointLog::Created
+        );
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<Option<()>, WikiError>(None)),
+            BaselineCheckpointLog::Clean
+        );
+    }
 
     async fn wait_for_maintenance_success(
         store: &Store,
@@ -2924,6 +3110,49 @@ mod tests {
             validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
             HttpExposure::Safe
         );
+    }
+
+    /// The exposure notice must not be something a log level can switch off.
+    /// `exposure_banner` is printed with `eprintln!`, outside the tracing
+    /// `EnvFilter`, so `RUST_LOG=error` or `log_level = "error"` cannot hide
+    /// that the server is reachable without a credential.
+    #[test]
+    fn every_unsafe_exposure_produces_an_operator_banner() {
+        let addr: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        assert_eq!(exposure_banner(HttpExposure::Safe, addr), None);
+
+        let override_banner = exposure_banner(HttpExposure::InsecureByOverride, addr)
+            .expect("an unauthenticated override must be announced");
+        assert!(override_banner.contains("NO AUTHENTICATION"));
+        assert!(override_banner.contains("0.0.0.0:49374"));
+        assert!(override_banner.contains("--allow-insecure-no-auth"));
+
+        let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
+            .expect("an unauthenticated container bind must be announced");
+        assert!(container_banner.contains("NO AUTHENTICATION"));
+        assert!(container_banner.contains("0.0.0.0:49374"));
+        // The remedy has to be in the text: the operator reading this on a
+        // terminal has no log collector to go digging in.
+        assert!(container_banner.contains("AI_MEMORY_AUTH_TOKEN"));
+    }
+
+    /// The Quick Start shape from #407 is exactly the one #902 reports as
+    /// silently exposed, so the two must agree: still not refused, but now
+    /// unconditionally announced.
+    #[test]
+    fn the_quick_start_container_bind_is_announced_not_refused() {
+        let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+            .expect("must not refuse");
+        assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
+        assert!(exposure_banner(exposure, quick_start).is_some());
+
+        // With a token configured there is nothing to announce.
+        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+            .expect("auth is fine");
+        assert_eq!(exposure_banner(authed, quick_start), None);
     }
 
     /// Regression for #407. The published image binds `0.0.0.0` because that
@@ -3389,6 +3618,7 @@ mod tests {
                 forget_sweep_interval_secs: 1,
                 lint_interval_secs: 1,
                 embedding_backfill_interval_secs: 1,
+                reconcile_tombstones_deleted_pages: false,
             },
             AutoImproveSettings::default(),
             store.reader.clone(),
@@ -3399,6 +3629,8 @@ mod tests {
             crate::config::DecaySettings::default(),
             crate::config::DreamSettings::default(),
             ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         )
         .await;
         assert!(tasks.is_empty());
@@ -3425,12 +3657,14 @@ mod tests {
                 forget_sweep_interval_secs: 0,
                 lint_interval_secs: 60,
                 embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
             },
             MaintenanceSettings {
                 enabled: true,
                 forget_sweep_interval_secs: 60,
                 lint_interval_secs: 0,
                 embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
             },
         ] {
             let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
@@ -3445,6 +3679,8 @@ mod tests {
                 crate::config::DecaySettings::default(),
                 crate::config::DreamSettings::default(),
                 ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -3566,6 +3802,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: worked_in,
@@ -3579,6 +3816,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: worked_in,
@@ -3667,6 +3905,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: elsewhere,
@@ -3680,6 +3919,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: elsewhere,
@@ -3729,6 +3969,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id,
@@ -3742,6 +3983,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -3942,6 +4184,8 @@ mod tests {
             &wiki,
             Some(&panic_llm),
             ai_memory_store::DecayParams::default().lambda,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         )
         .await
         .unwrap();
@@ -3999,7 +4243,7 @@ mod tests {
                     ws,
                     project,
                     embedder.provider().to_string(),
-                    embedder.model().to_string(),
+                    embedder.model_identity(),
                     embedder.dim(),
                 )
                 .await
@@ -4149,30 +4393,128 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
         let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
         let router = apply_host_layer(
-            web.protected.layer(axum::middleware::from_fn_with_state(
-                auth,
-                require_dual_auth,
-            )),
+            web.public.merge(
+                web.protected
+                    .layer(axum::middleware::from_fn_with_state(
+                        auth,
+                        require_dual_auth,
+                    ))
+                    .layer(axum::middleware::from_fn_with_state(
+                        html_auth,
+                        html_auth_redirect_mw,
+                    )),
+            ),
             vec!["localhost".to_string()],
         );
 
-        let resp = router
+        // Non-HTML clients still see JSON 401.
+        let json_401 = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
+
+        // Browser navigations redirect to the public login page.
+        let html_redir = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
+        let location = html_redir
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            location.starts_with("/web/login?next="),
+            "expected login redirect, got {location}"
+        );
+
+        // Login HTML is public (no auth).
+        let login = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/login")
                     .header("Host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(login.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Sign in"), "login page body: {html}");
+        assert!(
+            html.contains("ai-memory-base-path"),
+            "inject base-path meta"
+        );
 
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Change-password HTML is public (must_change_password flow).
+        let change = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/change-password")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.status(), StatusCode::OK);
+        let change_body = axum::body::to_bytes(change.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let change_html = std::str::from_utf8(&change_body).unwrap();
+        assert!(
+            change_html.contains("Change password"),
+            "change-password page body: {change_html}"
+        );
+
+        // `/api/v1` stays JSON even with an HTML Accept header.
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -4196,6 +4538,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -4256,6 +4599,7 @@ mod tests {
                 web_slug: "/",
                 base_href: "/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();

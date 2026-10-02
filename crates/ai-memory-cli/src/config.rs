@@ -265,6 +265,13 @@ pub struct Config {
     pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
+    /// Optional override for the GitHub Releases base URL used by
+    /// `ai-memory upgrade` (archive + `.sha256` download). Empty/unset
+    /// means `https://github.com/akitaonrails/ai-memory/releases`. Set via
+    /// `AI_MEMORY_RELEASE_BASE_URL` or `release_base_url` in config.toml —
+    /// intended for hermetic tests and mirrors, not day-to-day installs.
+    #[serde(default)]
+    pub release_base_url: Option<String>,
     /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
     /// CLI commands prepend it to every `/admin/*` request so deployments
     /// hosted behind a reverse proxy under a subpath don't 404. Settable via
@@ -392,13 +399,23 @@ pub struct Config {
     /// false`; `ai-memory backfill` remains available to run it by hand.
     pub backfill_on_start: bool,
     /// On by default. The first time `ai-memory run <harness>` launches a
-    /// harness (per harness + binary version), it auto-installs that harness's
-    /// ai-memory lifecycle hooks and MCP server if they are not already wired,
-    /// so managed launches capture and can query memory without a manual
-    /// `install-hooks` / `install-mcp` step. Idempotent and one-time per
-    /// harness. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
+    /// harness (per harness, binary version and config home), it auto-installs
+    /// that harness's ai-memory lifecycle hooks and MCP server if they are not
+    /// already wired, so managed launches capture and can query memory without
+    /// a manual `install-hooks` / `install-mcp` step. Idempotent and one-time
+    /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
+    /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
+    /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
+    /// injecting `--settings` that forces `bypassPermissions` over any
+    /// settings `defaultMode`. It never turns a launch without `--yolo` into a
+    /// bypassing one, and it cannot silence the user's own `ask` rules, which
+    /// Claude Code enforces in every mode. No-op for every other harness. Best
+    /// paired with ai-jail (see `docs/design-yolo-safety-ai-jail.md`). Set with
+    /// `AI_MEMORY_CLAUDE_TRUE_YOLO=true` or `claude_true_yolo = true` in
+    /// config.toml; `ai-memory run --true-yolo` requests it per launch.
+    pub claude_true_yolo: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -441,6 +458,48 @@ pub struct Config {
     pub embedding_dim: Option<u32>,
     /// Optional embedding base URL override.
     pub embedding_base_url: Option<String>,
+    /// Optional prefix prepended to every embedding **query** before it is
+    /// sent to the `openai` or `openai-compat` embedder, ahead of the
+    /// existing truncation. Unset (the default) is a no-op — no behaviour
+    /// change. Asymmetric self-hosted models need a query-side instruction
+    /// their publisher specifies; the OpenAI-compatible `/v1/embeddings`
+    /// wire format has no field for it, so the client prepends it instead.
+    /// `nvidia/Nemotron-3-Embed-1B-BF16` and base E5 models
+    /// (`intfloat/e5-base-v2`, multilingual E5, …) use a simple
+    /// `"query: "` / `"passage: "` pair (documents get
+    /// `embedding_document_prefix = "passage: "`). Instruction-tuned E5
+    /// variants and Qwen3-Embedding instead need a full task-instruction
+    /// string on the query side only, with **different exact spacing each**
+    /// — leave `embedding_document_prefix` unset for both (their documents
+    /// are plain text, no prefix):
+    /// `e5-mistral-7b-instruct` wants
+    /// `"Instruct: {task description}\nQuery: "` (a trailing space after
+    /// `Query:`); Qwen3-Embedding wants
+    /// `"Instruct: {task description}\nQuery:"` (no trailing space — the
+    /// query text follows the colon directly). Not trimmed: a publisher's
+    /// trailing space or embedded newline is significant and preserved
+    /// verbatim. Ignored by `google` (which has its own built-in
+    /// query/document asymmetry), `voyage`, `local`, and `copilot`.
+    /// Changing only this key never requires re-embedding existing pages —
+    /// the query side has no stored identity. See `docs/llm-providers.md`.
+    /// Settable via `AI_MEMORY_EMBEDDING_QUERY_PREFIX` (figment's `Env`
+    /// provider would otherwise trim a trailing space; `Config::load`
+    /// overlays the raw env bytes for this key specifically).
+    pub embedding_query_prefix: Option<String>,
+    /// Document-side counterpart of `embedding_query_prefix` (e.g.
+    /// `"passage: "` for Nemotron-3-Embed / base E5; see that field's doc
+    /// comment for which models this applies to). Unlike the query prefix,
+    /// this one IS folded into the stored embedding identity
+    /// (`Embedder::model_identity`): a non-empty value makes newly
+    /// embedded pages distinguishable from ones embedded before the
+    /// change (or under a different prefix), so `memory_query` and
+    /// `ai-memory embed`'s stale-row detection both treat a document-prefix
+    /// change like a model change — no manual `--force` needed, and an
+    /// empty value keeps the pre-existing (legacy) identity so upgrading
+    /// installs need no migration. Settable via
+    /// `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX` (same raw-env overlay as
+    /// `embedding_query_prefix`).
+    pub embedding_document_prefix: Option<String>,
     /// M8 retention-sweep parameters. The defaults give an ~80-day
     /// "survival floor" for unused episodic content (above the cold
     /// threshold), followed by ~180 days of tombstone grace before permanent
@@ -449,6 +508,25 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Lower edge (inclusive) of `memory_lint`'s A5 zero-LLM
+    /// contradiction-detection cosine-similarity band. Two cold pages whose
+    /// embeddings sit in `[contradiction_band_min, contradiction_band_max)`
+    /// are "same topic, not a duplicate" — flagged as a likely conflict.
+    ///
+    /// The band is a fixed absolute cosine value, but the background
+    /// similarity of unrelated pages is corpus-dependent: on a
+    /// single-language or single-domain store (or one written in a
+    /// non-English language), unrelated pages already sit well above the
+    /// general-purpose default floor, so the band ends up measuring domain
+    /// proximity rather than conflict and produces noisy findings. Raise
+    /// this floor for such a store. Default `0.4` preserves the historical
+    /// fixed band exactly. Settable via `AI_MEMORY_CONTRADICTION_BAND_MIN`.
+    pub contradiction_band_min: f32,
+    /// Upper edge (exclusive) of the band — see `contradiction_band_min`. At
+    /// or above this, two pages are treated as a near-duplicate (A3
+    /// cold-cluster dedup's territory) rather than a contradiction. Default
+    /// `0.75`. Settable via `AI_MEMORY_CONTRADICTION_BAND_MAX`.
+    pub contradiction_band_max: f32,
     /// Opt-in LLM "dream" pass (B2/B3/B4): rewrite/merge cold clusters with the
     /// configured provider, scheduled on idle and cancelled the moment the
     /// operator returns. OFF by default and gated on an R2 number before it may
@@ -457,6 +535,9 @@ pub struct Config {
     /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
     /// lexical query-intent routing). All off by default.
     pub retrieval: RetrievalSettings,
+    /// Search-path tuning that is not a ranking signal (contrast with
+    /// `retrieval`): today, only the FTS stopword list (issue #953).
+    pub search: SearchSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
@@ -703,6 +784,15 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Create every new project `restricted` rather than `open` (#708).
+    ///
+    /// Off by default: a new project is open to every authenticated user, as
+    /// every project was before per-project access existed. On, a new project
+    /// admits only its creator — who is granted `write` on it — and root,
+    /// until someone grants others. Existing projects are never changed by
+    /// this; an operator restricts one with `ai-memory project access`. The
+    /// reserved `scratch` and global-preferences projects are always open.
+    pub new_projects_restricted: bool,
     /// Mark the browser session cookie `Secure`. Human authentication on a
     /// non-loopback listener requires this explicit HTTPS reverse-proxy
     /// posture. It may be false only for direct loopback smoke/development.
@@ -851,6 +941,7 @@ impl Default for Config {
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
+            release_base_url: None,
             base_path: String::new(),
             home_dir: None,
             log_level: "info".into(),
@@ -868,6 +959,7 @@ impl Default for Config {
             capture_assistant: false,
             backfill_on_start: true,
             run_autowire: true,
+            claude_true_yolo: false,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -875,10 +967,15 @@ impl Default for Config {
             embedding_model: None,
             embedding_dim: None,
             embedding_base_url: None,
+            embedding_query_prefix: None,
+            embedding_document_prefix: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
             retrieval: RetrievalSettings::default(),
+            search: SearchSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
@@ -910,6 +1007,15 @@ pub struct ConsolidationSettings {
     /// Maximum tokens the provider may generate for a consolidation response.
     /// Small-context models must lower this together with `max_input_tokens`.
     pub max_output_tokens: u32,
+    /// Safety margin applied to the `max_input_tokens` budget (`0 < m <= 1`).
+    ///
+    /// `max_input_tokens` is an approximate char-count heuristic (a flat
+    /// chars-per-token ratio), so it under-budgets denser corpora — pt-BR text
+    /// and source code tokenize at fewer chars per token than English prose and
+    /// can overshoot a provider's real input limit by ~40%. This margin shrinks
+    /// the effective char budget (default 0.8); lower it further for a corpus
+    /// that is mostly non-English or code. (#884)
+    pub input_token_safety_margin: f64,
 }
 
 impl Default for ConsolidationSettings {
@@ -917,6 +1023,8 @@ impl Default for ConsolidationSettings {
         Self {
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            input_token_safety_margin:
+                ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
         }
     }
 }
@@ -947,8 +1055,15 @@ pub struct AutoImproveSettings {
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to `_rules/` and `procedures/`. A project that keeps durable
+    /// knowledge elsewhere — `decisions/`, `gotchas/` — can add those folders so
+    /// the reviewer stops proposing what is already written there (#834).
+    #[serde(default = "default_patchable_page_prefixes")]
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -1058,6 +1173,7 @@ impl Default for AutoImproveSettings {
             max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
             max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: default_patchable_page_prefixes(),
             max_patchable_body_chars:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal:
@@ -1138,6 +1254,32 @@ pub struct MaintenanceSettings {
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
+    /// Opt-in reconcile-delete safety net (#929). When `true`, the watcher's
+    /// 30s reconcile pass tombstones (`is_latest = 0` + `superseded_at`, never
+    /// a filesystem touch or a BLOCKING admission dispatch) an OKF-imported
+    /// content page (session summary pages are excluded — a same-workspace
+    /// `move-session` re-home can leave one with a correct row and no file, a
+    /// separate pre-existing bug) whose file has been missing on two
+    /// consecutive passes, after a circuit breaker that refuses to act on a
+    /// scope where more than `max(3, 50%)` of its candidate pages look
+    /// missing at once, or where a non-partial walk finds nothing at all
+    /// (see `ai_memory_wiki::watcher::reconcile_delete_breaker_threshold`) —
+    /// either shape is far more likely a walk/mount problem (an unmounted
+    /// volume, a git checkout mid-walk) than genuine deletions.
+    ///
+    /// The tombstone is NOT exempt from the aged-tombstone hard-delete sweep
+    /// (`hard_delete_after_days`) — the actual guarantee is narrower: a
+    /// reconcile tombstone is never itself destroyed while its chain has no
+    /// successor. If the file returns, the new version re-links to the
+    /// tombstoned chain (`ops::upsert_page_in_tx`'s resurrection path)
+    /// instead of starting fresh, so nothing is orphaned for that sweep to
+    /// destroy.
+    ///
+    /// Defaults to `false`: with this off, reconcile's behavior is
+    /// byte-identical to before this feature existed — deletions still
+    /// require `ai-memory delete-page`, and nothing new is logged. Doc:
+    /// `docs/okf.md`, `docs/install.md`.
+    pub reconcile_tombstones_deleted_pages: bool,
 }
 
 impl Default for MaintenanceSettings {
@@ -1147,6 +1289,7 @@ impl Default for MaintenanceSettings {
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
             embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
         }
     }
 }
@@ -1292,6 +1435,175 @@ impl RetrievalSettings {
     }
 }
 
+/// Upper bound on `search.fts.stopwords` list length: a stopword filter is a
+/// short function-word list (the built-in English one has ~60 entries), not
+/// a document blocklist. Rejected at load rather than silently accepted and
+/// then slow (or meaningless) at search time.
+const MAX_FTS_STOPWORDS: usize = 2000;
+/// Upper bound on a single `search.fts.stopwords` entry, in Unicode scalar
+/// values. Stopwords are short function words; a value this size is almost
+/// certainly a misconfiguration (a pasted sentence, a stray delimiter).
+const MAX_FTS_STOPWORD_LEN: usize = 64;
+
+/// `[search]` search-path tuning that is not itself a ranking signal —
+/// contrast with `[retrieval]`, which is. Today this holds only the FTS
+/// stopword list (issue #953).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchSettings {
+    /// FTS5 query-preparation tuning.
+    pub fts: FtsSettings,
+}
+
+/// `[search.fts]` bare natural-language FTS query preparation.
+///
+/// Env form: `AI_MEMORY_SEARCH_FTS_STOPWORDS` (a comma-separated string),
+/// the same convention `allowed_hosts` / `cors_allow_origins` /
+/// `auth.trusted_proxy_cidrs` use for a `Vec<String>` via
+/// `deserialize_string_or_vec`. This key does NOT go through that shared
+/// helper or the usual `__`-split figment `Env` layer, though: figment
+/// merges raw values before any deserializer runs, so a *present but blank*
+/// env var would silently replace a real `config.toml` list with nothing at
+/// the value level — there is no chance for a deserializer to treat "blank"
+/// specially after the fact. `stopwords` also carries a real meaning for
+/// "empty" (`[]` disables filtering outright) that must not be confused with
+/// "the env var happened to be unset/blank", so this key is read once in
+/// `Config::load` (see `apply_fts_stopwords_env`) and only overrides when the
+/// env var is set to a non-blank value — the same pattern
+/// `overlay_embedding_prefixes` uses for `AI_MEMORY_EMBEDDING_QUERY_PREFIX`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FtsSettings {
+    /// Words dropped from a bare (non-explicit-syntax) natural-language FTS
+    /// query before the OR-join
+    /// (`ai_memory_store::fts_query::prepare_fts5_query`).
+    ///
+    /// - **Absent** (the default, `None`): the built-in English list —
+    ///   byte-identical to every install that predates this key.
+    /// - **`[]`** (`Some(vec![])`): disables the filter entirely — every
+    ///   token, including English function words, survives the OR-join.
+    /// - **A non-empty list**: replaces the default outright with exactly
+    ///   those words (trimmed and validated by `Config::load`).
+    ///
+    /// Comparison folds full Unicode case (not ASCII-only) but never strips
+    /// diacritics — see `ai_memory_store::fts_query::FtsStopwords`'s doc
+    /// comment for the exact fold and why. In short: what matters here is
+    /// how a query is actually TYPED, not how wiki content is spelled —
+    /// content matches through the FTS index's own diacritic-folding
+    /// tokenizer regardless of this filter, but a bare query's stopword
+    /// check only ever sees the literal characters someone typed. A list
+    /// for an accented language should include every spelling a user or
+    /// agent might type, e.g. Portuguese `"e"` AND `"é"`, `"nao"` AND
+    /// `"não"`. Also note the filter matches whitespace-split raw tokens
+    /// before any punctuation handling, so an entry never matches a token
+    /// with attached punctuation (`"de,"`, `"que?"`) — the same limitation
+    /// English stopwords have always had.
+    ///
+    /// A non-English or mixed-language wiki should set this to that
+    /// language's function words, or to `[]`: left unset, only the built-in
+    /// English list is filtered, so another language's high-document-frequency
+    /// function words (`em`, `de`, `que`, `uma`, …) pass straight through the
+    /// OR-join and contaminate BM25 term-frequency scoring for every page
+    /// that happens to contain them (issue #953). Configuring this list does
+    /// not retroactively fix anything by itself — an install has to opt in.
+    pub stopwords: Option<Vec<String>>,
+}
+
+impl FtsSettings {
+    /// Store-side stopword set consumed by `ReaderPool::set_fts_stopwords`.
+    /// Assumes `Config::load` already validated `stopwords` (entry count and
+    /// length bounds) — this method does not re-validate.
+    #[must_use]
+    pub fn stopwords(&self) -> ai_memory_store::FtsStopwords {
+        match &self.stopwords {
+            None => ai_memory_store::FtsStopwords::default(),
+            Some(words) => ai_memory_store::FtsStopwords::new(words),
+        }
+    }
+
+    /// Validate and normalize `stopwords` in place: trims each entry's ends
+    /// (a hand-edited `config.toml` or a CSV env override can easily carry a
+    /// stray space) rather than rejecting it, then rejects a bound violation
+    /// or an entry with INTERNAL whitespace. A bare FTS query is tokenized
+    /// with `str::split_whitespace()` (`ai_memory_store::fts_query`), so a
+    /// multi-word entry like `"de la"` could never equal one token — it
+    /// would look configured while silently doing nothing.
+    ///
+    /// # Errors
+    /// Returns a message naming the offending bound or entry, always
+    /// prefixed `search.fts.stopwords` so the error is self-locating.
+    fn validate(&mut self) -> Result<(), String> {
+        let Some(words) = self.stopwords.as_mut() else {
+            return Ok(());
+        };
+        if words.len() > MAX_FTS_STOPWORDS {
+            return Err(format!(
+                "search.fts.stopwords must have at most {MAX_FTS_STOPWORDS} entries (got {}); \
+                 this filters function words out of bare FTS queries, not a document blocklist",
+                words.len()
+            ));
+        }
+        for word in words.iter_mut() {
+            let trimmed = word.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "search.fts.stopwords entries must not be empty or whitespace-only".to_string(),
+                );
+            }
+            if trimmed.chars().count() > MAX_FTS_STOPWORD_LEN {
+                return Err(format!(
+                    "search.fts.stopwords entry {word:?} exceeds the {MAX_FTS_STOPWORD_LEN}-\
+                     character limit (stopwords are short function words, not phrases or \
+                     sentences)"
+                ));
+            }
+            if trimmed.split_whitespace().count() > 1 {
+                return Err(format!(
+                    "search.fts.stopwords entry {word:?} contains internal whitespace; a bare \
+                     FTS query is split on whitespace before comparison, so a multi-word entry \
+                     can never match one token"
+                ));
+            }
+            if trimmed != word {
+                *word = trimmed.to_string();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse the `AI_MEMORY_SEARCH_FTS_STOPWORDS` env override into
+/// `config.search.fts.stopwords`, following the CSV-string convention
+/// `deserialize_string_or_vec` already uses for `allowed_hosts` /
+/// `cors_allow_origins` / `auth.trusted_proxy_cidrs`.
+///
+/// Not wired through the usual `__`-split figment `Env` layer +
+/// `deserialize_with`, because that layer merges RAW values across
+/// providers before any deserializer runs: a present-but-blank env var
+/// would silently replace a real `config.toml` list with nothing at the
+/// value level, before a deserializer ever got a chance to treat "blank"
+/// specially. Reading and applying it here instead, once, as data — the
+/// same pattern `overlay_embedding_prefixes` uses — lets an unset OR blank
+/// env var leave whatever `config.toml`/the default already resolved
+/// untouched, while a real comma list still overrides it. `raw` is the
+/// value already read by the caller (`Config::load`), so this stays
+/// directly unit-testable without mutating process env.
+fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    if raw.trim().is_empty() {
+        // A present-but-blank env var means "unset" here, not "disable
+        // filtering" — an empty `config.toml` `stopwords = []` is still the
+        // unambiguous way to ask for that.
+        return;
+    }
+    config.search.fts.stopwords = Some(
+        raw.split(',')
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect(),
+    );
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1316,6 +1628,19 @@ impl Config {
             figment = figment.merge(Toml::file(&resolved_config_path));
         }
         figment = figment.merge(Env::prefixed("AI_MEMORY_").split("__"));
+        // The environment is read once, here, and passed down as data —
+        // never inside `overlay_embedding_prefixes` itself — so that
+        // function stays directly testable without mutating process env or
+        // cwd (see its doc comment).
+        figment = overlay_embedding_prefixes(
+            figment,
+            std::env::var("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+                .ok()
+                .as_deref(),
+            std::env::var("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+                .ok()
+                .as_deref(),
+        );
 
         let mut config: Config = figment.extract().with_context(|| {
             format!(
@@ -1346,6 +1671,15 @@ impl Config {
                 })?;
             config.admission_webhooks = parsed;
         }
+        // FTS stopword list (issue #953): CSV env override, applied as data
+        // (see `apply_fts_stopwords_env`'s doc comment for why this can't go
+        // through the usual `__`-split figment `Env` layer).
+        apply_fts_stopwords_env(
+            &mut config,
+            std::env::var("AI_MEMORY_SEARCH_FTS_STOPWORDS")
+                .ok()
+                .as_deref(),
+        );
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -1405,6 +1739,34 @@ impl Config {
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
         }
+        // A5 zero-LLM contradiction band (`memory_lint`): both edges must be
+        // finite and inside cosine similarity's own range, and the band must
+        // be non-empty. An inverted or out-of-range band would either
+        // silently disable A5 (no pair ever falls inside an empty range) or
+        // compare against a meaningless similarity value; reject it at load
+        // rather than inside the lint pass.
+        if !config.contradiction_band_min.is_finite()
+            || !config.contradiction_band_max.is_finite()
+            || config.contradiction_band_min < 0.0
+            || config.contradiction_band_max > 1.0
+            || config.contradiction_band_min >= config.contradiction_band_max
+        {
+            anyhow::bail!(
+                "contradiction_band_min/contradiction_band_max must satisfy \
+                 0.0 <= contradiction_band_min < contradiction_band_max <= 1.0 \
+                 (got min={}, max={})",
+                config.contradiction_band_min,
+                config.contradiction_band_max
+            );
+        }
+        // FTS stopword list (issue #953): a configured list is a short
+        // function-word table, not a document blocklist or free-text field.
+        // Reject an oversized or malformed list (or normalize a trimmable
+        // one) at startup rather than shipping a slow, meaningless, or
+        // silently-inert filter into every search.
+        if let Err(message) = config.search.fts.validate() {
+            anyhow::bail!("{message}");
+        }
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -1437,6 +1799,21 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
+        let safety_margin = config.consolidation.input_token_safety_margin;
+        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
+            anyhow::bail!(
+                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
+                 (got {safety_margin}); it scales the approximate input-token budget"
+            );
+        }
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
         if config.llm_timeout_secs == 0 {
@@ -1881,6 +2258,14 @@ impl Config {
         } else {
             None
         };
+        // Not `non_empty`: that trims, and a publisher's trailing space
+        // (e.g. Nemotron-3-Embed's `"query: "`) is significant. By the time
+        // `Load` has run, `self.embedding_query_prefix` already holds the
+        // exact configured bytes regardless of source (TOML or env) — see
+        // `Config::load`'s env-prefix overlay, which corrects for
+        // figment's `Env` provider trimming unquoted values.
+        let query_prefix = self.embedding_query_prefix.clone().unwrap_or_default();
+        let document_prefix = self.embedding_document_prefix.clone().unwrap_or_default();
         Ok(Some(EmbedderConfig {
             provider,
             model,
@@ -1890,6 +2275,8 @@ impl Config {
             models_dir: Some(self.data_dir.join("models")),
             copilot_auth,
             defaulted,
+            query_prefix,
+            document_prefix,
         }))
     }
 
@@ -2094,6 +2481,51 @@ fn env_string(name: &str) -> Option<String> {
     })
 }
 
+/// Overlay the two embedding-prefix keys onto `figment` with their raw,
+/// untrimmed values, whenever the corresponding parameter is `Some` (even
+/// `Some("")` — an operator clearing a `config.toml`-set prefix back to
+/// none via an empty env var; only `None`, the variable genuinely absent,
+/// leaves a `config.toml` value or the default untouched).
+///
+/// figment's `Env` provider parses each var's string as a loose value
+/// (`figment::value::parse::value`), and its bare/unquoted branch calls
+/// `.trim()` — so `AI_MEMORY_EMBEDDING_QUERY_PREFIX="query: "` would
+/// otherwise reach `embedding_query_prefix` as `"query:"`, silently
+/// dropping the publisher-significant trailing space (verified against
+/// figment 0.10.19's vendored source, `src/value/parse.rs:78`).
+/// [`Serialized`] values are handed to figment as already-typed data (via
+/// `serde::Serialize`), so they never pass through that string parser and
+/// so are never trimmed. Callers merge this after `Env::prefixed` so it
+/// wins over the (possibly trimmed) value that provider already set.
+///
+/// The values come in as parameters, already read by the caller, rather
+/// than this function reading `std::env::var` itself — the same pattern
+/// `ai-memory-cli/src/commands/path_util.rs`'s `agent_config_home` and
+/// `ai-memory-hooks`'s `drain_with_live_token` use, and for the same
+/// reason: it keeps this function directly unit-testable without
+/// mutating process environment or the current directory. Both are
+/// unsafe or actively harmful to do from a `#[test]` in this crate's
+/// multi-threaded lib test binary — `std::env::set_var` is `unsafe` under
+/// edition 2024 and forbidden workspace-wide, and even a "safe" wrapper
+/// such as `figment::Jail` still calls `std::env::set_current_dir` on the
+/// real process (verified against its vendored source,
+/// `src/jail.rs:141`), racing every other test in the binary that reads
+/// env or relies on cwd — e.g. `tests/suite/backfill_e2e.rs`'s
+/// `Command::current_dir` calls.
+fn overlay_embedding_prefixes(
+    mut figment: Figment,
+    query_prefix_env: Option<&str>,
+    document_prefix_env: Option<&str>,
+) -> Figment {
+    if let Some(v) = query_prefix_env {
+        figment = figment.merge(Serialized::default("embedding_query_prefix", v));
+    }
+    if let Some(v) = document_prefix_env {
+        figment = figment.merge(Serialized::default("embedding_document_prefix", v));
+    }
+    figment
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     env_string(name).map(PathBuf::from)
 }
@@ -2216,7 +2648,13 @@ pub fn clear_hook_auth_token(data_dir: &Path) -> std::io::Result<()> {
 /// Read the persisted bearer, if one was stored. Trailing newline trimmed.
 #[must_use]
 pub fn read_hook_auth_token(data_dir: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(hook_auth_token_path_in(data_dir)).ok()?;
+    read_trimmed_secret(&hook_auth_token_path_in(data_dir))
+}
+
+/// Read a one-value secret file. Surrounding whitespace is trimmed, and a
+/// missing, unreadable, or blank file is `None` — never an empty bearer.
+pub(crate) fn read_trimmed_secret(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
@@ -2243,6 +2681,15 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
         // Windows has no mode bits here; the data dir's own ACL is the boundary.
         std::fs::write(path, contents)
     }
+}
+
+/// The historical patchable folders, kept as the default so an existing config
+/// that omits the key behaves exactly as before (#834).
+fn default_patchable_page_prefixes() -> Vec<String> {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect()
 }
 
 fn default_data_dir() -> PathBuf {
@@ -2510,6 +2957,48 @@ mod tests {
         );
     }
 
+    /// An install that never touched `contradiction_band_min`/`_max` sees no
+    /// change: the defaults are exactly the historical fixed band.
+    #[test]
+    fn contradiction_band_defaults_match_the_historical_fixed_band() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.contradiction_band_min,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW
+        );
+        assert_eq!(
+            cfg.contradiction_band_max,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_contradiction_band() {
+        for (min, max) in [
+            ("0.8", "0.4"),   // min >= max (inverted)
+            ("0.4", "0.4"),   // min >= max (equal)
+            ("-0.1", "0.75"), // min out of range
+            ("0.4", "1.5"),   // max out of range
+            ("nan", "0.75"),  // NaN
+            ("0.4", "nan"),   // NaN
+            ("0.4", "inf"),   // infinite (not finite)
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("contradiction_band_min = {min}\ncontradiction_band_max = {max}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("min={min} max={max} must fail closed"));
+            assert!(
+                error.to_string().contains("contradiction_band"),
+                "unexpected error for min={min} max={max}: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn load_rejects_destructive_invalid_breadth_weights() {
         for value in ["-0.1", "nan", "inf"] {
@@ -2523,6 +3012,249 @@ mod tests {
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    // --- issue #953: `[search.fts]` stopword config -------------------
+
+    /// Absent `[search.fts]` resolves to `None`, which `FtsSettings::stopwords`
+    /// turns into the built-in English list — an install that never touches
+    /// this key sees byte-identical search behaviour.
+    #[test]
+    fn absent_search_fts_defaults_to_builtin_english_list() {
+        let cfg = Config::default();
+        assert_eq!(cfg.search.fts.stopwords, None);
+        assert_eq!(
+            cfg.search.fts.stopwords(),
+            ai_memory_store::FtsStopwords::default()
+        );
+    }
+
+    /// An explicit empty list parses to `Some(vec![])`, which resolves to
+    /// "no filtering" rather than being treated the same as an absent key.
+    #[test]
+    fn explicit_empty_search_fts_stopwords_disables_filtering() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[search.fts]\nstopwords = []\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.search.fts.stopwords, Some(Vec::new()));
+        assert_eq!(
+            cfg.search.fts.stopwords(),
+            ai_memory_store::FtsStopwords::none()
+        );
+    }
+
+    /// A configured list parses verbatim and resolves to exactly those
+    /// words (lowercased), replacing the default outright rather than
+    /// extending it.
+    #[test]
+    fn configured_search_fts_stopwords_list_parses_and_replaces_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[search.fts]\nstopwords = [\"O\", \"de\", \"que\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["O".to_string(), "de".to_string(), "que".to_string()])
+        );
+        let resolved = cfg.search.fts.stopwords();
+        // Replaces, not extends: an English stopword absent from the
+        // configured list is no longer filtered.
+        assert_eq!(
+            resolved,
+            ai_memory_store::FtsStopwords::new(["o", "de", "que"])
+        );
+        assert_ne!(resolved, ai_memory_store::FtsStopwords::default());
+    }
+
+    #[test]
+    fn load_rejects_oversized_search_fts_stopwords_list() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let words: Vec<String> = (0..(MAX_FTS_STOPWORDS + 1))
+            .map(|i| format!("w{i}"))
+            .collect();
+        let toml = format!(
+            "[search.fts]\nstopwords = [{}]\n",
+            words
+                .iter()
+                .map(|w| format!("{w:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::fs::write(&config_path, toml).unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("oversized stopword list must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_blank_search_fts_stopword_entry() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[search.fts]\nstopwords = [\"de\", \"  \"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("blank stopword entry must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_oversized_search_fts_stopword_entry() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let long_word = "a".repeat(MAX_FTS_STOPWORD_LEN + 1);
+        std::fs::write(
+            &config_path,
+            format!("[search.fts]\nstopwords = [{long_word:?}]\n"),
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("oversized stopword entry must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    // `apply_fts_stopwords_env` and `FtsSettings::validate` are pure
+    // functions specifically so the env-override and validation logic stay
+    // unit-testable without mutating process env — `std::env::set_var` is
+    // unsafe under edition 2024 and forbidden workspace-wide, since it races
+    // every other test in this crate's multi-threaded lib test binary (see
+    // `overlay_embedding_prefixes`'s doc comment above, the precedent this
+    // mirrors). `Config::load` itself only ever reads the env var once and
+    // hands it to `apply_fts_stopwords_env` as a plain `Option<&str>`.
+
+    #[test]
+    fn apply_fts_stopwords_env_ignores_absent_env() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, None);
+        assert_eq!(cfg.search.fts.stopwords, None);
+    }
+
+    /// A present-but-blank env var must mean "unset", never "disable
+    /// filtering" — it must not clobber a real list `config.toml` already
+    /// resolved. `stopwords = []` in `config.toml` remains the unambiguous
+    /// way to disable filtering.
+    #[test]
+    fn apply_fts_stopwords_env_treats_blank_as_unset_and_does_not_clobber_config() {
+        let mut cfg = Config {
+            search: SearchSettings {
+                fts: FtsSettings {
+                    stopwords: Some(vec!["de".to_string()]),
+                },
+            },
+            ..Config::default()
+        };
+        apply_fts_stopwords_env(&mut cfg, Some(""));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["de".to_string()]),
+            "blank env must not clobber an already-configured list"
+        );
+        apply_fts_stopwords_env(&mut cfg, Some("   "));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["de".to_string()]),
+            "whitespace-only env must not clobber it either"
+        );
+    }
+
+    #[test]
+    fn apply_fts_stopwords_env_parses_csv_and_overrides() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, Some("o, de , que"));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["o".to_string(), "de".to_string(), "que".to_string()])
+        );
+    }
+
+    /// A CSV value that is present (non-blank as a whole string) but has no
+    /// real entries once split and trimmed still resolves to an explicit
+    /// empty list — matching `deserialize_string_or_vec`'s own filtering —
+    /// distinct from a truly blank/absent env var.
+    #[test]
+    fn apply_fts_stopwords_env_comma_only_value_yields_explicit_empty_list() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, Some(" , , "));
+        assert_eq!(cfg.search.fts.stopwords, Some(Vec::new()));
+    }
+
+    #[test]
+    fn fts_settings_validate_accepts_none_and_explicit_empty() {
+        assert!(FtsSettings::default().validate().is_ok());
+        let mut empty = FtsSettings {
+            stopwords: Some(Vec::new()),
+        };
+        assert!(empty.validate().is_ok());
+    }
+
+    /// Ends are trimmed rather than rejected (a hand-edited `config.toml` or
+    /// CSV env value can easily carry a stray space).
+    #[test]
+    fn fts_settings_validate_trims_entry_ends_without_rejecting() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec![" de".to_string(), "que ".to_string()]),
+        };
+        fts.validate().unwrap();
+        assert_eq!(
+            fts.stopwords,
+            Some(vec!["de".to_string(), "que".to_string()])
+        );
+    }
+
+    /// An entry with INTERNAL whitespace (`"de la"`) can never equal one
+    /// `str::split_whitespace()` token, so it would look configured while
+    /// silently doing nothing — reject it instead.
+    #[test]
+    fn fts_settings_validate_rejects_internal_whitespace_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["de la".to_string()]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("internal whitespace"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_blank_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["  ".to_string()]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("empty or whitespace-only"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_oversized_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["a".repeat(MAX_FTS_STOPWORD_LEN + 1)]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("character limit"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_oversized_list() {
+        let mut fts = FtsSettings {
+            stopwords: Some(
+                (0..(MAX_FTS_STOPWORDS + 1))
+                    .map(|i| format!("w{i}"))
+                    .collect(),
+            ),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("at most"), "{err}");
     }
 
     /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
@@ -2681,6 +3413,49 @@ mod tests {
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    /// #884: the input-token safety margin must stay in `(0.0, 1.0]` — a
+    /// non-positive value starves every prompt and a value above 1.0 loosens
+    /// the budget past the limit it exists to tighten.
+    #[test]
+    fn load_rejects_an_out_of_range_input_token_safety_margin() {
+        for value in ["0.0", "-0.1", "1.5", "nan"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\ninput_token_safety_margin = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an out-of-range safety margin must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("consolidation.input_token_safety_margin"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A valid margin survives the config round-trip and the default is 0.8.
+    #[test]
+    fn load_accepts_a_valid_input_token_safety_margin() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[consolidation]\ninput_token_safety_margin = 0.6\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("a margin inside (0.0, 1.0] must load");
+        assert_eq!(config.consolidation.input_token_safety_margin, 0.6);
+        assert_eq!(
+            ConsolidationSettings::default().input_token_safety_margin,
+            0.8
+        );
     }
 
     /// A small-context provider needs both sides of the context allocation to
@@ -2935,6 +3710,8 @@ mod tests {
             log_level = "debug"
             hook_rate_per_sec = 7.5
             hook_rate_burst = 12.0
+            contradiction_band_min = 0.5
+            contradiction_band_max = 0.8
 
             [auth]
             secure_cookie = true
@@ -2990,6 +3767,8 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.hook_rate_per_sec, 7.5);
         assert_eq!(cfg.hook_rate_burst, 12.0);
+        assert_eq!(cfg.contradiction_band_min, 0.5);
+        assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
@@ -3217,6 +3996,168 @@ mod tests {
             missing_base.embedder_config().unwrap_err(),
             LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
         ));
+    }
+
+    #[test]
+    fn embedding_prefixes_default_empty_and_are_not_trimmed_when_set() {
+        // Unset: EmbedderConfig carries empty strings, so downstream
+        // embedders see byte-identical behaviour to before this feature.
+        let unset = Config {
+            embedding_provider: Some("openai-compat".into()),
+            embedding_model: Some("nvidia/Nemotron-3-Embed-1B-BF16".into()),
+            embedding_dim: Some(2048),
+            embedding_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+        let embedder = unset.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.query_prefix, "");
+        assert_eq!(embedder.document_prefix, "");
+
+        // Set: the publisher's exact strings pass through, including the
+        // significant trailing space — `non_empty`'s trim would corrupt it.
+        let set = Config {
+            embedding_query_prefix: Some("query: ".into()),
+            embedding_document_prefix: Some("passage: ".into()),
+            ..unset
+        };
+        let embedder = set.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.query_prefix, "query: ");
+        assert_eq!(embedder.document_prefix, "passage: ");
+    }
+
+    /// Pure unit tests for `overlay_embedding_prefixes`: no process env or
+    /// cwd mutation anywhere here (the workspace forbids `std::env::set_var`
+    /// as `unsafe` under edition 2024, and `figment::Jail` calls
+    /// `std::env::set_current_dir` on the real process internally, racing
+    /// every other test in this multi-threaded lib test binary that
+    /// relies on cwd, such as `tests/suite/backfill_e2e.rs`'s
+    /// `Command::current_dir` calls). Each test builds its own minimal
+    /// `Figment` in memory instead, exactly mirroring what `Config::load`
+    /// does (`Serialized::defaults` as the base, optionally a lower-priority
+    /// `Serialized` merge standing in for a `config.toml` value), and
+    /// extracts a `Config` to assert on — the identical merge machinery the
+    /// real loader uses, with the "env value" supplied as a parameter
+    /// instead of read from the process.
+    #[test]
+    fn overlay_embedding_prefixes_preserves_trailing_whitespace() {
+        // The regression this guards: figment's `Env` provider parses an
+        // unquoted value with its loose-value parser, whose bare-value
+        // branch calls `.trim()` — so without this overlay a real
+        // `AI_MEMORY_EMBEDDING_QUERY_PREFIX="query: "` would arrive as
+        // `"query:"`, silently dropping the space the model publisher
+        // requires. `Serialized` bypasses that parser entirely.
+        let base = Figment::from(Serialized::defaults(Config::default()));
+        let overlaid = overlay_embedding_prefixes(base, Some("query: "), Some("passage: "));
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("query: "));
+        assert_eq!(cfg.embedding_document_prefix.as_deref(), Some("passage: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_none_leaves_a_lower_layer_untouched() {
+        // Simulates a `config.toml` value already merged in at lower
+        // priority; passing `None` (the env var genuinely absent) must not
+        // disturb it.
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, None, None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("toml-query: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_some_wins_over_a_lower_layer() {
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, Some("env-query: "), None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("env-query: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_empty_string_clears_a_lower_layer() {
+        // Present but empty (`Some("")`) is a deliberate override — an
+        // operator clearing a `config.toml` value via env without editing
+        // the file — distinct from `None` (the previous test), which must
+        // leave the lower layer untouched.
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, Some(""), None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some(""));
+    }
+
+    /// Exercises the real `Config::load` end to end, through an absolute
+    /// `config.toml` path and data dir from a `TempDir`. TOML strings were
+    /// never subject to figment's `Env`-provider trimming in the first
+    /// place, so this path already worked before the fix; this guards it
+    /// staying correct.
+    ///
+    /// This process's own environment is shared with every other test in
+    /// this binary and could already carry one of the two prefix vars from
+    /// the test runner's shell, which would make `Config::load` pick the
+    /// env value over the TOML one below and this test would silently stop
+    /// verifying the TOML-only path. Rather than assume the ambient
+    /// environment is clean, the actual `Config::load` call runs in a
+    /// separate child process with both vars explicitly removed via
+    /// `Command::env_remove` — real isolation instead of an in-process
+    /// assumption, and it does not touch this rule's target (mutating
+    /// *this* process's env), since a spawned child's environment is its
+    /// own.
+    #[test]
+    fn loader_toml_path_preserves_whitespace_with_no_env_var_set() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_LOADER_TOML_PATH_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            // Running as the child, with both prefix vars removed by the
+            // parent below: do the real work and print the result for the
+            // parent to assert on.
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                "embedding_query_prefix = \"query: \"\n\
+                 embedding_document_prefix = \"passage: \"\n",
+            )
+            .unwrap();
+            let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            println!(
+                "query={:?} document={:?}",
+                cfg.embedding_query_prefix, cfg.embedding_document_prefix
+            );
+            return;
+        }
+        // Running as the parent: re-exec this same test binary, filtered
+        // to just this one test, as a genuinely separate child process
+        // with both prefix env vars removed.
+        let exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("config::tests::loader_toml_path_preserves_whitespace_with_no_env_var_set")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env_remove("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+            .env_remove("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+            .output()
+            .expect("failed to spawn child test process");
+        assert!(
+            output.status.success(),
+            "child test process failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("query=Some(\"query: \")"),
+            "child stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("document=Some(\"passage: \")"),
+            "child stdout: {stdout}"
+        );
     }
 
     #[test]

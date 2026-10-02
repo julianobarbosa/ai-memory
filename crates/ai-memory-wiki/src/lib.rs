@@ -24,7 +24,7 @@ pub use atomic::write_atomic;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use ledger::is_rotated_event_ledger;
-pub use markdown::{Markdown, derive_title, emit, parse};
+pub use markdown::{Markdown, derive_title, emit, parse, rewrite_local_wikilinks};
 pub use migrations::run_pending as run_wiki_migrations;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest};

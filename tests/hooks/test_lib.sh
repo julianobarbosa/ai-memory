@@ -88,6 +88,28 @@ assert_eq "outside HOME plain dir rejects parent marker" "" \
 HOME="$TMP"
 export HOME
 
+# A trailing slash on $HOME does not move the boundary.
+mkdir -p "$TMP/slash-home/org/repo/.git" "$TMP/slash-home/plain/src"
+printf 'workspace = "org"\n' >"$TMP/slash-home/org/.ai-memory.toml"
+printf 'workspace = "above-home"\nserver = "team-b"\n' >"$TMP/.ai-memory.toml"
+for slash_home in "$TMP/slash-home" "$TMP/slash-home/" "$TMP/slash-home//"; do
+    HOME="$slash_home"
+    export HOME
+    assert_eq "HOME=$slash_home: marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: settings marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_settings_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: walk stops at HOME" "" \
+        "$(ai_memory_find_marker "$TMP/slash-home/plain/src")"
+    assert_eq "HOME=$slash_home: server walk stops at HOME" "no" \
+        "$(ai_memory_server_routed "$TMP/slash-home/plain/src" && echo yes || echo no)"
+done
+rm -f "$TMP/.ai-memory.toml"
+HOME="$TMP"
+export HOME
+
 # --- extract_cwd ------------------------------------------------------
 PAYLOAD='{"session_id":"x","cwd":"/home/u/foo","tool":"Read"}'
 assert_eq "extract cwd from payload"     "/home/u/foo" "$(ai_memory_extract_cwd "$PAYLOAD")"
@@ -108,6 +130,20 @@ assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
 PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
 assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
     "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
+# A large tool result must not make extraction quadratic in the payload
+# size: `${payload#*"key"}` pinned a CPU for minutes at a few hundred KB (#870).
+BIG=$(awk 'BEGIN { for (i = 0; i < 262144; i++) printf "x" }')
+PAYLOAD_CURSOR_BIG="{\"tool_output\":\"$BIG\",\"cwd\":\"\",\"workspace_roots\":[\"/home/u/big\"]}"
+assert_eq "extract cwd from a 256 KB cursor tool payload" "/home/u/big" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_BIG")"
+# Only the first occurrence of a key is read, so a non-string top-level value
+# never lets a nested field of the same name take its place.
+PAYLOAD_NULL_CWD='{"cwd":null,"tool_input":{"cwd":"/tmp/nested"},"workspace_roots":["/home/u/top"]}'
+assert_eq "extract cwd ignores nested cwd after a null one" "/home/u/top" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_NULL_CWD")"
+PAYLOAD_EMPTY_ROOTS='{"cwd":"","workspace_roots":[],"tool_input":{"workspace_roots":["/tmp/nested"]}}'
+assert_eq "extract cwd ignores nested roots after an empty array" "" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_EMPTY_ROOTS")"
 
 antigravity_initial() {
     if ai_memory_antigravity_is_initial_invocation "$1"; then
@@ -128,6 +164,11 @@ assert_eq "antigravity fractional invocation fails closed" "no" \
     "$(antigravity_initial '{"invocationNum":0.5,"conversationId":"agy"}')"
 assert_eq "extract antigravity conversation id" "agy" \
     "$(ai_memory_extract_session_id '{"conversationId":"agy"}')"
+PAYLOAD_AGY_BIG="{\"prompt\":\"$BIG\",\"invocationNum\":0,\"conversationId\":\"agy\"}"
+assert_eq "antigravity initial invocation after a 256 KB field" "yes" \
+    "$(antigravity_initial "$PAYLOAD_AGY_BIG")"
+assert_eq "extract session id after a 256 KB field" "agy" \
+    "$(ai_memory_extract_session_id "$PAYLOAD_AGY_BIG")"
 
 FAKE_CURL_BIN="$TMP/fake-curl-bin"
 FAKE_CURL_LOG="$TMP/fake-curl.log"
@@ -174,6 +215,16 @@ PS_HOME_STATIC=$(grep -Fq '$userHome = if ($env:HOME)' hooks/lib/ai-memory-hook.
     && ! grep -Eq '\$home[[:space:]]*=' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell marker helper avoids read-only HOME" "ok" "$PS_HOME_STATIC"
+# The guard's own behaviour is exercised by the Windows-only Rust test
+# (`powershell_server_routed.rs`); this pins that the hook entry point calls
+# it before it builds the query, on every platform the shell suite runs.
+PS_ROUTED_STATIC=$(grep -q 'function Test-AiMemoryServerRouted' hooks/lib/ai-memory-hook.ps1 \
+    && awk '/function Invoke-AiMemoryHook/ {f=1}
+            f && /Test-AiMemoryServerRouted/ && !t {t=NR}
+            f && /Get-AiMemoryMarkerQuery/ && !q {q=NR}
+            END {exit !(t && q && t < q)}' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell hook refuses a routed repository before building its query" "ok" "$PS_ROUTED_STATIC"
 
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
@@ -220,6 +271,31 @@ assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
 assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
     "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# --- repository identity (#708) ----------------------------------------
+# An undeclared checkout sends its normalised remote, with the credentials in
+# the URL dropped on this side; a declared project outranks the remote and
+# routes by name (nothing sent); an explicit identity outranks both.
+# Normalisation itself is checked case by case against the shared fixture by
+# `identity_parity_tests` in install_hooks.rs.
+if command -v git >/dev/null 2>&1; then
+    mkdir -p "$TMP/idrepo"
+    git -C "$TMP/idrepo" init -q
+    git -C "$TMP/idrepo" remote add origin "https://someone:tok3n@git.example.test/Acme/API.git"
+    ID_CWD=$(ai_memory_url_encode "$TMP/idrepo")
+    assert_eq "identity: undeclared checkout sends its remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'project = "mine"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: a declared project routes by name" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'project = "mine"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: an explicit identity outranks the project" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    rm -rf "$TMP/idrepo"
+fi
 
 # A marker declaring [briefing] but no workspace/project is NOT capture-only
 # (it declares a forwarded setting), so it stays a resolution boundary: the
@@ -333,6 +409,10 @@ assert_eq "url_encode escapes plus"       "a%2Bb"  "$(ai_memory_url_encode "a+b"
 assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
+# macOS /bin/sh is bash 3.2, which sign-extends bytes >= 0x80 in `printf "'c"`.
+assert_eq "url_encode encodes an accented macOS path" \
+    "%2FUsers%2Fme%2F%C3%81rea%20de%20Trabalho" \
+    "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
 # The spool dir follows the data dir, which the harness pins inside $TMP.
@@ -412,6 +492,362 @@ assert_eq "post_hook spools an undelivered event" "1" \
     "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 
 unset AI_MEMORY_DATA_DIR
+
+# --- external capture ownership (AI_MEMORY_CAPTURE_OWNER) -------------
+# A wrapper, extension or managed launcher that already produces this
+# session's capture events announces itself with AI_MEMORY_CAPTURE_OWNER.
+# The bundle must then stop PRODUCING events (no POST, no spool entry, no
+# piggyback drain) while still DELIVERING: the synchronous handoff GET keeps
+# working, a backlog already on disk stays put, and an explicit drain still
+# ships it. Every case below runs the real `ai_memory_post_hook` /
+# `ai_memory_get_handoff` / `ai_memory_drain_spool` path with curl stubbed,
+# so what is asserted is what the shipped functions do.
+
+# Stub curl: log method + URL, answer 200 to a POST and a body to a GET.
+# Only `--data-binary @-` reads the body from stdin. Consuming it for every
+# POST would block on an inherited terminal stdin the moment a caller passes
+# `@file` or an inline body, which the real curl never touches.
+curl() {
+    _tm=GET
+    _tu=""
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -X) shift; [ "$#" -gt 0 ] || break; _tm="$1" ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+            --data-binary=*) _tdata="${1#--data-binary=}" ;;
+            http://* | https://*) _tu="$1" ;;
+        esac
+        shift
+    done
+    if [ "$_tdata" = "@-" ]; then
+        cat >/dev/null
+    fi
+    if [ "$_tm" = POST ]; then
+        printf 'POST %s\n' "$_tu" >>"$CURL_LOG"
+        printf '200'
+    else
+        printf 'GET %s\n' "$_tu" >>"$CURL_LOG"
+        printf 'HANDOFF BODY'
+    fi
+    return 0
+}
+
+# Each case gets its own data dir, so the spool and the curl log start empty
+# without anything having to be cleared between cases.
+owner_case() {
+    AI_MEMORY_DATA_DIR="$TMP/owner-$1"
+    export AI_MEMORY_DATA_DIR
+    mkdir -p "$AI_MEMORY_DATA_DIR"
+    CURL_LOG="$AI_MEMORY_DATA_DIR/curl.log"
+    touch "$CURL_LOG"
+}
+owner_requests() { awk 'END { print NR + 0 }' "$CURL_LOG"; }
+owner_posts()    { awk '/^POST /{ n++ } END { print n + 0 }' "$CURL_LOG"; }
+owner_spooled()  { ls "$AI_MEMORY_DATA_DIR/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' '; }
+
+# 1. Owner set: an event produced now is dropped whole, and the backlog that
+#    was already queued is neither extended nor drained behind it.
+owner_case suppressed
+ai_memory_spool_event "http://127.0.0.1:1/hook?event=stop&agent=cursor" '{"e":"backlog"}'
+BACKLOG=$(owner_spooled)
+assert_eq "owner: backlog is queued before the gate" "1" "$BACKLOG"
+AI_MEMORY_CAPTURE_OWNER="external-runner"
+export AI_MEMORY_CAPTURE_OWNER
+printf '%s' '{"e":"owned"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "owner: post_hook sends nothing" "0" "$(owner_requests)"
+assert_eq "owner: post_hook spools nothing and drains nothing" "$BACKLOG" "$(owner_spooled)"
+
+# 2. Delivery is untouched: the handoff GET still runs and still returns.
+HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor")
+assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
+assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
+assert_eq "owner: still no POST"               "0" "$(owner_posts)"
+
+# 3. Standalone control: with no owner the same call POSTs as before.
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case control
+printf '%s' '{"e":"control"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "no owner: post_hook POSTs" "1" "$(owner_posts)"
+
+# 4. An exported-but-blank variable must not disable capture: empty and
+#    whitespace-only keep the default behaviour.
+AI_MEMORY_CAPTURE_OWNER=""
+export AI_MEMORY_CAPTURE_OWNER
+owner_case empty
+printf '%s' '{"e":"empty"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "empty owner: post_hook POSTs" "1" "$(owner_posts)"
+
+AI_MEMORY_CAPTURE_OWNER=$(printf ' \t ')
+export AI_MEMORY_CAPTURE_OWNER
+owner_case whitespace
+printf '%s' '{"e":"blank"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "whitespace owner: post_hook POSTs" "1" "$(owner_posts)"
+
+# 5. An EXPLICIT drain is delivery, not production: it must still ship a
+#    queued event while the owner is set, and retire it on a 2xx.
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case drain
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"pending"}'
+AI_MEMORY_CAPTURE_OWNER="external-runner"
+export AI_MEMORY_CAPTURE_OWNER
+ai_memory_drain_spool 64 >/dev/null 2>&1
+assert_eq "owner: explicit drain still delivers the backlog" "1" "$(owner_posts)"
+assert_eq "owner: delivered entry is retired"                "0" "$(owner_spooled)"
+
+unset -f curl
+unset AI_MEMORY_CAPTURE_OWNER
+unset AI_MEMORY_DATA_DIR
+
+# --- grok post-tool-use.sh: shipped shell handoff path -----------------
+# The native router (`commands/hook.rs`) and this script implement the same
+# contract: one destructive `GET /handoff` per Grok session on the first
+# PostToolUse, wrapped as PostToolUse additionalContext; child-session
+# payloads never fetch (the GET would burn the parent's baton). A PATH curl
+# shim runs the real shipped script, so what is asserted is what ships.
+GROK_HOOK="$(dirname "$0")/../../hooks/grok/post-tool-use.sh"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'EOF'
+#!/bin/sh
+# Fake curl: log "METHOD URL"; answer 200 to a POST, HANDOFF BODY to a GET.
+_gm=GET
+_gu=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -X) shift; [ $# -gt 0 ] || break; _gm=$1 ;;
+        http://* | https://*) _gu=$1 ;;
+    esac
+    shift
+done
+printf '%s %s\n' "$_gm" "$_gu" >>"$GROK_LOG"
+if [ "$_gm" = POST ]; then printf '200'; else printf 'HANDOFF BODY'; fi
+EOF
+chmod +x "$TMP/bin/curl"
+PATH="$TMP/bin:$PATH"
+export PATH
+
+grok_case() {
+    GROK_CASE_DIR="$TMP/grok-$1"
+    mkdir -p "$GROK_CASE_DIR/data"
+    AI_MEMORY_DATA_DIR="$GROK_CASE_DIR/data"
+    export AI_MEMORY_DATA_DIR
+    GROK_LOG="$GROK_CASE_DIR/curl.log"
+    : >"$GROK_LOG"
+    export GROK_LOG
+}
+grok_gets() { awk '/^GET /{ n++ } END { print n + 0 }' "$GROK_LOG"; }
+grok_run() {
+    printf '%s' "$1" | sh "$(dirname "$0")/../../hooks/grok/post-tool-use.sh" 2>/dev/null
+}
+grok_payload() {
+    printf '{"session_id":"%s","cwd":"%s","tool_name":"read_file"}' "$1" "$GROK_CASE_DIR"
+}
+
+# 1. First PostToolUse of a session: fetches once and wraps as additionalContext.
+grok_case first
+OUT=$(grok_run "$(grok_payload g-sess)")
+case "$OUT" in
+    *'"hookSpecificOutput"'*'"PostToolUse"'*'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1)); printf '  ok  %s\n' "grok: first post-tool-use wraps the handoff" ;;
+    *) FAIL=$((FAIL + 1)); printf '  FAIL grok: first post-tool-use wraps the handoff\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: first post-tool-use GETs the handoff with session id" "1" "$(grok_gets)"
+[ -f "$AI_MEMORY_DATA_DIR/briefed/post-g-sess" ] && PASS=$((PASS + 1)) || {
+    FAIL=$((FAIL + 1)); printf '  FAIL grok: shown marker post-g-sess missing\n'
+}
+
+# 2. Second call in the same session: `{}`, no second (destructive) GET.
+OUT=$(grok_run "$(grok_payload g-sess)")
+assert_eq "grok: second post-tool-use prints empty object" "{}" "$OUT"
+assert_eq "grok: second call does not re-fetch the handoff" "1" "$(grok_gets)"
+
+# 3. Subagent payloads never fetch — every key the native router knows.
+grok_child_payload() {
+    printf '{"session_id":"child","cwd":"%s","tool_name":"read_file","%s":"planner-a"}' \
+        "$GROK_CASE_DIR" "$1"
+}
+for key in subagentType subagent_type agent_type agent_id parentSessionId; do
+    grok_case "child-$key"
+    OUT=$(grok_run "$(grok_child_payload "$key")")
+    assert_eq "grok: $key payload does not fetch the handoff" "{}" "$OUT"
+    assert_eq "grok: $key payload sent zero GETs" "0" "$(grok_gets)"
+done
+
+unset AI_MEMORY_DATA_DIR GROK_LOG
+PATH=${PATH#"$TMP/bin:"}
+export PATH
+
+# --- session-start bundles that must never fetch a handoff (#998) ------
+# grok, kimi-code and pool each document in their own session-start.sh why
+# SessionStart must not call /handoff at all: Grok and Kimi discard its
+# stdout, and Pool's own comment says fetching there would be destructive
+# and silently lose an undelivered handoff. #1001 (the real [briefing]
+# delivery fix for #998) only touches the eight session-start bundles that
+# DO fetch a handoff; these three are deliberately not among them, and a
+# regression here would silently burn a single-use handoff with nothing to
+# show for it on the harness side. A PATH curl shim runs the real shipped
+# scripts, so what is asserted is what ships.
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SSTART_LOG"
+exit 0
+EOF
+chmod +x "$TMP/bin/curl"
+PATH="$TMP/bin:$PATH"
+export PATH
+
+for bundle in grok kimi-code pool; do
+    SSTART_LOG="$TMP/session-start-$bundle.log"
+    : >"$SSTART_LOG"
+    export SSTART_LOG
+    printf '{"cwd":"%s","session_id":"sstart-%s"}' "$TMP" "$bundle" \
+        | sh "$(dirname "$0")/../../hooks/$bundle/session-start.sh" >/dev/null 2>&1
+    assert_eq "$bundle: session-start posts the capture event" "1" \
+        "$(wc -l <"$SSTART_LOG" | tr -d ' ')"
+    assert_eq "$bundle: session-start never fetches a handoff" "0" \
+        "$(grep -c '/handoff' "$SSTART_LOG")"
+done
+
+unset SSTART_LOG
+PATH=${PATH#"$TMP/bin:"}
+export PATH
+
+# --- grok PowerShell bundle parity -------------------------------------
+# The PS lib is the documented fallback when the native binary is absent.
+# Static parity first (no pwsh needed): the child-session key set must
+# match the native router's five keys, and the per-process `$PID` fallback
+# key must never come back (it breaks the once-per-session gate).
+PS_LIB="$(dirname "$0")/../../hooks/lib/ai-memory-hook.ps1"
+for key in subagentType subagent_type agent_type agent_id parentSessionId; do
+    if grep -q "\"$key\"" "$PS_LIB"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok ps: child key %s missing from the subagent gate\n' "$key"
+    fi
+done
+if grep -q 'grok-post-\$PID' "$PS_LIB"; then
+    FAIL=$((FAIL + 1)); printf '  FAIL grok ps: per-process $PID shown-key fallback is back\n'
+else
+    PASS=$((PASS + 1)); printf '  ok  grok ps: shown-key fallback is stable, not per-process\n'
+fi
+
+# Behavioral probe: pure functions only, so a pwsh run adds real evidence
+# where pwsh exists (Windows CI / dev boxes) and skips elsewhere (same
+# posture as the Node-required runtime evidence in render_shared.rs).
+if command -v pwsh >/dev/null 2>&1; then
+    PS_OUT=$(pwsh -NoProfile -File "$(dirname "$0")/test_grok_ps.ps1" "$PS_LIB" 2>&1) \
+        && PASS=$((PASS + $(printf '%s\n' "$PS_OUT" | sed -n 's/.*checks=\([0-9]*\).*/\1/p') )) \
+        || { FAIL=$((FAIL + 1)); printf '  FAIL grok ps behavioral probe\n%s\n' "$PS_OUT"; }
+else
+    printf '  skip grok ps behavioral probe (pwsh unavailable)\n'
+fi
+
+# --- server profiles (#992) --------------------------------------------
+# Script hooks cannot route a `server` profile, so a routed repository must
+# reach neither the install-default server nor the spool.
+mkdir -p "$TMP/routed/sub" "$TMP/routed-bom" "$TMP/server-only/inner"
+printf 'workspace = "team-b"\nserver = "team-b"\n' >"$TMP/routed/.ai-memory.toml"
+printf 'workspace = "sub"\n' >"$TMP/routed/sub/.ai-memory.toml"
+printf '\357\273\277server = team-b\n' >"$TMP/routed-bom/.ai-memory.toml"
+printf 'workspace = "outer"\n' >"$TMP/server-only/.ai-memory.toml"
+printf 'server = "team-b"\n' >"$TMP/server-only/inner/.ai-memory.toml"
+
+assert_eq "routed marker: marker_qs carries only the routed flag" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed")"
+assert_eq "routed marker is inherited past a nested workspace-only marker" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed/sub")"
+assert_eq "a BOM cannot hide the server key" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed-bom")"
+assert_eq "a server-only marker is a settings boundary" \
+    "$TMP/server-only/inner/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/server-only/inner")"
+assert_eq "an unrouted repository is unchanged" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+AI_MEMORY_DATA_DIR="$TMP/routed-data"
+export AI_MEMORY_DATA_DIR
+CURL_CALLED="$TMP/curl-called"
+rm -f "$CURL_CALLED"
+curl() {
+    : >"$CURL_CALLED"
+    cat >/dev/null
+    return 7
+}
+printf '%s' '{"e":"routed"}' \
+    | ai_memory_post_hook "http://127.0.0.1:1/hook?event=user-prompt&agent=cursor$(ai_memory_marker_qs "$TMP/routed")" \
+    >/dev/null 2>&1
+ROUTED_HANDOFF=$(ai_memory_get_handoff "http://127.0.0.1:1/handoff?agent=cursor$(ai_memory_marker_qs "$TMP/routed")")
+unset -f curl
+assert_eq "a routed post and handoff never call curl" "no" \
+    "$([ -e "$CURL_CALLED" ] && echo yes || echo no)"
+assert_eq "a routed post is not spooled" "0" \
+    "$(ls "$TMP/routed-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "a routed handoff fetch prints nothing" "" "$ROUTED_HANDOFF"
+unset AI_MEMORY_DATA_DIR
+
+# --- session-start bundles forward the [briefing] opt-in -----------------
+# docs/marker-file.md: when the marker opts in, the handoff GET carries
+# `briefing` and `briefing_budget`, as the native hook's does. The bundles are
+# discovered from their scripts, so a new bundle that fetches the handoff at
+# session start is held to the same contract without editing this test.
+BRIEF_REPO="$TMP/brief-on"
+PLAIN_REPO="$TMP/brief-off"
+mkdir -p "$BRIEF_REPO" "$PLAIN_REPO"
+printf '[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n' >"$BRIEF_REPO/.ai-memory.toml"
+printf '[briefing]\ninject_on_session_start = false\nmax_chars = 6000\n' >"$PLAIN_REPO/.ai-memory.toml"
+
+# Runs bundle "$1" from repository "$2" with a fresh state dir and prints the
+# handoff GET it sent. The payload carries every cwd and session field the
+# bundles read, plus Antigravity's first-invocation marker.
+session_start_handoff_get() {
+    rm -rf "$TMP/brief-data" "$FAKE_CURL_LOG"
+    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s"}' "$2" "$2" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/brief-data" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh "$(dirname "$0")/../../hooks/$1/session-start.sh" >/dev/null 2>&1
+    grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true
+}
+
+BRIEF_BUNDLES=0
+for script in "$(dirname "$0")"/../../hooks/*/session-start.sh; do
+    grep -q 'ai_memory_get_handoff' "$script" || continue
+    bundle=$(basename "$(dirname "$script")")
+    BRIEF_BUNDLES=$((BRIEF_BUNDLES + 1))
+    GET=$(session_start_handoff_get "$bundle" "$BRIEF_REPO")
+    case "$GET" in
+        *'&briefing=true&briefing_budget=6000'*)
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-in handoff GET carries the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+    esac
+    GET=$(session_start_handoff_get "$bundle" "$PLAIN_REPO")
+    case "$GET" in
+        *'/handoff?'*briefing*)
+            FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+        *'/handoff?'*)
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-out handoff GET omits the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out session start still fetches the handoff\n    got =%s\n' "$bundle" "$GET" ;;
+    esac
+done
+# Guards the discovery itself: an empty glob or a renamed helper would
+# otherwise pass with nothing checked.
+assert_eq "session-start bundles that fetch the handoff were found" "yes" \
+    "$([ "$BRIEF_BUNDLES" -ge 9 ] && printf 'yes' || printf 'no (%s)' "$BRIEF_BUNDLES")"
+
+# The PowerShell bundle builds every session-start handoff GET in one place.
+PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {' hooks/lib/ai-memory-hook.ps1 \
+    && awk '/if \(\$Event -eq "session-start" -and -not \$BriefingOncePerSession\)/ {f=1; next}
+            f && /Get-AiMemoryBriefingQuery -Cwd \$Cwd/ {ok=1}
+            f && /^[[:space:]]*}/ {exit}
+            END {exit !ok}' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

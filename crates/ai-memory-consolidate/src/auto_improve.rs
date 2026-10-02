@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -28,6 +29,20 @@ const PROMPT_RESERVE_TOKENS: usize = 1_000;
 const MAX_PROPOSAL_BODY_CHARS: usize = 32_000;
 /// Default number of existing pages included as patchable context.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES: usize = 8;
+
+/// Wiki folders whose page bodies the reviewer may read, by path prefix.
+///
+/// This list decides which of a project's durable knowledge the model can see
+/// before it proposes anything. `render_recent_pages` gives every other page as
+/// one line — path, title, kind, updated_at — so a page outside these folders
+/// reaches the reviewer as a title and nothing else, and the model cannot tell
+/// that what it is about to propose is already written down (#834).
+///
+/// The default is the historical pair. It is a default rather than a constant
+/// because folder choice should not silently decide model visibility: a project
+/// that keeps its invariants in `decisions/` or `gotchas/` — which the wiki's own
+/// conventions encourage — can add them instead of restructuring its wiki.
+pub const DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES: [&str; 2] = ["_rules/", "procedures/"];
 /// Default maximum body chars rendered for one patchable target page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS: usize = 8_000;
 /// Default maximum patch edits per proposal.
@@ -134,8 +149,14 @@ pub struct AutoImproveReviewConfig {
     pub proposal_actor: String,
     /// Wiki-relative pending proposal sidecar folder.
     pub pending_path: String,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to [`DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES`]. Pages outside
+    /// these folders are still listed by title, but their content is never sent,
+    /// so the reviewer cannot notice that a proposal duplicates them (#834).
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -172,6 +193,10 @@ impl Default for AutoImproveReviewConfig {
             proposal_actor: DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -295,7 +320,12 @@ pub struct AutoImproveProposal {
     #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
+    ///
+    /// Advertised as an enum for the same reason as `operation`; still a
+    /// `String` so an unconstrained provider's `"full"` reaches
+    /// [`normalize_edit_mode`] instead of failing to deserialise.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -356,6 +386,26 @@ fn normalize_operation(raw: &str) -> String {
 
 fn default_edit_mode() -> String {
     "full_page".into()
+}
+
+/// Map the ways a model spells the two supported edit modes onto their
+/// canonical form.
+///
+/// Same narrow policy as [`normalize_operation`]: the system prompt says
+/// "Full-page proposals", and models answer `"full"`. Unknown values are left
+/// untouched so they still fail validation.
+fn normalize_edit_mode(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect();
+    match squashed.as_str() {
+        "" | "fullpage" | "full" => default_edit_mode(),
+        "patch" => "patch".into(),
+        _ => raw.to_string(),
+    }
 }
 
 /// A candidate the reviewer or validator rejected.
@@ -951,6 +1001,18 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
+/// Whether the reviewer may read this page's body, by folder prefix (#834).
+///
+/// An empty prefix list means no page body is sent, which is the honest reading
+/// of "no folders are patchable" — not "every folder is". An empty *prefix*
+/// would match every path, so it is ignored rather than silently opening the
+/// whole wiki.
+pub(crate) fn is_patchable_path(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+}
+
 pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -961,7 +1023,7 @@ pub(crate) async fn load_patchable_pages(
     let mut out = Vec::new();
     for page in recent_pages
         .iter()
-        .filter(|p| p.path.starts_with("_rules/") || p.path.starts_with("procedures/"))
+        .filter(|p| is_patchable_path(&p.path, &cfg.patchable_page_prefixes))
         .take(cfg.max_patchable_pages)
     {
         if let Some(body) = reader
@@ -1485,8 +1547,18 @@ pub(crate) fn validate_response(
 fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>) {
     normalize_kind(proposal, warnings);
 
-    if proposal.edit_mode.trim().is_empty() {
-        proposal.edit_mode = default_edit_mode();
+    // Server-owned: set when a patch is materialized. The schema still shows
+    // it to the model, and a model-supplied non-hash value on a full-page
+    // proposal would reach staging and fail the whole run on `hex_to_sha256`.
+    proposal.expected_base_body_sha256 = None;
+
+    let original_edit_mode = proposal.edit_mode.clone();
+    proposal.edit_mode = normalize_edit_mode(&original_edit_mode);
+    if !original_edit_mode.trim().is_empty() && proposal.edit_mode != original_edit_mode {
+        warnings.push(format!(
+            "proposal {} edit_mode normalized from {:?} to {:?}",
+            proposal.path, original_edit_mode, proposal.edit_mode
+        ));
     }
     if proposal.edit_mode == "patch" {
         return;
@@ -1590,7 +1662,18 @@ fn validate_proposal(
     {
         return Err("missing_evidence".into());
     }
-    let path = PagePath::new(proposal.path.clone()).map_err(|_| "invalid_path".to_string())?;
+    // Same class as bootstrap #847 / consolidation #848: a model-produced
+    // path with a Windows-illegal character (e.g. `:`) passes `PagePath::new`
+    // and would be staged, then fail `ensure_portable` at approve time.
+    // Sanitize before constructing the path so the staged proposal is
+    // applyable; a path that is still unportable after slugify is rejected
+    // rather than queued.
+    let cleaned = slugify_page_path(&proposal.path);
+    let path = PagePath::new(&cleaned).map_err(|_| "invalid_path".to_string())?;
+    if path.ensure_portable().is_err() {
+        return Err("invalid_path".into());
+    }
+    proposal.path = path.as_str().to_string();
     match proposal.edit_mode.as_str() {
         "" | "full_page" => {
             validate_full_page_proposal(proposal, cfg, existing_index, path.as_str())
@@ -1987,6 +2070,10 @@ mod tests {
             proposal_actor: "auto_improve".into(),
             pending_path: "_pending/auto-improve".into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -2075,7 +2162,7 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
+            "#!/bin/sh\nprintf '%070000d' 0\n" => {
                 let chunk = "x".repeat(100);
                 format!("for ($i = 0; $i -lt 700; $i++) {{ [Console]::Out.Write('{chunk}') }}\n")
             }
@@ -2158,6 +2245,60 @@ mod tests {
         );
     }
 
+    // #834: the folder filter decides which of a project's durable knowledge the
+    // reviewer can read at all. Everything outside it arrives as a title, so the
+    // model cannot tell that a proposal duplicates a page that already exists.
+    #[test]
+    fn default_prefixes_match_the_historical_pair() {
+        let cfg = AutoImproveReviewConfig::default();
+        assert_eq!(cfg.patchable_page_prefixes, vec!["_rules/", "procedures/"]);
+    }
+
+    #[test]
+    fn the_default_still_hides_decisions_and_gotchas() {
+        // Pinning the reported blindness rather than only the fix: this is the
+        // behaviour a project with no `_rules/` pages actually gets today.
+        let prefixes = AutoImproveReviewConfig::default().patchable_page_prefixes;
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        assert!(is_patchable_path("procedures/release.md", &prefixes));
+        assert!(!is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(!is_patchable_path("gotchas/sqlite-wal.md", &prefixes));
+    }
+
+    #[test]
+    fn configuring_a_folder_makes_its_pages_readable() {
+        let prefixes = vec!["_rules/".to_string(), "decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        // Not configured, so still title-only.
+        assert!(!is_patchable_path("procedures/release.md", &prefixes));
+    }
+
+    #[test]
+    fn an_empty_list_reads_no_page_bodies() {
+        // "No folders are patchable" must not mean "every folder is".
+        assert!(!is_patchable_path("_rules/testing.md", &[]));
+        assert!(!is_patchable_path("decisions/0001.md", &[]));
+    }
+
+    #[test]
+    fn an_empty_prefix_does_not_open_the_whole_wiki() {
+        // `"".starts_with` matches every path, so a stray empty entry would turn
+        // the filter off silently. It is ignored instead.
+        let prefixes = vec![String::new()];
+        assert!(!is_patchable_path("sessions/2026-09-21.md", &prefixes));
+        assert!(!is_patchable_path("anything.md", &prefixes));
+    }
+
+    #[test]
+    fn prefixes_match_folders_not_bare_name_prefixes() {
+        // `_rules/` carries its separator, so a sibling folder whose name merely
+        // starts with the same letters is not swept in.
+        let prefixes = vec!["decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001.md", &prefixes));
+        assert!(!is_patchable_path("decisions-archive/0001.md", &prefixes));
+    }
+
     #[tokio::test]
     async fn eval_error_timeout_and_invalid_json_fail_closed() {
         let cases = vec![
@@ -2230,9 +2371,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_eval_stdout_fails_closed() {
-        let script = write_eval_script(
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n",
-        );
+        // One zero-padded printf writes the 70,000 bytes at once. A shell loop
+        // printing one byte per iteration took longer than the gate's 2s
+        // timeout on a loaded machine, which failed the test as a timeout.
+        let script = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
@@ -2334,6 +2476,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2348,6 +2491,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2438,6 +2582,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2452,6 +2597,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2602,6 +2748,53 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "invalid_path");
         assert!(warnings.is_empty());
+    }
+
+    /// Same class as bootstrap #847 / consolidation #848: the reviewer LLM
+    /// echoes a conventional-commit subject into the page path. That passes
+    /// `PagePath::new` (deliberately tolerant) but fails `ensure_portable`,
+    /// so the proposal is staged and then cannot be applied.
+    #[test]
+    fn windows_illegal_model_path_is_sanitized_before_staging() {
+        let raw_path = "concepts/build(sandbox): orchestrate.md";
+        assert!(
+            PagePath::new(raw_path).is_ok(),
+            "precondition: PagePath::new is deliberately tolerant of ':'"
+        );
+        assert!(
+            PagePath::new(raw_path).unwrap().ensure_portable().is_err(),
+            "precondition: the raw model path is not portable"
+        );
+
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": raw_path,
+                "title": "Orchestrate the run",
+                "kind": "concept",
+                "confidence": 0.91,
+                "rationale": "The session recorded a durable conventional-commit workflow.",
+                "evidence": [{"quote": "build(sandbox): orchestrate the run"}],
+                "body_markdown": "# Orchestrate the run\n\nKeep the sandbox build orchestrated."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(
+            rejected.is_empty(),
+            "sanitized path should be accepted: {rejected:?}"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "concepts/build(sandbox)- orchestrate.md");
+        let path = PagePath::new(&accepted[0].path).unwrap();
+        assert!(
+            path.ensure_portable().is_ok(),
+            "staged path must be applyable"
+        );
     }
 
     #[test]
@@ -3201,6 +3394,66 @@ mod tests {
         );
     }
 
+    /// Same shape as #458 on the neighbouring field: `gpt-oss-20b` via LM
+    /// Studio answered `"edit_mode": "full"` for every candidate, so every run
+    /// ended with zero accepted proposals and only `unsupported_edit_mode`
+    /// rejections.
+    #[test]
+    fn a_proposal_saying_full_is_accepted_as_full_page() {
+        let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+        candidate.edit_mode = "full".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![candidate],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(rejected.is_empty(), "got {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].edit_mode, "full_page");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("edit_mode normalized from \"full\"")),
+            "normalisation should be reported, got {warnings:?}"
+        );
+
+        let mut unknown = proposal("gotchas/thing.md", "gotcha", 0.91);
+        unknown.edit_mode = "rewrite".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![unknown],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected[0].reason, "unsupported_edit_mode");
+    }
+
+    /// Once `"full"` stopped being rejected, the same `gpt-oss-20b` runs
+    /// failed at staging with `invalid expected_base_body_sha256: expected 64
+    /// hex chars`: the model filled in a field only the server can compute.
+    #[test]
+    fn a_model_supplied_base_sha_is_dropped_from_full_page_proposals() {
+        for supplied in ["", "null", "abc123", "N/A"] {
+            let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+            candidate.expected_base_body_sha256 = Some(supplied.into());
+            let raw = AutoImproveLlmResponse {
+                summary: "ok".into(),
+                proposals: vec![candidate],
+                rejected_candidates: Vec::new(),
+            };
+            let (accepted, rejected, _) =
+                validate_response(raw, &cfg(), &ExistingPageIndex::default());
+            assert!(rejected.is_empty(), "{supplied:?}: got {rejected:?}");
+            assert_eq!(
+                accepted[0].expected_base_body_sha256, None,
+                "{supplied:?} must not survive to staging"
+            );
+        }
+    }
+
     #[test]
     fn patch_to_missing_or_non_context_target_rejects() {
         let raw = AutoImproveLlmResponse {
@@ -3608,5 +3861,66 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+#[cfg(test)]
+mod edit_mode_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "full_page",
+            "full",
+            "Full",
+            "full-page",
+            "Full Page",
+            "FULLPAGE",
+            "",
+            "  ",
+        ] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                "full_page",
+                "{raw:?} means full page and must normalise"
+            );
+        }
+        for raw in ["patch", "PATCH", " Patch "] {
+            assert_eq!(normalize_edit_mode(raw), "patch", "{raw:?} must normalise");
+        }
+    }
+
+    #[test]
+    fn unknown_edit_modes_are_left_to_fail() {
+        for raw in ["rewrite", "replace", "append", "diff", "delete"] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                raw,
+                "{raw:?} is not a supported mode and must keep failing validation"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_constrains_edit_mode_to_the_supported_values() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let variants = value
+            .pointer("/properties/edit_mode/enum")
+            .and_then(|e| e.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            variants,
+            &vec![serde_json::json!("full_page"), serde_json::json!("patch")]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_edit_mode_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "edit_mode": "full" }))
+                .expect("must not fail to parse; normalisation happens before validation");
+        assert_eq!(parsed.edit_mode, "full");
     }
 }

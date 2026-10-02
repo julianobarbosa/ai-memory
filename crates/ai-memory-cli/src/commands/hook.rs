@@ -24,6 +24,7 @@ use ai_memory_hooks::{
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
+use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 
 use sha2::{Digest as _, Sha256};
 
@@ -34,7 +35,7 @@ use super::hook_capture::{
 };
 use super::hook_drain_process;
 use super::hook_spool;
-use super::path_util::strip_windows_verbatim_prefix;
+use super::path_util::{home_dir, strip_windows_verbatim_prefix};
 
 // All drain/handoff timings default to the current short values and can be
 // overridden by whole-minute env vars for very high-latency or large-backlog
@@ -54,6 +55,7 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -452,11 +454,65 @@ fn write_success_response<W: std::io::Write>(
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
+    } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
+        // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
+        // verbatim, so a `{}` here would become user-visible text on every
+        // prompt a gate dropped (allowlist, capture policy, refused profile).
+        Ok(())
     } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
         writeln!(stdout, r#"{{"decision": "allow"}}"#)
     } else {
         writeln!(stdout, "{{}}")
     }
+}
+
+const GROK_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
+
+fn grok_post_tool_handoff_envelope(handoff: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": clip_chars(handoff, GROK_ADDITIONAL_CONTEXT_CHARS),
+        }
+    })
+}
+
+fn payload_is_subagent(raw: &serde_json::Value) -> bool {
+    [
+        "subagentType",
+        "subagent_type",
+        "agent_type",
+        "agent_id",
+        "parentSessionId",
+    ]
+    .iter()
+    .any(|key| {
+        raw.get(*key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(12);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn handoff_shown_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    let key = briefed_marker_path(data_dir, agent, session_id, cwd);
+    data_dir
+        .join("handoff-shown")
+        .join(key.file_name().unwrap_or_default())
 }
 
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
@@ -508,6 +564,25 @@ where
 {
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
+    // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
+    // than server configuration. Hooks deliberately bypass Config::load.
+    let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
+    let delivers_context = (hook_event == HookEvent::SessionStart
+        && agent_kind.session_start_injects_handoff())
+        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
+        // Grok delivers the handoff on the first PostToolUse (its SessionStart /
+        // UserPromptSubmit stdout is discarded); that path is context delivery
+        // too, so external capture must not suppress it.
+        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff());
+    if external_capture && !args.check_capture && !delivers_context {
+        // Retiring the fallback session ID is lifecycle housekeeping, not
+        // capture. Preserve it even when no event is enqueued.
+        if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
+            clear_session_id(&resolve_data_dir(data_dir.as_deref()), agent_kind);
+        }
+        write_success_response(stdout, agent_kind, hook_event)?;
+        return Ok(());
+    }
     let (mut payload, mut json) = match parse_hook_payload(payload) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -554,6 +629,15 @@ where
     if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
         payload = serde_json::to_string(&json)?;
     }
+    if agent_kind == AgentKind::AntigravityCli
+        && ai_memory_hooks::enrich_antigravity_step_output(
+            &mut json,
+            hook_event,
+            home_dir().as_deref(),
+        )
+    {
+        payload = serde_json::to_string(&json)?;
+    }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
@@ -565,12 +649,14 @@ where
             inspection_cwd.as_deref().unwrap_or(""),
         )
     });
+    let dd = resolve_data_dir(data_dir.as_deref());
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
     // persisted per-install mode; otherwise the historical default.
     let capture_mode = args.capture_mode.map_or_else(
-        || persisted_capture_mode(&resolve_data_dir(data_dir.as_deref())),
+        || persisted_capture_mode(&dd),
         crate::cli::CaptureModeArg::mode,
     );
+    let route = resolve_hook_route(&dd, policy_cwd.as_deref(), || std::env::current_dir().ok());
     // Marker presence is the opt-in signal under allowlist mode. Resolved from
     // the same upward walk the policy uses, so opting in needs no new file.
     let marker_present = policy_cwd
@@ -579,20 +665,44 @@ where
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "capture_mode": capture_mode,
             "marker_present": marker_present,
-            "admits_capture": admits_capture,
+            "admits_capture": admits_capture && !external_capture,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
             "path_count": protocol.map_or(0, |protocol| protocol.path_count()),
             "disposition": protocol.map_or(CaptureDisposition::Keep, |protocol| protocol.disposition()),
             "extraction_state": protocol.map_or(ai_memory_hooks::ExtractionState::NotApplicable, |protocol| protocol.extraction_state()),
+            "server_profile": route.profile_name().map(ProfileName::as_str),
+            "server_resolution": route.resolution(),
         });
+        if external_capture {
+            output["external_capture"] = true.into();
+        }
         writeln!(stdout, "{output}")?;
         return Ok(());
     }
+    // #992: a marker that selects a server profile which does not resolve
+    // emits nothing — not the event, not a handoff fetch, not a backfill.
+    // Delivering to the install default instead would hand one team's
+    // capture to another team's server.
+    let profile = match route {
+        HookRoute::InstallDefault => None,
+        HookRoute::Profile(resolved) => Some(resolved),
+        HookRoute::Rejected { name, reason } => {
+            eprintln!(
+                "ai-memory hook warning: this repository's marker selects server profile {}, \
+                 which was refused ({}); the event was dropped",
+                name.as_ref()
+                    .map_or_else(|| "<invalid>".to_owned(), |n| format!("`{n}`")),
+                reason.as_str()
+            );
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+    };
     // #446: under allowlist mode a repository that never opted in emits
     // nothing. This sits outside the `tool_event` path on purpose — `decision`
     // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
@@ -636,8 +746,6 @@ where
         &json,
         args.project_strategy.and_then(|s| s.baked()),
     );
-    let base = args.server_url.trim_end_matches('/');
-    let dd = resolve_data_dir(data_dir.as_deref());
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
@@ -652,7 +760,19 @@ where
     // dir. An explicit `--auth-token` still wins, which keeps every config
     // written before this change working exactly as it did.
     let persisted_token = crate::config::read_hook_auth_token(&dd);
-    let effective_token = args.auth_token.as_deref().or(persisted_token.as_deref());
+    let install_token = args.auth_token.as_deref().or(persisted_token.as_deref());
+    // A profile carries its own URL and token and never falls back to the
+    // install's credentials or to OIDC: `auth.json` belongs to the install
+    // default, and presenting it to a profile's server would leak it across
+    // servers.
+    let (base, effective_token, profile_name) = match &profile {
+        Some(profile) => (
+            profile.url.as_str(),
+            Some(profile.token.as_str()),
+            Some(profile.name.as_str()),
+        ),
+        None => (args.server_url.trim_end_matches('/'), install_token, None),
+    };
 
     let oidc_present = effective_token.is_none()
         && OidcToken::load(&dd.join("auth.json"))
@@ -672,67 +792,77 @@ where
     // atomically with the observation row and skips replays whose previous
     // delivery succeeded but whose response was lost — closing the
     // conservative-retry duplication vector. Older servers ignore the param.
-    let ingest_key = uuid::Uuid::new_v4().simple().to_string();
-    let event_url = format!(
-        "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
-        args.event, args.agent, hook_qs, capture_qs
-    );
-    let entry = hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present);
-    if hook_spool::enqueue(&spool, &entry).is_err() {
-        eprintln!(
-            "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+    if !external_capture {
+        let ingest_key = uuid::Uuid::new_v4().simple().to_string();
+        let event_url = format!(
+            "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
+            args.event, args.agent, hook_qs, capture_qs
         );
-    }
-    // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
-    // per turn, so its stored id is cleared by `finalize-session` (or
-    // overwritten by the next session-start), never by a hook event.
-    if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
-        clear_session_id(&dd, AgentKind::Devin);
-    }
+        let entry =
+            hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
+                .routed_to(profile_name);
+        if hook_spool::enqueue(&spool, &entry).is_err() {
+            eprintln!(
+                "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+            );
+        }
+        // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
+        // per turn, so its stored id is cleared by `finalize-session` (or
+        // overwritten by the next session-start), never by a hook event.
+        if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+            clear_session_id(&dd, AgentKind::Devin);
+        }
 
-    // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
-    // outpaces the boundary-only drain and the spool grows until the next
-    // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
-    // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
-    // spool stays flat without ever stalling a tool call.
-    if should_incremental_drain(
-        &args.event,
-        hook_spool::spool_len(&spool),
-        incremental_drain_threshold(),
-    ) {
-        let _ = hook_spool::drain_exclusive(
-            &spool,
-            &dd,
-            INCREMENTAL_DRAIN_BUDGET,
-            INCREMENTAL_DRAIN_BUDGET,
-            hook_spool::DrainLockWait::NoWait,
-        )
-        .await;
-    }
+        // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
+        // outpaces the boundary-only drain and the spool grows until the next
+        // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
+        // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
+        // spool stays flat without ever stalling a tool call.
+        if should_incremental_drain(
+            &args.event,
+            hook_spool::spool_len(&spool),
+            incremental_drain_threshold(),
+        ) {
+            let _ = hook_spool::drain_exclusive(
+                &spool,
+                &dd,
+                INCREMENTAL_DRAIN_BUDGET,
+                INCREMENTAL_DRAIN_BUDGET,
+                hook_spool::DrainLockWait::NoWait,
+            )
+            .await;
+        }
 
-    // session-start: if this checkout has never had the one-time boot backfill
-    // attempted, spawn it detached. It self-gates (config opt-out, empty-store
-    // check) and records the attempt, so this is at most one extra process the
-    // first time a project is opened after installing hooks — never inline, so
-    // the SessionStart budget is untouched. Best-effort; a spawn failure must
-    // not affect session start.
-    if args.event == "session-start"
-        && let Ok(trigger_cwd) = std::env::current_dir()
-        && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
-    {
-        let _ = hook_drain_process::spawn_backfill(&dd);
+        // session-start: if this checkout has never had the one-time boot backfill
+        // attempted, spawn it detached. It self-gates (config opt-out, empty-store
+        // check) and records the attempt, so this is at most one extra process the
+        // first time a project is opened after installing hooks — never inline, so
+        // the SessionStart budget is untouched. Best-effort; a spawn failure must
+        // not affect session start.
+        if args.event == "session-start"
+            && let Ok(trigger_cwd) = std::env::current_dir()
+            && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
+        {
+            let target = match profile_name {
+                Some(name) => hook_drain_process::BackfillTarget::Profile(name),
+                None => hook_drain_process::BackfillTarget::ServerUrl(base),
+            };
+            let _ = hook_drain_process::spawn_backfill(&dd, target);
+        }
     }
 
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
-        let _ = hook_spool::drain_exclusive_within_budget(
-            &spool,
-            &dd,
-            start_drain_budget(),
-            drain_event_timeout(),
-        )
-        .await;
+        if !external_capture {
+            let _ = hook_spool::drain_exclusive_within_budget(
+                &spool,
+                &dd,
+                start_drain_budget(),
+                drain_event_timeout(),
+            )
+            .await;
+        }
         // Only fetch the handoff for agents that inject the session-start
         // hook's stdout as context. Grok ignores it, so fetching here would
         // consume the handoff server-side (the GET is destructive) and then
@@ -765,12 +895,12 @@ where
         }
     }
 
-    // user-prompt: agents whose SessionStart stdout is discarded (Kimi Code)
-    // receive the handoff here instead — kimi injects UserPromptSubmit stdout
-    // into the turn verbatim as a `hook_result` user message. The payload
-    // carries the native session id when available, so the destructive GET
-    // can also link the managed run to the native session, same as
-    // session-start does.
+    // user-prompt: agents whose SessionStart stdout is discarded AND whose
+    // UserPromptSubmit stdout is injected (Kimi Code) receive the handoff
+    // here. Grok discards both, so it must not take this path: the GET
+    // accepts the handoff. The payload carries the native session id when
+    // available, so the destructive GET can also link the managed run to the
+    // native session, same as session-start does.
     // The installed kimi hook passes the script stem (`user-prompt-submit`)
     // while the legacy shell path posts `user-prompt`; HookEvent::parse
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
@@ -840,20 +970,62 @@ where
         return Ok(());
     }
 
+    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
+    // model after the tool result. SessionStart and UserPromptSubmit stdout
+    // are discarded, so this is the event that can carry a handoff without
+    // burning it. One fetch per session. A session that never calls a tool
+    // leaves the handoff open for memory_handoff_accept.
+    if HookEvent::parse(&args.event) == HookEvent::PostToolUse
+        && AgentKind::from_wire(&args.agent).post_tool_injects_handoff()
+    {
+        let shown = handoff_shown_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        if !shown.is_file() && !payload_is_subagent(&json) {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let native_session_qs = canonical_session_id
+                .as_deref()
+                .map_or_else(String::new, |session_id| {
+                    format!("&session_id={}", url_encode(session_id))
+                });
+            let handoff_url = format!(
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                args.agent
+            );
+            let handoff =
+                get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
+            // Only a real body consumes this session's one chance. An empty
+            // or failed claim must retry on the next parent tool; a child
+            // session that errors must not burn the baton for the parent.
+            if let Some(handoff) = handoff {
+                mark_briefed(&shown);
+                let envelope = grok_post_tool_handoff_envelope(&handoff);
+                writeln!(stdout, "{envelope}")?;
+                return Ok(());
+            }
+        }
+    }
+
     // Boundary drain trigger: enqueue first, then ask a detached native drainer
     // to flush the shared spool. `session-end` remains the primary close path,
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
-    if should_spawn_background_drainer(&args.event)
+    if !external_capture
+        && should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
-            // The hook's own token, resolved the same way it authenticates
-            // its own request: `--auth-token`, else the environment, else the
-            // copy `install-hooks --apply` persisted under the data dir
-            // (#552). Current by construction either way. The drain uses it
-            // only to retry an entry the server has already rejected with 401
-            // (#542).
-            effective_token,
+            // The install's own token, resolved the same way an install-default
+            // event authenticates: `--auth-token`, else the copy
+            // `install-hooks --apply` persisted under the data dir (#552).
+            // Current by construction either way. The drain uses it only to
+            // retry an install-default entry the server has already rejected
+            // with 401 (#542); a profile entry retries with its own profile's
+            // token, so a profile's token is never handed over here.
+            install_token,
             spawn_background_drainer,
         )
     {
@@ -889,6 +1061,77 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             extract_cwd(raw).filter(|cwd| !cwd.trim().is_empty()),
             session_id,
         )
+    }
+}
+
+/// Where one event is delivered (#992).
+#[derive(Debug)]
+enum HookRoute {
+    /// No marker selects a server: the install-time `--server-url`, exactly
+    /// as before profiles existed.
+    InstallDefault,
+    /// The marker's profile resolved; its URL and token replace the install's.
+    Profile(ResolvedServer),
+    /// The marker selects a profile that did not resolve. Nothing is emitted.
+    Rejected {
+        /// The selected name, when it is a valid one (safe to print).
+        name: Option<ProfileName>,
+        reason: Rejection,
+    },
+}
+
+impl HookRoute {
+    fn profile_name(&self) -> Option<&ProfileName> {
+        match self {
+            Self::InstallDefault => None,
+            Self::Profile(resolved) => Some(&resolved.name),
+            Self::Rejected { name, .. } => name.as_ref(),
+        }
+    }
+
+    /// Label for `--check-capture`. Never a URL, path, or token.
+    fn resolution(&self) -> &'static str {
+        match self {
+            Self::InstallDefault => "install-default",
+            Self::Profile(_) => "marker",
+            Self::Rejected { reason, .. } => reason.as_str(),
+        }
+    }
+}
+
+/// Resolve the route for one event.
+///
+/// The payload's cwd decides; when the payload carries none, the hook
+/// process's own cwd does (the agent launches hooks in its workspace). An
+/// event without a payload cwd must not escape a profile-routed tree to the
+/// install default merely because the harness omitted the field.
+fn resolve_hook_route(
+    data_dir: &Path,
+    policy_cwd: Option<&str>,
+    process_cwd: impl FnOnce() -> Option<PathBuf>,
+) -> HookRoute {
+    let home = super::path_util::home_dir();
+    let cwd = policy_cwd
+        .map(str::to_owned)
+        .or_else(|| process_cwd().map(|dir| dir.to_string_lossy().into_owned()));
+    let Some(selection) = cwd
+        .as_deref()
+        .and_then(|cwd| crate::marker::find_server_selection(cwd, home.as_deref()))
+    else {
+        return HookRoute::InstallDefault;
+    };
+    let Some(raw_name) = selection.name else {
+        return HookRoute::Rejected {
+            name: None,
+            reason: Rejection::UnreadableMarker,
+        };
+    };
+    match server_profiles::resolve(data_dir, &raw_name, &selection.marker_dir, home.as_deref()) {
+        Ok(resolved) => HookRoute::Profile(resolved),
+        Err(reason) => HookRoute::Rejected {
+            name: ProfileName::parse(&raw_name),
+            reason,
+        },
     }
 }
 
@@ -2059,6 +2302,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_command_reading_an_ignored_path_is_dropped_before_spool() {
+        for (command, spooled) in [("cat ./secret/*.md | head", 0), ("cat public/readme.md", 1)] {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "[capture]\nignore_paths = [\"secret/**\"]\n",
+                )
+                .unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "claude-code".into();
+                let raw = serde_json::json!({
+                    "session_id": "shell", "cwd": tmp.path(),
+                    "tool_name": "Bash", "tool_input": {"command": command},
+                    "tool_response": {"stdout": "SENTINEL_CONTENT"},
+                });
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("tool events below the threshold must only spool"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+                    spooled,
+                    "{event}: {command}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn codex_native_capture_policy_runs_before_spool_and_preserves_identity() {
         for (tool, input, disposition) in [
             (
@@ -2309,6 +2589,8 @@ mod tests {
                 "marker_present",
                 "path_count",
                 "policy_state",
+                "server_profile",
+                "server_resolution",
                 "tool_family",
                 "version",
             ]
@@ -2425,6 +2707,80 @@ mod tests {
             .unwrap();
             assert_eq!(body["session_id"], value, "{key}");
         }
+    }
+
+    fn grok_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "grok".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_post_tool_use_spools_enriched_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact_dir = tmp.path().join("brain").join("conv-123");
+        let step_dir = artifact_dir
+            .join(".system_generated")
+            .join("steps")
+            .join("7");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(
+            step_dir.join("output.txt"),
+            "npm test passed with 0 errors\n",
+        )
+        .unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let raw = serde_json::json!({
+            "conversationId": "conv-123",
+            "workspacePaths": [tmp.path().to_str().unwrap()],
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "npm test"
+                }
+            },
+            "stepIdx": 7,
+            "artifactDirectoryPath": artifact_dir.to_str().unwrap()
+        });
+
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "post-tool-use".into(),
+            agent: "antigravity-cli".into(),
+            server_url: "http://127.0.0.1:41399".into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        };
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let spooled = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+        assert_eq!(spooled.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&spooled[0].body).unwrap();
+        assert_eq!(
+            body.get("tool_response")
+                .and_then(serde_json::Value::as_str),
+            Some("npm test passed with 0 errors")
+        );
     }
 
     fn kimi_hook_args(event: &str, server_url: &str) -> HookArgs {
@@ -2611,6 +2967,488 @@ mod tests {
                     && request.contains("session_id=kiro-session")
             }),
             "{recorded:?}"
+        );
+    }
+
+    // ── #992: per-repository server profiles ─────────────────────────────
+
+    /// Register `name` in `data_dir` with a token and the given roots.
+    fn register_profile(
+        data_dir: &Path,
+        name: &str,
+        url: &str,
+        roots: &[&Path],
+        token: Option<&str>,
+    ) {
+        let roots: Vec<String> = roots
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
+        crate::server_profiles::add(
+            data_dir,
+            &ProfileName::parse(name).unwrap(),
+            url,
+            &roots,
+            token,
+        )
+        .unwrap();
+    }
+
+    fn repo_with_marker(parent: &Path, name: &str, marker: &str) -> PathBuf {
+        let repo = parent.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+        repo
+    }
+
+    fn claude_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = devin_hook_args(event);
+        args.agent = "claude-code".into();
+        args.server_url = server_url.into();
+        args
+    }
+
+    async fn run_prompt(data_dir: &Path, args: HookArgs, cwd: &Path) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.to_path_buf()),
+            args,
+            serde_json::json!({"session_id": "s", "cwd": cwd, "prompt": "hello"}).to_string(),
+            &mut stdout,
+            |_, _| panic!("a prompt must only spool"),
+        )
+        .await
+        .unwrap();
+        stdout
+    }
+
+    /// Two repositories on one install deliver to two servers, each with its
+    /// own token, and neither with the install's persisted one.
+    #[tokio::test]
+    async fn each_repository_spools_to_its_own_profile_with_its_own_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        let repo_a = repo_with_marker(&work, "a", "server = \"team-a\"\n");
+        let repo_b = repo_with_marker(&work, "b", "workspace = \"b\"\nserver = \"team-b\"\n");
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo_a],
+            Some("tok-a"),
+        );
+        register_profile(
+            &data_dir,
+            "team-b",
+            "https://b.example/",
+            &[&repo_b],
+            Some("tok-b"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+
+        run_prompt(
+            &data_dir,
+            claude_args("user-prompt-submit", "https://default.example"),
+            &repo_a,
+        )
+        .await;
+        run_prompt(
+            &data_dir,
+            claude_args("user-prompt-submit", "https://default.example"),
+            &repo_b,
+        )
+        .await;
+
+        let entries = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0].url.starts_with("https://a.example/hook?"),
+            "{}",
+            entries[0].url
+        );
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert_eq!(entries[0].profile.as_deref(), Some("team-a"));
+        assert!(
+            entries[1].url.starts_with("https://b.example/hook?"),
+            "{}",
+            entries[1].url
+        );
+        assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
+        assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// Backward compatibility: without a `server` key the install default is
+    /// used exactly as before, and the spooled entry carries no profile.
+    #[tokio::test]
+    async fn a_repository_without_a_server_key_keeps_the_install_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(tmp.path(), "repo", "workspace = \"w\"\n");
+        register_profile(&data_dir, "team-a", "https://a.example", &[], Some("tok-a"));
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+
+        run_prompt(
+            &data_dir,
+            claude_args("user-prompt-submit", "https://default.example"),
+            &repo,
+        )
+        .await;
+
+        let spool = hook_spool::spool_dir(&data_dir);
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.starts_with("https://default.example/hook?"));
+        assert_eq!(entries[0].token.as_deref(), Some("INSTALL-TOKEN"));
+        let raw = std::fs::read_dir(&spool)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .next()
+            .unwrap();
+        assert!(!raw.contains("\"profile\""), "{raw}");
+    }
+
+    /// Every refusal emits nothing — no spool entry, no drainer — and
+    /// `--check-capture` names the reason without a URL, path, or token.
+    #[tokio::test]
+    async fn a_selection_that_does_not_resolve_emits_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let inside = repo_with_marker(tmp.path(), "inside", "server = \"rooted\"\n");
+        let outside = repo_with_marker(tmp.path(), "outside", "server = \"rooted\"\n");
+        let unknown = repo_with_marker(tmp.path(), "unknown", "server = \"nobody\"\n");
+        let tokenless = repo_with_marker(tmp.path(), "tokenless", "server = \"tokenless\"\n");
+        let unrooted = repo_with_marker(tmp.path(), "unrooted", "server = \"unrooted\"\n");
+        let bare = repo_with_marker(tmp.path(), "bare", "server = Bad/Name\n");
+        register_profile(
+            &data_dir,
+            "rooted",
+            "https://r.example",
+            &[&inside],
+            Some("tok-r"),
+        );
+        register_profile(
+            &data_dir,
+            "tokenless",
+            "https://t.example",
+            &[&tokenless],
+            None,
+        );
+        register_profile(
+            &data_dir,
+            "unrooted",
+            "https://u.example",
+            &[],
+            Some("tok-u"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+
+        for (cwd, resolution) in [
+            (&outside, "rejected-outside-roots"),
+            (&unknown, "rejected-unknown-profile"),
+            (&tokenless, "rejected-no-token"),
+            (&unrooted, "rejected-roots-required"),
+            (&bare, "rejected-invalid-profile-name"),
+            (&inside, "marker"),
+        ] {
+            let mut args = claude_args("user-prompt-submit", "https://default.example");
+            args.check_capture = true;
+            let stdout = run_prompt(&data_dir, args, cwd).await;
+            let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(output["server_resolution"], resolution, "{}", cwd.display());
+            let printed = String::from_utf8(stdout).unwrap();
+            for secret in ["tok-", "https://", &*tmp.path().to_string_lossy()] {
+                assert!(!printed.contains(secret), "{printed}");
+            }
+
+            let spool = hook_spool::spool_dir(&data_dir);
+            let before = hook_spool::spool_len(&spool);
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                claude_args("session-end", "https://default.example"),
+                serde_json::json!({"session_id": "s", "cwd": cwd}).to_string(),
+                &mut stdout,
+                |_, token| {
+                    assert!(
+                        resolution == "marker",
+                        "a refused route must not spawn a drainer"
+                    );
+                    assert_eq!(
+                        token,
+                        Some("INSTALL-TOKEN"),
+                        "the drain gets the install token for install-default retries, \
+                         never the profile's"
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            let spooled = hook_spool::spool_len(&spool) - before;
+            assert_eq!(spooled, usize::from(resolution == "marker"), "{resolution}");
+        }
+    }
+
+    /// An event whose payload has no cwd is routed by the hook process's own
+    /// cwd, so a harness omitting the field cannot escape a routed tree.
+    #[test]
+    fn an_event_without_a_payload_cwd_routes_by_the_process_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(tmp.path(), "repo", "server = \"team-b\"\n");
+        register_profile(
+            &data_dir,
+            "team-b",
+            "https://b.example",
+            &[&repo],
+            Some("tok-b"),
+        );
+
+        let routed = resolve_hook_route(&data_dir, None, || Some(repo.clone()));
+        assert!(matches!(routed, HookRoute::Profile(ref p) if p.url == "https://b.example"));
+        let refused = resolve_hook_route(&data_dir, None, || Some(repo.join("..")));
+        assert!(matches!(refused, HookRoute::InstallDefault), "{refused:?}");
+        let unknown = resolve_hook_route(&data_dir, None, || None);
+        assert!(matches!(unknown, HookRoute::InstallDefault));
+        let payload_wins =
+            resolve_hook_route(&data_dir, Some(&tmp.path().to_string_lossy()), || {
+                Some(repo.clone())
+            });
+        assert!(matches!(payload_wins, HookRoute::InstallDefault));
+    }
+
+    /// Kimi injects any UserPromptSubmit stdout into the turn verbatim, so a
+    /// prompt dropped by allowlist mode must print nothing — not even `{}`.
+    #[tokio::test]
+    async fn an_allowlist_drop_prints_nothing_for_kimi_user_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = kimi_hook_args("user-prompt", &dead_server_url());
+        args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({"session_id": "k", "cwd": tmp.path(), "prompt": "hi"}).to_string(),
+            &mut stdout,
+            |_, _| panic!("a dropped prompt spawns nothing"),
+        )
+        .await
+        .unwrap();
+        assert!(stdout.is_empty(), "{:?}", String::from_utf8_lossy(&stdout));
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    /// The same for a prompt dropped because its profile was refused.
+    #[tokio::test]
+    async fn a_refused_route_prints_nothing_for_kimi_user_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(tmp.path(), "repo", "server = \"nobody\"\n");
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt", &dead_server_url()),
+            serde_json::json!({"session_id": "k", "cwd": repo, "prompt": "hi"}).to_string(),
+            &mut stdout,
+            |_, _| panic!("a refused route spawns nothing"),
+        )
+        .await
+        .unwrap();
+        assert!(stdout.is_empty(), "{:?}", String::from_utf8_lossy(&stdout));
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    /// Session start fetches the handoff from the profile's server with the
+    /// profile's token; the install-default server sees nothing at all.
+    #[tokio::test]
+    async fn session_start_handoff_comes_from_the_profile_server_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (profile_base, mut profile_requests) = serve_requests("200 OK", "B-HANDOFF").await;
+        let (default_base, mut default_requests) = serve_requests("200 OK", "A-HANDOFF").await;
+        let repo = repo_with_marker(tmp.path(), "repo", "server = \"team-b\"\n");
+        register_profile(&data_dir, "team-b", &profile_base, &[&repo], Some("tok-b"));
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kiro_hook_args("session-start", &default_base),
+            serde_json::json!({"session_id": "kiro-session", "cwd": repo}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"B-HANDOFF\n");
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut profile_requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|r| r.starts_with("GET /handoff?")
+                && r.lines()
+                    .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok-b"))),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(|r| !r.contains("INSTALL-TOKEN")),
+            "{recorded:?}"
+        );
+        assert_eq!(first_request(&mut default_requests).await, None);
+    }
+
+    /// Recording stub that accepts exactly one bearer. An authorised
+    /// `/hook/batch` answers `{"accepted": n}`, an authorised per-event POST
+    /// `202`, anything else `401`. Every request is recorded whole (head and
+    /// body), so a test can see both who authenticated and what was delivered.
+    async fn serve_token_gated(
+        accepted_token: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Read until the head is complete and the body has arrived:
+                // a batch body can land in a second segment.
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&raw);
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let expected = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= expected {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&raw).into_owned();
+                let _ = tx.send(request.clone());
+                let authorized = request.lines().any(|l| {
+                    l.trim()
+                        .eq_ignore_ascii_case(&format!("authorization: Bearer {accepted_token}"))
+                });
+                let is_batch = request
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.contains("/hook/batch"));
+                let (status, body) = if !authorized {
+                    ("401 Unauthorized", "{\"error\":\"bad token\"}".to_string())
+                } else if is_batch {
+                    let payload = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                        .ok()
+                        .and_then(|v| v.as_array().map(Vec::len))
+                        .unwrap_or(0);
+                    ("200 OK", format!("{{\"accepted\":{accepted}}}"))
+                } else {
+                    ("202 Accepted", "queued".to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Everything a stub recorded, once no more requests arrive.
+    async fn recorded(requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut all = Vec::new();
+        while let Ok(Some(request)) =
+            tokio::time::timeout(Duration::from_millis(250), requests.recv()).await
+        {
+            all.push(request);
+        }
+        all
+    }
+
+    /// The issue's first acceptance criterion at the wire: two repositories
+    /// on one install, one routed to a profile and one not, spool into the
+    /// same queue and are drained by one pass, and each server receives
+    /// exactly its own event with exactly its own bearer. Server A accepts
+    /// only the install token and server B only the profile's, so a
+    /// misdelivered event or a swapped credential would be refused and
+    /// counted as undelivered.
+    #[tokio::test]
+    async fn a_mixed_spool_drains_each_event_only_to_its_own_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        let (base_a, mut requests_a) = serve_token_gated("INSTALL-TOKEN").await;
+        let (base_b, mut requests_b) = serve_token_gated("tok-b").await;
+        let repo_a = repo_with_marker(&work, "a", "workspace = \"a\"\n");
+        let repo_b = repo_with_marker(&work, "b", "workspace = \"b\"\nserver = \"team-b\"\n");
+        register_profile(&data_dir, "team-b", &base_b, &[&repo_b], Some("tok-b"));
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+
+        for (repo, sentinel) in [(&repo_a, "SENTINEL-A"), (&repo_b, "SENTINEL-B")] {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                claude_args("user-prompt-submit", &base_a),
+                serde_json::json!({"session_id": "s", "cwd": repo, "prompt": sentinel}).to_string(),
+                &mut stdout,
+                |_, _| panic!("a prompt only spools"),
+            )
+            .await
+            .unwrap();
+        }
+        let spool = hook_spool::spool_dir(&data_dir);
+        assert_eq!(hook_spool::spool_len(&spool), 2);
+
+        let result = hook_spool::drain_with_live_token(
+            &spool,
+            &data_dir,
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("INSTALL-TOKEN"),
+        )
+        .await;
+        assert_eq!(result.sent, 2, "{result:?}");
+        assert_eq!(hook_spool::spool_len(&spool), 0, "nothing left queued");
+
+        let got_a = recorded(&mut requests_a).await;
+        let got_b = recorded(&mut requests_b).await;
+        assert_eq!(got_a.len(), 1, "server A saw {got_a:?}");
+        assert_eq!(got_b.len(), 1, "server B saw {got_b:?}");
+        let (a, b) = (&got_a[0], &got_b[0]);
+        assert!(a.contains("SENTINEL-A") && !a.contains("SENTINEL-B"), "{a}");
+        assert!(b.contains("SENTINEL-B") && !b.contains("SENTINEL-A"), "{b}");
+        assert!(
+            a.lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer INSTALL-TOKEN"))
+                && !a.contains("tok-b"),
+            "{a}"
+        );
+        assert!(
+            b.lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok-b"))
+                && !b.contains("INSTALL-TOKEN"),
+            "{b}"
         );
     }
 
@@ -2903,6 +3741,243 @@ mod tests {
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
         assert!(!data_dir.join("briefed").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_session_start_never_fetches_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("session-start", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("user-prompt", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": tmp.path(),
+                "prompt": "hello"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // Grok discards allowing UserPromptSubmit stdout. Fetching would
+        // accept the handoff and then throw the body away.
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "grok user-prompt must not accept the handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_submit_stem_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "prompt": "hi"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "briefing opt-in must not make grok fetch /handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_prints_additional_context_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let payload = serde_json::json!({
+            "session_id": "grok-session",
+            "cwd": tmp.path(),
+            "tool_name": "read_file"
+        })
+        .to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            grok_hook_args("post-tool-use", &base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+        let first = first_request(&mut requests).await.unwrap();
+        assert!(first.starts_with("GET /handoff?"), "{first}");
+        assert!(first.contains("agent=grok"), "{first}");
+        assert!(first.contains("session_id=grok-session"), "{first}");
+        assert!(
+            data_dir
+                .join("handoff-shown")
+                .join("grok-session")
+                .is_file(),
+            "shown marker missing"
+        );
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(
+            first_request(&mut requests).await.is_none(),
+            "second post-tool must not fetch again"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_includes_briefing_when_the_marker_opts_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.contains("&briefing=true"), "{request}");
+        assert!(request.contains("&briefing_budget=6000"), "{request}");
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_skips_a_subagent_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "child-session",
+                "cwd": tmp.path(),
+                "subagentType": "goal-plan-writer",
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "a child session must not accept the parent handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_without_handoff_prints_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    #[test]
+    fn grok_additional_context_is_clipped_to_the_model_cap() {
+        let long = "x".repeat(GROK_ADDITIONAL_CONTEXT_CHARS + 50);
+        let envelope = grok_post_tool_handoff_envelope(&long);
+        let note = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(note.ends_with("\n[truncated]"));
+        assert!(note.chars().count() <= GROK_ADDITIONAL_CONTEXT_CHARS);
     }
 
     #[test]

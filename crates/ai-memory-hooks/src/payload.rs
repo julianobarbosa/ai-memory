@@ -89,6 +89,14 @@ pub struct HookQuery {
     /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
     /// from the enclosing checkout. Absent on older clients (#394).
     pub project_src: Option<String>,
+    /// Repository identity the client resolved for this checkout (#708):
+    /// an explicit marker `identity`, or a normalised git remote. Paired
+    /// with `identity_src`. Absent on older clients and for checkouts that
+    /// declare a `project`, which keep routing by name.
+    pub identity: Option<String>,
+    /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
+    /// else, or a malformed identity, is ignored and the event routes by name.
+    pub identity_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -117,6 +125,10 @@ pub struct HookEnvelope {
     /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
     /// when there is no override, so the two can never disagree (#394).
     pub project_source: ProjectSource,
+    /// Repository identity from the client, already validated by
+    /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
+    /// routes by project name, as every event did before identities existed.
+    pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -148,6 +160,12 @@ pub struct HookEnvelope {
     pub title_hint: Option<String>,
     /// Optional body excerpt extracted from the agent's raw payload.
     pub body_excerpt: Option<String>,
+    /// Original event time (RFC 3339), when the client supplied one —
+    /// notably backfill replaying a transcript's own per-event timestamps.
+    /// Bounded and converted at the point of use via
+    /// [`HookEnvelope::occurred_at_micros`]; never trust it unchecked.
+    #[serde(default)]
+    pub occurred_at: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
 }
@@ -164,6 +182,7 @@ impl std::fmt::Debug for HookEnvelope {
             .field("workspace_override", &self.workspace_override)
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
+            .field("identity", &self.identity)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -176,6 +195,17 @@ impl std::fmt::Debug for HookEnvelope {
             )
             .field("extension", &self.extension)
             .field("source_event", &self.source_event)
+            // Client-controlled and only loosely shaped at this point (parsed
+            // and bounded later, in `occurred_at_micros`), so it is capped
+            // here rather than logged verbatim — a valid RFC 3339 timestamp
+            // is well under this, only a hostile payload would hit it.
+            .field(
+                "occurred_at",
+                &self
+                    .occurred_at
+                    .as_deref()
+                    .map(|s| truncate_utf8_bytes(s, 64)),
+            )
             .field(
                 "title_hint",
                 &self.title_hint.as_ref().map(|_| "<redacted>"),
@@ -191,11 +221,12 @@ impl std::fmt::Debug for HookEnvelope {
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
 /// (a nested/spawned agent session) rather than the top-level session. Grok
-/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
-/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
-/// events). The set is a union so one check covers every harness that signals
-/// subagent-ness; a harness that does not signal it simply never matches.
-const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_id`
+/// on subagent events. `agent_type` alone is not a subagent marker: Claude
+/// Code also sets it on top-level sessions launched with `--agent`. The set
+/// is a union so one check covers every harness that signals subagent-ness;
+/// a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
 /// True when the raw hook payload carries a non-empty subagent marker — i.e.
 /// the event originates from a spawned subagent session. The ingest router
@@ -427,7 +458,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -502,6 +533,12 @@ impl HookEnvelope {
         } else {
             ProjectSource::Unspecified
         };
+        let identity = match (query.identity.as_deref(), query.identity_src.as_deref()) {
+            (Some(identity), Some(source)) => {
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+            }
+            _ => None,
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -520,6 +557,9 @@ impl HookEnvelope {
         } else {
             None
         };
+        if agent == AgentKind::AntigravityCli {
+            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
+        }
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -554,6 +594,25 @@ impl HookEnvelope {
             })
         };
         let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
+        // Original event time (RFC 3339), when the client carried one — currently
+        // only `ai-memory backfill`, replaying a transcript's own per-event
+        // timestamps. This is numeric metadata, not text, so it never goes
+        // through the sanitizer (invariant #6 is about untrusted TEXT reaching
+        // storage/prompts unscrubbed; a timestamp has no such surface). It is
+        // still client-controlled input over the hook endpoint, so it is bounded
+        // at parse time in `occurred_at_micros`, not trusted here.
+        //
+        // Read from the top-level body only, unlike `extract_string`'s nested
+        // `payload`/`event`/`properties`/`info`/`path` search: that search
+        // exists for text fields real agent harnesses nest under those keys,
+        // but a real harness payload happening to carry an `occurred_at` key
+        // somewhere in that structure must not be mistaken for backfill's own
+        // top-level field.
+        let occurred_at = raw
+            .get("occurred_at")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Self {
             event,
             agent,
@@ -563,6 +622,7 @@ impl HookEnvelope {
             project_override,
             project_strategy,
             project_source,
+            identity,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,
@@ -573,10 +633,42 @@ impl HookEnvelope {
             source_event,
             title_hint,
             body_excerpt,
+            occurred_at,
             raw,
         }
     }
+
+    /// Parse and bound [`Self::occurred_at`] into a microsecond timestamp
+    /// suitable for `NewSession`/`NewObservation::occurred_at`.
+    ///
+    /// `occurred_at` arrives from a client over the hook endpoint, so it is
+    /// bounded here rather than trusted outright: only strictly positive
+    /// values that are no more than [`MAX_OCCURRED_AT_FUTURE_SKEW_MICROS`]
+    /// ahead of server time are honored. Anything else — an unparseable
+    /// string, a non-positive value, or a suspicious far-future timestamp —
+    /// resolves to `None`, which callers fall back to "now" for. Hooks are
+    /// fire-and-forget, so this never errors.
+    #[must_use]
+    pub fn occurred_at_micros(&self) -> Option<i64> {
+        let parsed = self
+            .occurred_at
+            .as_deref()?
+            .parse::<jiff::Timestamp>()
+            .ok()?
+            .as_microsecond();
+        let now = jiff::Timestamp::now().as_microsecond();
+        if parsed > 0 && parsed <= now.saturating_add(MAX_OCCURRED_AT_FUTURE_SKEW_MICROS) {
+            Some(parsed)
+        } else {
+            None
+        }
+    }
 }
+
+/// How far ahead of server time a client-supplied `occurred_at` may sit
+/// before it is treated as bogus (clock skew, or a hostile client) and
+/// dropped to `None` instead of being trusted.
+const MAX_OCCURRED_AT_FUTURE_SKEW_MICROS: i64 = 5 * 60 * 1_000_000;
 
 /// An ingest key is client-controlled input: accept only short, plain tokens
 /// (1–64 ASCII alphanumerics, `-` or `_` — a UUID simple/hyphenated form
@@ -628,7 +720,9 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Codex
             | AgentKind::OpenCode
             | AgentKind::Pi
+            | AgentKind::Omp
             | AgentKind::AntigravityCli
+            | AgentKind::Grok
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
@@ -658,6 +752,23 @@ pub(crate) fn is_safe_tool_title(title: &str) -> bool {
     title.strip_prefix("tool ").is_some_and(|family| {
         serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).is_ok()
     })
+}
+
+/// Map a stored observation title back to the [`ToolFamily`] it was derived
+/// from, recognising **both** spellings this crate emits for a family label:
+/// the bare `canonical_tool_name` form the reserved-protocol path writes
+/// ("file" / "search-list" / "non-file" / "unknown") and the `"tool "`-prefixed
+/// [`safe_tool_title`] form every closed-tool agent writes ("tool file", …).
+///
+/// Returns `None` for a harness's own raw tool name ("edit", "bash", "Read"),
+/// which is never one of these labels. That distinction is load-bearing: it is
+/// what keeps the family labels out of handoffs, titles, and the file-activity
+/// heuristic while a real tool name still flows through. Shares the serde
+/// representation with [`safe_tool_title`] and [`is_safe_tool_title`], so a new
+/// `ToolFamily` variant is recognised here without a second edit.
+pub(crate) fn tool_family_from_title(title: &str) -> Option<ToolFamily> {
+    let family = title.strip_prefix("tool ").unwrap_or(title);
+    serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).ok()
 }
 
 fn safe_tool_body(
@@ -829,7 +940,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
+            extract_content(raw, &["prompt", "message", "text"]).map(|s| first_line(&s))
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -846,7 +957,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
 
 fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
     extract_string(raw, &["title", "summary", "subject", "name"])
-        .map(|s| truncate_for_title(&s))
+        .map(|s| first_line(&s))
         .unwrap_or_else(|| source_event.to_string())
 }
 
@@ -939,16 +1050,18 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
     }
 }
 
-pub(crate) fn truncate_for_title(s: &str) -> String {
-    const MAX: usize = 80;
-    let one_line: String = s.chars().take_while(|c| *c != '\n').collect();
-    if one_line.chars().count() <= MAX {
-        one_line
-    } else {
-        let mut buf: String = one_line.chars().take(MAX - 1).collect();
-        buf.push('…');
-        buf
-    }
+/// Reduce a hook-supplied string to its first line, discarding everything
+/// after the first `\n`.
+///
+/// This is the only shaping `title_hint` gets before it reaches the
+/// sanitizer: the 80-char display cap used to happen here too, but that ran
+/// *before* redaction and could cut a secret in half — the truncated prefix
+/// was then too short to match the sanitizer's pattern, so it was stored in
+/// clear text (#980). The length cap now lives in
+/// `ai_memory_core::sanitize::truncate_for_title`, applied by
+/// `Sanitized::new` *after* `Sanitizer::scrub`.
+fn first_line(s: &str) -> String {
+    s.chars().take_while(|c| *c != '\n').collect()
 }
 
 fn truncate_excerpt(s: &str) -> String {
@@ -1167,19 +1280,122 @@ mod tests {
         assert_eq!(env.project_source, ProjectSource::RepoRoot);
     }
 
+    /// `occurred_at` is client-controlled input arriving over the hook
+    /// endpoint, so it must be bounded, not trusted outright. A valid past
+    /// timestamp is stored exactly; garbage, non-positive, and far-future
+    /// values must all fall back to `None` ("now" at the store boundary) —
+    /// never an error, since hooks are fire-and-forget.
+    #[test]
+    fn occurred_at_micros_accepts_a_valid_past_timestamp() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s", "occurred_at": "2026-09-10T12:00:00Z" }),
+        );
+        let expected = "2026-09-10T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_microsecond();
+        assert_eq!(env.occurred_at_micros(), Some(expected));
+    }
+
+    #[test]
+    fn occurred_at_micros_rejects_a_far_future_timestamp() {
+        // Adversarial: a client claiming its event happened next year must not
+        // be trusted — the bound must actually reject it.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s", "occurred_at": "2099-01-01T00:00:00Z" }),
+        );
+        assert_eq!(
+            env.occurred_at_micros(),
+            None,
+            "a far-future timestamp must not be trusted"
+        );
+    }
+
+    #[test]
+    fn occurred_at_micros_rejects_non_positive_values() {
+        for bogus in ["1970-01-01T00:00:00Z", "0000-01-01T00:00:00Z"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "s", "occurred_at": bogus }),
+            );
+            // The epoch and earlier parse fine as an RFC 3339 timestamp but
+            // must still be rejected: a non-positive microsecond value is
+            // never a plausible original event time.
+            let micros = bogus.parse::<jiff::Timestamp>().unwrap().as_microsecond();
+            assert!(micros <= 0, "fixture must actually be non-positive");
+            assert_eq!(env.occurred_at_micros(), None);
+        }
+    }
+
+    #[test]
+    fn occurred_at_micros_rejects_garbage_strings() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s", "occurred_at": "not-a-timestamp" }),
+        );
+        assert_eq!(env.occurred_at_micros(), None);
+    }
+
+    #[test]
+    fn occurred_at_missing_from_the_body_parses_as_none() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.occurred_at, None);
+        assert_eq!(env.occurred_at_micros(), None);
+    }
+
     #[test]
     fn body_is_subagent_detects_harness_markers() {
         // grok tags subagent tool-use events with `subagentType`.
         assert!(body_is_subagent(
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
-        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
-            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
+    }
+
+    #[test]
+    fn body_is_subagent_keeps_top_level_claude_agent_sessions() {
+        // `claude --agent <name>` also sets agent_type on the main session.
+        let mut raw = serde_json::json!({
+            "session_id": "main-session",
+            "agent_type": "regulus:regulus",
+        });
+        assert!(!body_is_subagent(&raw), "agent_id absent");
+        for agent_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ] {
+            raw["agent_id"] = agent_id;
+            assert!(!body_is_subagent(&raw), "{raw}");
+        }
     }
 
     #[test]
@@ -1955,10 +2171,13 @@ mod tests {
 
     /// Title-hint extraction must truncate at the first newline (the
     /// "first line" rule used everywhere in the wiki log + handoff
-    /// surfaces) and cap at 80 chars to keep observation titles
-    /// scannable in the log.md heading.
+    /// surfaces), but must NOT cap length here any more: the 80-char display
+    /// cap moved to `ai_memory_core::sanitize::truncate_for_title`, applied
+    /// by `Sanitized::new` after redaction (#980) — truncating a long
+    /// `title_hint` in `payload.rs`, before the sanitizer ever runs, could
+    /// cut a secret in half and leave the unmatched fragment unredacted.
     #[test]
-    fn user_prompt_title_truncates_at_newline_and_at_max_chars() {
+    fn user_prompt_title_keeps_first_line_full_length_untruncated() {
         let q = HookQuery {
             event: "user-prompt".into(),
             agent: Some("claude-code".into()),
@@ -1971,12 +2190,13 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("first line"));
 
-        // Very long single line → truncated with ellipsis.
+        // Very long single line → title_hint keeps every character; the
+        // 80-char cap now happens later, after sanitization.
         let long = "x".repeat(200);
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({ "prompt": long }));
         let title = env.title_hint.unwrap();
-        assert!(title.chars().count() <= 80);
-        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().count(), 200);
+        assert!(!title.contains('…'));
     }
 
     #[test]
@@ -2159,6 +2379,35 @@ mod tests {
         assert!(
             body.contains("MARKER_OBJ_456"),
             "object tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case
+    /// aliases (`tool_name` / `tool_input` / `tool_use_id`). It was absent from
+    /// both `closed_tool_agent` and the `tool_observation_metadata` match, so
+    /// every Grok tool observation was stored with an empty body (#931).
+    #[test]
+    fn grok_post_tool_excerpt_captures_tool_response() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("grok".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_use_id": "call_grok_1",
+                "tool_response": {"stdout": "MARKER_GROK_931"},
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("grok post-tool body should not be empty");
+        assert!(
+            body.contains("MARKER_GROK_931"),
+            "grok tool_response should be serialized into the body: {body:?}"
         );
     }
 
@@ -2730,40 +2979,141 @@ mod tests {
     }
 
     #[test]
-    fn pi_post_outcomes_and_stable_id_are_rendered() {
-        for (is_error, outcome) in [
-            (Some(false), "success"),
-            (Some(true), "error"),
-            (None, "unknown"),
-        ] {
-            let mut raw = serde_json::json!({"tool":"bash","args":{},"callID":"pi-stable-190","output":"result"});
-            if let Some(is_error) = is_error {
-                raw["isError"] = serde_json::json!(is_error);
+    fn antigravity_post_tool_use_extracts_output_txt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cargo test"}
+                },
+                "stepIdx": 42,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("tool_family: non-file"));
+        assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_preserves_edit_tool_code_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("1");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "Created file test.rs\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "TargetFile": "/workspace/test.rs",
+                        "CodeContent": "fn preserved_code() {}"
+                    }
+                },
+                "stepIdx": 1,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("fn preserved_code() {}"));
+        assert!(!body.contains("Created file test.rs"));
+    }
+
+    #[test]
+    fn pi_and_omp_post_outcomes_and_stable_id_are_rendered() {
+        for agent in ["pi", "omp"] {
+            for (is_error, outcome) in [
+                (Some(false), "success"),
+                (Some(true), "error"),
+                (None, "unknown"),
+            ] {
+                let mut raw = serde_json::json!({"tool":"bash","args":{},"callID":"pi-stable-190","output":"result"});
+                if let Some(is_error) = is_error {
+                    raw["isError"] = serde_json::json!(is_error);
+                }
+                let pre = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: "pre-tool-use".into(),
+                        agent: Some(agent.into()),
+                        ..Default::default()
+                    },
+                    raw.clone(),
+                );
+                let post = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: "post-tool-use".into(),
+                        agent: Some(agent.into()),
+                        ..Default::default()
+                    },
+                    raw,
+                );
+                assert!(
+                    pre.body_excerpt
+                        .unwrap()
+                        .contains("tool_call_id: pi-stable-190")
+                );
+                let body = post.body_excerpt.unwrap();
+                assert!(body.contains("tool_call_id: pi-stable-190"));
+                assert!(
+                    body.contains(&format!("outcome: {outcome}")),
+                    "{agent}: {body}"
+                );
             }
-            let pre = HookEnvelope::from_query_and_body(
-                HookQuery {
-                    event: "pre-tool-use".into(),
-                    agent: Some("pi".into()),
-                    ..Default::default()
-                },
-                raw.clone(),
-            );
-            let post = HookEnvelope::from_query_and_body(
-                HookQuery {
-                    event: "post-tool-use".into(),
-                    agent: Some("pi".into()),
-                    ..Default::default()
-                },
-                raw,
-            );
-            assert!(
-                pre.body_excerpt
-                    .unwrap()
-                    .contains("tool_call_id: pi-stable-190")
-            );
-            let body = post.body_excerpt.unwrap();
-            assert!(body.contains("tool_call_id: pi-stable-190"));
-            assert!(body.contains(&format!("outcome: {outcome}")));
         }
+    }
+
+    #[test]
+    fn omp_tool_events_keep_family_call_id_and_output_but_not_arguments() {
+        // `build_pi_extension` in the CLI derives the Pi extension from the OMP
+        // one, so OMP posts this exact tool payload shape.
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("omp".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool":"bash","callID":"omp-1","args":{"command":"SENTINEL_COMMAND"}}),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        assert_eq!(
+            pre.body_excerpt.as_deref(),
+            Some("tool_family: non-file\ntool_call_id: omp-1")
+        );
+
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("omp".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool":"bash","callID":"omp-1","args":{"command":"SENTINEL_COMMAND"},"output":"tests passed","details":{"diff":"SENTINEL_DETAILS"}}),
+        );
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        assert_eq!(
+            post.body_excerpt.as_deref(),
+            Some("tool_family: non-file\ntool_call_id: omp-1\noutcome: unknown\n---\ntests passed")
+        );
     }
 }

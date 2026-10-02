@@ -334,7 +334,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // Keywords unique to evicted pages should disappear from search.
     let cognee_hits = store
         .reader
-        .search_pages("cognee".into(), 5)
+        .search_pages("cognee".into(), 5, None)
         .await
         .expect("search cognee");
     assert!(
@@ -344,7 +344,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let jiff_hits = store
         .reader
-        .search_pages("jiff".into(), 5)
+        .search_pages("jiff".into(), 5, None)
         .await
         .expect("search jiff");
     assert!(
@@ -358,7 +358,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // distinct standalone keywords to test each page independently.
     let backpressure_hits = store
         .reader
-        .search_pages("backpressure".into(), 5)
+        .search_pages("backpressure".into(), 5, None)
         .await
         .expect("search backpressure");
     let bp_paths: HashSet<&str> = backpressure_hits.iter().map(|h| h.path.as_str()).collect();
@@ -369,7 +369,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let mutations_hits = store
         .reader
-        .search_pages("mutations".into(), 5)
+        .search_pages("mutations".into(), 5, None)
         .await
         .expect("search mutations");
     let mut_paths: HashSet<&str> = mutations_hits.iter().map(|h| h.path.as_str()).collect();
@@ -380,7 +380,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let karpathy_hits = store
         .reader
-        .search_pages("karpathy".into(), 5)
+        .search_pages("karpathy".into(), 5, None)
         .await
         .expect("search karpathy");
     let karpathy_paths: HashSet<&str> = karpathy_hits.iter().map(|h| h.path.as_str()).collect();
@@ -394,7 +394,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // for a standalone token from the body instead of `iii-engine`.
     let sidecar_hits = store
         .reader
-        .search_pages("sidecar".into(), 5)
+        .search_pages("sidecar".into(), 5, None)
         .await
         .expect("search sidecar");
     let sidecar_paths: HashSet<&str> = sidecar_hits.iter().map(|h| h.path.as_str()).collect();
@@ -408,7 +408,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // term unique to that page should still return it.
     let midterm_hits = store
         .reader
-        .search_pages("dyn".into(), 5)
+        .search_pages("dyn".into(), 5, None)
         .await
         .expect("search dyn");
     let midterm_paths: HashSet<&str> = midterm_hits.iter().map(|h| h.path.as_str()).collect();
@@ -430,6 +430,8 @@ async fn m8_retention_lifecycle_end_to_end() {
             use_llm: true,
             decay_lambda: ai_memory_store::DecayParams::default().lambda,
             embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await
@@ -1045,7 +1047,18 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
     .await
     .unwrap();
     assert!(cleanup.evicted.is_empty());
-    assert_eq!(cleanup.hard_deleted, 2);
+    // #929 (B1 review fix): `reindex_page`'s upsert now resurrects a tombstoned
+    // chain instead of starting a disconnected one — see
+    // `ops::upsert_page_in_tx`'s resurrection path and
+    // `ops::reconcile_tombstone_resurrects_instead_of_orphaning_on_recreate`.
+    // The recreated file re-links onto `second` via `supersedes` and clears
+    // `second`'s `superseded_at`, which is what actually protects the old
+    // chain from `hard_delete_decayed_page_chain`: that function's root query
+    // requires `superseded_at IS NOT NULL`, and a resurrected row no longer
+    // has it set — exactly the same protection ordinary supersession-chain
+    // members already had. So this cleanup pass no longer has any tombstone
+    // root left to walk from, and hard-deletes nothing.
+    assert_eq!(cleanup.hard_deleted, 0);
     assert!(wiki.abs_path(ws, proj, &path).exists());
     let recreated = store
         .reader
@@ -1070,7 +1083,35 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(old_rows, 0);
+    assert_eq!(
+        old_rows, 2,
+        "the old chain must survive, resurrected rather than deleted"
+    );
+    let supersedes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT supersedes FROM pages WHERE id = ?1",
+            params![recreated.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        supersedes.as_deref(),
+        Some(&second.as_bytes()[..]),
+        "the recreated version must supersede the tombstoned chain"
+    );
+    let second_superseded_at: Option<i64> = conn
+        .query_row(
+            "SELECT superseded_at FROM pages WHERE id = ?1",
+            params![second.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        second_superseded_at, None,
+        "resurrection must clear the old tombstone's superseded_at"
+    );
+    drop(conn);
+
     assert!(
         store
             .reader
@@ -1081,6 +1122,25 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
             .any(|hit| hit.id == recreated),
         "the recreated page and its FTS entry must survive old-chain cleanup"
     );
+
+    // A further cleanup pass must not find anything to hard-delete either:
+    // the resurrected chain no longer has a tombstone root at all.
+    let second_pass = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &DecayParams {
+            cold_threshold: 0.0,
+            hard_delete_after_days: 0,
+            ..DecayParams::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_pass.hard_deleted, 0);
 }
 
 fn ws_dir_for(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {

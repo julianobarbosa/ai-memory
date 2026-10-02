@@ -38,9 +38,9 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS, DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT,
     DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS, DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
     DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS, DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
-    DEFAULT_AUTO_IMPROVE_PENDING_PATH, DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR,
-    DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
-    run_auto_improve_review,
+    DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES, DEFAULT_AUTO_IMPROVE_PENDING_PATH,
+    DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR, DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
+    default_auto_improve_eval_targets, run_auto_improve_review,
 };
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
@@ -56,14 +56,15 @@ pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
     DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
-    plan_bootstrap_chunks, prune_sources_to_budget,
+    plan_bootstrap_chunks, prune_sources_to_budget, read_identity_remotes,
 };
 pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
 pub use compaction::build_compacted_markdown;
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
-    DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
-    MIN_CONSOLIDATION_MAX_INPUT_TOKENS, MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
+    DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+    DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
@@ -80,7 +81,10 @@ pub use embed::{
 pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
 pub use keep_tokens::mine_keep_tokens;
-pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
+pub use lint::{
+    DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
+    LintOptions, LintReport, run_lint, stale_days_for,
+};
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
     MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,

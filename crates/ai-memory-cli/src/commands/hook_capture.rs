@@ -16,7 +16,9 @@ use crate::marker::{
     repo_root_project,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
-use ai_memory_hooks::{CaptureConfig, CapturePolicy, CaptureSource};
+use ai_memory_hooks::{
+    CaptureConfig, CapturePolicy, CaptureSource, PolicyState, describe_invalid_capture_config,
+};
 
 /// Resolve the nearest marker's capture policy without changing routing parsing.
 /// Root-level marker keys are intentionally ignored here; only `[capture]` is strict.
@@ -45,34 +47,95 @@ pub fn capture_policy(cwd: &str) -> CapturePolicy {
 }
 
 fn read_capture_config(marker: &Path) -> Result<CaptureConfig, ()> {
+    read_capture_config_verbose(marker).map_err(|_reason| ())
+}
+
+/// Same parse as [`read_capture_config`], but keeps the failure reason
+/// instead of collapsing it to `()`. The hot hook path only needs "did this
+/// parse" and discards the reason; diagnostics (`ai-memory doctor`) need it.
+/// Note this only covers the TOML-parse / `[capture]`-shape stage — a config
+/// that parses fine here can still be rejected later at compile time (see
+/// [`ai_memory_hooks::describe_invalid_capture_config`]).
+fn read_capture_config_verbose(marker: &Path) -> Result<CaptureConfig, String> {
     let mut bytes = Vec::with_capacity(MAX_MARKER_BYTES + 1);
     std::fs::File::open(marker)
-        .map_err(|_| ())?
+        .map_err(|e| format!("could not open marker file: {e}"))?
         .take((MAX_MARKER_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
+        .map_err(|e| format!("could not read marker file: {e}"))?;
     if bytes.len() > MAX_MARKER_BYTES {
-        return Err(());
+        return Err(format!(
+            "marker file is larger than the {MAX_MARKER_BYTES}-byte capture-config limit"
+        ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| ())?;
-    let document = text.parse::<toml_edit::DocumentMut>().map_err(|_| ())?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("marker file is not valid UTF-8: {e}"))?;
+    let document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("invalid TOML: {e}"))?;
     let Some(capture) = document.get("capture") else {
         return Ok(CaptureConfig::default());
     };
-    let table = capture.as_table().ok_or(())?;
-    if table.iter().any(|(key, _)| key != "ignore_paths") {
-        return Err(());
+    let table = capture
+        .as_table()
+        .ok_or_else(|| "`[capture]` must be a table".to_owned())?;
+    if let Some((key, _)) = table.iter().find(|(key, _)| *key != "ignore_paths") {
+        return Err(format!(
+            "`[capture]` has an unsupported key `{key}` (only `ignore_paths` is allowed)"
+        ));
     }
     let ignore_paths = match table.get("ignore_paths") {
         None => Vec::new(),
-        Some(item) => item
-            .as_array()
-            .ok_or(())?
-            .iter()
-            .map(|value| value.as_str().map(str::to_owned).ok_or(()))
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(item) => {
+            item.as_array()
+                .ok_or_else(|| "`[capture].ignore_paths` must be an array".to_owned())?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        "`[capture].ignore_paths` must contain only strings".to_owned()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     Ok(CaptureConfig { ignore_paths })
+}
+
+/// Diagnostic for `ai-memory doctor`: does the nearest `.ai-memory.toml`'s
+/// `[capture]` section actually resolve into an active policy?
+///
+/// Bases the check on [`capture_policy`]'s own resolution state -- the exact
+/// state the live hook path uses -- rather than a parse-only check, because a
+/// `[capture]` table can parse as valid TOML and still be rejected later at
+/// compile time (too many patterns, an unsupported glob character, a `~/`
+/// pattern with no home directory to expand it...), which a parse-only check
+/// would miss entirely.
+///
+/// Returns `None` when there is no marker, or the marker's capture config
+/// resolves (absent, empty, or a valid active policy). Returns
+/// `Some((marker_path, reason))` when a marker exists and its `[capture]`
+/// table is [`PolicyState::Invalid`] -- which fails CLOSED (every file and
+/// shell tool event is reduced to metadata until the marker is fixed;
+/// nothing leaks) but with no other signal anywhere that it happened.
+pub fn capture_config_problem(cwd: &str) -> Option<(PathBuf, String)> {
+    let marker = find_marker(cwd)?;
+    if capture_policy(cwd).state() != PolicyState::Invalid {
+        return None;
+    }
+    let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
+    let home = home_dir();
+    let reason = match read_capture_config_verbose(&marker) {
+        Err(reason) => reason,
+        Ok(config) => describe_invalid_capture_config(
+            &config,
+            marker_dir,
+            home.as_deref().and_then(Path::to_str),
+        )
+        .unwrap_or_else(|| {
+            "the `[capture]` table did not resolve into an active policy".to_owned()
+        }),
+    };
+    Some((marker, reason))
 }
 
 /// First top-level `cwd` string in the payload (parity with
@@ -260,12 +323,14 @@ fn marker_query_suffix_impl(
     let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
         (None, None, None, None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
+    let mut explicit_identity = None;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
     if let Some(marker) = find_settings_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
+        explicit_identity = parse_toml_key(&marker, "identity");
         strategy = parse_toml_key(&marker, "project_strategy");
         drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
         // `[recall] default_global = true` (or top-level; quoted or bare) —
@@ -281,6 +346,10 @@ fn marker_query_suffix_impl(
     // tell a deliberate marker rescope from a host-derived repo-root name.
     // Only the latter may yield to session-sticky attribution (#394).
     let mut project_src = project.as_ref().map(|_| "marker");
+    // Resolved before repo-root can fill `project` below: a repo-root name is
+    // an inference, while the chain's `manifest` rung means a name somebody
+    // wrote in the marker.
+    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
     }
@@ -299,6 +368,13 @@ fn marker_query_suffix_impl(
     }
     if let Some(val) = strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
+    }
+    if let Some(identity) = identity {
+        qs.push_str(&format!(
+            "&identity={}&identity_src={}",
+            url_encode(&identity.identity),
+            identity.source.as_str()
+        ));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
     // the `drop_subagent` flag so the server scopes the drop to this project.
@@ -327,6 +403,38 @@ fn marker_query_suffix_impl(
         }
     }
     qs
+}
+
+/// The repository identity to send with this checkout's events (#708), or
+/// `None` to let the server route by project name as it always has.
+///
+/// Only the rungs that route by identity are sent: an explicit `identity`
+/// from the marker, or — when the marker declares no `project` — the
+/// `upstream`/`origin` remote. A declared `project` outranks the remote and
+/// routes by name, so git is not consulted at all when one is present; that
+/// also keeps the lookup off the hot path for every repository that declares
+/// itself. The remote is normalised here, so credentials embedded in its URL
+/// never leave the machine.
+fn repository_identity(
+    cwd: &str,
+    explicit_identity: Option<&str>,
+    declared_project: Option<&str>,
+) -> Option<ai_memory_core::repository_identity::RepositoryIdentity> {
+    use ai_memory_core::repository_identity::{IdentityInputs, resolve};
+    let declared = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
+    let (upstream, origin) = if declared(explicit_identity) || declared(declared_project) {
+        (None, None)
+    } else {
+        ai_memory_consolidate::read_identity_remotes(std::path::Path::new(cwd))
+    };
+    resolve(&IdentityInputs {
+        explicit_identity,
+        manifest_name: declared_project,
+        upstream_remote: upstream.as_deref(),
+        origin_remote: origin.as_deref(),
+        folder_name: None,
+    })
+    .filter(|identity| identity.source.routes_by_identity())
 }
 
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
@@ -363,6 +471,17 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
+    /// `403` — the server understood the request and will never accept it.
+    /// Today that means the author may not write the project
+    /// the event belongs to.
+    ///
+    /// Terminal, and that is the whole point of separating it from
+    /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
+    /// it exhausts `MAX_ATTEMPTS`, and every one of those attempts is
+    /// guaranteed to be refused for the same reason. Retrying something that
+    /// cannot succeed is how a parse failure once cost this project 10.7M
+    /// tokens in a day. The entry is dropped on the spot.
+    Refused,
     /// `401` — the server rejected the bearer. Distinguished from
     /// [`Self::Failed`] because it says something about the *credential*
     /// rather than the entry: a spooled event carries the token frozen at
@@ -398,6 +517,7 @@ pub async fn post_hook(
             PostOutcome::Saturated
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
+        Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => PostOutcome::Refused,
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -555,6 +675,19 @@ pub async fn get_handoff(
             return None;
         }
     };
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        // Not authorized for this repository (#708). Same reasoning as the
+        // transport warning above: silence here would read as "nothing was
+        // handed off", when the truth is "you cannot see what was". The body
+        // is the server's reason and goes to stderr, never into context.
+        let reason = resp.text().await.unwrap_or_default();
+        eprintln!(
+            "ai-memory hook warning: not authorized for this project's memory ({}); \
+             nothing was injected",
+            reason.trim()
+        );
+        return None;
+    }
     if !resp.status().is_success() {
         return None;
     }
@@ -680,6 +813,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_hook_refused_on_403_is_terminal_not_a_failure() {
+        // 403 means the server will never accept this event. Classifying it as
+        // `Failed` would re-send it until it burnt `MAX_ATTEMPTS`, and every
+        // attempt would be refused identically — the shape of retry loop that
+        // once cost this project 10.7M tokens in a day. It must be its own
+        // outcome so the drain can drop it on the spot.
+        let url = serve_once("403 Forbidden", "capture not authorized").await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Refused);
+        assert_ne!(
+            outcome,
+            PostOutcome::Failed,
+            "a refusal must never be charged a retry attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handoff_never_injects_a_refusal() {
+        // A 403 carries the server's reason (#708). It is reported on stderr
+        // and must not reach the agent as context.
+        let url = serve_once(
+            "403 Forbidden",
+            "not authorized for scratch. This is an access problem, not an empty memory",
+        )
+        .await;
+        let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "a refusal must not become context");
+    }
+
+    #[tokio::test]
     async fn get_handoff_ignores_non_success_status() {
         let url = serve_once("401 Unauthorized", "unauthorized").await;
         let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
@@ -795,6 +958,105 @@ mod tests {
             cwd, r"C:\dev\myproject",
             "round-trips through percent-decoding"
         );
+    }
+
+    /// A throwaway repository with the given remotes, or `None` when there is
+    /// no `git` binary to build one with. The host is not a real forge, so a
+    /// developer's global `url.<base>.insteadOf` rules cannot rewrite it.
+    fn repo_with_remotes(remotes: &[(&str, &str)]) -> Option<tempfile::TempDir> {
+        let git = |args: &[&str], dir: &std::path::Path| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .ok()
+                .filter(std::process::ExitStatus::success)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q"], tmp.path())?;
+        for (name, url) in remotes {
+            git(&["remote", "add", name, url], tmp.path())?;
+        }
+        Some(tmp)
+    }
+
+    /// An undeclared checkout sends the identity of its remote — `upstream`
+    /// over `origin` — normalised on this side, so the credentials in the URL
+    /// never reach the query string.
+    #[test]
+    fn marker_query_suffix_sends_the_remote_identity_of_an_undeclared_checkout() {
+        let Some(repo) = repo_with_remotes(&[
+            (
+                "origin",
+                "https://someone:s3cret-token@git.example.test/Fork/API.git",
+            ),
+            ("upstream", "git@git.example.test:Acme/API.git"),
+        ]) else {
+            return;
+        };
+        let qs = marker_query_suffix(repo.path().to_str().unwrap(), None);
+        assert!(
+            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote"),
+            "{qs}"
+        );
+        assert!(
+            !qs.contains("s3cret"),
+            "credentials must not leave the machine: {qs}"
+        );
+
+        let Some(origin_only) = repo_with_remotes(&[(
+            "origin",
+            "https://someone:s3cret-token@git.example.test/Fork/API.git",
+        )]) else {
+            return;
+        };
+        let qs = marker_query_suffix(origin_only.path().to_str().unwrap(), None);
+        assert!(
+            qs.contains("&identity=git.example.test%2Ffork%2Fapi"),
+            "{qs}"
+        );
+        assert!(!qs.contains("s3cret"), "{qs}");
+    }
+
+    /// A declared `project` outranks the remote and routes by name, so nothing
+    /// is sent for it; an explicit `identity` outranks both.
+    #[test]
+    fn marker_query_suffix_lets_declarations_decide_the_identity() {
+        let Some(repo) = repo_with_remotes(&[("upstream", "git@git.example.test:acme/tool.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        let marker = repo.path().join(".ai-memory.toml");
+
+        std::fs::write(&marker, "project = \"my-fork\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(qs.contains("&project=my-fork"), "{qs}");
+        assert!(
+            !qs.contains("&identity="),
+            "a declared project routes by name: {qs}"
+        );
+
+        std::fs::write(
+            &marker,
+            "project = \"my-fork\"\nidentity = \"Acme/Platform\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity=acme%2Fplatform&identity_src=explicit"),
+            "{qs}"
+        );
+    }
+
+    /// No repository, no remote, no declaration: nothing to send, and the
+    /// server routes by folder name exactly as before.
+    #[test]
+    fn marker_query_suffix_sends_no_identity_outside_a_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("identity"), "{qs}");
     }
 
     #[test]
@@ -1167,5 +1429,85 @@ drop_subagent_captures = "true"
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), Some("repo-root"));
         assert!(qs.contains("&project=pinned"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_without_a_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_for_a_well_formed_capture_table() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "project = \"ok\"\n\n[capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    /// The exact failure mode found in practice: a dropped `#` turns a
+    /// wrapped comment into a stray token right after a `[capture]` header,
+    /// which is invalid TOML.
+    #[test]
+    fn capture_config_problem_reports_a_toml_syntax_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(
+            &marker,
+            "project = \"example\"\n\n\
+             [capture] this used to be a comment, now it is a stray token\n\
+             project_strategy = \"repo-root\"\n\n\
+             [capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        let (reported_marker, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("malformed TOML");
+        assert_eq!(reported_marker, marker);
+        assert!(reason.contains("invalid TOML"), "{reason}");
+    }
+
+    #[test]
+    fn capture_config_problem_reports_an_unsupported_capture_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nallowlist = [\"**\"]\n",
+        )
+        .unwrap();
+        let (_, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("unsupported key");
+        assert!(reason.contains("allowlist"), "{reason}");
+    }
+
+    /// The gap the parse-only check missed: a `[capture]` table that is
+    /// perfectly valid TOML, and a `[capture]` shape `read_capture_config`
+    /// accepts, but whose `ignore_paths` entry `compile` itself rejects (an
+    /// unsupported glob character). `capture_policy(cwd).state()` must still
+    /// catch this as `Invalid` even though the TOML parse alone would not.
+    #[test]
+    fn capture_config_problem_reports_a_pattern_compile_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets/{a,b}\"]\n",
+        )
+        .unwrap();
+        let (_, reason) = capture_config_problem(tmp.path().to_str().unwrap())
+            .expect("a rejected glob must still surface as a problem");
+        assert!(reason.contains("secrets/{a,b}"), "{reason}");
+        assert!(reason.contains("unsupported glob character"), "{reason}");
+    }
+
+    #[test]
+    fn read_capture_config_and_verbose_agree_on_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(&marker, "[capture]\nignore_paths = [\"**/*.pem\"]\n").unwrap();
+        let terse = read_capture_config(&marker).expect("valid marker parses");
+        let verbose = read_capture_config_verbose(&marker).expect("valid marker parses");
+        assert_eq!(terse.ignore_paths, verbose.ignore_paths);
     }
 }

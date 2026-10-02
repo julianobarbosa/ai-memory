@@ -101,8 +101,11 @@ and actor-proxy bearer without logging the values. Operator runbook:
 
 `/admin/*` and `/api/v1/*` accept a machine Bearer **or** a web session.
 Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
-behind auth. Once human auth becomes active, the engine expires the deprecated
-`ai_memory_auth` compatibility cookie.
+behind auth. With human auth active and no session, a browser GET to the
+builtin wiki redirects to `{web_slug}/login` (HTML form → `POST /auth/login`);
+`must_change_password` redirects to `{web_slug}/change-password`. JSON clients
+and `/api/v1` still receive JSON 401/403. Once human auth becomes active, the
+engine expires the deprecated `ai_memory_auth` compatibility cookie.
 
 ## Trusted proxy identity
 
@@ -150,6 +153,17 @@ root_subject = "<root-subject>"
   exact match with `root_issuer` plus `root_subject`.
 - Origin health checks or maintenance calls that need root should use the root
   bearer, not the proxy bearer. Raw actor headers on the root rung are ignored.
+- **A proxied non-root end-user is not subject to per-project `restricted`
+  grants.** The proxy branch authenticates the request as `AuthLevel::User`
+  with an `ActorContext`, but — unlike a database user — never maps it to a
+  database `UserId`/`AuthorizedViewer`: grants are keyed on `UserId`, and a
+  proxied identity has none to key on. A missing `AuthorizedViewer` reads as
+  "no per-project check applies" (the same as root, or an install with no
+  database users at all), so a `restricted` project is readable by any
+  proxied user with no grant. This is by design, not a gap: in a trusted-proxy
+  deployment the proxy itself is the authorization boundary. If you need
+  per-project `restricted` enforcement for individual end users, issue them
+  database-user tokens (see above) instead of relying on the proxy headers.
 
 ## Identity keys
 
@@ -489,6 +503,10 @@ the data dir, both `0600` (the data dir itself is `0700`):
 | `<data_dir>/auth-token` | the native `ai-memory hook` command |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`ai-memory uninstall` deletes both files when it removes the hooks (a full
+uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
+skills` keep them for the hooks still installed.
+
 It is deliberately **not** written into the agent's own config any more. Before
 #552 it went onto the hook's command line — `--auth-token <token>` for native
 hooks, an `AI_MEMORY_AUTH_TOKEN=` shell prefix for the script hooks — which put
@@ -677,26 +695,64 @@ Without `--as-user`, hooks install the same way they always have —
 the bearer authenticates, attribution flows from the token's owner
 (root user or DB user) at write time.
 
+## Per-project access
+
+Authentication says *who* is asking; each project's **access mode** decides
+what they may reach (#708):
+
+| Mode | Who reaches the project |
+|---|---|
+| `open` (default) | Every authenticated user — what every project was before access modes existed. |
+| `restricted` | The root operator, the user who created it, and users holding a grant on it. |
+
+Every existing project is `open` after upgrading, so nothing changes until an
+operator restricts one:
+
+```sh
+ai-memory project access --workspace acme --project checkout-api --mode restricted
+ai-memory user grant --user alice --workspace acme --project checkout-api --level write
+```
+
+Both are root-only. Restricting prints the users who have written to the
+project, hold no grant and did not create it — the people it now refuses — so you can grant the
+ones who should keep access; nothing is granted automatically.
+
+- **Grants** are `read` or `write`, per project; `write` includes `read`.
+  There is no per-project administrator: granting, revoking and restricting
+  are the root operator's, like every other administrative act.
+  `ai-memory user grant | revoke` manages them; `ai-memory user grants
+  [--user NAME]` and `ai-memory project grants --workspace W --project P` list
+  them (REST: `POST /admin/users/{name}/grant|revoke`,
+  `GET /admin/users/{name}/grants`, `GET /admin/projects/grants`). A user holds one level
+  per project; revoking deletes the grant, and purging a project or deleting
+  its workspace takes its grants with it. Every grant, level change and revoke
+  is recorded in the audit log (`grant_access` / `revoke_access`, with who did
+  it), so "who could reach this, and since when" stays answerable.
+- **Cross-project messages** respect access too: delivering into a restricted
+  project's inbox needs `write` on it (otherwise the mailbox would be a way
+  around its grants), and so do popping its inbox and cancelling its outbox,
+  which change its queues. Listing them needs `read`.
+- **Whoever creates a project** is recorded as its creator
+  (`projects.created_by`) and keeps full access if it is later restricted,
+  without holding a grant. Projects created before this existed, or by the
+  root token, have no recorded creator.
+- **New projects** are `open` unless `[auth] new_projects_restricted = true`
+  (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED=true`), which makes every project created from then on start `restricted`. The
+  reserved `scratch` project and the global preferences scope always start
+  open, and the global scope can never be restricted: it is shared by
+  construction.
+- **Gates entry, never rows.** Access decides which projects a user reaches;
+  inside a project pages stay shared exactly as before (see below).
+- **Refusals are explicit.** A user outside a restricted project gets a 403
+  naming it and the level needed, never an empty result; search, listings and the graph leave it
+  out rather than hinting at it. A hook capture into a project the user may
+  not write is dropped and counted (`dropped_unauthorized` in status), not
+  retried.
+- **No database users, no checks.** A single-operator install, and the root
+  bearer token, are never subject to access modes.
+
 ## Limitations
 
-- **Accounts are not a tenancy boundary.** Authentication tells the server
-  *who* is asking; nothing decides *what* they may read. Every authenticated
-  user sees every page in every project in **every workspace on the server** —
-  not just the one they are working in. A server holds many workspaces
-  (`projects.workspace_id` references `workspaces(id)`), but `users` carries no
-  workspace, project or repository reference and there is no grant, ACL or
-  membership table anywhere in the schema, so there is nothing for a read to be
-  checked against. Two accounts created minutes apart, sharing nothing but the
-  server, can each read the other's projects in full — including via
-  `memory_query`, which searches across scopes. All `/admin/*` endpoints are
-  still root-only in multi-user mode.
-
-  This is working as designed for the single-operator and homelab cases
-  ai-memory targets today. **If one server would hold work for more than one
-  team, that is not a supported configuration yet.** Run separate ai-memory
-  servers (per-user data dirs) behind a reverse proxy instead. Per-project
-  authorization is tracked in
-  [#708](https://github.com/akitaonrails/ai-memory/issues/708).
 
 - **No per-page RBAC *within* a project.** This one is deliberate and separate
   from the above: pages are shared inside a project because multi-session and
@@ -719,8 +775,7 @@ the bearer authenticates, attribution flows from the token's owner
   bearer / native `aim_` keys / web sessions, and `/admin/*` stays root-only unless a gateway
   translates accepted OIDC auth into upstream auth that ai-memory accepts.
   ai-memory still has one shared wiki per server and no
-  per-page RBAC — and, per the first bullet above, no per-project
-  authorization either: an accepted OIDC identity can read every project on
-  the server. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
+  per-page RBAC. Per-project access applies to the database user a gateway
+  authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.

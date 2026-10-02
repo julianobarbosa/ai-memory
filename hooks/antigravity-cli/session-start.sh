@@ -14,6 +14,8 @@ if ! ai_memory_antigravity_is_initial_invocation "$PAYLOAD"; then
 fi
 CWD=$(ai_memory_extract_cwd "$PAYLOAD")
 QS=$(ai_memory_marker_qs "$CWD")
+# The `[briefing]` opt-in rides the handoff GET, as in the native hook.
+BRIEF_QS=$(ai_memory_briefing_qs "$CWD")
 SESSION_ID=$(ai_memory_extract_session_id "$PAYLOAD")
 SESSION_QS=""
 if [ -n "$SESSION_ID" ]; then
@@ -22,7 +24,7 @@ fi
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=antigravity-cli${QS}" >/dev/null 2>&1 || true
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=antigravity-cli${QS}${SESSION_QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=antigravity-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then
     printf '{"injectSteps":[{"ephemeralMessage":'
     printf '%s' "$HANDOFF" | ai_memory_json_string

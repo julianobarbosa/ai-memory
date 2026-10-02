@@ -37,6 +37,7 @@ async fn scope(store: &Store) -> (WorkspaceId, ProjectId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: session_id,
             workspace_id: ws,
             project_id: proj,
@@ -57,6 +58,7 @@ fn observation(
 ) -> Sanitized<NewObservation> {
     Sanitized::new(
         NewObservation {
+            occurred_at: None,
             session_id,
             workspace_id: ws,
             project_id: proj,

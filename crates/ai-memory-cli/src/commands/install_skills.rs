@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, MANAGED_MARKER,
-    MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR,
+    MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -176,6 +176,18 @@ fn resolve_target_roots_for_platform(
                 platform,
             )?]
         }
+        InstallSkillsAgent::Hermes => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Hermes,
+                cwd,
+                home,
+                appdata,
+                grok_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
         InstallSkillsAgent::Both => vec![
             agent_root(
                 args.scope,
@@ -225,6 +237,7 @@ enum SkillRootKind {
     Agents,
     Devin,
     Grok,
+    Hermes,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,6 +288,7 @@ fn agent_root(
         SkillRootKind::Agents => AGENTS_SKILL_DIR,
         SkillRootKind::Devin => DEVIN_SKILL_DIR,
         SkillRootKind::Grok => GROK_SKILL_DIR,
+        SkillRootKind::Hermes => HERMES_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
@@ -419,6 +433,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&project_grok), ["/repo/.grok/skills"]);
+
+        let project_hermes = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Hermes),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project_hermes), ["/repo/.hermes/skills"]);
+
+        let global_hermes = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Hermes),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global_hermes), ["/home/alice/.hermes/skills"]);
 
         let project_both = resolve_target_roots(
             &args(InstallSkillsScope::Project, InstallSkillsAgent::Both),

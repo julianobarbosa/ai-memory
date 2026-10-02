@@ -46,15 +46,10 @@ pub struct GitAdapter {
 /// (tree cache included) survives them. `Index` itself is not `Send`.
 struct Open {
     repo: Repository,
-    commits_since_index_write: u32,
     /// HEAD as this adapter last left it; moved by another writer, the
     /// kept index is re-read and the next commit walks.
     head: Option<git2::Oid>,
 }
-
-/// The index file is written after a walk and every this many
-/// path-scoped commits.
-const INDEX_WRITE_EVERY: u32 = 50;
 
 #[derive(Debug, Default)]
 struct Written {
@@ -79,9 +74,18 @@ const UNREPORTED_SAMPLE: usize = 5;
 const RACY_READ_ATTEMPTS: u32 = 4;
 const RACY_READ_BACKOFF: Duration = Duration::from_millis(25);
 
-/// libgit2's "file changed before we could read it": a writer was mid-write.
+/// A staging read that raced a writer outside the commit lock: libgit2's
+/// "file changed before we could read it" (mid-write), or a file that was
+/// listed by the walk but gone by the time libgit2 streamed it in (an `Os`
+/// "failed to read file into stream" — e.g. an atomic writer's temp file
+/// renamed away between the scan and the read). Both settle within
+/// milliseconds; a rescan no longer sees a vanished file.
 fn is_racy_read(e: &git2::Error) -> bool {
-    e.class() == git2::ErrorClass::Filesystem && e.message().contains("changed before")
+    match e.class() {
+        git2::ErrorClass::Filesystem => e.message().contains("changed before"),
+        git2::ErrorClass::Os => e.message().contains("failed to read file into stream"),
+        _ => false,
+    }
 }
 
 /// Writes that reached the tree without a report: a writer bypassed the wiki.
@@ -230,11 +234,7 @@ impl GitAdapter {
         let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
             let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
-            *slot = Some(Open {
-                repo,
-                commits_since_index_write: 0,
-                head: None,
-            });
+            *slot = Some(Open { repo, head: None });
         }
         let open = slot.as_mut().expect("opened above");
         let head_now = open.repo.head().ok().and_then(|h| h.target());
@@ -328,15 +328,11 @@ impl GitAdapter {
 
     fn commit_staged(
         &self,
-        open: &mut Open,
+        open: &Open,
         message: &str,
         staging: &Staging,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let Open {
-            repo,
-            commits_since_index_write,
-            ..
-        } = open;
+        let repo = &open.repo;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         // Stage through libgit2's stat cache: an entry whose size and mtime
         // are unchanged keeps its cached blob OID and is not re-read, so a
@@ -356,19 +352,6 @@ impl GitAdapter {
                 stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
             }
         };
-        // The index file is the stat cache across restarts; serializing it
-        // costs the size of the tree, so not per commit.
-        let write_index = match staging {
-            Staging::Everything => true,
-            Staging::Paths(_) => {
-                *commits_since_index_write += 1;
-                *commits_since_index_write >= INDEX_WRITE_EVERY
-            }
-        };
-        if write_index {
-            index.write().map_err(CommitGit2Error::Other)?;
-            *commits_since_index_write = 0;
-        }
         debug!(
             touched,
             walked = matches!(staging, Staging::Everything),
@@ -387,6 +370,12 @@ impl GitAdapter {
                 index.write_tree().map_err(CommitGit2Error::Other)?
             }
         };
+        // Every commit, including the one with nothing to commit, leaves the
+        // index file matching the tree: another process (the git CLI, an
+        // editor, a backup) reads the file, and a stale one shows the
+        // checkpointed pages as both staged and unstaged (#983). Written
+        // after `write_tree`, it also carries the tree cache.
+        index.write().map_err(CommitGit2Error::Other)?;
 
         // If the index matches HEAD, there is nothing to commit.
         if let Ok(head) = repo.head()
@@ -708,6 +697,14 @@ fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
         return true;
     }
 
+    // An owner-check failure must NOT fall back to the git CLI: the CLI runs
+    // the same CVE-2022-24765 ownership guard and would refuse identically, so
+    // a fallback would only mask the real cause. Let it map through to
+    // `WikiError::GitOwner` and surface at ERROR instead.
+    if matches!(error.code(), ErrorCode::Owner) {
+        return false;
+    }
+
     #[cfg(windows)]
     {
         // On native Windows, libgit2 can fail to reopen a freshly initialised
@@ -873,6 +870,14 @@ fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::p
 }
 
 fn map_git_err(e: git2::Error) -> WikiError {
+    // An owner-check failure (`code=Owner`, CVE-2022-24765 dubious-ownership
+    // guard) is kept as a distinct variant so startup can log it at ERROR with
+    // an actionable fix instead of burying it in a generic WARN. Everything
+    // else stays an opaque I/O error, matching prior behaviour.
+    if matches!(e.code(), ErrorCode::Owner) {
+        warn!(error = %e, "libgit2 wiki owner-validation error");
+        return WikiError::GitOwner(e.to_string());
+    }
     warn!(error = %e, "libgit2 error");
     WikiError::Io(std::io::Error::other(e.to_string()))
 }
@@ -1270,6 +1275,43 @@ mod tests {
         assert!(!is_racy_read(&other_message));
     }
 
+    /// A libgit2 owner-check failure is not silently "recovered": it must not
+    /// trigger the git CLI fallback (the CLI enforces the same CVE-2022-24765
+    /// guard and would refuse identically), and it must map to the distinct
+    /// `GitOwner` variant so startup can surface it at ERROR. A generic error
+    /// still maps to the opaque I/O variant — proving the classification bites.
+    #[test]
+    fn owner_error_is_surfaced_not_recovered() {
+        let owner = git2::Error::new(
+            ErrorCode::Owner,
+            git2::ErrorClass::Config,
+            "repository path is not owned by current user",
+        );
+        assert!(
+            !should_try_commit_cli_fallback(&owner),
+            "an owner error must not fall back to the git CLI (same guard)"
+        );
+        assert!(
+            matches!(map_git_err(owner), WikiError::GitOwner(_)),
+            "an owner error must map to the distinct GitOwner variant"
+        );
+
+        // Control: a NotFound error still asks for the CLI fallback, and a
+        // generic error is still the opaque I/O variant (not GitOwner).
+        let not_found = git2::Error::new(
+            ErrorCode::NotFound,
+            git2::ErrorClass::Repository,
+            "not found",
+        );
+        assert!(should_try_commit_cli_fallback(&not_found));
+        let generic = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "some other failure",
+        );
+        assert!(matches!(map_git_err(generic), WikiError::Io(_)));
+    }
+
     /// A racy read keeps the commit path-scoped; any other failure walks.
     #[test]
     fn a_racy_read_failure_does_not_escalate_to_a_walk() {
@@ -1304,30 +1346,60 @@ mod tests {
         assert!(head_blob(&adapter, "d/y.md").is_none());
     }
 
+    /// What another process sees: a repository opened fresh reads the
+    /// index file, not the adapter's kept index.
+    fn assert_clean_from_outside(root: &Path, context: &str) {
+        let repo = Repository::open(root).unwrap();
+        let dirty: Vec<(String, git2::Status)> = repo
+            .statuses(None)
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.path().unwrap_or_default().to_owned(), entry.status()))
+            .collect();
+        assert!(dirty.is_empty(), "{context}: {dirty:?}");
+        // The git CLI too, where there is one.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["status", "--porcelain=v2"])
+            .current_dir(root)
+            .output()
+            && out.status.success()
+        {
+            let porcelain = String::from_utf8_lossy(&out.stdout);
+            assert!(porcelain.is_empty(), "{context}: git status: {porcelain}");
+        }
+    }
+
     #[test]
-    fn the_index_file_is_written_after_a_walk_and_every_fifty_commits() {
+    fn every_commit_leaves_the_index_file_matching_head() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a"), ("b.md", "b")]);
+        assert_clean_from_outside(&root, "after the walk");
+        for i in 1..=3 {
+            write(&root, "a.md", &format!("a{i}"));
+            adapter.mark_written(Path::new("a.md"));
+            assert!(
+                adapter
+                    .commit_all(&format!("scoped {i}"))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_clean_from_outside(&root, &format!("after scoped commit {i}"));
+        }
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a3"));
+    }
+
+    #[test]
+    fn a_commit_with_nothing_to_commit_still_writes_the_index_file() {
         let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
         let index_file = root.join(".git/index");
-        let after_walk = std::fs::read(&index_file).unwrap();
-        for i in 1..=INDEX_WRITE_EVERY {
-            let rel = format!("n-{i}.md");
-            write(&root, &rel, "n");
-            adapter.mark_written(Path::new(&rel));
-            assert!(adapter.commit_all(&rel).unwrap().is_some());
-            let now = std::fs::read(&index_file).unwrap();
-            if i < INDEX_WRITE_EVERY {
-                assert_eq!(now, after_walk, "commit {i} wrote the index file");
-            } else {
-                assert_ne!(now, after_walk, "commit {i} did not write the index file");
-            }
-        }
-        let before_walk = std::fs::read(&index_file).unwrap();
-        write(&root, "b.md", "b");
-        adapter.mark_written(Path::new("b.md"));
-        adapter.age_last_walk();
-        assert!(adapter.commit_all("sweep").unwrap().is_some());
-        assert_ne!(std::fs::read(&index_file).unwrap(), before_walk);
-        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+        let stale = std::fs::read(&index_file).unwrap();
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("a2").unwrap().is_some());
+        // The index file falls behind HEAD, as a missed write left it.
+        std::fs::write(&index_file, &stale).unwrap();
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("unchanged").unwrap().is_none());
+        assert_clean_from_outside(&root, "after the no-op commit");
     }
 
     #[test]
@@ -1383,6 +1455,33 @@ mod tests {
 
     /// Two session ends at once used to collide on libgit2's index lock and
     /// one of them lost its snapshot; now they queue.
+    /// The CI flake behind `concurrent_commits_queue_instead_of_failing`: a
+    /// walk listed a file that was gone when libgit2 read it, and libgit2
+    /// reports that as an `Os`-class "failed to read file into stream" — not
+    /// the "changed before" the retry recognized — so the commit failed
+    /// instead of retrying. Unrelated errors must still fail fast.
+    #[test]
+    fn a_file_vanishing_mid_walk_is_a_racy_read_but_other_errors_are_not() {
+        let err =
+            |class, message: &str| git2::Error::new(git2::ErrorCode::GenericError, class, message);
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to read file into stream: "
+        )));
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Filesystem,
+            "file changed before we could read it"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to open file"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Index,
+            "failed to read file into stream: "
+        )));
+    }
+
     #[test]
     fn concurrent_commits_queue_instead_of_failing() {
         let tmp = tempdir();

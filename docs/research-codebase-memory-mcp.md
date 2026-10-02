@@ -124,7 +124,7 @@ rests on real choke points, not analogy. Verdicts: one **2.1 feature**, one
 
 ### 7.1 Tiered tool profiles — **recommend for 2.1**
 
-*Where it plugs in.* The MCP server exposes **19 tools** through the rmcp
+*Where it plugs in.* The MCP server exposes **23 tools** through the rmcp
 `#[tool_router]` macro (`crates/ai-memory-mcp/src/server.rs:1239`), and
 `list_tools` (`server.rs:3966`) is the **single choke point** — it returns
 `tool_router.list_all()` unfiltered, with only a per-dialect schema *reshape*
@@ -134,7 +134,7 @@ classifies 8 tools as read-only (query, read_page, read_session_observations,
 recent, briefing, explore, status, install_self_routing) — today used only for
 rate-limit accounting, not visibility.
 
-*Why 2.1.* 19 tools is heavy MCP prompt surface pushed to every client every
+*Why 2.1.* 23 tools is heavy MCP prompt surface pushed to every client every
 turn. A **read-only "recall" tier** (the 8 already-classified tools) versus the
 full "curate" tier cuts prompt surface and over-permissioning for the common
 case (an agent that only *recalls* never needs `delete_page`/`forget_sweep`).

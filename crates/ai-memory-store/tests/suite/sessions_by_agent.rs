@@ -45,6 +45,7 @@ async fn session(
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: SessionId::new(),
             workspace_id: ws,
             project_id: proj,

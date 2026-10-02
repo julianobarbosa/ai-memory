@@ -110,6 +110,7 @@ async fn harness_with_two_sessions() -> Harness {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,

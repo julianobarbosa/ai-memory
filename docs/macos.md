@@ -37,9 +37,11 @@ normal Terminal.
   which works from the host agent.
 - Hooks are rendered for one of two platforms:
   - `posix-native` — a direct `ai-memory hook --event …` call. The default for
-    native macOS/Linux Claude Code installs (cargo / release binary); it uses
-    the local event spool + OIDC-token fallback.
-  - `posix` — `sh` runs the bundled `.sh` script. The Docker wrapper's default.
+    native macOS/Linux Claude Code installs (cargo / release binary) and the
+    Docker wrapper's checksum-verified host client; it uses the local event
+    spool + OIDC-token fallback and enforces capture policy v1.
+  - `posix` — `sh` runs the bundled `.sh` script. This is an explicit
+    compatibility fallback for the Docker wrapper.
 
   Set `AI_MEMORY_HOOK_PLATFORM` before wiring hooks to override the default.
 
@@ -125,6 +127,11 @@ Notes:
 - Keep the extracted `ai-memory` at a stable path; the hook commands (and the
   symlink, if you made one) reference it. Re-run `install-hooks` and re-point
   the symlink if you move it.
+- Later updates: with the release binary on `PATH` (or invoked as `./ai-memory`),
+  run `ai-memory upgrade` to download the latest matching macOS tarball, verify
+  its `.sha256`, replace the binary (and sibling `hooks/` when present), and
+  refresh staged agent hooks. See
+  [`docs/install.md#keeping-ai-memory-up-to-date`](install.md#keeping-ai-memory-up-to-date).
 
 ## Scenario B: Source Build
 
@@ -400,6 +407,16 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
   `launchctl print gui/$(id -u)/com.github.akitaonrails.ai-memory`. The app
   never writes into its own bundle; a missing `config.toml` is created under
   `~/Library/Application Support/ai-memory` by bundled `ai-memory init`.
+- **`Error: binding 127.0.0.1:49374` / `Address already in use` (the server
+  exits immediately and the menu extra stays red):** another process already
+  holds the port, for example OpenCode v2's background service (reported in
+  #1044 to default to 49374). Move one side — start
+  ai-memory elsewhere (`bind = "127.0.0.1:<free-port>"` in
+  `~/Library/Application Support/ai-memory/config.toml`, then update the app's
+  server URL in Settings to match), or move the other service
+  (`opencode service set port <free-port>`). Find the current holder with
+  `lsof -nP -iTCP:49374 -sTCP:LISTEN`. The menu extra now surfaces this error
+  instead of showing only a red status item.
 
 ## Suggested Test Checklist
 

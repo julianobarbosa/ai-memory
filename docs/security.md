@@ -35,6 +35,15 @@ ai-memory install-hooks --agent  claude-code --apply \
     --server-url "http://<server-ip>:49374" --auth-token "$TOKEN"
 ```
 
+When users must not see each other's projects at all, run separate servers.
+One machine can still capture for several of them: register each server as
+a named profile with `ai-memory server add` and let each repository's
+`.ai-memory.toml` select one with `server = "<name>"`. The marker never holds
+a URL or token, a profile can be restricted to the directories it serves, and
+a selection that does not resolve drops the event instead of sending it to
+another server. See
+[`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
+
 Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/workstream/*`, and
 machine calls to `/admin/*` and `/api/v1/*`. Humans sign in at
 `POST /auth/login`; the console uses an `HttpOnly` session cookie plus CSRF,

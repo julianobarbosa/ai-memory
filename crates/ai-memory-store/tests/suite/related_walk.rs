@@ -14,9 +14,13 @@
 //!   result.
 //! - **A total-node cap** bounds the response regardless of depth.
 //! - **Cross-project links resolve** and carry their real workspace/project.
+//! - **The walk honours per-project authorization (#708):** a viewer never
+//!   sees, nor walks through, a page in a project they cannot read.
 
-use ai_memory_core::{NewPage, PagePath, ProjectId, Tier, WorkspaceId};
-use ai_memory_store::{RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, Store};
+use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, WorkspaceId};
+use ai_memory_store::{
+    AccessMode, GrantLevel, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, Store,
+};
 
 fn page_with_links(
     ws: WorkspaceId,
@@ -150,7 +154,7 @@ async fn depth_one_returns_only_direct_neighbours() {
 
     let nodes = store
         .reader
-        .related_walk(ws, app, "notes/a.md".into(), 1)
+        .related_walk(ws, app, "notes/a.md".into(), 1, None)
         .await
         .unwrap();
 
@@ -179,7 +183,7 @@ async fn depth_two_adds_second_hop_including_cross_project() {
 
     let nodes = store
         .reader
-        .related_walk(ws, app, "notes/a.md".into(), 2)
+        .related_walk(ws, app, "notes/a.md".into(), 2, None)
         .await
         .unwrap();
 
@@ -209,13 +213,13 @@ async fn depth_is_clamped_to_the_hard_cap() {
 
     let capped = store
         .reader
-        .related_walk(ws, app, "notes/a.md".into(), RELATED_WALK_MAX_DEPTH)
+        .related_walk(ws, app, "notes/a.md".into(), RELATED_WALK_MAX_DEPTH, None)
         .await
         .unwrap();
     // Anything past the cap must behave exactly like the cap, not walk further.
     let over = store
         .reader
-        .related_walk(ws, app, "notes/a.md".into(), 100)
+        .related_walk(ws, app, "notes/a.md".into(), 100, None)
         .await
         .unwrap();
 
@@ -239,7 +243,7 @@ async fn walk_is_dedup_and_cycle_safe() {
     // seed, and never return a page twice.
     let nodes = store
         .reader
-        .related_walk(ws, app, "notes/a.md".into(), RELATED_WALK_MAX_DEPTH)
+        .related_walk(ws, app, "notes/a.md".into(), RELATED_WALK_MAX_DEPTH, None)
         .await
         .unwrap();
 
@@ -292,7 +296,7 @@ async fn total_node_cap_bounds_a_dense_hub() {
 
     let nodes = store
         .reader
-        .related_walk(ws, app, "hub.md".into(), 1)
+        .related_walk(ws, app, "hub.md".into(), 1, None)
         .await
         .unwrap();
 
@@ -314,8 +318,122 @@ async fn missing_seed_returns_empty() {
     let (_tmp, store, ws, app) = seeded_graph().await;
     let nodes = store
         .reader
-        .related_walk(ws, app, "notes/does-not-exist.md".into(), 2)
+        .related_walk(ws, app, "notes/does-not-exist.md".into(), 2, None)
         .await
         .unwrap();
     assert!(nodes.is_empty(), "a missing seed yields no related pages");
+}
+
+/// Under per-project authorization the walk shows only what the viewer may
+/// read and never walks through what they may not, in either direction: a
+/// page in a restricted project without a grant is absent, and so is a
+/// readable page reachable only through it.
+///
+/// ```text
+///   app:a ──▶ lib:x                  (lib restricted, viewer holds a grant)
+///   app:a ──▶ secret:s ──▶ lib:y     (secret restricted, no grant; lib:y only via s)
+///   secret:t ──▶ app:a               (incoming edge from the unreadable project)
+/// ```
+#[tokio::test]
+async fn the_walk_hides_and_does_not_cross_projects_the_viewer_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let mut projects = Vec::new();
+    for name in ["app", "lib", "secret"] {
+        projects.push(
+            store
+                .writer
+                .get_or_create_project(ws, name.to_string(), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let (app, lib, secret) = (projects[0], projects[1], projects[2]);
+    for page in [
+        page_with_links(ws, lib, "notes/x.md", vec![]),
+        page_with_links(ws, lib, "notes/y.md", vec![]),
+        page_with_links(
+            ws,
+            secret,
+            "notes/s.md",
+            vec![cross_project_link("lib", "notes/y.md")],
+        ),
+        page_with_links(
+            ws,
+            app,
+            "notes/a.md",
+            vec![
+                cross_project_link("lib", "notes/x.md"),
+                cross_project_link("secret", "notes/s.md"),
+            ],
+        ),
+        page_with_links(
+            ws,
+            secret,
+            "notes/t.md",
+            vec![cross_project_link("app", "notes/a.md")],
+        ),
+    ] {
+        store.writer.upsert_page(page).await.unwrap();
+    }
+    for project in [lib, secret] {
+        store
+            .writer
+            .set_access_mode(project, AccessMode::Restricted)
+            .await
+            .unwrap();
+    }
+    let viewer = store
+        .writer
+        .create_user(
+            NewUser {
+                username: "vera".into(),
+                name: None,
+                email: None,
+            },
+            [7; ai_memory_store::TOKEN_HASH_LEN],
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(viewer, lib, GrantLevel::Read, None)
+        .await
+        .unwrap();
+
+    let walk = |who: Option<UserId>| {
+        let reader = store.reader.clone();
+        async move {
+            let mut seen: Vec<String> = reader
+                .related_walk(ws, app, "notes/a.md".into(), RELATED_WALK_MAX_DEPTH, who)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|n| format!("{}:{}", n.page.project, n.page.path))
+                .collect();
+            seen.sort();
+            seen
+        }
+    };
+
+    assert_eq!(
+        walk(Some(viewer)).await,
+        vec!["lib:notes/x.md".to_string()],
+        "secret:s and secret:t are unreadable, and lib:y is reachable only through s"
+    );
+    // Control: no viewer (root, or authorization off) walks the whole graph.
+    assert_eq!(
+        walk(None).await,
+        vec![
+            "lib:notes/x.md".to_string(),
+            "lib:notes/y.md".to_string(),
+            "secret:notes/s.md".to_string(),
+            "secret:notes/t.md".to_string(),
+        ]
+    );
 }

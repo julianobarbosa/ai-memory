@@ -98,13 +98,24 @@ pub fn conform_frontmatter(path: &str, frontmatter: &mut Value) {
         map.insert("description".into(), Value::String(summary.to_string()));
     }
 
-    // stale_after ← existing TTL. `expires_at` is stored as an ISO-8601
-    // string by the TTL machinery; carry it verbatim.
+    // stale_after ← existing TTL. OKF timestamps must carry an explicit
+    // UTC offset, but `expires_at` also accepts a bare `YYYY-MM-DD`
+    // (end of that day, UTC): render that as the instant it names. An
+    // RFC 3339 value already conforms and is carried verbatim.
     if !map.contains_key("stale_after")
         && let Some(expires) = map.get("expires_at").and_then(Value::as_str)
+        && let Some(instant) = crate::page::parse_expires_at_instant(expires)
     {
-        map.insert("stale_after".into(), Value::String(expires.to_string()));
+        let stale_after = if expires.trim().parse::<jiff::Timestamp>().is_ok() {
+            expires.to_string()
+        } else {
+            instant.to_string()
+        };
+        map.insert("stale_after".into(), Value::String(stale_after));
     }
+    // A page an older build conformed carries the bare date it copied;
+    // any rewrite of it (a restore, a hand edit, a reindex) repairs it.
+    repair_date_only_stale_after_in(map);
 
     // sources ← session provenance already stamped by the consolidator.
     if !map.contains_key("sources")
@@ -116,7 +127,13 @@ pub fn conform_frontmatter(path: &str, frontmatter: &mut Value) {
             Value::String(format!("ai-memory://session/{session}")),
         );
         if let Some(agent) = map.get("agent").and_then(Value::as_str) {
-            entry.insert("author".into(), Value::String(agent.to_string()));
+            // The OKF actor grammar (§5.1) requires `<producer>/<version>`
+            // for agents or `process:<id>` for automated processes; a bare
+            // `claude-code` matches neither. We don't track a per-harness
+            // semantic version, so `<producer>/<version>` isn't honestly
+            // derivable — `process:<id>` is the correct, non-fabricated
+            // choice.
+            entry.insert("author".into(), Value::String(format!("process:{agent}")));
         }
         map.insert("sources".into(), Value::Array(vec![Value::Object(entry)]));
     }
@@ -139,6 +156,34 @@ pub fn conform_frontmatter(path: &str, frontmatter: &mut Value) {
             map.insert("generated".into(), json!({ "by": by }));
         }
     }
+}
+
+/// Repair a `stale_after` that a build before this rule copied verbatim from
+/// a date-only `expires_at`. The signature is exact: `stale_after` equals
+/// `expires_at` and is not an RFC 3339 instant. It becomes the instant the
+/// TTL expires the page, which is what [`conform_frontmatter`] derives today,
+/// so a repaired page matches one written fresh. Returns whether it changed
+/// anything; a `stale_after` that differs from `expires_at` is left alone.
+pub fn repair_date_only_stale_after(frontmatter: &mut Value) -> bool {
+    frontmatter
+        .as_object_mut()
+        .is_some_and(repair_date_only_stale_after_in)
+}
+
+fn repair_date_only_stale_after_in(map: &mut Map<String, Value>) -> bool {
+    let (Some(Value::String(stale)), Some(Value::String(expires))) =
+        (map.get("stale_after"), map.get("expires_at"))
+    else {
+        return false;
+    };
+    if stale != expires || stale.trim().parse::<jiff::Timestamp>().is_ok() {
+        return false;
+    }
+    let Some(instant) = crate::page::parse_expires_at_instant(expires) else {
+        return false;
+    };
+    map.insert("stale_after".into(), Value::String(instant.to_string()));
+    true
 }
 
 /// Clone `frontmatter` with `generated.at` removed — the store compares
@@ -237,7 +282,7 @@ mod tests {
             fm["sources"][0]["resource"],
             "ai-memory://session/0192aaaa-0000-7000-8000-000000000000"
         );
-        assert_eq!(fm["sources"][0]["author"], "claude-code");
+        assert_eq!(fm["sources"][0]["author"], "process:claude-code");
         assert!(
             fm["generated"]["by"]
                 .as_str()
@@ -246,6 +291,61 @@ mod tests {
         );
         // extensions untouched
         assert_eq!(fm["tier"], "episodic");
+    }
+
+    #[test]
+    fn a_date_only_ttl_becomes_an_offset_bearing_stale_after() {
+        let mut fm = json!({"expires_at": "2026-10-01"});
+        conform_frontmatter("notes/x.md", &mut fm);
+        let once = fm.clone();
+        conform_frontmatter("notes/x.md", &mut fm);
+        assert_eq!(once, fm, "second conform changed bytes");
+        // The TTL's own reading of a bare date: the end of that day, UTC.
+        assert_eq!(fm["stale_after"], "2026-10-01T23:59:59.999999Z");
+        assert_eq!(fm["expires_at"], "2026-10-01");
+    }
+
+    #[test]
+    fn an_rfc3339_ttl_is_carried_into_stale_after_verbatim() {
+        let mut fm = json!({"expires_at": "2026-10-01T12:00:00-03:00"});
+        conform_frontmatter("notes/x.md", &mut fm);
+        assert_eq!(fm["stale_after"], "2026-10-01T12:00:00-03:00");
+    }
+
+    #[test]
+    fn an_unparseable_ttl_derives_no_stale_after() {
+        let mut fm = json!({"expires_at": "soon"});
+        conform_frontmatter("notes/x.md", &mut fm);
+        assert!(fm.get("stale_after").is_none());
+    }
+
+    #[test]
+    fn a_stale_after_copied_from_a_date_only_ttl_is_repaired() {
+        let mut fm = json!({"expires_at": "2026-10-01", "stale_after": "2026-10-01"});
+        assert!(repair_date_only_stale_after(&mut fm));
+        assert_eq!(fm["stale_after"], "2026-10-01T23:59:59.999999Z");
+        assert!(
+            !repair_date_only_stale_after(&mut fm),
+            "repair is idempotent"
+        );
+
+        // conform_frontmatter repairs it too, so any rewrite heals the page.
+        let mut old = json!({"expires_at": "2026-10-01", "stale_after": "2026-10-01"});
+        conform_frontmatter("notes/x.md", &mut old);
+        assert_eq!(old["stale_after"], "2026-10-01T23:59:59.999999Z");
+    }
+
+    #[test]
+    fn a_stale_after_that_is_not_the_verbatim_copy_is_left_alone() {
+        for mut fm in [
+            json!({"expires_at": "2026-10-01", "stale_after": "2026-09-01"}),
+            json!({"expires_at": "2026-10-01T12:00:00Z", "stale_after": "2026-10-01T12:00:00Z"}),
+            json!({"stale_after": "2026-10-01"}),
+        ] {
+            let before = fm.clone();
+            assert!(!repair_date_only_stale_after(&mut fm));
+            assert_eq!(fm, before);
+        }
     }
 
     #[test]
@@ -277,6 +377,21 @@ mod tests {
         let mut fm = json!({"generated_by_model": "openai-compat/qwen3:32b"});
         conform_frontmatter("sessions/x.md", &mut fm);
         assert_eq!(fm["generated"]["by"], "openai-compat/qwen3:32b");
+    }
+
+    #[test]
+    fn sources_author_uses_the_process_actor_form() {
+        // OKF §5.1's actor grammar requires `<producer>/<version>` for an
+        // agent or `process:<id>` for an automated process; a bare agent
+        // name like `claude-code` matches neither. We don't track a
+        // per-harness semantic version, so `process:<agent>` is the honest
+        // choice, not a fabricated version.
+        let mut fm = json!({
+            "session_id": "0192aaaa-0000-7000-8000-000000000000",
+            "agent": "codex",
+        });
+        conform_frontmatter("sessions/x.md", &mut fm);
+        assert_eq!(fm["sources"][0]["author"], "process:codex");
     }
 
     #[test]

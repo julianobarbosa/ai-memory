@@ -186,6 +186,7 @@ async fn ownership_writes_reject_malformed_identity_keys() {
         store
             .writer
             .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
                 id: invalid_session,
                 workspace_id: ws,
                 project_id: proj,
@@ -428,7 +429,7 @@ async fn unattributed_readers_do_not_see_owned_handoffs() {
     assert!(
         store
             .reader
-            .latest_open_handoff_for_workspace(ws, OwnerFilter::Unattributed)
+            .latest_open_handoff_for_workspace(ws, OwnerFilter::Unattributed, None)
             .await
             .unwrap()
             .is_none()
@@ -437,7 +438,7 @@ async fn unattributed_readers_do_not_see_owned_handoffs() {
     assert!(
         store
             .reader
-            .latest_open_handoff_for_workspace(ws, OwnerFilter::Any)
+            .latest_open_handoff_for_workspace(ws, OwnerFilter::Any, None)
             .await
             .unwrap()
             .is_some()
@@ -721,7 +722,7 @@ async fn an_owner_name_with_a_quote_filters_like_any_other() {
             .pending_handoff_count,
         store
             .reader
-            .briefing_for_workspace(ws, 5, filter())
+            .briefing_for_workspace(ws, 5, filter(), None)
             .await
             .unwrap()
             .pending_handoff_count,
@@ -760,6 +761,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -769,7 +771,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
             })
             .await
             .unwrap();
-        store
+        let id = store
             .writer
             .insert_handoff(NewHandoff {
                 workspace_id: ws,
@@ -785,7 +787,9 @@ async fn automatic_supersession_does_not_reach_across_operators() {
                 owner_user: stamp,
             })
             .await
-            .unwrap()
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        id
     }
 
     let bob = auto_handoff(&store, ws, proj, "bob", "bob's baton").await;
@@ -887,6 +891,7 @@ async fn open_session_lookup_is_owner_scoped() {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id,
                 workspace_id: ws,
                 project_id: proj,
@@ -949,5 +954,121 @@ async fn open_session_lookup_is_owner_scoped() {
             .await
             .unwrap(),
         None,
+    );
+}
+
+/// `memory_handoff_accept` reports `consumed_by_hook` from this lookup, keyed on
+/// a session id the caller supplies. That id is routing data, not identity, so
+/// the scope and owner predicates are what bound the answer: a forged id, a
+/// foreign project, another session or an ended one must all come back empty,
+/// while the session that really claimed the baton at SessionStart sees it.
+#[tokio::test]
+async fn a_session_start_claim_is_confirmed_only_to_its_own_live_session() {
+    use ai_memory_core::{HandoffState, NewSession, SessionId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+
+    let begin = |id: SessionId| NewSession {
+        occurred_at: None,
+        id,
+        workspace_id: ws,
+        project_id: proj,
+        agent_kind: AgentKind::ClaudeCode,
+        cwd: None,
+        actor_user: Some(operator("alice")),
+    };
+    let receiver = SessionId::from_native("alice-claude-session");
+    let sibling = SessionId::from_native("alice-other-session");
+    for id in [receiver, sibling] {
+        store.writer.begin_session(begin(id)).await.unwrap();
+    }
+
+    let id = store
+        .writer
+        .insert_handoff(handoff(ws, proj, "alice's baton", Some("alice")))
+        .await
+        .unwrap();
+    let claimed = store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            accepting_session: Some(receiver),
+            ..acceptance(
+                id,
+                ws,
+                proj,
+                Some(operator("alice")),
+                filter_for("alice"),
+                None,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(claimed, "the receiving session claims the baton at start");
+
+    let lookup = |proj: ProjectId, session: SessionId, filter: OwnerFilter| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .handoff_claimed_by_live_session(ws, proj, session, filter)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Control: the session that claimed it, as its owner.
+    assert_eq!(
+        lookup(proj, receiver, filter_for("alice")).await,
+        Some(id),
+        "the receiving session must be told its own SessionStart claimed the baton",
+    );
+    assert_eq!(
+        lookup(proj, receiver, OwnerFilter::Any).await,
+        Some(id),
+        "root recovery sees the claim too",
+    );
+
+    // Bob names Alice's session: the owner filter still hides her row.
+    assert_eq!(
+        lookup(proj, receiver, filter_for("bob")).await,
+        None,
+        "a forged session id must not confirm another operator's claim",
+    );
+    assert_eq!(
+        lookup(proj, receiver, OwnerFilter::Unattributed).await,
+        None,
+        "an unattributed caller must not see an owned claim",
+    );
+    // The right session, the wrong project.
+    assert_eq!(
+        lookup(other_proj, receiver, filter_for("alice")).await,
+        None,
+        "a claim in one project must not be reported in another",
+    );
+    // Alice again, from a session that claimed nothing.
+    assert_eq!(
+        lookup(proj, sibling, filter_for("alice")).await,
+        None,
+        "another session of the same operator did not receive this baton",
+    );
+
+    // Once the session ends there is no context the baton could be in.
+    store.writer.end_session(receiver, None).await.unwrap();
+    let row = store.reader.handoff_by_id(id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.state, row.lifecycle.accepted_by_session),
+        (HandoffState::Accepted, Some(receiver)),
+        "the claim itself must survive the end, so only liveness can hide it",
+    );
+    assert_eq!(
+        lookup(proj, receiver, filter_for("alice")).await,
+        None,
+        "an ended session must not be told the baton is in its context",
     );
 }

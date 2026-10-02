@@ -99,6 +99,7 @@ async fn observation_fts_rows_report_index_drift() {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: session_id,
             workspace_id: ws,
             project_id: proj,
@@ -112,6 +113,7 @@ async fn observation_fts_rows_report_index_drift() {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id,
                 workspace_id: ws,
                 project_id: proj,

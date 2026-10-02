@@ -134,7 +134,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Muse Code | MCP-only |
-| Hermes Agent | Community |
+| Hermes Agent | Supported |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
 
@@ -193,6 +193,18 @@ user-level systemd units.
 yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
 ```
+
+### Fedora (RPM)
+
+Download the `x86_64` or `aarch64` RPM from the
+[latest release](https://github.com/akitaonrails/ai-memory/releases/latest),
+then install it:
+
+```bash
+sudo dnf install ./ai-memory-*.rpm
+```
+
+Then follow the native Linux service instructions in [`docs/install.md`](docs/install.md).
 
 Single-user workstation:
 
@@ -306,6 +318,14 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+On Linux and macOS, the Docker wrapper runs `install-hooks` through its
+checksum-verified native host client. The installed hooks therefore enforce
+client-side capture controls such as `[capture] ignore_paths` and allowlist
+mode before an event reaches the spool or network. Set
+`AI_MEMORY_HOOK_PLATFORM=posix` explicitly only when you need the legacy shell
+compatibility path; the installer warns that path cannot enforce capture
+policy v1.
+
 The examples use `docker`; replace it with `podman` on a Podman host. The
 wrapper automatically uses Podman when Docker is not installed. Set
 `AI_MEMORY_DOCKER=podman` to force Podman when both engines are available.
@@ -315,7 +335,12 @@ prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
 On macOS the native binary is the recommended path when you do not need
 Docker — either the [menu bar app](#macos-menu-bar-app) above or a
-[release tarball / launchd agent](docs/macos.md).
+[release tarball / launchd agent](docs/macos.md). Later updates for that
+path use `ai-memory upgrade` (checksum-verified GitHub release replace + hook
+refresh) — see
+[`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
+The same native upgrade path covers Windows x86_64 zip installs under a
+writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support
@@ -332,13 +357,22 @@ way to launch: the first time it runs a harness it auto-installs that harness's
 ai-memory hooks + MCP if they are missing (so capture and recall just work —
 no separate `install-hooks`/`install-mcp` step to forget), it wires the right
 project scope by construction, and it adds cross-harness *session* continuity on
-top of shared memory. Everything is idempotent and one-time per harness.
+top of shared memory. Everything is idempotent and one-time per harness and
+config home.
 
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
 ai-memory continue           # resume the newest managed checkout
+# after a dead launcher left its lease behind (same operator only)
+ai-memory run --force-unlock codex
 ```
+
+`--force-unlock` immediately expires the selected workstream's active lease;
+use it only when you know the previous launcher is gone. It does not kill a
+native process, and it cannot evict another authenticated operator's run. See
+the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
+for the full safety contract.
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
@@ -346,7 +380,9 @@ Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `ai-memory run`).
 
 `ai-memory uninstall --apply` removes everything ai-memory installed,
-and only what it installed. Install commands are idempotent and write
+and only what it installed. It also clears `ai-memory run`'s auto-wire
+record, so the next managed launch wires that harness again; to keep it
+unwired, launch with `--no-autowire` or set `AI_MEMORY_RUN_AUTOWIRE=false`. Install commands are idempotent and write
 timestamped backups next to any file they touch.
 
 ## Everyday use
@@ -386,7 +422,8 @@ your machine can reach it. From there, hardening is incremental: a bearer
 token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
 a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
-paths or invert to allowlist mode.
+paths or invert to allowlist mode. A repository can also route its capture
+to a different server than the one the hooks were installed against.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and
@@ -439,7 +476,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
-| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
+| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation, plus per-repository server profiles. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
@@ -448,6 +485,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
+| [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
 | [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
 | [`docs/security.md`](docs/security.md) | The full security model. |
 | [`docs/support-matrix.md`](docs/support-matrix.md) | The full agent/platform matrix with notes. |
@@ -466,7 +504,8 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer) and [external lifecycle relay](companions/ai-memory-relay). |
+| [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 
 ## License

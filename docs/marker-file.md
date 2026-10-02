@@ -57,7 +57,9 @@ hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
 `briefing_budget` query params to the server when a marker declares them;
 handoff lookup also sends `cwd` when no marker exists so the default
-`project = basename(cwd)` route works consistently.
+`project = basename(cwd)` route works consistently. Every client also sends
+`identity` / `identity_src` when the checkout has a repository identity (see
+[Repository identity](#repository-identity)), with or without a marker.
 
 ## Schema
 
@@ -75,6 +77,15 @@ project = "pe-portais"
 # linked worktrees and subdirectories share one project. Ignored when
 # `project` is present.
 project_strategy = "repo-root"
+
+# Optional. Pin this checkout's repository identity: the key its captures
+# route by, whatever the folder is called and wherever it is checked out.
+# Outranks `project` and the git remote. Use it for a directory with no
+# remote that must not collide with every other folder of the same name,
+# for two checkouts that should share one memory, or for a monorepo
+# subdirectory that deserves its own. Case-folded. See "Repository
+# identity" below.
+identity = "acme/platform"
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
 # and the server accepts but does NOT store this project's subagent-session
@@ -156,9 +167,15 @@ for instructions the agent is expected to obey every turn.
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's
 subagent captures stored as usual. Top-level (non-subagent) sessions are
-always stored regardless. This is per-project on purpose: there is no
-server-global switch, so opting one noisy project in never sheds subagent
-captures for the others on a shared instance.
+always stored regardless, including Claude Code sessions launched with
+`--agent`: `agent_type` alone describes the selected agent, while a non-empty
+`agent_id` identifies a subagent. Claude Code reports a subagent under the
+parent's `session_id`, so only the events carrying `agent_id` (plus
+`SubagentStart`/`SubagentStop`) are dropped and the parent session's own
+prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
+still identifies subagent captures. This is per-project on purpose: there is no server-global
+switch, so opting one noisy project in never sheds subagent captures for the
+others on a shared instance.
 
 ## Allowlist mode: the marker as an opt-in
 
@@ -191,10 +208,135 @@ before it ever POSTs. Only the raw script-fallback paths (the
 `setup-agent` snippets) POST to the server directly without running either
 enforcement point, so allowlist mode does not gate them.
 
+## Routing capture to another server (`server`)
+
+One machine can deliver hook capture to more than one ai-memory server, for
+example when each organisation you work for runs its own. Register each server
+locally under a name, then let a repository's marker select one:
+
+```bash
+ai-memory server add team-a --url https://memory-a.example.com --root ~/work/team-a --auth-token-stdin
+ai-memory server add team-b --url https://memory-b.example.com --root ~/work/team-b --auth-token-stdin
+ai-memory server list      # names, URLs, roots, and whether a token is stored; never the token
+```
+
+```toml
+# ~/work/team-b/.ai-memory.toml
+workspace = "team-b"
+server = "team-b"          # a profile NAME, never a URL
+```
+
+Profiles live in `<data_dir>/servers.toml`; each token is stored separately in
+`<data_dir>/auth-tokens/<name>`, owner-only. A marker, a rendered hook config
+and a process command line never contain a URL or token for a profile. A
+repository without a `server` key keeps using the server `install-hooks`
+configured, exactly as before. `ai-memory uninstall` removes the stored
+tokens together with the hooks that read them and keeps the registry, so a
+later reinstall lists each profile with `token: missing` until you store one
+again.
+
+The marker is repository content, so treat it as untrusted: it can only choose
+among servers **you** registered. When several profiles exist, each must
+declare `--root` directories, and a marker outside a profile's roots cannot
+select it. This is what stops a cloned repository naming another team's
+profile.
+
+Every failure is fail-closed. If the named profile is unknown, has no token,
+is outside its roots, needs roots it does not have, or `servers.toml` is
+malformed, the hook emits **nothing** for that event: nothing is spooled, no
+handoff is fetched, and a one-line warning goes to the hook's stderr. It never
+falls back to the install default, because that would deliver one team's
+capture to another team's server.
+
+Routing is inherited down the tree, unlike the other keys. The nearest marker
+that declares `server` decides, so a nested marker that only sets `workspace`,
+or only `[capture]`, keeps its ancestor's profile. A nested marker can select
+a different profile, but only if that profile's roots admit it. Outside
+`$HOME` the search does not stop at the checkout root, so an
+organisation-level marker above a repository (`/srv/work/team-b/`) still
+routes it. Inside `$HOME` it stops at `$HOME`, as for every other key. Note
+that allowlist mode keeps its own nearest-marker rule: outside `$HOME`, a
+repository whose only marker is that organisation-level one is routed but not
+opted in, so under allowlist mode it emits nothing until it has a marker of
+its own.
+
+The selection fails closed on shape too:
+
+- An unquoted or empty `server =` is a selection that fails name validation,
+  never a silent "no selection".
+- A UTF-8 BOM or a stray non-UTF-8 byte cannot hide the key.
+- A marker on the way up that cannot be read is refused
+  (`rejected-unreadable-marker`), because it may declare a profile.
+- An event whose payload carries no `cwd` is routed by the hook process's
+  working directory instead of going to the install default.
+
+Re-running `ai-memory server add` for an existing profile keeps its roots when
+`--root` is omitted, so rotating a token cannot lift the restriction. Changing
+a profile's `--url` without a new token discards the old token first: a token
+belongs to the server it was issued for, so the profile refuses events until
+you add one for the new URL.
+
+Check the decision for a directory without sending anything:
+
+```bash
+echo '{"cwd":"'"$PWD"'"}' | ai-memory hook --event user-prompt-submit --agent claude-code \
+  --server-url http://127.0.0.1:49374 --check-capture
+```
+
+`server_resolution` is `install-default`, `marker`, or one of
+`rejected-unknown-profile`, `rejected-no-token`, `rejected-outside-roots`,
+`rejected-roots-required`, `rejected-invalid-profile-name`,
+`rejected-unreadable-marker` or `rejected-invalid-registry`. `server_profile`
+names the profile; no URL, path or token is printed.
+
+**Supported integrations.** Native `ai-memory hook` commands route profiles,
+including the session-start handoff fetch, the spooled events drained later,
+and the one-time boot backfill. The generated TypeScript integrations
+(`opencode`, `opencode2`, `omp`, `pi`, `openclaw`) do not route yet: a
+repository whose marker selects a profile emits nothing from them and fetches
+no handoff. The script hooks (the `.sh` and `.ps1` bundles used by the
+`AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper and `setup-agent`
+snippets) cannot route either, and likewise drop a routed repository's events
+and handoff fetch. Clients older than this change ignore the key and deliver to
+their install default, so upgrade every client before adding `server` to a
+shared marker.
+
+**Known limits.**
+
+- **Mixed binaries on one data dir.** Spooled events record their profile in a
+  field older binaries do not know. If an older `ai-memory` drains the same
+  spool, it treats profile events as install-default ones: it may retry a
+  rejected one with the install token, or re-send one addressed to a dead
+  loopback port to the server in `config.toml`. Upgrade every install that
+  shares a data dir.
+- **MCP and `ai-memory run`.** Profiles route hook capture only. The MCP
+  server entry and `ai-memory run` (its managed-run ledger and heartbeats)
+  still talk to the server they were configured with, so in a routed
+  repository they reach the install default. Point that repository's MCP
+  client at its own server with a per-repository `.mcp.json`, and avoid
+  `ai-memory run` there until it learns profiles.
+
+Profiles use static tokens only. OIDC `auth.json` stays with the install
+default and is never presented to a profile's server.
+
+**One server, several identities.** Two profiles may share a URL and differ
+only in their token. On a shared server that restricts projects per user
+(#708), this lets each repository authenticate as the account that has access
+to it:
+
+```bash
+ai-memory server add team-a --url https://memory.example.com --root ~/work/team-a --auth-token-stdin   # team-a account
+ai-memory server add team-b --url https://memory.example.com --root ~/work/team-b --auth-token-stdin   # team-b account
+```
+
+Events from different profiles never share a request, and each profile's
+retries use only its own token.
+
 ## Capture exclusions
 
 Use the exact per-repository shape `[capture]` plus `ignore_paths = [...]`
-below to keep recognized file-tool activity under matching paths out of capture:
+below to keep recognized file-tool and shell-tool activity under matching paths
+out of capture:
 
 ```toml
 [capture]
@@ -231,15 +373,44 @@ logs, or server storage. With an active policy, recognized search/list tools are
 dropped conservatively; missing or malformed recognized file candidates, an
 unsupported recognized schema, or an invalid policy become **metadata-only**.
 That form contains only bounded routing/tool/decision metadata, never paths,
-patterns, arguments, output, errors, titles, or nested payload. Known non-file
-and unknown tools retain current behavior. Excluding content before transport
+patterns, arguments, output, errors, titles, or nested payload. Unknown tools
+retain current behavior.
+
+Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
+have no path field, so the command line is split into words lexically, the way
+a POSIX shell quotes and separates them, without expanding or running anything.
+Codex shell calls, including its `exec_command` path, reach hooks as `Bash`
+with the command in `tool_input.command`.
+A command given as an argument vector keeps each element as one word (a path
+with spaces stays whole, up to 256 characters) and also splits each element on
+its own, so a `bash -lc "<script>"` script is read like any command line. Each
+argument that is not a flag, plus the value of a `--flag=value` or
+`NAME=value` word, is resolved like a file-tool path: from the tool's own
+`workdir` argument when it has one, otherwise from the event's `cwd`. If
+one matches a pattern, the whole event is **dropped**, exactly like a matching
+file read. An argument containing `*` or `?` also matches when its glob can
+reach a pattern's directory: `cat docs/*/0001.md` is dropped under
+`docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
+the match budget is dropped. Variables, command substitution, `cd` state, and
+commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
+their output is still captured. An invalid policy makes a shell command
+**metadata-only**, like a file tool, because a broken marker cannot prove its
+arguments miss every ignored path; this holds even when the command cannot be
+read. An older server drops that metadata-only shell event, so upgrade the
+server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
 This is a lexical capture boundary, **not complete DLP**. It does not resolve
-symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands and
-free-form patches are not parsed; prompts, assistant text, notifications, and
-quoted content are not path-attributable. Add each relevant visible alias
+symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands are
+matched only lexically (above), and free-form patches are not parsed; prompts,
+assistant text, notifications, and quoted content are not path-attributable.
+A copy of a file's content under another path is not linked back to it either:
+Claude Code saves a large tool result to
+`~/.claude/projects/<project>/<session>/tool-results/<id>.txt` and reads it back
+with its file tool, and that read no longer matches the original path. Add
+`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` to exclude those
+re-reads too (for every file, not only the ignored ones). Add each relevant visible alias
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
 
@@ -247,11 +418,15 @@ can be mentioned.
 
 Capture policy v1 is enforced by native `ai-memory hook` commands (including
 native POSIX/Windows hook commands) and generated OpenCode, OMP, Pi, and
-OpenClaw integrations. Local installers default to native commands where that
-path is supported. Legacy `.sh`/`.ps1` hooks and remote-only/Docker script
-bundles do **not** enforce it. Reinstall hooks or refresh/reinstall generated
-plugins after upgrading; existing hooks/plugins keep their prior behavior.
-Installer capability output describes the selected integration.
+OpenClaw integrations, including the lexical shell-command matching above.
+Local installers default to native commands where that
+path is supported. The Linux/macOS Docker wrapper's ordinary `install-hooks`
+path uses its checksum-verified native host client and is supported too.
+Legacy `.sh`/`.ps1` hooks, explicit compatibility overrides, and
+remote-only/manual Docker script bundles do **not** enforce it. Reinstall hooks
+or refresh/reinstall generated plugins after upgrading; existing hooks/plugins
+keep their prior behavior. Installer capability output describes the selected
+integration.
 
 New clients remain safe with old servers because stripping and dropping happen
 on the client. Old clients talking to new servers retain old behavior and cannot
@@ -273,7 +448,7 @@ printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit
 ```
 
 The normal capture contract is intentionally narrow: supported Claude Code,
-OpenCode, Pi, and Antigravity tool events retain only canonical tool family,
+OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
 arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
@@ -359,6 +534,42 @@ so the worktree has no `.ai-memory.toml` ancestor of its own) and even
 when the server runs in a container that cannot see the host checkout.
 Put the marker anywhere on the walk-up path from the worktree — commonly
 a single `~/.ai-memory.toml` — to select the strategy.
+
+### Repository identity
+
+A project's name comes from its folder, and folder names collide: two
+unrelated repositories both checked out as `api/` would otherwise share one
+project. On a server with per-project grants (#708) that means one grant, so
+every client resolves a **repository identity** for the checkout and sends it
+with each event. The first rung that yields one wins:
+
+1. `identity = "…"` in the marker;
+2. `project = "…"` in the marker;
+3. the `upstream` git remote, else `origin`, normalised
+   (`git@github.com:Acme/API.git` → `github.com/acme/api`);
+4. the folder name.
+
+Only rungs 1 and 3 change routing. A declared `project` routes by name as it
+always has — a statement outranks the remote, so a fork whose marker names
+its own project is never filed under the repository it forked from — and a
+bare folder name routes exactly as before. What routes by identity is an
+undeclared checkout with a remote, or a checkout with an explicit
+`identity`:
+
+- The project already carrying the identity wins, whatever it is called:
+  `~/work/api` and `~/dev/acme-api`, both cloned from `github.com/acme/api`,
+  are one project.
+- An existing project with that name and no identity yet is **claimed in
+  place** by the first capture that may write to it, so upgrading moves no
+  memory.
+- If the name already belongs to a different identity, the new repository
+  gets its own project, named from its owner (`github.com/orgb/api` →
+  `orgb-api`, then `orgb-api-2`, …).
+
+The remote is normalised on the host, so credentials embedded in a remote
+URL never leave the machine. Other remote names (`fork`, `mine`) are
+ignored on purpose: they differ per person, and would give one repository a
+different identity for each of them.
 
 ### Single workspace, no per-repo overrides
 
@@ -503,13 +714,16 @@ hook events that arrive without a usable one.
 ## What the marker file does NOT do
 
 - ❌ No glob patterns. Walk-up by literal ancestry only.
-- ❌ No merge of ancestor markers. Closest wins.
+- ❌ No merge of ancestor markers. Closest wins. (`server` is the one key
+  inherited from the nearest marker that declares it; see above.)
 - ❌ No automatic migration of `default`-workspace projects.
 - ❌ No automatic repo-root collapsing. Worktrees and subdirectories only
   share a project when `project_strategy = "repo-root"` is explicitly set
   (per marker, or baked install-wide — see above).
-- ❌ No user-set env / auth / hook-url override. Use the existing env vars
-  (`AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_HOOK_URL`) for those. (A repo-root
+- ❌ No URL or token in the marker. `server = "<name>"` selects a server
+  profile registered locally with `ai-memory server add`; it cannot introduce a
+  new destination or carry a credential. Otherwise use the existing env vars
+  (`AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_HOOK_URL`). (A repo-root
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)

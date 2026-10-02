@@ -326,3 +326,131 @@ async fn legacy_unowned_handoffs_stay_visible_to_everyone() {
         );
     }
 }
+
+/// `memory_handoff_accept`'s `status`, checked against the body: a handoff
+/// comes back exactly when the status says this call claimed one.
+async fn accept_status(router: &Router, headers: &[(&str, &str)]) -> String {
+    let got = call(
+        router,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        headers,
+    )
+    .await;
+    let status = got
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no status in {got}"))
+        .to_owned();
+    assert_eq!(
+        got.get("handoff").is_some_and(|h| !h.is_null()),
+        status == "claimed",
+        "the body and the status disagree: {got}",
+    );
+    status
+}
+
+fn with_session(
+    mut headers: Vec<(&'static str, &'static str)>,
+    session: &'static str,
+) -> Vec<(&'static str, &'static str)> {
+    headers.push(("x-memory-actor-session-id", session));
+    headers
+}
+
+/// `consumed_by_hook` tells an agent the baton is already in its context, so it
+/// is said only to the session whose SessionStart claimed it. The session id on
+/// the request is routing data a client can forge: a colleague forwarding that
+/// id, the same operator from another session, and a request with no session
+/// at all must each hear `none_pending`, not a pointer at someone else's context.
+#[tokio::test]
+async fn consumed_by_hook_is_reported_only_to_the_session_that_claimed_it() {
+    use ai_memory_core::{AgentKind, HandoffAcceptance, NewSession, OwnerFilter, SessionId};
+
+    let h = harness(Some("dj"), true).await;
+    let alice = proxied("x-memory-actor-user", "alice");
+    assert_eq!(accept_status(&h.http, &alice).await, "none_pending");
+
+    begin(&h.http, "alices-baton", &alice).await;
+    let rows = h
+        .store
+        .reader
+        .list_handoffs(h.ws, h.proj, None, OwnerFilter::Any, 10)
+        .await
+        .expect("list");
+    let owner = rows[0]
+        .origin
+        .owner_user
+        .clone()
+        .expect("a proxied operator owns the baton");
+
+    // What the SessionStart hook does: claim the baton for Alice's session under
+    // the native id her session-aware client then forwards on every MCP call.
+    let session = SessionId::from_native("alice-claude-session");
+    h.store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: h.ws,
+            project_id: h.proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: Some(owner.clone()),
+        })
+        .await
+        .expect("receiving session");
+    let claimed = h
+        .store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            handoff_id: rows[0].scope.id,
+            workspace_id: h.ws,
+            project_id: h.proj,
+            accepting_agent: AgentKind::ClaudeCode,
+            accepting_session: Some(session),
+            accepting_user: Some(owner.clone()),
+            owner_filter: OwnerFilter::User(owner),
+            receiving_cwd: None,
+        })
+        .await
+        .expect("session-start claim");
+    assert!(claimed);
+
+    assert_eq!(
+        accept_status(
+            &h.http,
+            &with_session(alice.clone(), "alice-claude-session")
+        )
+        .await,
+        "consumed_by_hook",
+        "the session that received the baton must be told it is in its context",
+    );
+    for (label, headers) in [
+        (
+            "bob forwarding alice's session id",
+            with_session(
+                proxied("x-memory-actor-user", "bob"),
+                "alice-claude-session",
+            ),
+        ),
+        (
+            "alice from another session",
+            with_session(alice.clone(), "alice-other-session"),
+        ),
+        ("alice with no session id", alice.clone()),
+    ] {
+        assert_eq!(
+            accept_status(&h.http, &headers).await,
+            "none_pending",
+            "{label} was pointed at a handoff that is not in its context",
+        );
+    }
+
+    // A baton left after the session started is still claimed normally.
+    begin(&h.http, "a-later-baton", &alice).await;
+    assert_eq!(
+        accept_status(&h.http, &with_session(alice, "alice-claude-session")).await,
+        "claimed",
+    );
+}

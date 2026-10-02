@@ -1,8 +1,42 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Status: proposal for review — not implemented.** This is the design pass promised
-on #708 before any code lands. It changes a security boundary, so it is deliberately
-separated from implementation.
+**Implementation status.** Slices 2 and 3 have landed. Slice 2 is the inert
+V68 schema (`project_grants` + `projects.access_mode`, default `open`) and the
+`authorize_project` choke point (`ai-memory-store/src/project_authz.rs`),
+wired into `ScopeResolver` read/write resolution and the writer actor. Slice 3
+makes `restricted` safe end-to-end:
+
+- **Creator.** V69 adds `projects.created_by`, set when a database user's call
+  creates the project; `resolve_project_authz` derives `is_creator` from it.
+  Projects that predate V69 have none, and admit only root and grants once
+  restricted.
+- **Every surface opts in.** MCP tools, `/api/v1`, the web pages, hook routes
+  and captures attach `ScopeResolver::with_project_authz` (or its free-function
+  form, `authorize_scope_for`) for every database user. Root and installs with
+  no database users attach nothing and behave as before.
+- **Read-shaped mutations need write.** Tools that take read-shaped arguments
+  but mutate (delete, feedback, sweep, lint, auto-improve, handoff accept and
+  cancel, message pop and cancel, a message's recipient) resolve at
+  `ProjectAccess::Write`.
+- **Unscoped reads** — search, listings, the graph and the workspace
+  overview — are filtered in SQL before `LIMIT` with the same rule the choke
+  point applies; the global preferences scope stays readable by everyone.
+- **Raw-id entry points** (managed runs, workstreams, session-scoped
+  consolidation) resolve the id to its project and authorize it.
+- **Management surface**, root-only: `ai-memory project access`,
+  `ai-memory user grant|revoke|grants`, `ai-memory project grants`, and the
+  matching `/admin` routes; every change is recorded in `audit_log`.
+  `[auth] new_projects_restricted` makes new projects start `restricted`.
+- **Captures** into a project the author may not write are dropped and counted
+  (`dropped_unauthorized`), never retried.
+
+Per-project administrators remain out of scope: granting, revoking and
+restricting are root's alone. Sections below are the original design pass,
+retained as the spec.
+
+**Original status: proposal for review — not implemented.** This was the design
+pass promised on #708 before any code lands. It changes a security boundary, so
+it is deliberately separated from implementation.
 
 ## Problem
 
@@ -40,7 +74,7 @@ so existing open deployments do not silently lock out on upgrade.
 (above + write_page/consolidate/handoff/message/delete). `admin` stays global/root as
 today (project-admin is out of scope for v1).
 
-### Schema (new migration, next free V on `release/2.3`)
+### Schema (new migration, next free V on `release/2.5`)
 ```sql
 CREATE TABLE project_grants (
     workspace_id BLOB NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -69,6 +103,46 @@ Anonymous is denied on any restricted project. This must **not** reintroduce the
 invariant-#16 hazard: the grant gate is an *authorization* check that returns
 allow/deny; it is not an `OwnerFilter` on page rows. A team with grants still sees the
 same shared pages — grants gate entry to the project, not row visibility within it.
+
+### Enforcement gaps beyond the choke point (must close before enforcing)
+
+The single `authorize_project` choke point at scope resolution is **necessary but not
+sufficient**: two read classes never resolve a single `(workspace, project)` scope, so
+they bypass the gate entirely. Both must be handled or a `restricted` project leaks.
+
+1. **Unscoped / cross-project reads.** `memory_query(global=true)`, global `memory_recent`,
+   and cross-project web search fan out across every project and never call the scope
+   resolver, so `authorize_project` is never reached. These must filter the **result set
+   by the caller's readable projects inside SQL, before `LIMIT`** — not after. Post-filtering
+   a materialized page would still leak the *existence and count* of hits in projects the
+   caller cannot read (and could starve the visible results under the limit). Concretely:
+   join candidate rows against `project_grants` (+ `access_mode='open'` + creator + root)
+   and apply the predicate in the same query that orders and limits. A caller with no
+   grants sees exactly the open projects, as today.
+2. **Raw-id entry points.** Several paths take a `session_id` / `run_id` / `page_id`
+   directly and resolve their project *from the row*, bypassing scope resolution by
+   construction: consolidation-by-session-id, managed-run routes, SessionStart handoff
+   delivery, and `ReaderPool::page_evidence_counts(page_ids)`. Each must resolve the id →
+   its `(workspace, project)` and then call `authorize_project` before returning content —
+   an unauthorized id is `NotFound`/`Forbidden`, never a silent read. Audit every
+   entry point that accepts a bare id against this rule; a new one that skips it silently
+   reopens the hole while every scoped test still passes.
+
+Structural enforcement (recommended): make the unguarded lookups crate-private so the
+compiler forces new call sites through the guarded resolver + `authorize_project`, the
+same way `ScopeResolver` already funnels scoped access.
+
+### Ship inert, and never fail closed on missing rows
+
+The feature must be a no-op until an operator opts in, and it must not turn a resolution
+gap into a lockout (the #678 dead-end lesson: an unresolved pointer means degrade, not
+refuse). Concretely: an empty `project_grants` table plus `access_mode DEFAULT 'open'`
+means every existing project stays open; enabling `restricted` on a project with **zero
+grants still admits root and the project creator** (never "locked out of my own data");
+a startup that cannot read the grants table (older schema mid-migration) degrades to
+`open` with a loud warning rather than denying every read; and single-user / loopback
+(`distinguishes_operators()` false) skips the gate entirely. Enforcement is gated on
+both the server distinguishing operators **and** the specific project being `restricted`.
 
 ### Management surface (root-only, `/admin/*`)
 `ai-memory user grant --user alice --workspace w --project p --level write` and
@@ -102,4 +176,45 @@ abstractions. Those can layer on the `project_grants` table later.
 Table-driven authorization tests (root / granted-read / granted-write / no-grant /
 anonymous × open/restricted projects), a multi-session integration test proving a
 non-granted user is refused a restricted project while a granted teammate is admitted
-(the invariant-#16 shape that unit tests miss), and a migration idempotency test.
+(the invariant-#16 shape that unit tests miss), and a migration idempotency test. Plus,
+for the two bypass classes above:
+- an **unscoped-read leak test**: `memory_query(global=true)` / global `recent` / web
+  search by a caller with no grant returns hits only from open projects and never
+  reveals the count or existence of hits in a `restricted` project (the filter is
+  applied before `LIMIT`, verified with enough rows that a naive post-filter would
+  under-fill the visible window);
+- a **raw-id authz test** per bare-id entry point (session/run/page id, and
+  `page_evidence_counts`): an id belonging to a `restricted` project the caller lacks a
+  grant for returns `Forbidden`/`NotFound`, not content;
+- a **ship-inert test**: an empty grants table, and a `restricted` project with zero
+  grants, both still admit root and the creator; a caller on an `open` project is
+  unaffected.
+
+## Identity routing (slice 4, #925 — resolved: always-on)
+
+Authorization is only sound if two unrelated checkouts that happen to share a
+folder basename (`~/work/api` and `~/clients/acme/api`) resolve to **different**
+projects — otherwise one grant silently covers both. Slice 4 routes captures by
+**repository identity** (the normalized git remote) instead of folder name:
+
+- A new `V70` migration adds `projects.identity` / `identity_source`
+  (`NOT NULL DEFAULT ''`) with a **partial** unique index
+  `(workspace_id, identity) WHERE identity <> ''` and **no backfill** (a
+  backfill on `lower(name)` would fail a workspace holding both `API` and `api`).
+- Identity is derived by `git2::Repository::discover` (config read only) and
+  normalized **lexically** (scheme split, credential strip, `.git`/slash tidy) —
+  never `fs::canonicalize`. Credentials in a remote URL are stripped client-side
+  and never sent; the server re-validates any wire `identity` (`accept_wire_identity`).
+- Resolution order is **explicit scope > declared `project` > git-remote identity
+  > folder name**; a non-git directory falls back to the folder-name behavior
+  (fail-closed, no new collision).
+- The same normalization runs at all four capture front doors — native
+  `ai-memory hook`, the shell bundle, the PowerShell bundle, and the generated
+  TypeScript integrations — checked by a shared-fixture parity test so they
+  cannot drift.
+
+**Decision (resolved):** this is **always-on** in 2.5.0, not gated behind a
+flag. Opt-in would leave the same-basename grant hole open for anyone who did
+not opt in, defeating the authorization slices. The trade-off — that an upgrading
+install's captures re-bucket by repository identity (two same-name repos split; one
+repo opened from two folders converges) — is documented in the CHANGELOG.

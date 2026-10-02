@@ -17,7 +17,7 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 
 ## Single-use handoff behavior
 
-The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use and the tool will normally return null after SessionStart consumed it.
+The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use: after SessionStart consumed it the tool returns no handoff, with `status` `consumed_by_hook` when the client forwards its session id and `none_pending` otherwise.
 
 If no pending handoff block is visible, inspect with `memory_handoff_list` first. Listing does not claim or expire anything. When the user asks where we left off, claim one listed row with `memory_handoff_accept` and that `handoff_id`, using the client-aware project scope below. Do not treat list as a second accept path.
 
