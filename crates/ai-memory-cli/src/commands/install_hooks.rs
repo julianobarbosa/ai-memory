@@ -3302,8 +3302,8 @@ const OPENCODE2_BINDING: &str = r#"
     type SessionInfo = Awaited<ReturnType<typeof ctx.session.get>>;
     const sessions = new Map<SessionID, Promise<SessionInfo>>();
     const assistantText = new Map<SessionID, string>();
-    // Stops listening on unload. Deliveries keep `hookAbort` until the final
-    // session-ends have had their drain budget.
+    // Stops listening on unload. Deliveries keep `hookAbort` until the queued
+    // events have had their drain budget.
     const unload = new AbortController();
 
     async function sessionInfo(id: SessionID): Promise<SessionInfo> {
@@ -3508,10 +3508,12 @@ const OPENCODE2_BINDING: &str = r#"
           // Unload is best-effort; a dead host has nothing to unregister.
         }
       }
-      for (const [id, pending] of sessions) {
-        const session = await pending.catch(() => undefined);
-        if (session) endSession(id, directory, undefined, subagentMarker(session));
-      }
+      // Dispose is an unload, not a shutdown: OpenCode evicts idle location
+      // services and reloads this plugin while its sessions stay alive, so
+      // ending them here would freeze live sessions (a later SessionStart
+      // cannot reopen an ended session) and fabricate a baton and summary
+      // page per eviction (#1074). Real ends arrive as `session.deleted`, and
+      // each completed root turn already published its checkpoint and baton.
       await drainHookQueueForDispose();
       // Whatever is still in flight after the budget fails over to the spool.
       hookAbort.abort();
@@ -9006,6 +9008,16 @@ model = "gpt-5"
         // Hook registrations are disposed on unload so a reload cannot
         // leave stale callbacks capturing twice.
         assert!(plugin.contains("registration.dispose()"));
+        // #1074: OpenCode unloads the plugin on idle-location eviction while
+        // the host and its sessions stay alive, so dispose must not end
+        // tracked sessions. `session.deleted` (asserted above) stays the only
+        // end: the definition plus that one call are the whole `endSession`
+        // surface of the generated plugin.
+        assert_eq!(
+            plugin.matches("endSession(").count(),
+            2,
+            "endSession must appear only as the definition and the session.deleted call"
+        );
         // Pre-compaction arrives on its own start event; the completion
         // event stays as the consolidation trigger, like v1.
         assert!(plugin.contains("session.compaction.started"));

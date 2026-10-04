@@ -44,8 +44,9 @@ The set is deliberately closed: a free-text relation column turns into
 an unqueryable folksonomy. Keys outside the vocabulary are skipped at
 the write boundary (with a warning) — a typo cannot mint a new edge
 kind. Targets use the same grammar as wikilinks: `path`,
-`project:path`, or `workspace/project:path`; extension-less targets
-gain `.md`.
+`project:path`, `workspace/project:path`, or `_global:path` (the
+reserved preferences project in the default workspace); extension-less
+targets gain `.md`.
 
 ## What typed edges do
 

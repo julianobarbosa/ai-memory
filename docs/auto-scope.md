@@ -32,9 +32,10 @@ The `[auto_scope]` config block still selects the mode explicitly, including
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
 | `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | **Default.** Isolates parallel harnesses and separate operators. Falls back to the shared slot for a caller with no coordinate, and for an install where nothing has ever been keyed (no lifecycle hooks); fails closed on a genuine session mismatch. |
 
-Both opt-in modes still publish foreground activity to the single slot in
-parallel, so a caller with no actor identity (anonymous probe, legacy code
-path) sees the most recently active project rather than an empty pointer.
+The `per_actor` and `per_session` isolation modes still publish foreground
+activity to the single slot in parallel, so a caller with no actor identity
+(anonymous probe, legacy code path) sees the most recently active project
+rather than an empty pointer.
 Non-foreground events refresh only their exact keyed entry when one exists.
 That preserves legacy behavior without letting a delayed tail take over, but
 it is not per-session isolation; use explicit `workspace` + `project`

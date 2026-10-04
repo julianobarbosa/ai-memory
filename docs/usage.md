@@ -411,9 +411,11 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 The web UI is read-only: project list, per-project page tree,
 breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
 pages, `[[wiki links]]` become clickable links to the target page —
-`[[path]]`, `[[path|label]]`, `[[project:path]]`, and
-`[[workspace/project:path]]` are all supported (resolved against the
-current page's project unless the target carries its own scope).
+`[[path]]`, `[[path|label]]`, `[[project:path]]`,
+`[[workspace/project:path]]`, and `[[_global:path]]` are all supported
+(resolved against the current page's project unless the target carries
+its own scope; `[[_global:path]]` always names the reserved `_global`
+project in the default workspace).
 `[[…]]` stays literal inside fenced code (` ``` ` and `~~~` close
 only by their own glyph), inline `` `…` `` code, and 4-space-indented
 code; external schemes inside the brackets (`http://`, `https://`,

@@ -289,8 +289,15 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
             .await
             .unwrap();
         assert!(
-            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Write).await,
+            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Read).await,
             "{reserved} must stay open"
+        );
+        // The global scope reaches every user's reads, so its writes are
+        // gated even though it stays open (GHSA-7qj3-7wqw-m5w6).
+        assert_eq!(
+            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Write).await,
+            reserved == ai_memory_core::DEFAULT_PROJECT_NAME,
+            "{reserved} write"
         );
     }
     // An existing project is not touched by the flag.

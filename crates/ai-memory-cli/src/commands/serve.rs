@@ -1130,9 +1130,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // `--project` (issue #2). In stdio mode no hook router is built, so
     // this stays empty and the baked-in default is used.
     // Construct ActiveProject with the configured `[auto_scope]` mode +
-    // TTL/cap. `single` (default) preserves the legacy behaviour; the
-    // opt-in modes (`per_session`, `per_actor`) keyed-isolate concurrent
-    // sessions / operators on shared installs.
+    // TTL/cap. `per_actor` (default) and `per_session` keyed-isolate
+    // concurrent sessions / operators; `single` preserves the pre-v1.39
+    // process-wide slot.
     let active_project = ActiveProject::with_config(
         config.auto_scope.mode,
         std::time::Duration::from_secs(config.auto_scope.session_ttl_secs),
@@ -1199,6 +1199,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // connected is the exact state a launched-but-unused server sits
             // in, and until #699 nothing here listened for one at all.
             let service = tokio::select! {
+                // A handshake that completes in the same poll a signal
+                // arrives in counts as connected: an unbiased select would
+                // pick either branch at random.
+                biased;
                 service = server.serve(stdio()) => Some(service?),
                 signal = shutdown.recv() => {
                     info!(signal, "shutdown signal received before a client connected; stopping");

@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use ai_memory_core::PagePath;
+use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, PagePath};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
 /// Render a markdown body to HTML using GFM-ish defaults.
@@ -17,12 +17,13 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 /// Wiki content can be derived from prompts, hooks, or LLM output, so
 /// the browser surface must treat it as untrusted.
 ///
-/// `[[wiki links]]` (with the `[[target|label]]`, `[[project:path]]`, and
-/// `[[workspace/project:path]]` variants the engine's link extractor
-/// understands) are rendered as clickable internal links resolved against
-/// the page's own `workspace`/`project` unless the target carries its own
-/// scope. Wikilinks inside fenced code blocks and inline code are left as
-/// literal text.
+/// `[[wiki links]]` (with the `[[target|label]]`, `[[project:path]]`,
+/// `[[workspace/project:path]]`, and reserved `[[_global:path]]` variants
+/// the engine's link extractor understands) are rendered as clickable
+/// internal links resolved against the page's own `workspace`/`project`
+/// unless the target carries its own scope. `[[_global:path]]` always
+/// points at the `_global` project in the default workspace. Wikilinks
+/// inside fenced code blocks and inline code are left as literal text.
 #[must_use]
 pub fn render(body: &str, workspace: &str, project: &str) -> String {
     // Rewrite `[[wikilinks]]` into ordinary markdown links BEFORE parsing.
@@ -251,6 +252,11 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
 /// defaulting to the current page's `workspace`/`project`. A `scope` made of
 /// anything other than `[-_/.alnum]` is treated as part of the path (so a
 /// stray colon in a filename doesn't masquerade as a scope).
+///
+/// `[[_global:path]]` always names the reserved preferences project in
+/// [`DEFAULT_WORKSPACE_NAME`], even when the current page lives elsewhere
+/// (issue #1042). An explicit `[[workspace/_global:path]]` keeps the named
+/// workspace.
 fn split_scope<'a>(
     target: &'a str,
     cur_ws: &'a str,
@@ -268,6 +274,9 @@ fn split_scope<'a>(
                     (ws.trim(), proj.trim(), rest.trim())
                 }
                 Some(_) => (cur_ws, cur_proj, target), // malformed `ws/`
+                None if scope == GLOBAL_SCOPE_PROJECT => {
+                    (DEFAULT_WORKSPACE_NAME, scope, rest.trim())
+                }
                 None => (cur_ws, scope, rest.trim()),
             };
         }
@@ -626,6 +635,27 @@ mod tests {
         assert!(
             html.contains(r#"href="w/ws2/proj2/p/y.md""#),
             "workspace/project scope: {html}"
+        );
+    }
+
+    #[test]
+    fn wikilink_global_scope_pins_to_default_workspace() {
+        let html = render("see [[_global:python-env]] here", "other", "embodied-ai");
+        assert!(
+            html.contains(r#"href="w/default/_global/p/python-env.md""#),
+            "project-only _global from another workspace: {html}"
+        );
+
+        let html = render("[[machine:notes/x]]", "other", "embodied-ai");
+        assert!(
+            html.contains(r#"href="w/other/machine/p/notes/x.md""#),
+            "non-global project-only stays on the source workspace: {html}"
+        );
+
+        let html = render("[[other/_global:notes/x]]", "default", "scratch");
+        assert!(
+            html.contains(r#"href="w/other/_global/p/notes/x.md""#),
+            "explicit workspace is kept: {html}"
         );
     }
 

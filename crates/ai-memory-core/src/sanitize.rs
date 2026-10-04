@@ -16,7 +16,7 @@
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
 //! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
-//! github_pat_…, Google AIza… plus OAuth refresh tokens 1//…, Meta /
+//! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
 //! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
@@ -91,8 +91,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
     (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
-    // Naked Google / Gemini API keys.
+    // Naked Google / Gemini API keys (legacy standard-key shape).
     (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
+    // Gemini authorization ("auth") keys. AI Studio has issued these instead
+    // of `AIza…` keys since 2026-05-28: `AQ.Ab` followed by a base64url tail
+    // (48 characters on a key issued 2026-10). The `.Ab` anchor keeps
+    // ordinary text such as "AQ.A" headings or `AQ.` abbreviations intact;
+    // the open tail floor matches the AIza rule's.
+    (r"AQ\.Ab[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Google OAuth refresh tokens. Longer-lived than the AIza keys above:
     // they mint fresh access tokens until explicitly revoked, so a leaked
     // one outlives the session it came from.
@@ -514,6 +520,28 @@ mod tests {
         let out = s().scrub("the key AIzaSyFAKEfake0123456789abcdefghijkl is leaked");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("AIzaSy"));
+    }
+
+    #[test]
+    fn scrubs_naked_gemini_auth_key() {
+        // SHAPE only (`AQ.Ab` + base64url tail), never a live value — same
+        // rule as the AIzaSy… fixture above.
+        let out = s().scrub("export it: AQ.AbFAKEfake0123456789abcdefghijklmn-_FAKE done");
+        assert!(out.contains("[REDACTED:"), "{out}");
+        assert!(!out.contains("AQ.AbFAKE"), "{out}");
+        assert!(out.ends_with(" done"), "{out}");
+    }
+
+    #[test]
+    fn leaves_short_aq_prefixed_text_alone() {
+        // Not a key: too short, or missing the `.Ab` anchor.
+        for text in [
+            "see AQ.Ab for details",
+            "AQ.A section",
+            "AQ.Xyz0123456789abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert_eq!(s().scrub(text), text);
+        }
     }
 
     // Every fixture below is a SHAPE, never a live value — same rule as the

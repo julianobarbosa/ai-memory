@@ -1875,8 +1875,8 @@ impl AiMemoryServer {
     ///      when hooks have published one (for THIS actor),
     ///   2. that same explicit `project` in the server's baked workspace,
     ///   3. the hook-published [`ActiveProject`] (the cwd the agent is
-    ///      currently working in, keyed by `actor` in opt-in isolation
-    ///      modes),
+    ///      currently working in, keyed by `actor` in the `per_actor` and
+    ///      `per_session` isolation modes),
     ///   4. the server's baked-in `--project` default.
     ///
     /// `actor` is built by [`Self::actor_key_from_parts`]; pass
@@ -3840,10 +3840,15 @@ impl AiMemoryServer {
                         None,
                     ));
                 }
-                ai_memory_store::create_global_scope(&self.writer)
-                    .await
-                    .map_err(Self::scope_error)?
-                    .as_tuple()
+                // The same resolver and choke point as an explicit
+                // `default/_global` write, so both spellings are gated alike.
+                self.write_target_ids_with_actor(
+                    Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+                    Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                )
+                .await?
             }
             Some(other) => {
                 return Err(McpError::internal_error(
@@ -12048,6 +12053,234 @@ mod tests {
             )
             .await
             .expect("a writer may delete");
+    }
+
+    /// Two users and a restricted project, for the global-scope write gate:
+    /// `joao` writes `acme-app`, `maria` holds nothing anywhere.
+    async fn global_gate_fixture(
+        tmp: &TempDir,
+    ) -> (
+        Store,
+        AiMemoryServer,
+        ai_memory_core::UserId,
+        ai_memory_core::UserId,
+    ) {
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let acme = store
+            .writer
+            .get_or_create_project(ws, "acme-app", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(acme, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let mut users = Vec::new();
+        for name in ["joao", "maria"] {
+            users.push(
+                store
+                    .writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        grant_writer(store.db_path(), users[0], acme);
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, acme)
+            .with_wiki(wiki);
+        (store, server, users[0], users[1])
+    }
+
+    fn parts_as_user(user: ai_memory_core::UserId) -> axum::http::request::Parts {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(AuthLevel::User);
+        parts.extensions.insert(user);
+        parts
+            .extensions
+            .insert(ai_memory_core::AuthorizedViewer(user));
+        parts
+    }
+
+    fn global_page(
+        path: &str,
+        scope: Option<&str>,
+        workspace: Option<&str>,
+        project: Option<&str>,
+    ) -> WritePageArgs {
+        WritePageArgs {
+            path: path.into(),
+            body: "# Preferences\n\nglobalverify marker.".into(),
+            title: None,
+            tier: Some("semantic".into()),
+            tags: vec![],
+            pinned: false,
+            project: project.map(str::to_owned),
+            workspace: workspace.map(str::to_owned),
+            scope: scope.map(str::to_owned),
+            expires_at: None,
+        }
+    }
+
+    /// GHSA-7qj3-7wqw-m5w6: the reserved global scope is unioned into every
+    /// user's reads, so a database user without a write grant on it must not
+    /// write it — through `scope: "global"` or by naming `default/_global` —
+    /// nor delete from it. Having created `_global` first grants nothing.
+    #[tokio::test]
+    async fn a_user_without_a_global_grant_cannot_change_the_global_scope() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, _joao, maria) = global_gate_fixture(&tmp).await;
+
+        for (label, args) in [
+            (
+                "scope: global",
+                global_page("preferences.md", Some("global"), None, None),
+            ),
+            (
+                "explicit default/_global",
+                global_page("preferences.md", None, Some("default"), Some("_global")),
+            ),
+        ] {
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(parts_as_user(maria)))
+                .await
+                .expect_err(label);
+            assert!(
+                err.message.contains("not authorized for _global"),
+                "{label}: {}",
+                err.message
+            );
+        }
+        // Maria's refused write created `_global` and recorded her as its
+        // creator; that must not have made her a writer.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let creator: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT created_by FROM projects WHERE name = '_global'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(creator.as_deref(), Some(maria.as_bytes().as_slice()));
+        server
+            .memory_write_page(
+                Parameters(global_page("preferences.md", Some("global"), None, None)),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("the creator of _global is not its writer");
+
+        // Root (no viewer) writes a real global page; maria cannot delete it.
+        server
+            .memory_write_page(
+                Parameters(global_page("preferences.md", Some("global"), None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("root writes the global scope");
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "preferences.md".into(),
+                    project: Some("_global".into()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("maria holds no write grant on _global");
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("preferences.md".into()),
+                    query: None,
+                    project: Some("_global".into()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("the refused delete left the page, and reads stay open");
+    }
+
+    /// The legitimate half of GHSA-7qj3: a write grant on `_global` admits
+    /// both spellings, and every user still reads the global page through the
+    /// union on their own restricted project.
+    #[tokio::test]
+    async fn a_global_write_grant_admits_writes_and_the_union_stays_readable() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, joao, maria) = global_gate_fixture(&tmp).await;
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        grant_writer(store.db_path(), maria, global.project_id);
+
+        server
+            .memory_write_page(
+                Parameters(global_page("preferences.md", Some("global"), None, None)),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("a write grant on _global admits scope: global");
+        server
+            .memory_write_page(
+                Parameters(global_page(
+                    "style.md",
+                    None,
+                    Some("default"),
+                    Some("_global"),
+                )),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("a write grant on _global admits default/_global");
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "globalverify".into(),
+                    limit: Some(5),
+                    project: Some("acme-app".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("default".into()),
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .expect("joao reads his restricted project");
+        let value = tool_json(&result);
+        let paths: Vec<&str> = value["global_scope_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert!(paths.contains(&"preferences.md"), "{value}");
     }
 
     /// The finding that started #708, as a test.

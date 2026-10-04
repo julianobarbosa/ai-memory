@@ -16,8 +16,8 @@
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
 //! * **OpenAI OAuth/Codex**: ChatGPT/Codex Responses API with
 //!   `text.format = { type: "json_schema", strict: true }`.
-//! * **OpenCode Go**: Responses API for GPT-5.6 Luna; OpenAI-compatible Chat
-//!   Completions for the rest of the catalogue.
+//! * **OpenCode Zen/Go**: model-published Responses, Anthropic Messages, or
+//!   OpenAI-compatible Chat Completions transport.
 //! * **GitHub Copilot**: GitHub token exchange to a short-lived Copilot API
 //!   token, then OpenAI-style Chat Completions with JSON schema format.
 //! * **Gemini**: `generationConfig.responseMimeType = "application/json"`

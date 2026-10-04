@@ -209,6 +209,77 @@ pub async fn discover_native_session(
     Ok(None)
 }
 
+/// Whether a Claude transcript was written by a Claude Code background session
+/// (one the Claude Code daemon hosts), whose records carry
+/// `"sessionKind": "bg"`. Foreground transcripts never carry the field, so this
+/// keeps the launcher from asking Claude about live sessions on every resume.
+pub fn claude_session_ran_in_background(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    let Some(path) = locate_session_file(
+        ManagedHarness::Claude,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let reader = BufReader::new(File::open(&path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"sessionKind\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
+            && value.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The id `claude attach` takes for `native_session_id` when `claude agents
+/// --json` lists it as a live background session in this checkout.
+///
+/// Claude Code refuses `--resume` on a background session that is still
+/// running and points at `claude attach <id>`, whose `<id>` is the short id
+/// the listing prints, not the full session id. Anything unexpected in the
+/// listing yields `None`, so the launcher keeps its native resume.
+pub fn claude_live_background_attach_id(
+    agents_json: &[u8],
+    native_session_id: &str,
+    cwd: &Path,
+) -> Option<String> {
+    let sessions: Vec<Value> = serde_json::from_slice(agents_json).ok()?;
+    sessions.iter().find_map(|session| {
+        let attach_id = session.get("id").and_then(Value::as_str)?;
+        let matches = session.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+            && session.get("kind").and_then(Value::as_str) == Some("background")
+            && session
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
+        (matches
+            && attach_id
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphanumeric())
+            && attach_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then(|| attach_id.to_string())
+    })
+}
+
 /// Find the Claude Code background session that `native_session_id` attached
 /// to during this run, if any.
 ///
@@ -4391,6 +4462,87 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn claude_session_ran_in_background_needs_its_own_bg_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&project).unwrap();
+        let write = |id: &str, records: &[Value]| {
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(project.join(format!("{id}.jsonl")), body).unwrap();
+        };
+        let ran = |id: &str| claude_session_ran_in_background(temp.path(), &cwd, None, id).unwrap();
+
+        write(
+            "fg",
+            &[json!({"type": "user", "sessionId": "fg", "cwd": cwd})],
+        );
+        assert!(!ran("fg"));
+        // A foreground transcript can quote another session's bg record (a
+        // pasted log, a tool result); only its own sessionId counts.
+        write(
+            "quoting",
+            &[
+                json!({"type": "user", "sessionId": "quoting", "cwd": cwd,
+                     "message": {"content": "{\"sessionKind\":\"bg\",\"sessionId\":\"other\"}"}}),
+                json!({"type": "user", "sessionId": "other", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(!ran("quoting"));
+        write(
+            "bg",
+            &[
+                json!({"type": "mode", "sessionId": "bg"}),
+                json!({"type": "user", "sessionId": "bg", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(ran("bg"));
+        assert!(!ran("missing"));
+    }
+
+    #[test]
+    fn claude_live_background_attach_id_matches_only_a_live_background_session_here() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let listing = |entries: Value| serde_json::to_vec(&entries).unwrap();
+        let entry = |id: &str, session: &str, kind: &str, cwd: &Path| json!({"id": id, "sessionId": session, "kind": kind, "status": "idle", "cwd": cwd});
+        let full = "94e41265-4001-431c-828e-1c54953e596b";
+
+        let live = listing(json!([
+            entry("aaaa1111", "another-session", "background", &cwd),
+            entry("94e41265", full, "background", &cwd),
+        ]));
+        assert_eq!(
+            claude_live_background_attach_id(&live, full, &cwd).as_deref(),
+            Some("94e41265")
+        );
+        for refused in [
+            // The same session listed as an interactive one, or from another
+            // checkout, is not attached to from here.
+            listing(json!([entry("94e41265", full, "interactive", &cwd)])),
+            listing(json!([entry("94e41265", full, "background", &other)])),
+            // An id that could smuggle an option or path into argv.
+            listing(json!([entry("--help", full, "background", &cwd)])),
+            listing(json!([entry("../x", full, "background", &cwd)])),
+            listing(json!([])),
+            b"not json".to_vec(),
+            listing(json!({"sessions": []})),
+        ] {
+            assert_eq!(claude_live_background_attach_id(&refused, full, &cwd), None);
+        }
     }
 
     #[test]

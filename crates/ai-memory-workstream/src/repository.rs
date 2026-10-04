@@ -27,9 +27,49 @@ pub struct RepositoryIdentity {
     pub linked_worktree: bool,
 }
 
+/// Stable checkout keys, without scanning files or collecting a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFingerprints {
+    /// Repository identity hash shared by linked worktrees.
+    pub repo_fingerprint: String,
+    /// Worktree-specific identity hash.
+    pub worktree_fingerprint: String,
+}
+
+struct RepositoryMetadata {
+    cwd: PathBuf,
+    fingerprints: RepositoryFingerprints,
+    linked_worktree: bool,
+}
+
 /// Inspect the current checkout without committing, stashing, resetting, or
 /// otherwise changing it.
 pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
+    let metadata = inspect_metadata(cwd)?;
+    Ok(RepositoryIdentity {
+        checkpoint: checkpoint(&metadata.cwd),
+        origin_push_url: git(&metadata.cwd, &["remote", "get-url", "--push", "origin"])
+            .as_deref()
+            .and_then(|urls| urls.lines().next())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned),
+        cwd: metadata.cwd,
+        repo_fingerprint: metadata.fingerprints.repo_fingerprint,
+        worktree_fingerprint: metadata.fingerprints.worktree_fingerprint,
+        linked_worktree: metadata.linked_worktree,
+    })
+}
+
+/// Inspect only the stable keys needed to list checkout-local workstreams.
+///
+/// Listing must not run `git status`: a large working tree or an unavailable
+/// filesystem-monitor hook can otherwise block the picker before its first frame.
+pub fn inspect_repository_fingerprints(cwd: &Path) -> Result<RepositoryFingerprints> {
+    Ok(inspect_metadata(cwd)?.fingerprints)
+}
+
+fn inspect_metadata(cwd: &Path) -> Result<RepositoryMetadata> {
     let canonical = cwd
         .canonicalize()
         .with_context(|| format!("canonicalizing managed run cwd {}", cwd.display()))?;
@@ -55,17 +95,12 @@ pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
         (_, Some(root)) => format!("{}\nroot\n{root}", sha256(&repo_seed)),
         _ => format!("{}\ncwd\n{}", sha256(&repo_seed), canonical.display()),
     };
-    Ok(RepositoryIdentity {
-        cwd: canonical.clone(),
-        repo_fingerprint: sha256(&repo_seed),
-        worktree_fingerprint: sha256(&worktree_seed),
-        checkpoint: checkpoint(&canonical),
-        origin_push_url: git(&canonical, &["remote", "get-url", "--push", "origin"])
-            .as_deref()
-            .and_then(|urls| urls.lines().next())
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_owned),
+    Ok(RepositoryMetadata {
+        cwd: canonical,
+        fingerprints: RepositoryFingerprints {
+            repo_fingerprint: sha256(&repo_seed),
+            worktree_fingerprint: sha256(&worktree_seed),
+        },
         linked_worktree: matches!(
             (&git_dir, &common_dir),
             (Some(git_dir), Some(common)) if git_dir != common
@@ -163,6 +198,9 @@ mod tests {
         assert_eq!(first.repo_fingerprint.len(), 64);
         assert_eq!(first.origin_push_url, None);
         assert!(!first.linked_worktree);
+        let lightweight = inspect_repository_fingerprints(temp.path()).unwrap();
+        assert_eq!(lightweight.repo_fingerprint, first.repo_fingerprint);
+        assert_eq!(lightweight.worktree_fingerprint, first.worktree_fingerprint);
     }
 
     fn git_fixture(cwd: &Path, args: &[&str]) {
@@ -226,6 +264,13 @@ mod tests {
         let worktree = inspect_repository(&linked).unwrap();
         assert!(worktree.linked_worktree);
         assert_eq!(worktree.origin_push_url, primary.origin_push_url);
+        for (path, full) in [(&main, &primary), (&linked, &worktree)] {
+            let lightweight = inspect_repository_fingerprints(path).unwrap();
+            assert_eq!(lightweight.repo_fingerprint, full.repo_fingerprint);
+            assert_eq!(lightweight.worktree_fingerprint, full.worktree_fingerprint);
+        }
+        assert_eq!(primary.repo_fingerprint, worktree.repo_fingerprint);
+        assert_ne!(primary.worktree_fingerprint, worktree.worktree_fingerprint);
     }
 
     /// The push URL counts, not the fetch URL. The `.invalid` host keeps a

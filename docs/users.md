@@ -741,6 +741,12 @@ ones who should keep access; nothing is granted automatically.
   reserved `scratch` project and the global preferences scope always start
   open, and the global scope can never be restricted: it is shared by
   construction.
+- **Writing the global preferences scope** (`scope: "global"`, or
+  `default/_global` by name) needs root or an explicit `write` grant on it,
+  because its pages reach every user's queries. Reading it stays open, and
+  having created it first grants nothing. To let a user maintain team-wide
+  preferences: `ai-memory user grant --user alice --project _global --level
+  write` (the scope must already exist; root creates it with its first write).
 - **Gates entry, never rows.** Access decides which projects a user reaches;
   inside a project pages stay shared exactly as before (see below).
 - **Refusals are explicit.** A user outside a restricted project gets a 403

@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed a store write sent while the writer was shutting down occasionally
+  waiting forever instead of failing with `WriterClosed`: the writer now
+  closes its queue and drains in-flight commands before it stops.
+- Fixed `resume` and `workstreams` running `git status` on every linked checkout
+  before listing anything: listing now reads only the checkout's stable
+  fingerprints, so a large working tree or a slow filesystem-monitor hook no
+  longer blocks the picker before its first frame. (#1039)
+- Fixed the generated OpenCode 2 plugin ending every tracked session when
+  OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
+  host and its sessions stay alive, so each eviction froze a live session
+  (`SessionStart` cannot reopen an ended OpenCode session), fabricated a
+  spurious summary page and open handoff, and made the next baton fetch fail
+  with `invalid state: an ended session cannot accept a handoff`. Plugin
+  unload no longer posts `session-end`; deletion (`session.deleted`) remains
+  the end signal and a completed root turn already publishes its continuation
+  checkpoint and baton. Regenerate the plugin with
+  `ai-memory install-hooks --agent opencode2 --apply`. (#1074)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
   mutation guards are released before embedding; external editors remain
@@ -118,6 +135,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subagent under its parent's session id, so a subagent's events no longer
   mark that session as a subagent: the parent's Stop, SessionEnd, summary and
   handoff are kept. (#1041, #1048)
+- Corrected the `[auto_scope]` default in doc comments (`Config`,
+  `AutoScopeSettings`, the `ActiveProjectMode` module docs, `serve`) and the
+  README docs index: they still named `single` as the default or called
+  `per_actor` opt-in, but the default has been `per_actor` since v1.39. (#1065)
+- Fixed `gemini-3.8-flash` consolidation and lint spending hidden thinking
+  tokens on strict-JSON calls. The Gemini provider now sends
+  `thinkingBudget = 0` to 3.8 Flash as it already did for 2.5 and 3.5 Flash
+  (verified live: 0 thought tokens, about half the latency); 3.8 Flash-Lite
+  keeps the field omitted until verified. (#1077)
+- Fixed the secret scrubber missing Gemini authorization keys. AI Studio has
+  issued `AQ.Ab…` keys instead of `AIza…` since 2026-05-28, so a bare new key
+  reached capture unredacted; it is now redacted as `google_api_key`. (#1077)
+- Fixed the OpenCode provider sending every Go/Zen model through Chat
+  Completions. It now selects the published wire API per supported model:
+  Responses, Anthropic Messages, or OpenAI-compatible Chat Completions.
+  Claude Sonnet 5.5 and the legacy Sonnet 4 ID also use Messages.
+  Its default model is now `mimo-v2.6-flash`, matching the default Go catalogue;
+  Claude models require an explicit Zen base URL. Configured base URLs remain
+  authoritative, with no automatic switching between Go and Zen billing.
+  MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on
+  Zen; Go's Muse Contributor IDs use Responses. Changing the base URL also
+  reselects the transport while preserving configured headers, reasoning,
+  and timeout.
+  (#1080)
+- Fixed `[[_global:path]]` resolving against the source page's workspace
+  instead of the reserved `_global` project in the default workspace. A
+  page outside `default` can now graph-link to standing global pages, and
+  `/web` points at the same home. Sibling `[[project:path]]` and explicit
+  `[[workspace/project:path]]` are unchanged. Legacy rows that stored the
+  project-only form with a NULL workspace resolve when the reserved page
+  is next written. (#1042)
+- Fixed `ai-memory run claude` / `continue` exiting with Claude's "That session
+  is running in the background" error when the linked session is a Claude Code
+  background session that is still running and the launch carries any native
+  flag. The launcher now confirms the session is live in this checkout with
+  `claude agents --json` (only for a transcript recorded in the background) and
+  opens it with `claude attach <id>`; any failure keeps the native resume.
+  Documented the observed attach-hook behavior, early-exit import boundary and
+  fallback validation limits.
+  (#1052)
+
+### Security
+- Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
+  write grant on the reserved global preferences scope (`default/_global`)
+  could write it, and its pages are unioned into every user's queries,
+  including restricted projects. Writing it now needs root or an explicit
+  `write` grant on `_global`, whichever way the scope is named; creating it
+  grants nothing, reads stay open, and installs without database users are
+  unchanged. Reported by @Josehbr.
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a

@@ -3195,7 +3195,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::grants::set_access_mode(&conn, project_id, mode);
                 send_or_warn(reply, result, "set_access_mode");
             }
-            WriteCmd::Shutdown => break,
+            WriteCmd::Shutdown => {
+                // Dropping the receiver drains the queue, but a sender that
+                // already holds a permit can still push afterwards; that
+                // command would never be dropped and its caller would wait
+                // forever. Closing first and receiving until `None` waits for
+                // those in-flight sends, and dropping each command drops its
+                // reply, so every caller sees `WriterClosed`.
+                rx.close();
+                while rx.blocking_recv().is_some() {}
+                break;
+            }
             WriteCmd::AuthorizeProject {
                 workspace_id,
                 project_id,
@@ -4642,6 +4652,45 @@ mod tests {
             store.reader.session_project_ids(sid).await.unwrap(),
             Some((ws, dst))
         );
+    }
+
+    /// Commands racing the shutdown never hang: a send that holds a channel
+    /// permit when the actor stops must still be dropped, so its caller gets
+    /// a reply (a result or `WriterClosed`) instead of waiting forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commands_racing_shutdown_always_get_a_reply() {
+        for round in 0..20 {
+            let tmp = TempDir::new().unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let writer = store.writer.clone();
+            drop(store);
+            let callers: Vec<_> = (0..64)
+                .map(|i| {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        writer
+                            .get_or_create_workspace(&format!("ws-{round}-{i}"))
+                            .await
+                    })
+                })
+                .collect();
+            writer
+                .inner
+                .tx
+                .send(WriteCmd::Shutdown)
+                .await
+                .expect("writer channel closed before Shutdown");
+            for caller in callers {
+                let reply = tokio::time::timeout(std::time::Duration::from_secs(10), caller)
+                    .await
+                    .expect("a command racing shutdown hung instead of replying")
+                    .expect("caller task panicked");
+                assert!(
+                    matches!(reply, Ok(_) | Err(StoreError::WriterClosed)),
+                    "unexpected reply: {reply:?}"
+                );
+            }
+        }
     }
 
     /// Once the actor has stopped, calls fail fast with

@@ -419,9 +419,43 @@ Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
 
-Claude Code background sessions run inside the Claude Code daemon, not in the
-process `ai-memory run` spawned, so their hooks never carry the run's id. When a
-managed Claude session attaches to one (`/resume` on a session shown as
+When the linked Claude session is a Claude Code background session that is
+still running in the daemon, Claude refuses `--resume <id>` when another flag
+comes with it (seen with `--model`, `--effort` and
+`--dangerously-skip-permissions` on Claude Code 2.1.287; a bare `--resume`
+attaches) and points at `claude attach <id>`. Only when the
+transcript shows the session ran in the background (`sessionKind: "bg"`)
+does ai-memory ask `claude agents --json --cwd <checkout>`. When that lists the
+session as a live background one in this checkout, it launches
+`claude attach <id>` with the listing's short id instead. Native arguments are
+not passed to the attach client. In the Claude Code 2.1.288 lifecycle validation,
+no new `SessionStart` was observed from the attach client; the background
+worker's hooks carried the background session id. Delivery of a pending
+workstream context packet through attach remains unverified: that validation
+did not exercise a pending packet. The launcher reports this limitation and
+suppresses the missing-acknowledgement warning for attach. (#1052)
+
+When the attach client detaches or exits early, the managed run finishes with
+the client's exit status and imports the linked transcript available at finish.
+It neither stops the daemon nor waits for the background turn to complete;
+events written after that import remain outside it. In the same validation,
+Ctrl-Z detached with exit 0, and terminating only the attach client produced
+exit 1 while the daemon continued and emitted `Stop` after the run finished.
+
+A failed, unavailable or unexpected `claude agents` listing keeps the native
+resume and its original flags. That fallback can still encounter Claude's
+refusal to resume a live background session with flags. The lifecycle test
+injected an exit-127 listing and an incompatible JSON object, then exercised
+the real resume and backend; an older Claude binary without `agents` was not
+tested. These observations are recorded in the
+[PR #1067 lifecycle validation](https://github.com/akitaonrails/ai-memory/pull/1067#issuecomment-5962340148).
+
+Claude Code background sessions run inside the Claude Code daemon, separately
+from the attach client. Their hooks use the daemon worker's inherited
+environment: the 2.1.288 validation observed an `AI_MEMORY_RUN_ID` from an
+earlier launch, different from the current attach runs. A daemon hook therefore
+does not by itself identify the current attaching run. When a managed Claude
+session attaches to one (`/resume` on a session shown as
 "running in the background"), the conversation goes on in the background
 session's transcript. At the end of the run, ai-memory looks for a transcript
 written during the run whose `sessionKind: "bg"` records name the run's own

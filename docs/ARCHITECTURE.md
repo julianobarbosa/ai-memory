@@ -410,6 +410,11 @@ so that dependencies between projects become explicit edges in the graph:
 
 * `[[project:path.md]]` — a sibling project in the same workspace.
 * `[[workspace/project:path.md]]` — a project in another workspace.
+* `[[_global:path.md]]` — the reserved `_global` preferences project in
+  the default workspace, even when the source page lives elsewhere.
+  Bare `[[name]]` stays project-local; this is the form that names the
+  shared scope. An explicit `[[workspace/_global:path.md]]` keeps the
+  named workspace.
 
 The parser (`ai-memory-wiki::extract_links`) yields a `LinkTarget
 { workspace, project, path }`; the store resolves it against the named

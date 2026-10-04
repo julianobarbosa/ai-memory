@@ -1660,8 +1660,9 @@ fn replace_links_in_tx(
         // The relation joins the dedupe key (and the table's PK): a
         // typed edge and a plain reference to the same target are two
         // different rows, mirroring `link_type` in the schema.
+        let to_workspace = link_workspace_name(link);
         let key = (
-            link.workspace.clone(),
+            to_workspace.map(str::to_owned),
             link.project.clone(),
             link.path.as_str().to_string(),
             link.relation,
@@ -1678,7 +1679,7 @@ fn replace_links_in_tx(
             params![
                 from_page_id.as_bytes(),
                 to_page_blob,
-                link.workspace,
+                to_workspace,
                 link.project,
                 link.path.as_str(),
                 link.relation
@@ -1711,11 +1712,24 @@ fn insert_evidence_in_tx(
     Ok(())
 }
 
+/// Workspace recorded on a scoped link. A project-only `[[_global:path]]`
+/// qualifier has no workspace in the source, but the reserved preferences
+/// project lives in [`ai_memory_core::DEFAULT_WORKSPACE_NAME`] (issue #1042).
+fn link_workspace_name(link: &LinkTarget) -> Option<&str> {
+    match (link.workspace.as_deref(), link.project.as_deref()) {
+        (None, Some(ai_memory_core::GLOBAL_SCOPE_PROJECT)) => {
+            Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        }
+        (name, _) => name,
+    }
+}
+
 /// Resolve a link target to the latest page id it points at, or `None` if the
 /// target workspace / project / page does not exist yet (an unresolved forward
 /// link). A bare link resolves within the source page's own project; a
 /// `[[project:path]]` / `[[workspace/project:path]]` link resolves against the
-/// named project (same workspace when only the project is given).
+/// named project (same workspace when only the project is given). A project-only
+/// `[[_global:path]]` link always resolves in the default workspace.
 fn latest_page_id_for_link(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
@@ -1727,7 +1741,7 @@ fn latest_page_id_for_link(
             page.project_id.as_bytes().to_vec(),
         ),
         Some(project_name) => {
-            let workspace_blob: Vec<u8> = match &link.workspace {
+            let workspace_blob: Vec<u8> = match link_workspace_name(link) {
                 None => page.workspace_id.as_bytes().to_vec(),
                 Some(workspace_name) => {
                     let found: Option<Vec<u8>> = tx
@@ -1836,6 +1850,25 @@ fn refresh_incoming_links_for_path(
                 page.workspace_id.as_bytes(),
             ],
         )?;
+        // Legacy rows stored `[[_global:path]]` with `to_workspace` NULL and
+        // were only refreshed when the source page lived in the default
+        // workspace. The reserved home is always `default/_global`, so a
+        // write of that page also heals NULL-workspace `_global` edges from
+        // every workspace (issue #1042).
+        if project_name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+            && workspace_name == ai_memory_core::DEFAULT_WORKSPACE_NAME
+        {
+            tx.execute(
+                "UPDATE links \
+                 SET to_page_id = ?1 \
+                 WHERE to_project = ?2 AND to_path = ?3 AND to_workspace IS NULL",
+                params![
+                    latest_page_id.as_bytes(),
+                    ai_memory_core::GLOBAL_SCOPE_PROJECT,
+                    page.path.as_str(),
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -10878,6 +10911,162 @@ pub(crate) mod tests {
             Some(&target_id.as_bytes()[..]),
             "link must resolve across projects once the target lands"
         );
+    }
+
+    /// `[[_global:path]]` from a page outside the default workspace resolves
+    /// to the reserved `_global` project there, and the stored row names
+    /// that workspace (issue #1042).
+    #[test]
+    fn upsert_page_resolves_global_link_from_another_workspace() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let global = get_or_create_project(
+            &mut conn,
+            &default_ws,
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            None,
+        )
+        .unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+
+        let mut source = page(
+            other_ws,
+            other_proj,
+            "notes/here.md",
+            "see the standing rule",
+        );
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some(ai_memory_core::GLOBAL_SCOPE_PROJECT.into()),
+            path: PagePath::new("python-env.md").unwrap(),
+            relation: None,
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        let (to_workspace, to_project, resolved): (
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+        ) = conn
+            .query_row(
+                "SELECT to_workspace, to_project, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            to_workspace.as_deref(),
+            Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        );
+        assert_eq!(
+            to_project.as_deref(),
+            Some(ai_memory_core::GLOBAL_SCOPE_PROJECT)
+        );
+        assert!(resolved.is_none(), "forward link stays unresolved");
+
+        let target_id = upsert_page(
+            &mut conn,
+            &page(default_ws, global, "python-env.md", "use the venv"),
+        )
+        .unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "[[_global:path]] must resolve in default/_global, not other/_global"
+        );
+    }
+
+    /// Pre-fix rows stored `[[_global:path]]` with `to_workspace` NULL. A
+    /// later write of the reserved page must still pick them up.
+    #[test]
+    fn writing_a_global_page_heals_legacy_null_workspace_edges() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let global = get_or_create_project(
+            &mut conn,
+            &default_ws,
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            None,
+        )
+        .unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+
+        let source_id = upsert_page(
+            &mut conn,
+            &page(other_ws, other_proj, "notes/here.md", "body"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO links \
+                 (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
+             VALUES (?1, NULL, NULL, ?2, 'python-env.md', 'references')",
+            params![source_id.as_bytes(), ai_memory_core::GLOBAL_SCOPE_PROJECT],
+        )
+        .unwrap();
+
+        let target_id = upsert_page(
+            &mut conn,
+            &page(default_ws, global, "python-env.md", "use the venv"),
+        )
+        .unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "a NULL-workspace _global edge must resolve when default/_global is written"
+        );
+    }
+
+    /// A sibling-project `[[infra:path]]` from a non-default workspace still
+    /// resolves in that workspace, not in `default`.
+    #[test]
+    fn upsert_page_project_only_non_global_stays_in_source_workspace() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let _default_infra = get_or_create_project(&mut conn, &default_ws, "infra", None).unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+        let other_infra = get_or_create_project(&mut conn, &other_ws, "infra", None).unwrap();
+
+        let mut source = page(other_ws, other_proj, "notes/here.md", "depends on infra");
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some("infra".into()),
+            path: PagePath::new("runbooks/02.md").unwrap(),
+            relation: None,
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+        let target_id = upsert_page(
+            &mut conn,
+            &page(other_ws, other_infra, "runbooks/02.md", "the runbook"),
+        )
+        .unwrap();
+        let (to_workspace, resolved): (Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT to_workspace, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            to_workspace, None,
+            "non-global project-only stays NULL workspace"
+        );
+        assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
     }
 
     /// Store-boundary defense in depth: an unbounded handoff field or list

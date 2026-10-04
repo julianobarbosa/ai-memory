@@ -558,10 +558,11 @@ pub struct Config {
     /// `AI_MEMORY_AUTH_TOKEN` env var or `[auth].bearer_token` in
     /// config.toml.
     pub auth: AuthSettings,
-    /// `[auto_scope]` — opt-in isolation of the hook-published "current
-    /// project" pointer used by MCP tools that omit `workspace`/`project`.
-    /// Default `single` mode preserves the legacy global slot; `per_session`
-    /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
+    /// `[auto_scope]` — isolation of the hook-published "current project"
+    /// pointer used by MCP tools that omit `workspace`/`project`. The default
+    /// `per_actor` mode keys it by whatever coordinate the caller has;
+    /// `per_session` keys by `session_id`, and `single` keeps the pre-v1.39
+    /// global slot. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
     /// `[routing]` — how mid-session events whose cwd moved are attributed.
@@ -890,9 +891,10 @@ impl std::fmt::Debug for AuthSettings {
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
-/// project" pointer is shared across concurrent callers. The legacy default
-/// is `single` (process-wide slot, last-write-wins). Opt-in modes isolate
-/// concurrent agent runs and/or operators.
+/// project" pointer is shared across concurrent callers. The default is
+/// `per_actor` (since v1.39), which keys the pointer by whatever coordinate the
+/// caller has; `per_session` keys by `session_id`, and `single` keeps the
+/// pre-v1.39 process-wide slot (last-write-wins).
 ///
 /// Set under `[auto_scope]` in `config.toml` or via the
 /// `AI_MEMORY_AUTO_SCOPE__MODE`, `AI_MEMORY_AUTO_SCOPE__SESSION_TTL_SECS`,
@@ -900,7 +902,7 @@ impl std::fmt::Debug for AuthSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoScopeSettings {
-    /// `single` (default), `per_session`, or `per_actor`. See
+    /// `per_actor` (default), `per_session`, or `single`. See
     /// [`ai_memory_core::ActiveProjectMode`] for full semantics.
     pub mode: ai_memory_core::ActiveProjectMode,
     /// TTL (seconds) for per-key entries in `per_session`/`per_actor`
@@ -4565,7 +4567,8 @@ mod tests {
 
             let provider = cfg.llm_provider_config().unwrap().unwrap();
             assert_eq!(provider.provider, ProviderChoice::OpenCode, "{spelling}");
-            assert_eq!(provider.model, "claude-sonnet-4-6", "{spelling}");
+            assert_eq!(provider.model, "mimo-v2.6-flash", "{spelling}");
+            assert!(provider.base_url.is_none(), "{spelling}");
             assert_eq!(
                 provider.auth.requirement(),
                 AuthRequirement::RequiredApiKey {

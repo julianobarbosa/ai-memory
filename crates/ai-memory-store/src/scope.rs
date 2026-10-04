@@ -526,10 +526,11 @@ pub async fn resolve_many_existing_scopes_guarded(
 /// scope participates in default reads by existence, so an absent scope
 /// means "nothing to union in", never an error (issue #154).
 ///
-/// Unauthorized by design, together with [`create_global_scope`]: the global
-/// scope is unioned into everybody's default reads, and the unscoped-read
-/// filters admit it for every viewer (#708). Per-project authorization is
-/// about project scopes; the global preferences scope is common ground.
+/// Unauthorized by design: the global scope is unioned into everybody's
+/// default reads, and the unscoped-read filters admit it for every viewer
+/// (#708). Writing it is gated: the choke point admits only root or a `write`
+/// grant on it, so user-facing writes resolve it through a [`ScopeResolver`]
+/// rather than [`create_global_scope`].
 ///
 /// # Errors
 /// Propagates store failures only; a missing workspace or project is `None`.
@@ -557,8 +558,9 @@ pub async fn lookup_global_scope(
     }))
 }
 
-/// Create or fetch the reserved global preferences scope. Write-path only —
-/// the counterpart of [`lookup_global_scope`] for `scope: "global"` writes.
+/// Create or fetch the reserved global preferences scope, unauthorized.
+/// For server-internal callers and tests: a caller acting for a user resolves
+/// it through a [`ScopeResolver`], whose choke point gates the write.
 ///
 /// # Errors
 /// Propagates store failures.

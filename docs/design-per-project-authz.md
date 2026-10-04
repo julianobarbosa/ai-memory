@@ -161,7 +161,9 @@ explicitly, then grants users. Single-user/loopback is unaffected (no DB users �
    config `[auth] new_projects_restricted = true` to flip it — so secure-by-default is
    available without breaking the common case.
 2. **Global scope (`_global`)**: read-open to all authenticated users (it is shared
-   preference context), never restricted. Writes stay as today.
+   preference context), never restricted. Writing it needs root or an explicit
+   `write` grant on it (GHSA-7qj3-7wqw-m5w6): an open write there reaches every
+   user's reads, restricted projects included.
 3. **Interaction with cross-project messaging (V64)**: a `restricted` recipient inbox
    should require the sender to hold a `write` grant on the recipient project, or the
    message is refused — otherwise grants are bypassable via the mailbox. This ties #708
