@@ -252,6 +252,9 @@ pub struct BootstrapOutcome {
     /// Number of LLM calls made (1 when chunking is off or unnecessary).
     #[serde(default)]
     pub llm_chunks: usize,
+    /// Non-fatal scope-manifest repair warning supplied by the admin transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
 }
 
 /// Bootstrap configuration. Built by the CLI from `BootstrapArgs`
@@ -456,6 +459,7 @@ impl Bootstrap {
                 pages_written: Vec::new(),
                 rationale: "(dry-run; LLM not invoked)".to_string(),
                 dry_run: true,
+                manifest_warning: None,
                 llm_chunks: plan_bootstrap_chunks(kept.clone(), chunk_budget).len(),
             });
         }
@@ -664,6 +668,7 @@ impl Bootstrap {
             rationale,
             dry_run: false,
             llm_chunks,
+            manifest_warning: None,
         })
     }
 
@@ -740,6 +745,27 @@ pub fn discover_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> {
     repo.workdir()
         .map(Path::to_path_buf)
         .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
+}
+
+/// Whether git ignores `path` in the repository containing it; `None`
+/// outside any repository, or when the path cannot be related to the
+/// repository's working directory. Lets an installer that writes a file
+/// inside a checkout warn when a commit could pick it up. Honors the
+/// repository's `.gitignore` files, `.git/info/exclude`, and the global
+/// excludes file, like `git check-ignore`.
+#[must_use]
+pub fn path_is_git_ignored(path: &Path) -> Option<bool> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let repo = git2::Repository::discover(parent).ok()?;
+    let workdir = repo.workdir()?;
+    // libgit2 wants a workdir-relative path. Canonicalize both sides so a
+    // symlinked prefix (`/var` vs `/private/var` on macOS) or Windows'
+    // `\\?\` verbatim form on only one of them still strips.
+    let dir = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    let relative = dir.strip_prefix(&workdir).ok()?.join(name);
+    repo.is_path_ignored(relative).ok()
 }
 
 /// URLs of the `upstream` and `origin` remotes of the repository containing
@@ -2124,6 +2150,34 @@ mod tests {
             root.as_ref().and_then(|p| p.canonicalize().ok()),
             Some(repo.canonicalize().unwrap()),
         );
+    }
+
+    /// `path_is_git_ignored` answers like `git check-ignore`: `None` outside
+    /// a repository, otherwise whether some ignore rule covers the path. The
+    /// fixture file name is deliberately unlike anything a developer's global
+    /// excludes would already list.
+    #[test]
+    fn path_is_git_ignored_follows_the_repository_rules() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let file = repo.join("notes").join("scratch.local");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "x").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        assert_eq!(path_is_git_ignored(&file), Some(false));
+        fs::write(repo.join(".gitignore"), "notes/scratch.local\n").unwrap();
+        assert_eq!(path_is_git_ignored(&file), Some(true));
+
+        let plain = tmp.path().join("plain").join("scratch.local");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, "x").unwrap();
+        assert_eq!(path_is_git_ignored(&plain), None);
     }
 
     /// `MainRepoRoot` falls back to `Basename` semantics when no git

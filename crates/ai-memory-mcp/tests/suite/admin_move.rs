@@ -14,6 +14,7 @@
 //! (sessions/observations/handoffs) are dropped by the purge.
 
 use super::common::{post, spawn_capture_hook};
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, Sanitized,
     Sanitizer, SessionId, Tier,
@@ -318,6 +319,63 @@ async fn move_project_true_move_into_fresh_dest() {
     assert!(!src_dir.exists(), "source dir must be removed after move");
 }
 
+#[tokio::test]
+async fn move_project_merge_surfaces_destination_promotion_manifest_warning() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "src",
+        "acme-api",
+        "notes/a.md",
+        "body a",
+    )
+    .await;
+    let dst_ws = store.writer.get_or_create_workspace("dst").await.unwrap();
+    let (dst_project, _) = store
+        .writer
+        .resolve_project_by_identity(
+            dst_ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(dst_ws.to_string())
+        .join(dst_project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "acme-api", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merged_into_existing"], true, "{body}");
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
+    );
+}
+
 /// Without `confirm: true` the server returns 400 and leaves the source intact.
 #[tokio::test]
 async fn move_project_requires_confirm() {
@@ -430,6 +488,28 @@ async fn move_project_same_workspace_rejected() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "w", "project": "proj", "to_workspace": "w", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// A private profile (`default/_profile.<user id>`) cannot be moved out of
+/// the default workspace: its owner finds it there, so a move would orphan it.
+/// The refusal comes before any lookup, so nothing is touched.
+#[tokio::test]
+async fn move_project_refuses_a_private_profile() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "_profile.00000000000000000000000000000001",
+            "to_workspace": "elsewhere",
+            "confirm": true
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -848,12 +928,10 @@ async fn ids(
     (ws_id, proj_id)
 }
 
-/// W1: when the on-disk dir rename fails mid true-move, the SQL re-stamp is
-/// rolled back so NOTHING moves (no DB-ahead-of-disk split-brain). We force the
-/// rename to fail by planting a FILE where the destination workspace dir would
-/// be created.
+/// A non-directory namespace component is refused before the project move, so
+/// neither disk nor SQLite changes.
 #[tokio::test]
-async fn true_move_rolls_back_when_dir_rename_fails() {
+async fn true_move_refuses_an_invalid_destination_namespace_without_db_changes() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
@@ -882,7 +960,7 @@ async fn true_move_rolls_back_when_dir_rename_fails() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("nothing changed"),
+            .contains("not a directory"),
         "{body}"
     );
 
@@ -2946,7 +3024,7 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
 }
 
 #[tokio::test]
-async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
+async fn delete_workspace_refuses_invalid_namespace_before_db_or_notification() {
     let (url, rx) = spawn_capture_hook().await;
 
     let tmp = TempDir::new().unwrap();
@@ -2978,28 +3056,28 @@ async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notificati
     )
     .await;
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_json(resp).await;
     assert!(
-        body["files_deleted"].as_array().unwrap().is_empty(),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a directory"),
         "{body}"
     );
-    assert_eq!(body["files_failed"].as_array().unwrap().len(), 1, "{body}");
     assert!(
         store
             .reader
             .find_workspace("victim".into())
             .await
             .unwrap()
-            .is_none(),
-        "DB delete should still commit and be reported as partial filesystem failure"
+            .is_some(),
+        "namespace refusal must leave DB rows intact"
     );
-
-    let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
-        .await
-        .expect("async purge_workspace dispatch should fire")
-        .unwrap();
-    assert_eq!(payload["ctx"]["op"], "purge_workspace");
-    assert_eq!(payload["ctx"]["workspace"], "victim");
-    assert_eq!(payload["ctx"]["partial_failure"], true);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .is_err(),
+        "a refused operation must not notify observers"
+    );
 }

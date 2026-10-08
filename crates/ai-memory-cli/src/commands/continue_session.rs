@@ -78,6 +78,8 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 fresh: args.fresh,
                 force_unlock: false,
                 no_autowire: false,
+                require_server: false,
+                profile: None,
                 env: Vec::new(),
                 env_file: None,
                 // Bare mode: `run` resolves the harness that owns the newest

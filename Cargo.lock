@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -106,12 +106,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "ai-memory-core"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -163,6 +163,7 @@ dependencies = [
  "axum",
  "git2",
  "jiff",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -175,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -204,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -239,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -265,11 +266,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "2.5.2"
+version = "2.6.1"
 
 [[package]]
 name = "ai-memory-web"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-store",
@@ -277,6 +278,7 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64 0.22.1",
  "jiff",
  "pulldown-cmark",
  "serde",
@@ -292,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -324,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "2.5.2"
+version = "2.6.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",

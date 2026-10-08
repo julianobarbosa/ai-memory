@@ -98,3 +98,47 @@ fn integration_tests_cost_at_most_one_binary_per_crate() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// Every function a CodeQL model under `.github/codeql/extensions` names must
+/// still exist where its path says. A renamed or moved function would leave
+/// the model matching nothing, and the alerts it clears would silently return.
+#[test]
+fn codeql_model_targets_exist() {
+    let repo_root = crates_dir()
+        .parent()
+        .expect("crates/ lives in the repository root")
+        .to_path_buf();
+    let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
+    let mut targets = 0;
+    let mut problems = Vec::new();
+    for entry in fs::read_dir(&models_dir)
+        .expect("read the CodeQL model dir")
+        .flatten()
+    {
+        let text = fs::read_to_string(entry.path()).expect("read model file");
+        for target in text
+            .split('"')
+            .filter(|token| token.starts_with("ai_memory_cli::"))
+        {
+            targets += 1;
+            let mut segments: Vec<&str> = target.split("::").skip(1).collect();
+            let function = segments.pop().expect("a path names a function");
+            let file = crates_dir()
+                .join("ai-memory-cli/src")
+                .join(format!("{}.rs", segments.join("/")));
+            let source = fs::read_to_string(&file).unwrap_or_default();
+            if !source.contains(&format!("fn {function}(")) {
+                problems.push(format!(
+                    "{target}: no `fn {function}(` in {}",
+                    file.display()
+                ));
+            }
+        }
+    }
+    assert!(targets > 0, "the model dir names no ai_memory_cli function");
+    assert!(
+        problems.is_empty(),
+        "stale CodeQL model targets:\n{}",
+        problems.join("\n")
+    );
+}

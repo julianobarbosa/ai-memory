@@ -49,6 +49,7 @@ case "$AGENT" in
     claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi) ;;
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
+    open-code) AGENT="opencode" ;;
     opencode-v2|open-code2) AGENT="opencode2" ;;
     *)
         echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi)" >&2
@@ -67,7 +68,7 @@ fi
 if [[ "$AGENT" == "opencode" ]]; then
     echo "OpenCode uses a generated TypeScript plugin, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent opencode --apply"
-    echo "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts."
+    echo "Then restart OpenCode; ai-memory detects V1/V2 and prints the installed plugin path."
     exit 0
 fi
 

@@ -246,8 +246,9 @@ mod tests {
                 "Static MCP clients",
                 "must pass `workspace` and `project` together on every project-scoped call",
                 "nearest `.ai-memory.toml`",
-                "never guess them from a directory name",
-                "never rely on the server's last active project",
+                "normalized `upstream`, then `origin`",
+                "folder basename only when no valid remote exists",
+                "Never rely on the server's last active project",
                 "`global=true` must omit `workspace`, `project`, and `scopes`",
                 "`scope: \"global\"`",
             ] {

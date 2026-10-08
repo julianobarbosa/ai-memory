@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
 use crate::marker::{
-    find_marker, find_settings_marker, is_truthy, parse_toml_flag, parse_toml_key,
-    repo_root_project,
+    RoutingSelection, RoutingSource, find_marker, find_settings_marker, is_truthy, parse_toml_flag,
+    parse_toml_key, repo_root_project, routing_selection,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
@@ -281,9 +281,9 @@ pub fn url_encode(s: &str) -> String {
 /// `default_strategy` is the install-time default baked into the native hook
 /// command by `install-hooks --project-strategy` (passed via the `hook
 /// --project-strategy` flag). It fills `project_strategy` only when no marker
-/// pinned one — a marker's explicit `project` / `project_strategy` always win
-/// (§3.3). repo-root is resolved here, host-side, because a containerized
-/// server cannot see this checkout.
+/// pins one. A marker's explicit `project` or `identity` and operator-home
+/// routing win; otherwise a valid remote's canonical path wins, and repo-root
+/// is only the host-side no-valid-remote fallback.
 pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     marker_query_suffix_impl(cwd, default_strategy, true)
 }
@@ -314,24 +314,298 @@ pub fn marker_requests_briefing(cwd: &str) -> bool {
         .is_some_and(|value| is_truthy(&value))
 }
 
+/// Host-side routing hints sent with native lifecycle events.
+/// Missing names are left to the server; this inspection creates no scope.
+#[derive(Debug, serde::Serialize)]
+pub struct HookScope {
+    #[serde(serialize_with = "serialize_scope_hint")]
+    workspace: Option<String>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    project: Option<String>,
+    project_src: Option<&'static str>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    project_strategy: Option<String>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    identity: Option<String>,
+    identity_src: Option<&'static str>,
+    identity_style: Option<&'static str>,
+    aliases: Option<String>,
+    server_may_remap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RepositoryCoordinateEvidence {
+    pub(crate) marker_status: &'static str,
+    pub(crate) scope_source: &'static str,
+    pub(crate) identity_source: Option<String>,
+    pub(crate) identity_style: Option<String>,
+    pub(crate) canonical_candidate: Option<String>,
+    pub(crate) legacy_candidate: Option<String>,
+    pub(crate) messages: Vec<String>,
+}
+
+pub(crate) struct RepositoryCoordinateInspection {
+    pub(crate) evidence: RepositoryCoordinateEvidence,
+    pub(crate) repository: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+}
+
+const MAX_SCOPE_HINT_BYTES: usize = 512;
+
+fn serialize_scope_hint<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &value
+            .as_deref()
+            .filter(|value| value.len() <= MAX_SCOPE_HINT_BYTES),
+        serializer,
+    )
+}
+
+impl HookScope {
+    /// Whether all routing hints fit the bounded inspection response.
+    #[must_use]
+    pub fn is_inspectable(&self) -> bool {
+        [
+            &self.workspace,
+            &self.project,
+            &self.project_strategy,
+            &self.identity,
+        ]
+        .into_iter()
+        .all(|value| {
+            value
+                .as_ref()
+                .is_none_or(|value| value.len() <= MAX_SCOPE_HINT_BYTES)
+        })
+    }
+
+    /// Whether only one name was explicitly declared in the marker.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        (self.workspace.is_some() || self.project_src == Some("marker")) && !self.is_explicit()
+    }
+
+    /// Whether both names were resolved on the host.
+    #[must_use]
+    pub fn is_explicit(&self) -> bool {
+        self.workspace
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+            && self
+                .project
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+    }
+}
+
+/// Inspect the same marker, worktree and repository identity as hook routing.
+#[must_use]
+pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
+    hook_scope_from_selection(cwd, default_strategy, routing_selection(cwd).ok().flatten())
+}
+
+pub(crate) fn inspect_repository_coordinate(
+    identity_cwd: &str,
+    marker: &crate::marker::MarkerInspection,
+    explicit_workspace: Option<&str>,
+    explicit_project: Option<&str>,
+) -> RepositoryCoordinateInspection {
+    let declared_project = if explicit_project.is_some_and(|value| !value.is_empty()) {
+        None
+    } else {
+        marker.fields.project.as_deref()
+    };
+    let repository = marker.route_identity.clone().or_else(|| {
+        repository_identity(
+            identity_cwd,
+            marker.fields.identity.as_deref(),
+            declared_project,
+        )
+    });
+    let identity_style = repository.as_ref().and_then(|identity| {
+        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote)
+            .then(|| forwarded_identity_style(marker.fields.identity_style.as_deref()).to_owned())
+    });
+    RepositoryCoordinateInspection {
+        evidence: RepositoryCoordinateEvidence {
+            marker_status: marker.status,
+            scope_source: match (
+                explicit_workspace.is_some_and(|value| !value.is_empty()),
+                explicit_project.is_some_and(|value| !value.is_empty()),
+                marker.scope.is_some(),
+            ) {
+                (true, true, _) => "cli",
+                (true, false, _) | (false, true, _) => "cli_and_marker_or_fallback",
+                (false, false, true) => "marker_or_fallback",
+                _ => "fallback",
+            },
+            identity_source: repository
+                .as_ref()
+                .map(|identity| identity.source.as_str().to_owned()),
+            identity_style,
+            canonical_candidate: repository
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::path_style_name),
+            legacy_candidate: repository
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::legacy_basename_name),
+            messages: match marker.status {
+                "invalid_home_routes" => {
+                    vec!["invalid home route map; marker routing was refused".to_owned()]
+                }
+                "invalid" => vec!["invalid marker TOML; marker routing was ignored".to_owned()],
+                "unreadable" => vec!["unreadable marker; marker routing was ignored".to_owned()],
+                "conflicting" => {
+                    vec!["conflicting marker settings; marker routing was ignored".to_owned()]
+                }
+                "ignored" => vec!["marker ignored by configuration".to_owned()],
+                _ => Vec::new(),
+            },
+        },
+        repository,
+    }
+}
+
+fn hook_scope_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    selection: Option<RoutingSelection>,
+) -> HookScope {
+    let workspace = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.workspace.clone());
+    let mut project = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.project.clone());
+    let mut strategy = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.project_strategy.clone());
+    let explicit_identity = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.identity.clone());
+    let style = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.identity_style.clone());
+    let mut aliases =
+        selection
+            .as_ref()
+            .and_then(|selection| match selection.fields.aliases.clone() {
+                Ok(Some(aliases)) if !aliases.is_empty() => serde_json::to_string(&aliases).ok(),
+                Ok(_) => None,
+                Err(_) => Some("invalid".to_owned()),
+            });
+    let canonical_project = project.clone();
+    let routed = selection.as_ref().is_some_and(|selection| {
+        matches!(
+            selection.source,
+            RoutingSource::HomeIdentityRoute | RoutingSource::HomePathRoute
+        )
+    });
+    let mut project_src = project.as_ref().map(|_| "marker");
+    let identity = if routed {
+        selection.and_then(|selection| selection.remote_identity)
+    } else if aliases.is_none() {
+        repository_identity(cwd, explicit_identity.as_deref(), project.as_deref())
+    } else {
+        repository_identity(cwd, None, None).filter(|identity| {
+            identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+        })
+    };
+    if aliases.is_some()
+        && identity.as_ref().is_none_or(|identity| {
+            identity.source != ai_memory_core::repository_identity::IdentitySource::GitRemote
+        })
+    {
+        aliases = if routed {
+            None
+        } else {
+            Some("invalid".to_owned())
+        };
+    } else if aliases.is_some() && canonical_project.is_none() {
+        aliases = Some("invalid".to_owned());
+    }
+    if strategy.is_none() {
+        strategy = default_strategy.map(str::to_owned);
+    }
+    if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
+        project = repo_root_project(cwd);
+        project_src = project.as_ref().map(|_| "repo-root");
+    }
+    // Only a remote has a host to drop, so the style travels with a remote
+    // identity and nothing else (#1033).
+    let identity_style = identity.as_ref().and_then(|identity| {
+        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote)
+            .then(|| forwarded_identity_style(style.as_deref()))
+    });
+    let (identity, identity_src) = match identity {
+        Some(identity) => (Some(identity.identity), Some(identity.source.as_str())),
+        None => (None, None),
+    };
+    let server_may_remap = project_src != Some("marker") || identity.is_some();
+    HookScope {
+        workspace,
+        project,
+        project_src,
+        project_strategy: strategy,
+        identity,
+        identity_src,
+        identity_style,
+        aliases,
+        server_may_remap,
+    }
+}
+
+/// The `identity_style` every Phase-5 client sends with a valid git remote.
+/// Explicit marker/home-route values win; omission emits `path`. The server
+/// keeps omitted wire input as legacy `host_path` for old-client compatibility.
+fn forwarded_identity_style(raw: Option<&str>) -> &'static str {
+    use ai_memory_core::repository_identity::IdentityStyle;
+    raw.and_then(IdentityStyle::from_str_opt)
+        .unwrap_or(IdentityStyle::Path)
+        .as_str()
+}
+
+/// A resolved marker's `[profile]` flag as the explicit value the hook
+/// forwards: `0` for a falsy value, `1` for anything else, an absent key
+/// included.
+fn profile_flag_value(raw: Option<String>) -> &'static str {
+    if raw.as_deref().is_some_and(crate::marker::is_falsy) {
+        "0"
+    } else {
+        "1"
+    }
+}
+
 fn marker_query_suffix_impl(
     cwd: &str,
     default_strategy: Option<&str>,
     include_briefing: bool,
 ) -> String {
+    let selection = match routing_selection(cwd) {
+        Ok(selection) => selection,
+        Err(_) => return String::new(),
+    };
+    marker_query_suffix_impl_from_selection(cwd, default_strategy, include_briefing, selection)
+}
+
+fn marker_query_suffix_impl_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    include_briefing: bool,
+    selection: Option<RoutingSelection>,
+) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
-    let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
-        (None, None, None, None, None);
+    let marker = selection.as_ref().map(|selection| selection.path.clone());
+    let scope = hook_scope_from_selection(cwd, default_strategy, selection);
+    let (mut drop_subagent, mut default_global) = (None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
-    let mut explicit_identity = None;
+    let (mut profile_contribute, mut profile_consume) = (None, None);
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
-    if let Some(marker) = find_settings_marker(cwd) {
-        workspace = parse_toml_key(&marker, "workspace");
-        project = parse_toml_key(&marker, "project");
-        explicit_identity = parse_toml_key(&marker, "identity");
-        strategy = parse_toml_key(&marker, "project_strategy");
+    if let Some(marker) = marker {
         drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
         // `[recall] default_global = true` (or top-level; quoted or bare) —
         // a meta-repo opts every default-scoped read into a global search.
@@ -341,40 +615,37 @@ fn marker_query_suffix_impl(
         // appended to the session-start handoff fetch (#176).
         briefing = parse_toml_flag(&marker, "inject_on_session_start");
         briefing_budget = parse_toml_flag(&marker, "max_chars");
+        // `[profile] contribute` / `consume` (quoted or bare), always sent
+        // explicitly once a marker resolved: a falsy value sends `0`, anything
+        // else (an absent key included) `1`. Removing the key re-enables; no
+        // marker sends nothing, so the server keeps what it stored.
+        profile_contribute = Some(profile_flag_value(parse_toml_flag(&marker, "contribute")));
+        profile_consume = Some(profile_flag_value(parse_toml_flag(&marker, "consume")));
     }
-    // Provenance of `project`, forwarded as `project_src` so the server can
-    // tell a deliberate marker rescope from a host-derived repo-root name.
-    // Only the latter may yield to session-sticky attribution (#394).
-    let mut project_src = project.as_ref().map(|_| "marker");
-    // Resolved before repo-root can fill `project` below: a repo-root name is
-    // an inference, while the chain's `manifest` rung means a name somebody
-    // wrote in the marker.
-    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
-    if strategy.is_none() {
-        strategy = default_strategy.map(str::to_owned);
-    }
-    if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
-        project = repo_root_project(cwd);
-        project_src = project.as_ref().map(|_| "repo-root");
-    }
-    if let Some(val) = workspace {
+    if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
     }
-    if let Some(val) = project {
+    if let Some(val) = scope.project {
         qs.push_str(&format!("&project={}", url_encode(&val)));
     }
-    if let Some(val) = project_src {
+    if let Some(val) = scope.project_src {
         qs.push_str(&format!("&project_src={val}"));
     }
-    if let Some(val) = strategy {
+    if let Some(val) = scope.project_strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
     }
-    if let Some(identity) = identity {
+    if let (Some(identity), Some(source)) = (scope.identity, scope.identity_src) {
         qs.push_str(&format!(
             "&identity={}&identity_src={}",
-            url_encode(&identity.identity),
-            identity.source.as_str()
+            url_encode(&identity),
+            source
         ));
+    }
+    if let Some(style) = scope.identity_style {
+        qs.push_str(&format!("&identity_style={style}"));
+    }
+    if let Some(aliases) = scope.aliases {
+        qs.push_str(&format!("&aliases={}", url_encode(&aliases)));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
     // the `drop_subagent` flag so the server scopes the drop to this project.
@@ -387,6 +658,15 @@ fn marker_query_suffix_impl(
     // tools search globally. Truthiness is decided server-side.
     if let Some(val) = default_global.filter(|v| !v.is_empty()) {
         qs.push_str(&format!("&default_global={}", url_encode(&val)));
+    }
+    // Per-project `[profile]` settings: the server records `contribute` on the
+    // project for harvesting, and `consume = false` suppresses the digest and
+    // the profile union for this project.
+    if let Some(val) = profile_contribute {
+        qs.push_str(&format!("&profile_contribute={val}"));
+    }
+    if let Some(val) = profile_consume {
+        qs.push_str(&format!("&profile_consume={val}"));
     }
     // Per-repo session-start brief opt-in: forwarded on every request for
     // simplicity (the capture path ignores it); only the `/handoff` GET at
@@ -462,7 +742,7 @@ pub enum PostOutcome {
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
     /// Any other non-2xx: the server answered and refused. A genuine miss
-    /// that should count against `MAX_ATTEMPTS`.
+    /// that should count against the retry limit.
     Failed,
     /// The request never reached a server — connection refused, DNS failure,
     /// or timeout. Distinguished from [`Self::Failed`] because it says
@@ -477,7 +757,7 @@ pub enum PostOutcome {
     ///
     /// Terminal, and that is the whole point of separating it from
     /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
-    /// it exhausts `MAX_ATTEMPTS`, and every one of those attempts is
+    /// it exhausts the retry limit, and every one of those attempts is
     /// guaranteed to be refused for the same reason. Retrying something that
     /// cannot succeed is how a parse failure once cost this project 10.7M
     /// tokens in a day. The entry is dropped on the spot.
@@ -815,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn post_hook_refused_on_403_is_terminal_not_a_failure() {
         // 403 means the server will never accept this event. Classifying it as
-        // `Failed` would re-send it until it burnt `MAX_ATTEMPTS`, and every
+        // `Failed` would re-send it until it burnt the retry limit, and every
         // attempt would be refused identically — the shape of retry loop that
         // once cost this project 10.7M tokens in a day. It must be its own
         // outcome so the drain can drop it on the spot.
@@ -827,6 +1107,39 @@ mod tests {
             PostOutcome::Failed,
             "a refusal must never be charged a retry attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn post_hook_408_and_425_are_retryable_failed_not_refused() {
+        // 408 (request timeout) and 425 (too early) say "retry me", not
+        // "never": they must fall through to `Failed` so the spool keeps the
+        // entry queued subject to the attempt limit. Classifying every 4xx as
+        // a terminal refusal deleted such events on the spot (#1092
+        // regression).
+        for status in ["408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "retry later").await;
+            let outcome =
+                post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+            assert_ne!(
+                outcome,
+                PostOutcome::Refused,
+                "{status} is retryable and must not be terminal"
+            );
+            assert_eq!(outcome, PostOutcome::Failed, "{status} is a retryable miss");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_batch_unhandled_4xx_is_retryable_failed() {
+        // Base semantics: only 401/404/405/429 are special-cased for batches;
+        // every other status — 400, and retryable timeouts like 408/425 — is
+        // a `Failed` with an unknown outcome, never a terminal refusal.
+        for status in ["400 Bad Request", "408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "invalid batch").await;
+            let outcome =
+                post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
+            assert_eq!(outcome, BatchOutcome::Failed, "{status} is retryable");
+        }
     }
 
     #[tokio::test]
@@ -997,7 +1310,7 @@ mod tests {
         };
         let qs = marker_query_suffix(repo.path().to_str().unwrap(), None);
         assert!(
-            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote"),
+            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path"),
             "{qs}"
         );
         assert!(
@@ -1017,6 +1330,11 @@ mod tests {
             "{qs}"
         );
         assert!(!qs.contains("s3cret"), "{qs}");
+        let scope =
+            serde_json::to_value(hook_scope(origin_only.path().to_str().unwrap(), None)).unwrap();
+        assert_eq!(scope["identity"], "git.example.test/fork/api");
+        assert_eq!(scope["identity_src"], "git_remote");
+        assert!(!scope.to_string().contains("s3cret"));
     }
 
     /// A declared `project` outranks the remote and routes by name, so nothing
@@ -1050,6 +1368,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn marker_aliases_keep_project_canonical_and_forward_remote_identity() {
+        let Some(repo) = repo_with_remotes(&[("origin", "git@git.example.test:acme/api.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "project = \"acme-api\"\naliases = [\" former-name \", \"legacy_name\", \"former-name\"]\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        let url = reqwest::Url::parse(&format!("http://localhost/handoff?agent=test{qs}")).unwrap();
+        let params = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(params.get("project").map(String::as_str), Some("acme-api"));
+        assert_eq!(
+            params.get("identity").map(String::as_str),
+            Some("git.example.test/acme/api")
+        );
+        assert_eq!(
+            params.get("identity_src").map(String::as_str),
+            Some("git_remote")
+        );
+        assert_eq!(
+            params.get("aliases").map(String::as_str),
+            Some("[\"former-name\",\"legacy_name\"]")
+        );
+    }
+
+    /// #1033: every valid remote carries a style. Omission and invalid marker
+    /// values send `path`; explicit `host_path` remains the opt-out. A declared
+    /// project or identity has no inferred remote style.
+    #[test]
+    fn marker_query_suffix_forwards_the_path_style_with_a_remote_identity() {
+        let Some(repo) = repo_with_remotes(&[("origin", "git@git.example.test:acme/api.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        let marker = repo.path().join(".ai-memory.toml");
+
+        std::fs::write(&marker, "").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=path"),
+            "{qs}"
+        );
+
+        std::fs::write(&marker, "identity_style = \"path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=path"),
+            "{qs}"
+        );
+        let scope = serde_json::to_value(hook_scope(cwd, None)).unwrap();
+        assert_eq!(scope["identity_style"], "path");
+
+        std::fs::write(&marker, "identity_style = \"host_path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=host_path"),
+            "{qs}"
+        );
+
+        std::fs::write(&marker, "identity_style = \"Path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(qs.contains("&identity_style=path"), "{qs}");
+
+        for (body, why) in [
+            (
+                "identity_style = \"path\"\nproject = \"api\"\n",
+                "a declared project routes by name",
+            ),
+            (
+                "identity_style = \"path\"\nidentity = \"acme/api\"\n",
+                "a declared identity keeps its own name",
+            ),
+        ] {
+            std::fs::write(&marker, body).unwrap();
+            let qs = marker_query_suffix(cwd, None);
+            assert!(!qs.contains("identity_style"), "{why}: {qs}");
+        }
+    }
+
+    /// The forwarding decision every client makes, against the shared fixture.
+    #[test]
+    fn forwarded_identity_style_matches_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-core/fixtures/remote_identity_cases.json"
+        ))
+        .unwrap();
+        for case in cases["identity_style"].as_array().unwrap() {
+            let value = case["value"].as_str().unwrap();
+            let expected = case["style"].as_str().unwrap_or("path");
+            assert_eq!(forwarded_identity_style(Some(value)), expected, "{value:?}");
+        }
+        assert_eq!(forwarded_identity_style(None), "path");
+    }
+
     /// No repository, no remote, no declaration: nothing to send, and the
     /// server routes by folder name exactly as before.
     #[test]
@@ -1057,6 +1478,87 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!qs.contains("identity"), "{qs}");
+    }
+
+    #[test]
+    fn matched_home_route_keeps_root_behavior_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("src/api/lib");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\nproject_strategy=\"repo-root\"\ndrop_subagent_captures=\"true\"\n[recall]\ndefault_global=true\n[briefing]\ninject_on_session_start=true\nmax_chars=3210\n[profile]\ncontribute=true\nconsume=false\n[routes.path.\"~/src/api\"]\nroute_workspace=\"right\"\nroute_project=\"api\"\n",
+        )
+        .unwrap();
+        let selection = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap();
+        let query =
+            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, true, selection);
+        for expected in [
+            "&workspace=right",
+            "&project=api",
+            "&drop_subagent=true",
+            "&default_global=true",
+            "&briefing=true",
+            "&briefing_budget=3210",
+            "&profile_contribute=1",
+            "&profile_consume=0",
+        ] {
+            assert!(query.contains(expected), "{expected}: {query}");
+        }
+        assert!(!query.contains("project_strategy="), "{query}");
+        assert!(!query.contains("workspace=wrong"), "{query}");
+    }
+
+    #[test]
+    fn non_git_home_path_route_omits_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("src/api");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "[routes.path.\"~/src/api\"]\nroute_workspace=\"path\"\nroute_project=\"api\"\nroute_aliases=[\"old-api\"]\n",
+        )
+        .unwrap();
+        let selection = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap();
+        let query =
+            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, false, selection);
+        assert!(query.contains("&workspace=path&project=api"), "{query}");
+        assert!(!query.contains("aliases="), "{query}");
+        assert!(!query.contains("identity_src="), "{query}");
+    }
+
+    #[test]
+    fn invalid_home_routes_produce_no_hook_scope_or_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\n[routes.path.\"relative\"]\nroute_workspace=\"route\"\nroute_project=\"route\"\n",
+        )
+        .unwrap();
+        let result = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1081,6 +1583,44 @@ drop_subagent_captures = "true"
         assert!(qs.contains("&project=infra"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
         assert!(qs.contains("&drop_subagent=true"), "{qs}");
+    }
+
+    /// `[profile] contribute` / `consume` are forwarded as written (quoted or
+    /// bare) for the server to interpret, and a marker that sets only them is
+    /// a settings boundary; a marker without them forwards nothing.
+    #[test]
+    fn marker_query_suffix_forwards_the_profile_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "[profile]\ncontribute = false\nconsume = \"no\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(qs.contains("&profile_contribute=0"), "{qs}");
+        assert!(qs.contains("&profile_consume=0"), "{qs}");
+        assert!(
+            !qs.contains("workspace=outer"),
+            "a [profile] marker is a boundary: {qs}"
+        );
+        // A resolved marker without the keys states the defaults explicitly,
+        // so removing an opt-out from the marker turns it back on.
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(
+            outer.contains("&profile_contribute=1&profile_consume=1"),
+            "{outer}"
+        );
+        // No marker at all: nothing is sent, so the server keeps what it stored.
+        let bare = tempfile::TempDir::new().unwrap();
+        let none = marker_query_suffix(bare.path().to_str().unwrap(), None);
+        assert!(!none.contains("profile_"), "{none}");
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so
@@ -1239,7 +1779,7 @@ drop_subagent_captures = "true"
         if !std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["worktree", "add", "-q"])
+            .args(["worktree", "add", "-q", "-b", "feat/worktree-inspection"])
             .arg(&wt)
             .status()
             .unwrap()
@@ -1257,6 +1797,13 @@ drop_subagent_captures = "true"
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(qs.contains("&project=acme-api"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+        let scope = hook_scope(wt.to_str().unwrap(), None);
+        assert!(scope.is_explicit());
+        let scope = serde_json::to_value(scope).unwrap();
+        assert_eq!(scope["workspace"], "oss");
+        assert_eq!(scope["project"], "acme-api");
+        assert_eq!(scope["project_src"], "repo-root");
+        assert_eq!(scope["server_may_remap"], true);
     }
 
     // ── install-time default strategy (#128), no marker required ──────

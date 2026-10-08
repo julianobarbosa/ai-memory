@@ -13,7 +13,7 @@ use ai_memory_core::{
     ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, ReadPointer, UserId, WorkspaceId,
 };
 
-use crate::error::StoreError;
+use crate::error::{AmbiguousProjectHolders, StoreError};
 use crate::project_authz::{GrantLevel, ProjectAccess, ProjectPrincipal};
 use crate::{ReaderPool, WriterHandle};
 
@@ -53,6 +53,15 @@ pub struct ResolvedScope {
     pub workspace_id: WorkspaceId,
     /// Project id inside the workspace.
     pub project_id: ProjectId,
+}
+
+/// Result of write-scope resolution, including a committed name promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWriteScope {
+    /// Stable workspace/project ids selected for the write.
+    pub scope: ResolvedScope,
+    /// Previous name when this resolution promoted the row in place.
+    pub promoted_from: Option<String>,
 }
 
 impl ResolvedScope {
@@ -167,6 +176,15 @@ pub enum ScopeResolutionError {
         /// Project name supplied by the caller.
         project: String,
     },
+    /// A compatibility key matched more than one project in the workspace.
+    ProjectNameAmbiguous {
+        /// Workspace name supplied by the caller.
+        workspace: String,
+        /// Project name supplied by the caller.
+        project: String,
+        /// The projects that answer to the name, when the lookup knows them.
+        holders: AmbiguousProjectHolders,
+    },
     /// A project-only read did not resolve in either the actor's active
     /// workspace or the server's default workspace.
     ProjectNotFoundInActiveOrDefault {
@@ -196,6 +214,7 @@ impl ScopeResolutionError {
                 | ScopeResolutionError::ScopeWorkspaceEmpty
                 | ScopeResolutionError::ScopeProjectEmpty
                 | ScopeResolutionError::TooManyScopes { .. }
+                | ScopeResolutionError::ProjectNameAmbiguous { .. }
                 | ScopeResolutionError::AmbiguousUnscopedWrite
         )
     }
@@ -240,6 +259,30 @@ impl fmt::Display for ScopeResolutionError {
                 write!(
                     f,
                     "project '{project}' not found in workspace '{workspace}'"
+                )?;
+                // A project name never contains '/', so this is a
+                // `workspace/project` label passed as the project (#1152).
+                if let Some((ws, proj)) = project.split_once('/')
+                    && !ws.is_empty()
+                    && !proj.is_empty()
+                    && !proj.contains('/')
+                {
+                    write!(
+                        f,
+                        "; project names never contain '/': pass workspace \"{ws}\" and \
+                         project \"{proj}\" as separate arguments"
+                    )?;
+                }
+                Ok(())
+            }
+            ScopeResolutionError::ProjectNameAmbiguous {
+                workspace,
+                project,
+                holders,
+            } => {
+                write!(
+                    f,
+                    "project '{project}' is ambiguous in workspace '{workspace}'{holders}"
                 )
             }
             ScopeResolutionError::ProjectNotFoundInActiveOrDefault { project } => {
@@ -262,6 +305,22 @@ impl std::error::Error for ScopeResolutionError {}
 impl From<StoreError> for ScopeResolutionError {
     fn from(value: StoreError) -> Self {
         ScopeResolutionError::Store(value.to_string())
+    }
+}
+
+fn project_lookup_error(error: StoreError, workspace: &str, project: &str) -> ScopeResolutionError {
+    match error {
+        StoreError::ProjectNameAmbiguous { holders, .. } => {
+            ScopeResolutionError::ProjectNameAmbiguous {
+                workspace: workspace.to_owned(),
+                project: project.to_owned(),
+                holders,
+            }
+        }
+        StoreError::Forbidden(message) => ScopeResolutionError::Forbidden(format!(
+            "not authorized for {project}: this needs write access. {message}"
+        )),
+        other => other.into(),
     }
 }
 
@@ -294,8 +353,9 @@ pub async fn lookup_existing_scope(
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     let workspace_id = lookup_existing_workspace(reader, workspace).await?;
     let project_id = reader
-        .find_project(workspace_id, project.to_owned())
-        .await?
+        .resolve_existing_project_name(workspace_id, project.to_owned())
+        .await
+        .map_err(|error| project_lookup_error(error, workspace, project))?
         .ok_or_else(|| ScopeResolutionError::ProjectNotFoundInWorkspace {
             workspace: workspace.to_owned(),
             project: project.to_owned(),
@@ -330,14 +390,18 @@ pub async fn create_explicit_scope(
     writer: &WriterHandle,
     workspace: &str,
     project: &str,
-) -> Result<ResolvedScope, ScopeResolutionError> {
+) -> Result<ResolvedWriteScope, ScopeResolutionError> {
     let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
-    let project_id = writer
-        .get_or_create_project(workspace_id, project.to_owned(), None)
-        .await?;
-    Ok(ResolvedScope {
-        workspace_id,
-        project_id,
+    let resolved = writer
+        .resolve_project_name_for_write(workspace_id, project.to_owned(), None, false)
+        .await
+        .map_err(|error| project_lookup_error(error, workspace, project))?;
+    Ok(ResolvedWriteScope {
+        scope: ResolvedScope {
+            workspace_id,
+            project_id: resolved.project_id,
+        },
+        promoted_from: resolved.promoted_from,
     })
 }
 
@@ -469,6 +533,8 @@ pub async fn lookup_existing_scope_guarded(
 }
 
 /// [`create_explicit_scope`] on behalf of `viewer`, authorized for a write.
+/// Returns promotion metadata that the runtime caller must use to refresh the
+/// scope manifest after the SQL transaction commits.
 ///
 /// A project this call creates records `viewer` as its creator in the same
 /// transaction, and the choke point admits a creator, so they can write to and
@@ -485,16 +551,219 @@ pub async fn create_explicit_scope_guarded(
     workspace: &str,
     project: &str,
     viewer: Option<UserId>,
-) -> Result<ResolvedScope, ScopeResolutionError> {
+) -> Result<ResolvedWriteScope, ScopeResolutionError> {
+    let _ = reader;
+    refuse_foreign_profile_name(Some(workspace), project, viewer)?;
     let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
-    let (project_id, _) = writer
-        .get_or_create_project_as(workspace_id, project.to_owned(), None, viewer)
-        .await?;
+    create_project_in_workspace_guarded(writer, workspace_id, project, viewer, true).await
+}
+
+/// Refusal for an explicit write that names a profile project it does not own.
+pub const PROFILE_NAME_RESERVED: &str = "profile projects are reserved: write profile entries \
+     with scope \"profile\", which resolves your own profile";
+
+/// A database user may name exactly one profile project explicitly: their own
+/// private profile, `default/_profile.<their id>`. Any other `_profile` or
+/// `_profile.*` name is refused before anything is created, so a user cannot
+/// create (squat) another operator's private profile and lock its owner out,
+/// nor create a workspace profile outside the profile path. A caller with no
+/// database user (root, or a single-user server) may, for repair.
+///
+/// `workspace` is the name the caller gave; `None` (the workspace inferred
+/// from the active project or the server default) never matches, so a user
+/// names `default` explicitly to reach their own private profile this way.
+fn refuse_foreign_profile_name(
+    workspace: Option<&str>,
+    project: &str,
+    viewer: Option<UserId>,
+) -> Result<(), ScopeResolutionError> {
+    if !ai_memory_core::profile::is_profile_project(project) {
+        return Ok(());
+    }
+    let Some(viewer) = viewer else {
+        return Ok(());
+    };
+    if workspace == Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        && project == ai_memory_core::profile::user_profile_project(viewer)
+    {
+        return Ok(());
+    }
+    Err(ScopeResolutionError::Forbidden(
+        PROFILE_NAME_RESERVED.to_owned(),
+    ))
+}
+
+/// [`create_explicit_scope_guarded`] for a workspace already resolved by id.
+async fn create_project_in_workspace_guarded(
+    writer: &WriterHandle,
+    workspace_id: WorkspaceId,
+    project: &str,
+    viewer: Option<UserId>,
+    promote: bool,
+) -> Result<ResolvedWriteScope, ScopeResolutionError> {
+    let principal = viewer.map(ProjectPrincipal::user);
+    let resolved = if promote {
+        writer
+            .resolve_project_name_for_write(
+                workspace_id,
+                project.to_owned(),
+                principal,
+                viewer.is_some(),
+            )
+            .await
+    } else {
+        writer
+            .resolve_project_name_for_write_without_promotion(
+                workspace_id,
+                project.to_owned(),
+                principal,
+                viewer.is_some(),
+            )
+            .await
+    }
+    .map_err(|error| project_lookup_error(error, "the resolved workspace", project))?;
     let scope = ResolvedScope {
         workspace_id,
-        project_id,
+        project_id: resolved.project_id,
     };
-    authorize_scope_for(reader, Some(writer), scope, viewer, ProjectAccess::Write).await
+    if let Some(error) = resolved.authorization_error {
+        return Err(ScopeResolutionError::Forbidden(format!(
+            "not authorized for {project}: this needs write access. {}",
+            error.message()
+        )));
+    }
+    Ok(ResolvedWriteScope {
+        scope,
+        promoted_from: resolved.promoted_from,
+    })
+}
+
+/// Refusal for a private-profile request that carries no database user: a
+/// `user` profile belongs to one, and an anonymous or root caller has none.
+pub const PRIVATE_PROFILE_NEEDS_USER: &str = "this server keeps a private profile per database \
+     user; authenticate with your own API key to read or write yours";
+
+/// Where the cross-project profile lives for a caller, without creating it
+/// (`docs/design-cross-project-profile.md`). `workspace_id` is the workspace of
+/// the project the caller is in; `viewer` the database user the request
+/// authenticated as. `Ok(None)` means there is no profile to read yet, or
+/// none for this caller (a private profile with no database user).
+///
+/// A private profile is read through the per-project choke point, so only its
+/// creator (and root, as with every restricted project) is admitted.
+///
+/// # Errors
+/// Store failures, and [`ScopeResolutionError::Forbidden`] if a private
+/// profile refuses the viewer.
+pub async fn lookup_profile_scope(
+    reader: &ReaderPool,
+    share: ai_memory_core::profile::EffectiveProfileShare,
+    workspace_id: WorkspaceId,
+    viewer: Option<UserId>,
+) -> Result<Option<ResolvedScope>, ScopeResolutionError> {
+    use ai_memory_core::profile::{EffectiveProfileShare, WORKSPACE_PROFILE_PROJECT};
+    match share {
+        EffectiveProfileShare::Global => lookup_global_scope(reader).await,
+        EffectiveProfileShare::Workspace => Ok(reader
+            .find_project(workspace_id, WORKSPACE_PROFILE_PROJECT.to_owned())
+            .await?
+            .map(|project_id| ResolvedScope {
+                workspace_id,
+                project_id,
+            })),
+        EffectiveProfileShare::User => {
+            let Some(viewer) = viewer else {
+                return Ok(None);
+            };
+            let Some(default_workspace) = reader
+                .find_workspace(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let Some(project_id) = reader
+                .find_project(
+                    default_workspace,
+                    ai_memory_core::profile::user_profile_project(viewer),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let scope = ResolvedScope {
+                workspace_id: default_workspace,
+                project_id,
+            };
+            authorize_scope_for(reader, None, scope, Some(viewer), ProjectAccess::Read)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+/// Create or fetch the caller's profile scope for a write, authorized.
+///
+/// The shared scopes (`global`, `workspace`) go through the reserved-scope
+/// write gate: on a server with database users only root or a `write` grant
+/// on that scope may write it. A private profile is created restricted, with
+/// the caller as its creator, so only they (and root) can use it.
+///
+/// # Errors
+/// [`ScopeResolutionError::Forbidden`] when the gate refuses the caller or a
+/// private profile is requested without a database user; store failures
+/// otherwise.
+pub async fn create_profile_scope(
+    _reader: &ReaderPool,
+    writer: &WriterHandle,
+    share: ai_memory_core::profile::EffectiveProfileShare,
+    workspace_id: WorkspaceId,
+    viewer: Option<UserId>,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    use ai_memory_core::profile::{EffectiveProfileShare, WORKSPACE_PROFILE_PROJECT};
+    match share {
+        EffectiveProfileShare::Global => {
+            let workspace_id = writer
+                .get_or_create_workspace(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned())
+                .await?;
+            create_project_in_workspace_guarded(
+                writer,
+                workspace_id,
+                ai_memory_core::GLOBAL_SCOPE_PROJECT,
+                viewer,
+                false,
+            )
+            .await
+            .map(|resolved| resolved.scope)
+        }
+        EffectiveProfileShare::Workspace => create_project_in_workspace_guarded(
+            writer,
+            workspace_id,
+            WORKSPACE_PROFILE_PROJECT,
+            viewer,
+            false,
+        )
+        .await
+        .map(|resolved| resolved.scope),
+        EffectiveProfileShare::User => {
+            let Some(viewer) = viewer else {
+                return Err(ScopeResolutionError::Forbidden(
+                    PRIVATE_PROFILE_NEEDS_USER.to_owned(),
+                ));
+            };
+            let workspace_id = writer
+                .get_or_create_workspace(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned())
+                .await?;
+            create_project_in_workspace_guarded(
+                writer,
+                workspace_id,
+                &ai_memory_core::profile::user_profile_project(viewer),
+                Some(viewer),
+                false,
+            )
+            .await
+            .map(|resolved| resolved.scope)
+        }
+    }
 }
 
 /// [`resolve_many_existing_scopes`], every scope authorized for `viewer`.
@@ -567,12 +836,22 @@ pub async fn lookup_global_scope(
 pub async fn create_global_scope(
     writer: &WriterHandle,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    create_explicit_scope(
-        writer,
-        ai_memory_core::DEFAULT_WORKSPACE_NAME,
-        ai_memory_core::GLOBAL_SCOPE_PROJECT,
-    )
-    .await
+    let workspace = ai_memory_core::DEFAULT_WORKSPACE_NAME;
+    let project = ai_memory_core::GLOBAL_SCOPE_PROJECT;
+    let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
+    let resolved = writer
+        .resolve_project_name_for_write_without_promotion(
+            workspace_id,
+            project.to_owned(),
+            None,
+            false,
+        )
+        .await
+        .map_err(|error| project_lookup_error(error, workspace, project))?;
+    Ok(ResolvedScope {
+        workspace_id,
+        project_id: resolved.project_id,
+    })
 }
 
 /// Resolve and de-duplicate explicit multi-scope names without creating
@@ -690,6 +969,29 @@ impl<'a> ScopeResolver<'a> {
         lookup_existing_scope(self.reader, workspace, project).await
     }
 
+    async fn resolve_named_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        workspace: &str,
+        project: &str,
+        need: ProjectAccess,
+    ) -> Result<Option<ResolvedScope>, ScopeResolutionError> {
+        let project_id = self
+            .reader
+            .resolve_existing_project_name(workspace_id, project.to_owned())
+            .await
+            .map_err(|error| project_lookup_error(error, workspace, project))?;
+        let Some(project_id) = project_id else {
+            return Ok(None);
+        };
+        let scope = ResolvedScope {
+            workspace_id,
+            project_id,
+        };
+        self.authorize_scope(scope, need).await?;
+        Ok(Some(scope))
+    }
+
     /// Resolve MCP-style read arguments: explicit pair if both names are
     /// provided, reject partial pair, otherwise use project-only lookup or the
     /// current-project/default fallback chain.
@@ -758,8 +1060,14 @@ impl<'a> ScopeResolver<'a> {
             trimmed_opt(explicit_project),
         ) {
             (Some(workspace), Some(project)) => {
-                let scope = self.lookup_existing(workspace, project).await?;
-                self.authorize_scope(scope, need).await?;
+                let workspace_id = lookup_existing_workspace(self.reader, workspace).await?;
+                let scope = self
+                    .resolve_named_in_workspace(workspace_id, workspace, project, need)
+                    .await?
+                    .ok_or_else(|| ScopeResolutionError::ProjectNotFoundInWorkspace {
+                        workspace: workspace.to_owned(),
+                        project: project.to_owned(),
+                    })?;
                 Ok((scope, ScopeSource::Explicit))
             }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
@@ -807,29 +1115,22 @@ impl<'a> ScopeResolver<'a> {
         let active = pointer.ids();
         if let Some(project) = trimmed_opt(explicit_project) {
             if let Some((active_ws, _)) = active
-                && let Some(project_id) = self
-                    .reader
-                    .find_project(active_ws, project.to_owned())
+                && let Some(scope) = self
+                    .resolve_named_in_workspace(active_ws, "the active workspace", project, need)
                     .await?
             {
-                let scope = ResolvedScope {
-                    workspace_id: active_ws,
-                    project_id,
-                };
-                self.authorize_scope(scope, need).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             if active.map(|(ws, _)| ws) != Some(self.default_workspace_id)
-                && let Some(project_id) = self
-                    .reader
-                    .find_project(self.default_workspace_id, project.to_owned())
+                && let Some(scope) = self
+                    .resolve_named_in_workspace(
+                        self.default_workspace_id,
+                        "the default workspace",
+                        project,
+                        need,
+                    )
                     .await?
             {
-                let scope = ResolvedScope {
-                    workspace_id: self.default_workspace_id,
-                    project_id,
-                };
-                self.authorize_scope(scope, need).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             return Err(ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
@@ -853,7 +1154,7 @@ impl<'a> ScopeResolver<'a> {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ActorKey,
-    ) -> Result<ResolvedScope, ScopeResolutionError> {
+    ) -> Result<ResolvedWriteScope, ScopeResolutionError> {
         let Some(project) = trimmed_opt(explicit_project) else {
             if trimmed_opt(explicit_workspace).is_some() {
                 return Err(ScopeResolutionError::WorkspaceProjectPairRequired);
@@ -880,7 +1181,10 @@ impl<'a> ScopeResolver<'a> {
                 project_id,
             };
             self.authorize_scope(scope, ProjectAccess::Write).await?;
-            return Ok(scope);
+            return Ok(ResolvedWriteScope {
+                scope,
+                promoted_from: None,
+            });
         };
         let Some(writer) = self.writer else {
             return Err(ScopeResolutionError::WriterRequired);
@@ -892,19 +1196,37 @@ impl<'a> ScopeResolver<'a> {
                 .map(|(workspace_id, _)| workspace_id)
                 .unwrap_or(self.default_workspace_id),
         };
-        // A project this call creates records the caller as its creator, whom
-        // the choke point below then admits; one that already existed is
-        // decided like any other write, so "create" is never a way in.
         let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
-        let (project_id, _) = writer
-            .get_or_create_project_as(workspace_id, project.to_owned(), None, creator)
-            .await?;
+        refuse_foreign_profile_name(trimmed_opt(explicit_workspace), project, creator)?;
+        let resolved = writer
+            .resolve_project_name_for_write(
+                workspace_id,
+                project.to_owned(),
+                self.authz.clone(),
+                self.distinguishes_operators,
+            )
+            .await
+            .map_err(|error| {
+                project_lookup_error(
+                    error,
+                    trimmed_opt(explicit_workspace).unwrap_or("the active workspace"),
+                    project,
+                )
+            })?;
         let scope = ResolvedScope {
             workspace_id,
-            project_id,
+            project_id: resolved.project_id,
         };
-        self.authorize_scope(scope, ProjectAccess::Write).await?;
-        Ok(scope)
+        if let Some(error) = resolved.authorization_error {
+            return Err(ScopeResolutionError::Forbidden(format!(
+                "not authorized for {project}: this needs write access. {}",
+                error.message()
+            )));
+        }
+        Ok(ResolvedWriteScope {
+            scope,
+            promoted_from: resolved.promoted_from,
+        })
     }
 
     /// Resolve and de-duplicate an explicit multi-scope list, every scope
@@ -936,6 +1258,27 @@ mod tests {
     use ai_memory_core::NewUser;
 
     use crate::{AccessMode, GrantLevel};
+
+    /// A `workspace/project` label passed as the project names the split
+    /// (#1152); an ordinary miss keeps the plain message.
+    #[test]
+    fn a_slashed_project_name_points_at_the_separate_arguments() {
+        let glued = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "myorg/myproject".into(),
+        }
+        .to_string();
+        assert!(
+            glued.contains("pass workspace \"myorg\" and project \"myproject\""),
+            "{glued}"
+        );
+        let plain = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "ghost".into(),
+        }
+        .to_string();
+        assert_eq!(plain, "project 'ghost' not found in workspace 'default'");
+    }
 
     async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
         store
@@ -1115,12 +1458,12 @@ mod tests {
         // A project that does not exist yet is created with Bob as its
         // creator, who is admitted without any grant.
         let fresh = create("brand-new", bob).await.unwrap();
-        assert_eq!(fresh.workspace_id, ws);
-        assert_eq!(created_by(&store, fresh.project_id), Some(bob));
+        assert_eq!(fresh.scope.workspace_id, ws);
+        assert_eq!(created_by(&store, fresh.scope.project_id), Some(bob));
         assert!(
             store
                 .reader
-                .grants_for(bob, fresh.project_id)
+                .grants_for(bob, fresh.scope.project_id)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1139,7 +1482,7 @@ mod tests {
         // A second "create" of the same name by someone else is a write to an
         // existing project: refused, and it does not make them its creator.
         assert!(create("brand-new", alice).await.unwrap_err().is_forbidden());
-        assert_eq!(created_by(&store, fresh.project_id), Some(bob));
+        assert_eq!(created_by(&store, fresh.scope.project_id), Some(bob));
     }
 
     /// With no viewer — root, or an install with no database users — a created
@@ -1158,7 +1501,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(created_by(&store, fresh.project_id), None);
+        assert_eq!(created_by(&store, fresh.scope.project_id), None);
     }
 
     /// The MCP write path creates through the resolver, not the free function,
@@ -1175,7 +1518,7 @@ mod tests {
             .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
             .await
             .unwrap();
-        assert_eq!(created_by(&store, created.project_id), Some(bob));
+        assert_eq!(created_by(&store, created.scope.project_id), Some(bob));
         as_bob
             .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
             .await
@@ -1363,7 +1706,7 @@ mod tests {
             .resolve_write_args(None, Some("new-project"), &actor)
             .await
             .unwrap();
-        assert_eq!(created.workspace_id, active_ws);
+        assert_eq!(created.scope.workspace_id, active_ws);
         assert!(
             store
                 .reader
@@ -1379,7 +1722,7 @@ mod tests {
                 .find_project(active_ws, "new-project".into())
                 .await
                 .unwrap(),
-            Some(created.project_id)
+            Some(created.scope.project_id)
         );
     }
 
@@ -1697,7 +2040,7 @@ mod tests {
             lookup_existing_scope(&store.reader, "ghost", "app")
                 .await
                 .unwrap(),
-            created
+            created.scope
         );
 
         // Multi-scope resolution keeps same-named projects in their own
@@ -1826,7 +2169,7 @@ mod tests {
             .resolve_write_args(None, None, &ActorKey::default())
             .await
             .unwrap();
-        assert_eq!(scope.as_tuple(), (team_ws, team_proj));
+        assert_eq!(scope.scope.as_tuple(), (team_ws, team_proj));
     }
 
     #[tokio::test]
@@ -1852,7 +2195,7 @@ mod tests {
             .resolve_write_args(None, None, &actor)
             .await
             .unwrap();
-        assert_eq!(scope.as_tuple(), (default_ws, default_proj));
+        assert_eq!(scope.scope.as_tuple(), (default_ws, default_proj));
     }
 
     #[tokio::test]
@@ -1875,7 +2218,7 @@ mod tests {
             .resolve_write_args(None, None, &actor)
             .await
             .unwrap();
-        assert_eq!(scope.as_tuple(), (team_ws, team_proj));
+        assert_eq!(scope.scope.as_tuple(), (team_ws, team_proj));
     }
 
     #[tokio::test]
@@ -1948,7 +2291,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                write.as_tuple(),
+                write.scope.as_tuple(),
                 (default_ws, default_proj),
                 "write target must be exactly what it was before the seed existed"
             );

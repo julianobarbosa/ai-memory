@@ -8,6 +8,7 @@
 pub mod admission;
 mod atomic;
 pub mod backup;
+mod confinement;
 mod error;
 mod git;
 mod ledger;
@@ -21,6 +22,7 @@ pub use admission::{
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
 pub use atomic::write_atomic;
+pub use confinement::validate_wiki_tree;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use ledger::is_rotated_event_ledger;

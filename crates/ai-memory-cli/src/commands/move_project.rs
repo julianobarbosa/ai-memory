@@ -73,6 +73,9 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     let purged = report["source_purged"].as_bool().unwrap_or(false);
     let moved_via = report["moved_via"].as_str().unwrap_or("");
     let skipped_count = report["pages_skipped"].as_array().map_or(0, |s| s.len());
+    if let Some(warning) = report["manifest_warning"].as_str() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
 
     if (moved_via == "true-move" || purged)
         && let Err(error) = super::project_registry::rekey_scope(

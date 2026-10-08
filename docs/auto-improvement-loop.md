@@ -240,6 +240,17 @@ Hooks never run the eval command. See
 [`auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for the full stdin /
 stdout contract and example scorer scripts.
 
+The same execution also produces structured `eval_results` in the review report
+and staged run's config JSON. Accepted proposals carry the matching `eval_result`
+in their pending sidecar evidence. The records include server-generated `eval_id`
+values distinct from review run IDs, observed success/rejection/failure/timeout,
+request/body digests, bounded sanitized reasons, and a checker
+invocation digest. The invocation digest identifies configuration rather than
+executable contents; external reports remain attributed evidence. Missing fields
+in older reports/sidecars are accepted. Report deserialization discards eval
+results rather than trusting supplied observations. See the eval-gates document above for
+the exact digest and provenance limits.
+
 ## Proposed Page Targets
 
 | Target | Use for | Notes |

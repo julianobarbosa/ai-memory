@@ -84,6 +84,13 @@ stubs for them.
   extension messages. The dry-run and manifest report the truncation count.
 - Conversation bodies receive client-side credential redaction before replay
   and then cross ai-memory's normal server sanitizer as a second boundary.
+  The [shared private privacy helpers](../ai-memory-client) scrub nested values
+  before event hashes, previews, manifests and delivery. Sensitive native source
+  identities are refused before deriving an imported session ID or writing a
+  manifest. Valid native session strings are preserved exactly. UTF-8 byte caps
+  keep complete redaction markers, and numeric token metrics use an exact
+  11-name allowlist. Body provenance remains untrusted and cannot supply actor
+  or destination authority.
 - Stable session IDs derive from `(workspace, project, source, session_id)`.
   Each replay event has a stable `ingest_key`; a changed transcript gets a new
   terminal generation key, so rerunning an interrupted import is safe and

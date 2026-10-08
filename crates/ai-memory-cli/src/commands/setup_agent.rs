@@ -36,14 +36,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::cli::{AgentChoice, SetupAgentArgs};
-use crate::commands::install_mcp;
+use crate::cli::{
+    AgentChoice, HookInstallScope, InstallHooksArgs, InstallMcpArgs, McpClient, SetupAgentArgs,
+};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload, build_pool_settings_yaml,
-    hook_script_for_current_platform,
+    COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
+    build_pool_settings_yaml, hook_script_for_current_platform,
 };
+use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
 /// Run the `setup-agent` subcommand.
@@ -52,7 +54,25 @@ use crate::config::{Config, DEFAULT_SERVER_URL};
 /// Returns an error if the source bundle can't be located, the
 /// destination directory can't be created, any script copy fails,
 /// or the JSON config can't be serialised.
-pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
+pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
+    args.agent = match (args.agent, args.opencode_dialect) {
+        (AgentChoice::OpenCode, Some(choice)) => match choice.dialect() {
+            ai_memory_workstream::OpenCodeDialect::V1 => AgentChoice::OpenCode,
+            ai_memory_workstream::OpenCodeDialect::V2 => AgentChoice::OpenCode2,
+        },
+        (AgentChoice::OpenCode, None) => bail!(
+            "setup-agent --agent opencode requires --opencode-dialect v1|v2 because a container cannot inspect the host executable"
+        ),
+        (AgentChoice::OpenCode2, None) => AgentChoice::OpenCode2,
+        (AgentChoice::OpenCode2, Some(_)) => bail!(
+            "--opencode-dialect cannot be combined with the force-V2 opencode2 compatibility alias"
+        ),
+        (agent, None) => agent,
+        (agent, Some(_)) => bail!(
+            "--opencode-dialect is valid only with --agent opencode, not {}",
+            agent.kind().as_str()
+        ),
+    };
     let server_url = if args.server_url == DEFAULT_SERVER_URL && config.server_url_configured() {
         normalise_hook_server_url(&config.server_url)
     } else {
@@ -71,7 +91,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             | AgentChoice::Omp
             | AgentChoice::Openclaw
     ) {
-        emit_extension_setup_hint(&args)?;
+        emit_extension_setup_hint(config, &args)?;
         return Ok(());
     }
     // Zero and ZCode run ai-memory's native `hook` command directly (exec
@@ -176,6 +196,9 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::CopilotCli => {
+            emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
+        }
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi
@@ -285,7 +308,7 @@ fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
+fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<()> {
     let (label, agent, restart_note, mcp_client) = match args.agent {
         AgentChoice::OpenCode => (
             "OpenCode",
@@ -327,6 +350,50 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
         "# Legacy shell/PowerShell and remote-only paths are unsupported compatibility modes."
     );
     println!("# Install it directly instead:");
+    if matches!(args.agent, AgentChoice::OpenCode | AgentChoice::OpenCode2) {
+        let dialect = if args.agent == AgentChoice::OpenCode {
+            ai_memory_workstream::OpenCodeDialect::V1
+        } else {
+            ai_memory_workstream::OpenCodeDialect::V2
+        };
+        install_hooks::run_with_opencode_dialect(
+            config,
+            InstallHooksArgs {
+                agent: AgentChoice::OpenCode,
+                hooks_dir: None,
+                server_url: Some(args.server_url.clone()),
+                auth_token: args.auth_token.clone(),
+                as_user: None,
+                apply: false,
+                config_file: None,
+                scope: HookInstallScope::Global,
+                project_strategy: None,
+                capture_assistant: false,
+                capture_mode: None,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                profile: None,
+            },
+            Some(dialect),
+        )?;
+        install_mcp::run_with_opencode_dialect(
+            config,
+            InstallMcpArgs {
+                client: McpClient::OpenCode,
+                server_url: Some(args.server_url.clone()),
+                name: "ai-memory".to_string(),
+                auth_token: args.auth_token.clone(),
+                apply: false,
+                config_file: None,
+                session_aware: false,
+                flavor: None,
+            },
+            Some(dialect),
+        )?;
+        println!();
+        println!("{restart_note}");
+        return Ok(());
+    }
     println!("ai-memory install-hooks --agent {agent} --apply \\");
     if args.auth_token.is_some() {
         println!("  --server-url {} \\", args.server_url);
@@ -408,7 +475,7 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
 fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
     let snippet = build_pool_settings_yaml(emit_root, &args.server_url, args.auth_token.as_deref());
     println!("# Pool (Poolside Agent CLI) — merge into the repo-root .poolside/settings.yaml");
-    println!("# of each project Pool runs in; ai-memory does not write project-local files.");
+    println!("# of each project Pool runs in; ai-memory does not write committed project files.");
     println!("# Hook scripts (must be reachable from the host that runs Pool):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);
@@ -642,6 +709,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = SetupAgentArgs {
             agent: AgentChoice::Pi,
+            opencode_dialect: None,
             to: tmp.path().join("hooks"),
             host_prefix: None,
             server_url: "http://127.0.0.1:49374".into(),
@@ -658,6 +726,7 @@ mod tests {
     fn devin_setup_emits_script_hook_config() {
         let args = SetupAgentArgs {
             agent: AgentChoice::Devin,
+            opencode_dialect: None,
             to: PathBuf::from("/container/hooks"),
             host_prefix: Some(PathBuf::from("/host/hooks")),
             server_url: "http://127.0.0.1:49374".into(),
@@ -720,6 +789,7 @@ mod tests {
         let dest = tmp.path().join("dest");
         let args = SetupAgentArgs {
             agent: AgentChoice::Devin,
+            opencode_dialect: None,
             to: dest.clone(),
             host_prefix: None,
             server_url: "http://127.0.0.1:49374".into(),

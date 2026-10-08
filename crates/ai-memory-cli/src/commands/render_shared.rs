@@ -77,6 +77,30 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// GitHub Copilot CLI's lifecycle events, configured with PascalCase event
+/// names so the payload comes in the Claude Code/VS-Code-compatible shape
+/// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_result`) instead of
+/// its native camelCase one — this lets it free-ride on the same key-based
+/// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
+/// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
+/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// `PostToolUseFailure`, which Copilot (per
+/// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
+/// instead of `PostToolUse` when a tool call errors — the server already
+/// aliases it to `PostToolUse` (`HookEvent::parse`), so it reuses that script.
+pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Kiro CLI v2-engine lifecycle events. Each pair is
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
 ///
@@ -875,6 +899,14 @@ pub(crate) enum HookShape {
     /// `hooks.json` also requires a sibling `version: 1` key at
     /// the top level — handled by the caller's apply path.
     Flat,
+    /// GitHub Copilot CLI: `"E": [ { "type":"command", "command":"..." } ]`.
+    /// Entries sit directly in the event array like Cursor's, but with no
+    /// `matcher`: Copilot rejects it on `sessionStart`/`sessionEnd`/
+    /// `userPromptSubmitted`/`agentStop`/`subagentStop`/`errorOccurred` and
+    /// treats it as an optional filter elsewhere, so omitting it everywhere
+    /// means "fire on every invocation". The file's top-level `version: 1` is
+    /// handled by the caller's apply path, as for Cursor.
+    FlatWithoutMatcher,
 }
 
 /// One hook profile = (event vocabulary, JSON shape). Each agent
@@ -961,6 +993,13 @@ pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
 pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
     events: &COMMAND_CODE_EVENTS,
     shape: HookShape::NestedWithoutMatcher,
+};
+/// Copilot keeps its flat entry shape even with PascalCase event names — only
+/// the payload sent to the script switches to snake_case — so this is
+/// `FlatWithoutMatcher`, not Claude's `Nested` (see the variant's doc).
+pub(crate) const COPILOT_CLI_PROFILE: HookProfile = HookProfile {
+    events: &COPILOT_CLI_EVENTS,
+    shape: HookShape::FlatWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -1500,6 +1539,7 @@ fn build_hook_payload_for_platform(
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
+            HookShape::FlatWithoutMatcher => Value::Array(vec![handler]),
         };
         hooks_block.insert((*event).to_string(), entry);
     }
@@ -2851,6 +2891,38 @@ if (inheritOnly) {
     /// outer level — which made Claude Code refuse to load
     /// settings.json with "hooks: Expected array, but received
     /// undefined" on every event.
+    /// Copilot CLI keeps its flat entry shape even when the event names are
+    /// PascalCase (only the payload sent to the script changes), and rejects
+    /// `matcher` on session/stop/subagent events — so every entry must be a
+    /// bare `{type, command}` handler: no nested `hooks`, no `matcher`.
+    #[test]
+    fn copilot_cli_payload_uses_flat_entries_without_matcher() {
+        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let v = build_posix_hook_payload(
+            COPILOT_CLI_PROFILE.events,
+            &root,
+            "http://localhost:49374",
+            None,
+            COPILOT_CLI_PROFILE.shape,
+        );
+        let hooks = v.pointer("/hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+        for (event, _) in COPILOT_CLI_EVENTS {
+            let entry = v
+                .pointer(&format!("/hooks/{event}/0"))
+                .and_then(|e| e.as_object())
+                .unwrap_or_else(|| panic!("missing /hooks/{event}/0"));
+            assert_eq!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("command"),
+                "{event}"
+            );
+            assert!(entry.contains_key("command"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("hooks"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("matcher"), "{event}: {entry:?}");
+        }
+    }
+
     #[test]
     fn cursor_payload_uses_flat_shape() {
         // Flat shape: no inner `hooks: [...]` array; each event
@@ -3267,7 +3339,9 @@ if (inheritOnly) {
                 HookShape::Nested | HookShape::NestedWithoutMatcher => {
                     v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
                 }
-                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+                HookShape::Flat | HookShape::FlatWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0").unwrap().clone()
+                }
             }
         }
 
@@ -3313,6 +3387,7 @@ if (inheritOnly) {
             ("antigravity-cli", HookShape::Flat),
             ("grok", HookShape::Nested),
             ("devin", HookShape::Nested),
+            ("copilot-cli", HookShape::FlatWithoutMatcher),
         ] {
             let handler = handler_for(HookCommandPlatform::WindowsNative, agent, shape);
             assert!(

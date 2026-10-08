@@ -220,3 +220,99 @@ flag. Opt-in would leave the same-basename grant hole open for anyone who did
 not opt in, defeating the authorization slices. The trade-off — that an upgrading
 install's captures re-bucket by repository identity (two same-name repos split; one
 repo opened from two folders converges) — is documented in the CHANGELOG.
+
+## Path-keyed coordinates (#1033 — staged)
+
+Identity routing already converges worktrees and clones of one repository into
+one project for **captures**. Two gaps remain: the project's **name** is still
+the first-seen folder basename, and MCP tools resolve `(workspace, project)` by
+that name, so a static client that passes a worktree folder misses the merged
+project. #1033 makes a remote-derived key the default name, landing in steps on
+`release/2.6`:
+
+1. **Normaliser and opt-in naming (landed first).** `repository_identity::
+   styled_key` spells an identity under `IdentityStyle`: `path` drops a git
+   remote's host (`github.com/acme/api` → `acme/api`); `host_path` is the #708
+   identity unchanged. A marker's explicit style is forwarded by all four capture clients
+   alongside a remote identity, and `resolve_project_by_identity` then names a
+   project it **creates** `path_style_name(identity)` (`acme-api`: `/` written
+   as `-`, today's split-name character rule). Captures keep routing by the
+   full identity. **Cross-forge collisions are detected, never merged:** the
+   path name is used only while no project in the workspace holds it, checked
+   in the same transaction as the identity match, so `gitlab.com/acme/api`
+   after `github.com/acme/api` falls back to the name it would otherwise get.
+   Existing projects — matched, claimed or unclaimed — are never renamed.
+   Checked against the `styled_key` and `identity_style` sections of
+   `fixtures/remote_identity_cases.json` (core plus shell, PowerShell and
+   TypeScript parity), store adversarial tests, and a two-operator
+   `multi_session.rs` case. Reporting the fallback in `doctor` is a follow-up.
+2. **Default naming chain (landed final).** `upstream` → `origin` supplies the
+   full hostful identity and the canonical hostless path name for new projects;
+   only a checkout with no valid network remote falls back to its folder. Marker
+   `project`/`identity` and operator-home routes still outrank this inference.
+   Phase-5 clients explicitly send `path`; explicit `host_path` is forwarded as
+   the compatibility opt-out. A new server still treats omission as `host_path`
+   because old clients omitted that historical default. Old servers safely
+   accept or ignore the existing style field; no new wire field is required.
+3. **Dual-key resolve and in-place name promotion (landed).** Static callers
+   still pass only `workspace` + `project`. Within that workspace, exact stored
+   name, the canonical path-style name derived from a stored full hostful git
+   identity, and the v2 repository basename resolve to one UUID only when the
+   candidate set is unique. Reads are no-create and never rename. An existing
+   write path resolves, authorizes at `ProjectAccess::Write`, and promotes only
+   `projects.name` in one writer transaction with its audit row; UUID foreign
+   keys stay put. A target-name conflict, two forges sharing the hostless key,
+   or multiple candidates fails closed. The legacy basename remains readable
+   after promotion through v2. No alias table was added. V76 stores the two
+    deterministic keys derived from V70's full `projects.identity` and indexes
+    them so hot reads/writes use three bounded equality probes instead of
+    scanning a workspace; startup backfills pre-V76 identity rows before traffic.
+    Project `_meta.md` stores optional typed `identity` and `identity_source`
+    plus the derived `canonical_name`/`legacy_name` keys. Clean
+    reindex validates the pair, derives the indexed keys from the identity, and
+    recreates the original UUID/name; pre-V76 manifests without identity remain
+     valid and rebuild an identity-less project.
+4. **Coordinate diagnostics (landed).** `GET /admin/project-coordinate` and
+   `ai-memory doctor` classify exact, canonical-compatibility,
+   legacy-compatibility, missing, and ambiguous coordinates. They report
+   rename eligibility and collision reasons from read-only indexed store
+   queries; no project, claim, rename, audit entry, or manifest is written.
+   The admin route follows the existing single-user compatibility contract and
+   becomes root-only whenever the deployment distinguishes operators. Stored
+   remote identities are not returned; the CLI parses one typed local marker
+   inspection, honours CLI-over-marker scope precedence, supplies only its
+   normalized credential-free identity, and renders safe marker/source classes,
+   source/style and derived names. Ambiguous server scope leaves local session
+   evidence intact and marks captured counts unavailable rather than zero. An
+   ambiguous result may carry the preferred identity-backed candidate UUID and
+   current name for operator context; it still represents no unique resolution
+   and is never rename-eligible.
+5. **Local marker aliases (landed).** `aliases = ["former-name"]` is bounded,
+   normalized, deduplicated and forwarded identically by native, POSIX shell,
+   PowerShell and generated TypeScript clients on capture and handoff requests.
+   The marker's `project` remains canonical. Alias lookup stays within its
+   selected workspace and requires the checkout's full hostful git-remote
+   identity to match the stored row; reads do not rename, while capture may use
+   only the Phase 1 write-authorized canonical promotion. Alias lists are
+   transient routing hints, not persisted rows, and stay supported after v3.
+6. **Operator-home routes (landed).** The exact operator-home
+   `.ai-memory.toml` accepts bounded namespaced identity and path tables. Exact
+   normalized hostful identity wins the longest component-safe lexical path;
+   local non-home settings markers win both. Route project names are canonical,
+   route aliases reuse the Phase 3 wire only with remote identity plus marker
+   provenance, malformed or ambiguous maps fail closed, and old line parsers
+   ignore the deliberately prefixed `route_*` child fields. Native callers use
+   `AI_MEMORY_HOME` first; portable clients use `HOME`/`USERPROFILE`, and Docker
+    compares the forwarded host cwd.
+7. **Default flip (landed final).** `Path` is now the explicit client default;
+   the typed server/wire default remains legacy-safe `HostPath`. Authorized
+   captures carrying explicit `path` can claim or promote compatible basename/
+   host-path rows in the same writer transaction and preserve their UUID;
+   handoff/static reads remain no-create/no-rename. Canonical names held by a
+   different hostful identity fail closed and use the existing fallback. The
+   indexed canonical/legacy compatibility keys and marker aliases remain through
+   v3; no schema migration was required for this final slice.
+
+
+
+Paths stay lexically normalised throughout; nothing canonicalises.

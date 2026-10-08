@@ -7,6 +7,112 @@ use ai_memory_core::AgentKind;
 use anyhow::{Result, anyhow, bail};
 use uuid::Uuid;
 
+/// OpenCode's incompatible major-version contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeDialect {
+    /// OpenCode 1 plugin, MCP, and transcript contracts.
+    V1,
+    /// OpenCode 2 plugin, MCP, and transcript contracts.
+    V2,
+}
+
+impl OpenCodeDialect {
+    /// Parse an OpenCode `--version` response without guessing an unknown major.
+    pub fn parse_version_output(output: &str) -> Result<Self> {
+        let mut versions = output
+            .split_ascii_whitespace()
+            .filter_map(parse_semver_major);
+        let major = versions
+            .next()
+            .ok_or_else(|| anyhow!("OpenCode returned no strict semantic version"))?;
+        if versions.next().is_some() {
+            bail!("OpenCode returned multiple semantic versions");
+        }
+        match major {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            other => bail!(
+                "OpenCode major {other} is not supported; upgrade ai-memory before using this OpenCode version"
+            ),
+        }
+    }
+
+    /// Numeric major used in persisted compatibility keys.
+    #[must_use]
+    pub const fn major(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Managed harness carrying this dialect through launch and transcript IO.
+    #[must_use]
+    pub const fn harness(self) -> ManagedHarness {
+        match self {
+            Self::V1 => ManagedHarness::OpenCode,
+            Self::V2 => ManagedHarness::OpenCode2,
+        }
+    }
+}
+
+fn parse_semver_major(raw: &str) -> Option<u64> {
+    let trimmed =
+        raw.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'));
+    let token = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let (without_build, build) = token
+        .split_once('+')
+        .map_or((token, None), |(core, build)| (core, Some(build)));
+    if without_build.contains('+')
+        || build.is_some_and(|value| !valid_semver_identifiers(value, false))
+    {
+        return None;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|value| !valid_semver_identifiers(value, true)) {
+        return None;
+    }
+    let mut parts = core.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let patch = parts.next()?;
+    if parts.next().is_some()
+        || !valid_semver_number(major)
+        || !valid_semver_number(minor)
+        || !valid_semver_number(patch)
+    {
+        return None;
+    }
+    major.parse().ok()
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_leading_zero_numeric: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_leading_zero_numeric
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier.len() == 1
+                    || !identifier.starts_with('0'))
+        })
+}
+
 /// Harnesses with native-session and transcript adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedHarness {
@@ -255,8 +361,6 @@ pub fn build_launch_plan_with_env(
     env_overrides: &[(String, String)],
     roots: Option<LaunchRoots<'_>>,
 ) -> Result<LaunchPlan> {
-    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
-    let mut args = native_args;
     let get = |name: &str| {
         env_overrides
             .iter()
@@ -264,6 +368,27 @@ pub fn build_launch_plan_with_env(
             .map(|(_, value)| OsString::from(value))
             .or_else(|| std::env::var_os(name))
     };
+    build_launch_plan_with_env_lookup(
+        harness,
+        executable,
+        native_args,
+        linked_session_id,
+        get,
+        roots,
+    )
+}
+
+/// Build a launch plan from one caller-owned environment snapshot.
+pub fn build_launch_plan_with_env_lookup(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString> + Copy,
+    roots: Option<LaunchRoots<'_>>,
+) -> Result<LaunchPlan> {
+    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
+    let mut args = native_args;
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
@@ -286,6 +411,12 @@ pub fn build_launch_plan_with_env(
         _ => None,
     });
     let mut expected = explicit_session_id(harness, &args);
+    for id in expected.as_deref().into_iter().chain(linked_session_id) {
+        ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
+    }
+    if harness == ManagedHarness::CommandCode {
+        expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
+    }
     let mode = launch_mode(harness, &args);
     if mode == LaunchMode::Session
         && harness == ManagedHarness::KiroV3
@@ -494,6 +625,21 @@ pub fn apply_claude_true_yolo(harness: ManagedHarness, args: &mut Vec<OsString>)
 pub fn allows_native_session_adoption(harness: ManagedHarness, native_args: &[OsString]) -> bool {
     launch_mode(harness, native_args) == LaunchMode::Session
         && !has_native_session_selector(harness, native_args)
+        && !noninteractive_invocation(harness, native_args)
+}
+
+/// Whether a successful managed run represents an interactive session where
+/// follow-up choices may be offered in the parent terminal.
+///
+/// Explicit native session selectors remain interactive; this differs from
+/// [`allows_native_session_adoption`], which also rejects them because that
+/// function controls a separate prompt for choosing an existing session.
+#[must_use]
+pub fn is_interactive_session_invocation(
+    harness: ManagedHarness,
+    native_args: &[OsString],
+) -> bool {
+    launch_mode(harness, native_args) == LaunchMode::Session
         && !noninteractive_invocation(harness, native_args)
 }
 
@@ -898,8 +1044,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
-        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"])
-            .filter(|value| Uuid::parse_str(value).is_ok()),
+        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"]),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => flag_value(args, &["--resume-id"]),
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
@@ -1714,6 +1859,59 @@ mod tests {
         assert!(!allows_native_session_adoption(
             ManagedHarness::CommandCode,
             &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+    }
+
+    #[test]
+    fn opencode_version_parser_accepts_strict_and_decorated_versions() {
+        for (output, expected) in [
+            ("1.18.34", OpenCodeDialect::V1),
+            ("v2.0.23", OpenCodeDialect::V2),
+            ("OpenCode v2.0.23 (build abc)", OpenCodeDialect::V2),
+            ("opencode 1.18.34-beta.1", OpenCodeDialect::V1),
+        ] {
+            assert_eq!(
+                OpenCodeDialect::parse_version_output(output).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_version_parser_rejects_malformed_and_unsupported_versions() {
+        for output in ["2", "2.0", "latest", "version 2.x", "1.2.3 2.0.0"] {
+            assert!(
+                OpenCodeDialect::parse_version_output(output).is_err(),
+                "{output}"
+            );
+        }
+        let error = OpenCodeDialect::parse_version_output("3.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("major 3 is not supported"), "{error}");
+    }
+
+    #[test]
+    fn post_run_prompt_is_limited_to_interactive_session_invocations() {
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("resume"), OsString::from("chosen")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("exec"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Pi,
+            &[OsString::from("--no-session")]
+        ));
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--model"), OsString::from("opus")]
         ));
     }
 
@@ -3268,5 +3466,58 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[test]
+    fn native_identity_selector_rejects_original_before_resume_arguments() {
+        let bad = "sk-abcdefghijklmnopqrstuvwx";
+        for (args, linked) in [
+            (vec![OsString::from("resume"), OsString::from(bad)], None),
+            (Vec::new(), Some(bad)),
+        ] {
+            let result = build_launch_plan(ManagedHarness::Codex, None, args, linked);
+            assert!(
+                result.is_err(),
+                "selector must refuse dirty original identity"
+            );
+            assert!(!format!("{:#}", result.unwrap_err()).contains(bad));
+        }
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(bad)],
+            None,
+        );
+        assert!(
+            command_code.is_err(),
+            "Command Code must check original privacy before UUID filtering"
+        );
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(uuid)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(command_code.expected_session_id.as_deref(), Some(uuid));
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from("vendor-id")],
+            None,
+        )
+        .unwrap();
+        assert!(command_code.expected_session_id.is_none());
+        assert!(command_code.args.iter().any(|arg| arg == "vendor-id"));
+        let plan = build_launch_plan(
+            ManagedHarness::Codex,
+            None,
+            Vec::new(),
+            Some("vendor-界-01"),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_session_id.as_deref(), Some("vendor-界-01"));
+        assert!(plan.args.iter().any(|arg| arg == "vendor-界-01"));
     }
 }

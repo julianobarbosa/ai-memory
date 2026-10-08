@@ -12,11 +12,14 @@ use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
-    ReaderPool, WriterHandle, artifact_path_for, f32_vec_to_bytes,
+    ReaderPool, ScopeRow, WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
+use crate::confinement::{
+    Prepare, project_path, project_root as confined_project_root, tree_path, workspace_path,
+};
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, parse};
@@ -207,7 +210,7 @@ impl Wiki {
     /// created.
     pub fn new(data_dir: &Path, writer: WriterHandle) -> WikiResult<Self> {
         let root = data_dir.join("wiki");
-        std::fs::create_dir_all(&root)?;
+        crate::confinement::initialize_root(&root)?;
         let git = GitAdapter::open_or_init(&root)?;
         Ok(Self {
             root,
@@ -334,6 +337,7 @@ impl Wiki {
     /// # Errors
     /// Propagates [`WikiError`] from the git adapter.
     pub fn commit_all(&self, message: &str) -> WikiResult<Option<git2::Oid>> {
+        self.inspect_wiki_tree()?;
         self.git.commit_all(message)
     }
 
@@ -349,8 +353,25 @@ impl Wiki {
         file_name: &str,
         bytes: &[u8],
     ) -> std::io::Result<PathBuf> {
-        let path = self.project_root(workspace_id, project_id).join(file_name);
-        self.git.append(&path, bytes)?;
+        self.append_under_project_checked(workspace_id, project_id, file_name, bytes)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn append_under_project_checked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> WikiResult<PathBuf> {
+        let path = project_path(
+            &self.root,
+            workspace_id,
+            project_id,
+            Path::new(file_name),
+            Prepare::Parents,
+        )?;
+        self.git.append_checked(&path, bytes)?;
         Ok(path)
     }
     /// Return the most recent wiki git checkpoints, newest first.
@@ -370,9 +391,8 @@ impl Wiki {
     /// # Errors
     /// Propagates [`WikiError`] from the git adapter.
     pub fn ensure_upgrade_baseline_checkpoint(&self) -> WikiResult<Option<git2::Oid>> {
-        if self.git.commit_count() == 0 {
-            self.git
-                .commit_all("upgrade baseline: existing wiki tree before recovery checkpoints")
+        if self.git.commit_count_checked()? == 0 {
+            self.commit_all("upgrade baseline: existing wiki tree before recovery checkpoints")
         } else {
             Ok(None)
         }
@@ -424,7 +444,11 @@ impl Wiki {
         to_workspace: WorkspaceId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<MoveSummary> {
+        self.inspect_project_tree(from_workspace, project_id)?;
+        self.inspect_project_tree(to_workspace, project_id)?;
         let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(from_workspace, project_id)?;
+        self.inspect_project_tree(to_workspace, project_id)?;
         let resolved_ctx = if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             ctx.op = AdmissionOp::MoveProject;
@@ -436,8 +460,8 @@ impl Wiki {
             None
         };
 
-        let src = self.project_root(from_workspace, project_id);
-        let dst = self.project_root(to_workspace, project_id);
+        let src = self.confined_project_root(from_workspace, project_id, Prepare::Inspect)?;
+        let dst = self.confined_project_root(to_workspace, project_id, Prepare::Parents)?;
 
         if dst.exists() {
             return Err(crate::WikiError::DestinationExists(
@@ -446,10 +470,7 @@ impl Wiki {
         }
 
         let renamed = if src.exists() {
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            self.git.rename(&src, &dst)?;
+            self.git.rename_checked(&src, &dst)?;
             true
         } else {
             // Nothing on disk to move (a project with zero written pages).
@@ -468,17 +489,12 @@ impl Wiki {
                 Ok(summary)
             }
             Err(e) => {
-                if renamed {
-                    if let Some(parent) = src.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    if let Err(rollback_err) = self.git.rename(&dst, &src) {
-                        return Err(crate::WikiError::Io(std::io::Error::other(format!(
-                            "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
-                            dst.display(),
-                            src.display()
-                        ))));
-                    }
+                if renamed && let Err(rollback_err) = self.git.rename_checked(&dst, &src) {
+                    return Err(crate::WikiError::Io(std::io::Error::other(format!(
+                        "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
+                        dst.display(),
+                        src.display()
+                    ))));
                 }
                 Err(e.into())
             }
@@ -517,7 +533,11 @@ impl Wiki {
         author_id: Option<UserId>,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<MoveSessionOutcome> {
+        self.inspect_project_tree(from.0, from.1)?;
+        self.inspect_project_tree(to.0, to.1)?;
         let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(from.0, from.1)?;
+        self.inspect_project_tree(to.0, to.1)?;
         let resolved_ctx = if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             ctx.op = AdmissionOp::MoveSession;
@@ -529,17 +549,23 @@ impl Wiki {
         };
 
         let file_name = format!("{session_id}.md");
-        let src = self
-            .project_root(from.0, from.1)
-            .join("sessions")
-            .join(&file_name);
+        let src = project_path(
+            &self.root,
+            from.0,
+            from.1,
+            &PathBuf::from("sessions").join(&file_name),
+            Prepare::Inspect,
+        )?;
         let parked = if from != to && src.is_file() {
             let target = match pages {
                 PagesMode::Move => {
-                    let dst = self
-                        .project_root(to.0, to.1)
-                        .join("sessions")
-                        .join(&file_name);
+                    let dst = project_path(
+                        &self.root,
+                        to.0,
+                        to.1,
+                        &PathBuf::from("sessions").join(&file_name),
+                        Prepare::Parents,
+                    )?;
                     if dst.exists() {
                         return Err(WikiError::DestinationPageExists(dst.display().to_string()));
                     }
@@ -551,10 +577,7 @@ impl Wiki {
                     src.with_file_name(format!(".ai-memory-tmp.move-session.{file_name}"))
                 }
             };
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            self.git.rename(&src, &target)?;
+            self.git.rename_checked(&src, &target)?;
             Some(target)
         } else {
             None
@@ -572,7 +595,7 @@ impl Wiki {
                     (Some(tmp), PagesMode::Regenerate) => {
                         // The rows are retired; a leftover temp file is
                         // ignored by the watcher, so this is best-effort.
-                        if let Err(e) = self.git.remove_file(tmp) {
+                        if let Err(e) = self.git.remove_file_checked(tmp) {
                             tracing::warn!(
                                 error = %e,
                                 path = %tmp.display(),
@@ -589,7 +612,7 @@ impl Wiki {
             }
             Err(e) => {
                 if let Some(target) = parked
-                    && let Err(rollback_err) = self.git.rename(&target, &src)
+                    && let Err(rollback_err) = self.git.rename_checked(&target, &src)
                 {
                     return Err(WikiError::Io(std::io::Error::other(format!(
                         "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({e}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
@@ -670,18 +693,27 @@ impl Wiki {
                 return;
             }
         };
-        let ws_dir = self.root.join(workspace_id.to_string());
-        let mut project_fm = serde_json::json!({ "project": scope.project_name });
-        if let Some(repo_path) = scope.repo_path {
-            project_fm["repo_path"] = serde_json::Value::String(repo_path);
-        }
+        let ws_dir = match workspace_path(&self.root, workspace_id, Prepare::Directory) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(%error, "scope-manifest path confinement failed (non-fatal)");
+                return;
+            }
+        };
+        let workspace_name = scope.workspace_name.clone();
+        let project_fm = match Self::project_scope_frontmatter(scope) {
+            Ok(frontmatter) => frontmatter,
+            Err(e) => {
+                tracing::warn!(error = %e, "scope-manifest identity is invalid (non-fatal)");
+                return;
+            }
+        };
         let written = self
-            .write_scope_manifest(
-                &ws_dir,
-                serde_json::json!({ "workspace": scope.workspace_name }),
-            )
+            .write_scope_manifest(&ws_dir, serde_json::json!({ "workspace": workspace_name }))
             .and_then(|_| {
-                self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)
+                let project_dir =
+                    self.confined_project_root(workspace_id, project_id, Prepare::Directory)?;
+                self.write_scope_manifest(&project_dir, project_fm)
             });
         match written {
             Ok(_) => {
@@ -717,9 +749,120 @@ impl Wiki {
         project_id: ProjectId,
         path: &PagePath,
     ) -> WikiResult<Markdown> {
-        let abs = self.abs_path(workspace_id, project_id, path);
+        let abs = self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let raw = std::fs::read_to_string(&abs)?;
         parse(&raw)
+    }
+
+    /// Whether the calling agent wrote `sessions/<session_id>.md` itself,
+    /// through `memory_write_page` with that session's id: the page carries
+    /// `consolidated_by: agent`. The automatic session-page writers leave such
+    /// a page alone, because it was compiled by the model the user was
+    /// working with. A missing page is `false`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::read_page`] errors other than a missing file.
+    pub fn session_page_written_by_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> WikiResult<bool> {
+        let path = PagePath::new(format!("sessions/{session_id}.md"))?;
+        let frontmatter = match self.read_page(workspace_id, project_id, &path) {
+            Ok(md) => md.frontmatter,
+            Err(WikiError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(frontmatter
+            .get("consolidated_by")
+            .and_then(serde_json::Value::as_str)
+            == Some("agent"))
+    }
+
+    fn confined_project_root(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        prepare: Prepare,
+    ) -> WikiResult<PathBuf> {
+        confined_project_root(&self.root, workspace_id, project_id, prepare)
+    }
+
+    /// Refuse a project tree containing a symbolic link or reparse point.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] for any linked component.
+    pub fn validate_project_tree(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        self.inspect_project_tree(workspace_id, project_id)
+    }
+
+    pub(crate) fn validate_project_root(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        self.confined_project_root(workspace_id, project_id, Prepare::Inspect)
+            .map(|_| ())
+    }
+
+    pub(crate) fn validate_page_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> WikiResult<()> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)
+            .map(|_| ())
+    }
+
+    /// Refuse a workspace tree containing a symbolic link or reparse point.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] for any linked component.
+    pub fn validate_workspace_tree(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
+        self.inspect_workspace_tree(workspace_id)
+    }
+
+    fn inspect_wiki_tree(&self) -> WikiResult<()> {
+        let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
+        crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])
+    }
+
+    fn inspect_project_tree(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        let root = self.confined_project_root(workspace_id, project_id, Prepare::Inspect)?;
+        crate::confinement::inspect_tree_if_present(&root)
+    }
+
+    fn inspect_workspace_tree(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
+        let root = workspace_path(&self.root, workspace_id, Prepare::Inspect)?;
+        crate::confinement::inspect_tree_if_present(&root)
+    }
+
+    fn confined_page_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        prepare: Prepare,
+    ) -> WikiResult<PathBuf> {
+        project_path(
+            &self.root,
+            workspace_id,
+            project_id,
+            Path::new(path.as_str()),
+            prepare,
+        )
     }
 
     /// Restore one page from a git checkpoint and reindex it into the store.
@@ -741,6 +884,7 @@ impl Wiki {
         path: PagePath,
         rev: &str,
     ) -> WikiResult<PageId> {
+        self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
         let rel = PathBuf::from(workspace_id.to_string())
             .join(project_id.to_string())
             .join(path.as_str());
@@ -759,10 +903,7 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
-        let abs = self.abs_path(workspace_id, project_id, &path);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
         self.git.write_atomic(&abs, raw.as_bytes())?;
         let id = self
             .writer
@@ -842,7 +983,9 @@ impl Wiki {
         admission_ctx: Option<AdmissionContext>,
         author_id: Option<ai_memory_core::UserId>,
     ) -> WikiResult<()> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
         self.remove_page_locked(
@@ -878,6 +1021,7 @@ impl Wiki {
         expected_latest_id: PageId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<bool> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -918,6 +1062,7 @@ impl Wiki {
         expected_latest_id: PageId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<bool> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -993,6 +1138,7 @@ impl Wiki {
         path: &PagePath,
         expected_latest_id: PageId,
     ) -> WikiResult<bool> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -1006,7 +1152,7 @@ impl Wiki {
         if current != Some(expected_latest_id) {
             return Ok(false);
         }
-        let abs = self.abs_path(workspace_id, project_id, path);
+        let abs = self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         if abs.try_exists()? {
             // The file came back (e.g. a slow atomic-save pattern beyond the
             // two-pass window, or a deliberate rewrite mid-check). Leave the
@@ -1050,6 +1196,7 @@ impl Wiki {
         admission_ctx: Option<AdmissionContext>,
         removal: PageStoreRemoval,
     ) -> WikiResult<bool> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
@@ -1059,11 +1206,11 @@ impl Wiki {
             chain.notify(Some(path.as_str()), &ctx).await?;
             resolved_ctx = Some(ctx);
         }
-        let abs = self.abs_path(workspace_id, project_id, path);
+        let abs = self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let quarantined = match quarantine_file(&self.git, &abs) {
             Ok(path) => path,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(crate::WikiError::Io(e)),
+            Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
         };
 
         let delete_result = match removal {
@@ -1107,7 +1254,7 @@ impl Wiki {
         }
 
         if let Some(quarantine) = quarantined {
-            self.git.remove_file(&quarantine)?;
+            self.git.remove_file_checked(&quarantine)?;
         }
 
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
@@ -1136,6 +1283,7 @@ impl Wiki {
         tombstone_id: PageId,
         cutoff_us: i64,
     ) -> WikiResult<usize> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -1146,7 +1294,7 @@ impl Wiki {
         let mut current_latest = reader
             .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
             .await?;
-        let abs = self.abs_path(workspace_id, project_id, path);
+        let abs = self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         if current_latest.is_none() && abs.try_exists()? {
             // Deliberately drops any `PendingEmbed`: this whole function runs
             // under the exclusive write lock (`_guard` above, held until
@@ -1189,6 +1337,7 @@ impl Wiki {
         project_id: ProjectId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<()> {
+        self.inspect_project_tree(workspace_id, project_id)?;
         let ctx = self
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
@@ -1209,6 +1358,7 @@ impl Wiki {
         project_id: ProjectId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<Option<AdmissionContext>> {
+        self.inspect_project_tree(workspace_id, project_id)?;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             ctx.op = AdmissionOp::PurgeProject;
@@ -1233,6 +1383,7 @@ impl Wiki {
         project_id: ProjectId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<Option<AdmissionContext>> {
+        self.inspect_project_tree(workspace_id, project_id)?;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             ctx.op = AdmissionOp::PurgeSession;
@@ -1256,6 +1407,7 @@ impl Wiki {
         workspace_id: WorkspaceId,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<Option<AdmissionContext>> {
+        self.inspect_workspace_tree(workspace_id)?;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             ctx.op = AdmissionOp::PurgeWorkspace;
@@ -1356,6 +1508,7 @@ impl Wiki {
         op: AdmissionOp,
         actor: ActorContext,
     ) -> WikiResult<()> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = AdmissionContext {
                 op,
@@ -1379,11 +1532,12 @@ impl Wiki {
         project_id: ProjectId,
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
-        let root = self.project_root(workspace_id, project_id);
-        match self.git.remove_dir_all(&root) {
+        self.inspect_project_tree(workspace_id, project_id)?;
+        let root = self.confined_project_root(workspace_id, project_id, Prepare::Inspect)?;
+        match self.git.remove_dir_all_checked(&root) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::WikiError::Io(e)),
+            Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1395,11 +1549,12 @@ impl Wiki {
     /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
     pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
-        let root = self.root.join(workspace_id.to_string());
-        match self.git.remove_dir_all(&root) {
+        self.inspect_workspace_tree(workspace_id)?;
+        let root = workspace_path(&self.root, workspace_id, Prepare::Inspect)?;
+        match self.git.remove_dir_all_checked(&root) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::WikiError::Io(e)),
+            Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1441,7 +1596,9 @@ impl Wiki {
         author_id: Option<UserId>,
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
+        self.inspect_project_tree(workspace_id, project_id)?;
         let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(workspace_id, project_id)?;
         // Always `Commit`: a caller that only wants a preview (the HTTP
         // handler's `dry_run` branch) goes straight through
         // `WriterHandle::purge_session` instead, bypassing this wrapper
@@ -1462,12 +1619,12 @@ impl Wiki {
         let mut files_failed = Vec::new();
         for path in &summary.removed_paths {
             let abs = self.abs_path(workspace_id, project_id, path);
-            match self.git.remove_file(&abs) {
+            match self.git.remove_file_checked(&abs) {
                 Ok(()) => {
                     sync_parent_best_effort(&abs);
                     files_deleted.push(path.clone());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     tracing::warn!(
                         operation = "purge-session",
@@ -1524,6 +1681,13 @@ impl Wiki {
         project_id: ProjectId,
         proposal_id: AutoImproveProposalId,
     ) -> WikiResult<PathBuf> {
+        project_path(
+            &self.root,
+            workspace_id,
+            project_id,
+            Path::new(&artifact_path_for(proposal_id)),
+            Prepare::Inspect,
+        )?;
         let reader = self.store_reader.as_ref().ok_or_else(|| {
             ai_memory_wiki_error("auto-improve sidecar write requires a store reader")
         })?;
@@ -1552,6 +1716,7 @@ impl Wiki {
         author_id: Option<UserId>,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<ApproveAutoImproveProposalResult> {
+        self.inspect_project_tree(workspace_id, project_id)?;
         let reader = self
             .store_reader
             .as_ref()
@@ -1563,6 +1728,7 @@ impl Wiki {
 
         let path = detail.summary.target_path.clone();
         path.ensure_portable()?;
+        self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
         let mut frontmatter = serde_json::json!({
             "kind": detail.summary.kind,
             "title": detail.summary.title,
@@ -1633,9 +1799,10 @@ impl Wiki {
 
         let result = {
             let _guard = self.mutation_lock.write().await;
+            self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
-            let abs = self.abs_path(workspace_id, project_id, &path);
+            let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
             let installed =
                 replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
             match self
@@ -1696,6 +1863,7 @@ impl Wiki {
         project_id: ProjectId,
         path: PagePath,
     ) -> WikiResult<PageId> {
+        self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
         if is_pending_path(&path) {
             return Err(ai_memory_wiki_error(
                 "refusing to index pending proposal sidecar",
@@ -1707,6 +1875,7 @@ impl Wiki {
         // would block every other write in the wiki for its duration.
         let (id, pending_embed) = {
             let _guard = self.mutation_lock.read().await;
+            self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             self.reindex_page_locked(workspace_id, project_id, path)
@@ -1741,14 +1910,9 @@ impl Wiki {
         path: PagePath,
     ) -> WikiResult<(PageId, Option<PendingEmbed>)> {
         let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
-        let abs = self.abs_path(workspace_id, project_id, &path);
-        if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
-            return Err(WikiError::Io(std::io::Error::other(format!(
-                "refusing to reindex symlinked page {}",
-                path.as_str()
-            ))));
-        }
-        let md = self.read_page(workspace_id, project_id, &path)?;
+        let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
+        let raw = std::fs::read_to_string(&abs)?;
+        let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
@@ -1821,6 +1985,48 @@ impl Wiki {
         Ok((id, pending_embed))
     }
 
+    fn project_scope_frontmatter(scope: ScopeRow) -> WikiResult<serde_json::Value> {
+        let project_id = scope.project_id;
+        let identity = match (scope.identity.as_deref(), scope.identity_source.as_deref()) {
+            (Some(identity), Some(source)) => Some(
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+                    .ok_or_else(|| {
+                        WikiError::Io(std::io::Error::other(format!(
+                            "project {} has an invalid identity/source pair",
+                            scope.project_id
+                        )))
+                    })?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "project {} has an incomplete identity/source pair",
+                    scope.project_id
+                ))));
+            }
+        };
+        let canonical_name = identity
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::path_style_name);
+        let legacy_name = identity
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+        if scope.canonical_name != canonical_name || scope.legacy_name != legacy_name {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "project {project_id} has coordinate keys inconsistent with its identity"
+            ))));
+        }
+        let manifest = ai_memory_core::repository_identity::ProjectManifest {
+            project: scope.project_name,
+            repo_path: scope.repo_path,
+            identity: identity.as_ref().map(|value| value.identity.clone()),
+            identity_source: identity.map(|value| value.source),
+            canonical_name,
+            legacy_name,
+        };
+        serde_json::to_value(manifest).map_err(WikiError::from)
+    }
+
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
         let path = dir.join("_meta.md");
@@ -1835,7 +2041,7 @@ impl Wiki {
             };
             WikiError::Io(std::io::Error::new(error.kind(), message))
         })?;
-        if meta.file_type().is_symlink() {
+        if crate::confinement::is_link_like(&meta) {
             return Err(WikiError::Io(std::io::Error::other(format!(
                 "refusing to read symlinked scope manifest {}",
                 path.display()
@@ -1852,8 +2058,9 @@ impl Wiki {
 
     /// Rebuild the **entire** store index from the on-disk wiki tree — the
     /// "DB is rebuildable from files" guarantee made concrete. Walks every
-    /// `<ws-uuid>/<proj-uuid>/` directory, recreates the workspace/project rows
-    /// from each dir's self-describing `_meta.md` manifest (preserving the ids
+    /// `<ws-uuid>/<proj-uuid>/` directory, recreates workspace/project rows and
+    /// optional repository identity from each self-describing `_meta.md`
+    /// manifest (preserving the ids
     /// the tree is keyed by, via [`WriterHandle::ensure_workspace_with_id`] /
     /// [`ensure_project_with_id`]), then reindexes every page. Pages are
     /// detected by content (a frontmatter file named `log.md` is a page; the
@@ -1873,6 +2080,7 @@ impl Wiki {
     /// [`Self::backfill_scope_manifests`] repairs trees written by older
     /// ones on every start.
     pub async fn reindex_all(&self) -> WikiResult<ReindexSummary> {
+        self.inspect_wiki_tree()?;
         let root = self.root().to_path_buf();
         let project_dirs =
             tokio::task::spawn_blocking(move || crate::watcher::walk_project_dirs(&root))
@@ -1918,21 +2126,58 @@ impl Wiki {
             }
 
             let meta = Self::read_scope_meta(&proj_root)?;
-            let name = meta
+            if meta
                 .get("project")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    WikiError::Io(std::io::Error::other(format!(
-                        "{}/_meta.md is missing the `project` name",
+                .and_then(|value| value.as_str())
+                .is_none()
+            {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "{}/_meta.md is missing the `project` name",
+                    proj_root.display()
+                ))));
+            }
+            let manifest: ai_memory_core::repository_identity::ProjectManifest =
+                serde_json::from_value(meta)?;
+            let identity = match (manifest.identity.as_deref(), manifest.identity_source) {
+                (Some(identity), Some(source)) => Some(
+                    ai_memory_core::repository_identity::accept_wire_identity(
+                        identity,
+                        source.as_str(),
+                    )
+                    .ok_or_else(|| {
+                        WikiError::Io(std::io::Error::other(format!(
+                            "{}/_meta.md has an invalid repository identity/source pair",
+                            proj_root.display()
+                        )))
+                    })?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "{}/_meta.md must provide identity and identity_source together",
                         proj_root.display()
-                    )))
-                })?;
-            let repo_path = meta
-                .get("repo_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+                    ))));
+                }
+            };
+            let derived_canonical = identity
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::path_style_name);
+            let derived_legacy = identity
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+            let has_coordinate_assertion =
+                manifest.canonical_name.is_some() || manifest.legacy_name.is_some();
+            if has_coordinate_assertion
+                && (manifest.canonical_name != derived_canonical
+                    || manifest.legacy_name != derived_legacy)
+            {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "{}/_meta.md repository coordinate keys do not match its identity",
+                    proj_root.display()
+                ))));
+            }
             self.writer
-                .ensure_project_with_id(proj, ws, name, repo_path)
+                .ensure_project_with_id(proj, ws, manifest.project, manifest.repo_path, identity)
                 .await?;
             summary.projects += 1;
 
@@ -1979,6 +2224,13 @@ impl Wiki {
         dir: &Path,
         mut frontmatter: serde_json::Value,
     ) -> WikiResult<bool> {
+        let relative = dir
+            .strip_prefix(&self.root)
+            .map_err(|_| WikiError::Confinement {
+                path: dir.to_path_buf(),
+                reason: "scope manifest directory is outside the wiki root",
+            })?;
+        let dir = tree_path(&self.root, relative, Prepare::Directory)?;
         // OKF conformance at the manifest choke point: every non-reserved
         // .md needs a `type`, and the startup backfill's byte-compare must
         // agree with what the OKF migration writes — a typeless emit here
@@ -1996,7 +2248,7 @@ impl Wiki {
         })?;
         let path = dir.join("_meta.md");
         match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+            Ok(meta) if crate::confinement::is_link_like(&meta) => {
                 return Err(WikiError::Io(std::io::Error::other(format!(
                     "refusing to update symlinked scope manifest {}",
                     path.display()
@@ -2009,16 +2261,56 @@ impl Wiki {
             }
             Ok(_) | Err(_) => {}
         }
-        std::fs::create_dir_all(dir)?;
         self.git.write_atomic(&path, content.as_bytes())?;
         Ok(true)
     }
 
+    /// Refresh one committed renamed scope from its current store row and checkpoint it.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for store, filesystem, or checkpoint errors.
+    pub async fn refresh_renamed_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<Option<String>> {
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            WikiError::Io(std::io::Error::other(
+                "scope refresh requires a store reader",
+            ))
+        })?;
+        let _guard = self.mutation_lock.write().await;
+        self.manifested_scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(workspace_id, project_id));
+        let scope = reader
+            .scope_row_by_ids(workspace_id, project_id)
+            .await?
+            .ok_or_else(|| {
+                WikiError::Io(std::io::Error::other("renamed scope no longer exists"))
+            })?;
+        let ws_dir = self.root.join(workspace_id.to_string());
+        self.write_scope_manifest(
+            &ws_dir,
+            serde_json::json!({ "workspace": scope.workspace_name }),
+        )?;
+        let project_fm = Self::project_scope_frontmatter(scope)?;
+        self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)?;
+        let checkpoint = self
+            .commit_all(&format!("rename-project {workspace_id}/{project_id}"))?
+            .map(|oid| oid.to_string());
+        self.manifested_scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((workspace_id, project_id));
+        Ok(checkpoint)
+    }
+
     /// Ensure every workspace/project scope has its self-describing `_meta.md`
-    /// manifest on disk (`workspace`/`project` name + `repo_path`), so the wiki
-    /// tree alone is enough to rebuild the index via [`Self::reindex_all`] —
-    /// the "DB is rebuildable from files" guarantee. Idempotent; safe to run on
-    /// every startup. No-op without a store reader. Returns the count written.
+    /// manifest on disk (names, `repo_path`, and optional repository identity
+    /// coordinates). Idempotent, safe at startup, and a no-op without a store
+    /// reader.
     ///
     /// # Errors
     /// Returns [`WikiError`] for store or filesystem errors.
@@ -2031,7 +2323,7 @@ impl Wiki {
         let scopes = reader.list_all_scopes().await?;
         let mut written = 0;
         for ws in workspaces {
-            let ws_dir = self.root().join(ws.workspace_id.to_string());
+            let ws_dir = workspace_path(&self.root, ws.workspace_id, Prepare::Directory)?;
             if self.write_scope_manifest(
                 &ws_dir,
                 serde_json::json!({ "workspace": ws.workspace_name }),
@@ -2040,12 +2332,10 @@ impl Wiki {
             }
         }
         for s in scopes {
-            let ws_dir = self.root().join(s.workspace_id.to_string());
-            let mut fm = serde_json::json!({ "project": s.project_name });
-            if let Some(rp) = s.repo_path {
-                fm["repo_path"] = serde_json::Value::String(rp);
-            }
-            if self.write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+            let project_dir =
+                self.confined_project_root(s.workspace_id, s.project_id, Prepare::Directory)?;
+            let fm = Self::project_scope_frontmatter(s)?;
+            if self.write_scope_manifest(&project_dir, fm)? {
                 written += 1;
             }
         }
@@ -2062,13 +2352,19 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for store, filesystem or git errors.
     pub async fn repair_date_only_stale_after(&self) -> WikiResult<(u64, usize)> {
+        self.inspect_wiki_tree()?;
         let _guard = self.mutation_lock.write().await;
+        self.inspect_wiki_tree()?;
         let repair = self.writer.repair_date_only_stale_after().await?;
         let mut files = 0;
         for page in &repair.date_only_pages {
-            let abs = self
-                .project_root(page.workspace_id, page.project_id)
-                .join(&page.path);
+            let page_path = PagePath::new(&page.path)?;
+            let abs = self.confined_page_path(
+                page.workspace_id,
+                page.project_id,
+                &page_path,
+                Prepare::Inspect,
+            )?;
             let raw = match std::fs::read_to_string(&abs) {
                 Ok(raw) => raw,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2083,8 +2379,7 @@ impl Wiki {
             }
         }
         if files > 0 {
-            self.git
-                .commit_all("okf: repair date-only stale_after on existing pages")?;
+            self.commit_all("okf: repair date-only stale_after on existing pages")?;
         }
         Ok((repair.rows_repaired, files))
     }
@@ -2106,6 +2401,12 @@ impl Wiki {
         // supported platform, before anything is written.
         for req in &requests {
             req.path.ensure_portable()?;
+            self.confined_page_path(
+                req.workspace_id,
+                req.project_id,
+                &req.path,
+                Prepare::Inspect,
+            )?;
         }
         // Pre-compute markdown for each request. Filesystem work happens only
         // after the mutation guard + project/workspace validation below.
@@ -2173,6 +2474,14 @@ impl Wiki {
 
         let (ids, dispatches) = {
             let _guard = self.mutation_lock.read().await;
+            for (req, _, _, _) in &staged {
+                self.confined_page_path(
+                    req.workspace_id,
+                    req.project_id,
+                    &req.path,
+                    Prepare::Inspect,
+                )?;
+            }
             // Serialize every path in this batch against concurrent single-page
             // or batch writers to the same path (#607). Sorted acquisition
             // keeps a batch deadlock-free against any other writer.
@@ -2187,13 +2496,18 @@ impl Wiki {
                 std::path::PathBuf,
                 Option<AdmissionContext>,
             )> = Vec::with_capacity(staged.len());
-            for (req, emitted, abs, ctx) in staged {
+            for (req, emitted, _abs, ctx) in staged {
                 self.ensure_project_workspace(req.workspace_id, req.project_id)
                     .await?;
+                let abs = self.confined_page_path(
+                    req.workspace_id,
+                    req.project_id,
+                    &req.path,
+                    Prepare::Parents,
+                )?;
                 let parent = abs.parent().ok_or_else(|| {
                     ai_memory_wiki_error("page path has no parent (cannot stage tempfile)")
                 })?;
-                std::fs::create_dir_all(parent)?;
                 let mut tmp = tempfile::Builder::new()
                     .prefix(".ai-memory-tmp.")
                     .tempfile_in(parent)?;
@@ -2326,6 +2640,12 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
+        self.confined_page_path(
+            req.workspace_id,
+            req.project_id,
+            &req.path,
+            Prepare::Inspect,
+        )?;
         // Reject a path that cannot be materialised and checkpointed on every
         // supported platform, before anything is written.
         //
@@ -2439,14 +2759,12 @@ impl Wiki {
             // writer's and leave disk disagreeing with the DB `latest` row
             // (#607). Different paths still proceed concurrently.
             let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
+            self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
-            let abs = self.abs_path(workspace_id, project_id, &path);
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
             let installed =
-                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?; // lgtm [rust/path-injection]
 
             match self
                 .writer
@@ -2926,10 +3244,10 @@ fn rollback_installed_files(git: &GitAdapter, installed: &[InstalledFile]) -> Wi
     for file in installed.iter().rev() {
         match &file.previous {
             Some(bytes) => git.write_atomic(&file.path, bytes)?,
-            None => match git.remove_file(&file.path) {
+            None => match git.remove_file_checked(&file.path) {
                 Ok(()) => sync_parent_best_effort(&file.path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(WikiError::Io(e)),
+                Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             },
         }
     }
@@ -2949,21 +3267,21 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
     Ok(())
 }
 
-fn quarantine_file(git: &GitAdapter, path: &Path) -> std::io::Result<Option<PathBuf>> {
+fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>> {
     let Some(parent) = path.parent() else {
-        return Err(std::io::Error::other(
+        return Err(WikiError::Io(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
-        ));
+        )));
     };
     let tmp = tempfile::Builder::new()
         .prefix(".ai-memory-delete.")
         .tempfile_in(parent)?;
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
-    git.remove_file(&quarantine)?;
-    match git.rename(path, &quarantine) {
+    git.remove_file_checked(&quarantine)?;
+    match git.rename_checked(path, &quarantine) {
         Ok(()) => Ok(Some(quarantine)),
         Err(e) => {
-            let _ = git.remove_file(&quarantine);
+            let _ = git.remove_file_checked(&quarantine);
             Err(e)
         }
     }
@@ -2976,7 +3294,7 @@ fn restore_quarantined_file(
     page_path: &PagePath,
 ) {
     if let Some(quarantine) = quarantined
-        && let Err(error) = git.rename(quarantine, path)
+        && let Err(error) = git.rename_checked(quarantine, path)
     {
         tracing::error!(
             path = %page_path.as_str(),
@@ -3789,6 +4107,305 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         (store, wiki, ws, proj)
+    }
+
+    #[test]
+    fn append_under_project_public_api_remains_io_result() {
+        let method: fn(&Wiki, WorkspaceId, ProjectId, &str, &[u8]) -> std::io::Result<PathBuf> =
+            Wiki::append_under_project;
+        let _ = method;
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_confined<T>(result: WikiResult<T>) {
+        assert!(
+            matches!(result, Err(WikiError::Confinement { .. })),
+            "expected confinement refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn page_reads_refuse_leaf_and_ancestor_symlinks_without_fallback_classification() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let outside = TempDir::new().unwrap();
+        let outside_page = outside.path().join("page.md");
+        std::fs::write(&outside_page, "# Outside\n\ncanary\n").unwrap();
+        let project = wiki.project_root(ws, proj);
+        std::fs::create_dir_all(&project).unwrap();
+
+        let leaf = PagePath::new("leaf.md").unwrap();
+        symlink(&outside_page, &wiki.abs_path(ws, proj, &leaf));
+        let leaf_error = wiki.read_page(ws, proj, &leaf).unwrap_err();
+        assert!(matches!(leaf_error, WikiError::Confinement { .. }));
+        assert!(
+            !matches!(leaf_error, WikiError::Io(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+
+        let outside_dir = outside.path().join("tree");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("page.md"), "# Outside ancestor\n").unwrap();
+        symlink(&outside_dir, &project.join("linked"));
+        assert_confined(wiki.read_page(ws, proj, &PagePath::new("linked/page.md").unwrap()));
+
+        let dangling = PagePath::new("dangling.md").unwrap();
+        symlink(
+            &outside.path().join("missing.md"),
+            &wiki.abs_path(ws, proj, &dangling),
+        );
+        assert_confined(wiki.read_page(ws, proj, &dangling));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn page_mutations_refuse_ancestor_symlink_and_leave_outside_and_store_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let outside = TempDir::new().unwrap();
+        let project = wiki.project_root(ws, proj);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(outside.path().join("write.md"), "outside canary").unwrap();
+        symlink(outside.path(), &project.join("linked"));
+
+        assert_confined(
+            wiki.write_page(req(
+                ws,
+                proj,
+                "linked/write.md",
+                "blocked",
+                serde_json::json!({}),
+            ))
+            .await,
+        );
+        assert_confined(
+            wiki.apply_batch(vec![req(
+                ws,
+                proj,
+                "linked/batch.md",
+                "blocked",
+                serde_json::json!({}),
+            )])
+            .await,
+        );
+        assert_confined(
+            wiki.delete_page(
+                ws,
+                proj,
+                &PagePath::new("linked/write.md").unwrap(),
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("write.md")).unwrap(),
+            "outside canary"
+        );
+        assert!(!outside.path().join("batch.md").exists());
+        assert!(
+            store
+                .reader
+                .search_pages("blocked".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confinement_refusal_happens_before_blocking_and_observer_admission() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/observe",
+                post(|State(calls): State<Arc<AtomicUsize>>| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let outside = TempDir::new().unwrap();
+        let project = wiki.project_root(ws, proj);
+        std::fs::create_dir_all(&project).unwrap();
+        symlink(outside.path(), &project.join("linked"));
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "observer".into(),
+                url: format!("http://{address}/observe"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Ignore,
+                events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+
+        assert_confined(
+            wiki.write_page(req(
+                ws,
+                proj,
+                "linked/write.md",
+                "blocked",
+                serde_json::json!({}),
+            ))
+            .await,
+        );
+        assert_confined(
+            wiki.delete_page(
+                ws,
+                proj,
+                &PagePath::new("linked/delete.md").unwrap(),
+                None,
+                None,
+            )
+            .await,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_and_reindex_refuse_ancestor_symlink_without_touching_canary_or_db() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let committed = PagePath::new("notes/source.md").unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            committed.as_str(),
+            "safe",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        wiki.commit_all("fixture").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let canary = outside.path().join("target.md");
+        std::fs::write(&canary, "canary").unwrap();
+        symlink(outside.path(), &wiki.project_root(ws, proj).join("linked"));
+        let linked = PagePath::new("linked/target.md").unwrap();
+        assert_confined(wiki.reindex_page(ws, proj, linked.clone()).await);
+        assert_confined(
+            wiki.restore_page_from_checkpoint(ws, proj, linked.clone(), "HEAD")
+                .await,
+        );
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "canary");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, linked.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_wiki_root_is_refused_during_construction() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), &tmp.path().join("wiki"));
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(matches!(
+            Wiki::new(tmp.path(), store.writer.clone()),
+            Err(WikiError::Confinement { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_or_dangling_scope_roots_are_refused_but_real_roots_work() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/control.md",
+            "control",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let linked_ws = WorkspaceId::new();
+        symlink(outside.path(), &wiki.root().join(linked_ws.to_string()));
+        assert_confined(
+            wiki.write_page(req(
+                linked_ws,
+                ProjectId::new(),
+                "notes/refused.md",
+                "blocked",
+                serde_json::json!({}),
+            ))
+            .await,
+        );
+
+        let workspace = wiki.root().join(ws.to_string());
+        let linked_project = ProjectId::new();
+        symlink(outside.path(), &workspace.join(linked_project.to_string()));
+        assert_confined(
+            wiki.write_page(req(
+                ws,
+                linked_project,
+                "notes/refused.md",
+                "blocked",
+                serde_json::json!({}),
+            ))
+            .await,
+        );
+
+        let dangling_project = ProjectId::new();
+        symlink(
+            &outside.path().join("missing"),
+            &workspace.join(dangling_project.to_string()),
+        );
+        assert_confined(
+            wiki.write_page(req(
+                ws,
+                dangling_project,
+                "notes/refused.md",
+                "blocked",
+                serde_json::json!({}),
+            ))
+            .await,
+        );
+        assert_eq!(
+            wiki.read_page(ws, proj, &PagePath::new("notes/control.md").unwrap())
+                .unwrap()
+                .body,
+            "control"
+        );
+        assert!(
+            store
+                .reader
+                .search_pages("blocked".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4887,7 +5504,7 @@ mod tests {
             .hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
             .await
             .expect_err("symlinked recreation must fail closed");
-        assert!(error.to_string().contains("symlinked page"), "{error}");
+        assert!(matches!(error, WikiError::Confinement { .. }), "{error}");
         assert_eq!(
             store
                 .reader
@@ -6464,6 +7081,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promoted_identity_round_trips_through_manifest_and_clean_reindex() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let workspace = source
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let identity = ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/platform/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        };
+        let (project, _) = source
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                identity.clone(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                Some("/src/api".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/history.md",
+            "history survives reindex",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let promoted =
+            ai_memory_store::create_explicit_scope(&source.writer, "default", "acme-platform-api")
+                .await
+                .unwrap();
+        assert_eq!(promoted.scope.project_id, project);
+        assert_eq!(promoted.promoted_from.as_deref(), Some("api"));
+        assert!(
+            wiki.refresh_renamed_scope(workspace, project)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            manifest.contains("project: acme-platform-api"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("identity: github.com/acme/platform/api"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("identity_source: git_remote"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("canonical_name: acme-platform-api"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("legacy_name: api"), "{manifest}");
+        let source_history = wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            source_history
+                .iter()
+                .any(|checkpoint| checkpoint.summary.contains("rename-project"))
+        );
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        let rebuilt_wiki = Wiki::new(dst.path(), rebuilt.writer.clone()).unwrap();
+        let summary = rebuilt_wiki.reindex_all().await.unwrap();
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 1);
+        let restored_history = rebuilt_wiki.recent_checkpoints(10).unwrap();
+        assert_eq!(
+            restored_history
+                .iter()
+                .map(|checkpoint| &checkpoint.oid)
+                .collect::<Vec<_>>(),
+            source_history
+                .iter()
+                .map(|checkpoint| &checkpoint.oid)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rebuilt
+                .reader
+                .project_name_by_id(workspace, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-platform-api")
+        );
+        let rebuilt_scope = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rebuilt_scope.identity.as_deref(),
+            Some("github.com/acme/platform/api")
+        );
+        assert_eq!(rebuilt_scope.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(
+            rebuilt_scope.canonical_name.as_deref(),
+            Some("acme-platform-api")
+        );
+        assert_eq!(rebuilt_scope.legacy_name.as_deref(), Some("api"));
+        assert!(
+            rebuilt
+                .reader
+                .page_body_by_ids(workspace, project, "notes/history.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .contains("history survives reindex")
+        );
+        for key in ["acme-platform-api", "api"] {
+            assert_eq!(
+                ai_memory_store::lookup_existing_scope(&rebuilt.reader, "default", key)
+                    .await
+                    .unwrap()
+                    .project_id,
+                project
+            );
+        }
+        let (captured, resolution) = rebuilt
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                identity,
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                "another-checkout",
+                Some("/other/api".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured, project);
+        assert_eq!(resolution, ai_memory_store::IdentityResolution::Matched);
+        let count: i64 = rebuilt
+            .reader
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "capture must not create a second project UUID");
+    }
+
+    #[tokio::test]
+    async fn reindex_rejects_project_coordinate_fields_that_do_not_match_identity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let workspace = WorkspaceId::new();
+        let project = ProjectId::new();
+        let workspace_dir = tmp.path().join("wiki").join(workspace.to_string());
+        let project_dir = workspace_dir.join(project.to_string());
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("_meta.md"),
+            "---\nworkspace: default\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("_meta.md"),
+            "---\nproject: acme-api\nidentity: github.com/acme/api\nidentity_source: git_remote\ncanonical_name: forged-api\nlegacy_name: api\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+
+        let error = wiki.reindex_all().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinate keys do not match its identity"),
+            "{error}"
+        );
+        assert!(
+            store
+                .reader
+                .scope_row_by_ids(workspace, project)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_manifest_without_derived_keys_reindexes_and_derives_them() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        let workspace = source
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project, _) = source
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/a.md",
+            "identity history",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        std::fs::write(
+            &manifest_path,
+            "---\nproject: api\nidentity: github.com/acme/api\nidentity_source: git_remote\ntype: Scope Manifest\n---\n",
+        ).unwrap();
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        Wiki::new(dst.path(), rebuilt.writer.clone())
+            .unwrap()
+            .reindex_all()
+            .await
+            .unwrap();
+        let scope = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.canonical_name.as_deref(), Some("acme-api"));
+        assert_eq!(scope.legacy_name.as_deref(), Some("api"));
+    }
+
+    #[tokio::test]
+    async fn old_project_manifest_without_identity_still_reindexes() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        let workspace = source
+            .writer
+            .get_or_create_workspace("legacy")
+            .await
+            .unwrap();
+        let project = source
+            .writer
+            .get_or_create_project(workspace, "old-format", Some("/legacy".into()))
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/legacy.md",
+            "legacy manifest history",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        std::fs::write(
+            &manifest_path,
+            "---\nproject: old-format\nrepo_path: /legacy\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        Wiki::new(dst.path(), rebuilt.writer.clone())
+            .unwrap()
+            .reindex_all()
+            .await
+            .unwrap();
+        let row = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.project_name, "old-format");
+        assert_eq!(row.repo_path.as_deref(), Some("/legacy"));
+        assert!(row.identity.is_none());
+        assert!(row.identity_source.is_none());
+        assert!(row.canonical_name.is_none());
+        assert!(row.legacy_name.is_none());
+    }
+
+    #[tokio::test]
     async fn backfill_writes_manifest_for_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -6713,7 +7665,7 @@ mod tests {
 
         let err = wiki.reindex_all().await.unwrap_err();
         assert!(
-            err.to_string().contains("symlinked scope manifest"),
+            matches!(err, WikiError::Confinement { .. }),
             "reindex must reject symlinked manifests, got {err:#}"
         );
     }

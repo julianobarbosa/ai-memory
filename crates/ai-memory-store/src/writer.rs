@@ -36,9 +36,9 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession,
-    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
+    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -78,14 +78,54 @@ pub(crate) enum WriteCmd {
         mode: crate::AccessMode,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
+    SetProjectProfileFlags {
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    RecordProfileHarvest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    ClearProfileHarvestMarks {
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    RecordProfileEntries {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     ResolveProjectByIdentity {
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
         name: String,
         repo_path: Option<String>,
         candidate: Option<ProjectId>,
         creator: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<(ProjectId, ops::IdentityResolution)>>,
+    },
+    ResolveProjectNameForWrite {
+        workspace_id: WorkspaceId,
+        name: String,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+        reply: oneshot::Sender<StoreResult<ops::ProjectNameWriteResolution>>,
+    },
+    ResolveProjectAliasesForWrite {
+        workspace_id: WorkspaceId,
+        canonical: String,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        reply: oneshot::Sender<StoreResult<Option<ops::ProjectAliasWriteResolution>>>,
     },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
@@ -102,6 +142,7 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         name: String,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     ScopeIsPurged {
@@ -736,6 +777,10 @@ pub(crate) enum WriteCmd {
         input: LinkOrAdoptManagedRunSession,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
+    LinkManagedRunSessionInScope {
+        input: LinkManagedRunSessionInScope,
+        reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
+    },
     AcceptManagedRunContext {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -748,6 +793,7 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
     },
@@ -931,16 +977,125 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Persist a project's `[profile]` flags (forwarded from its marker at
+    /// session start). A no-op when they already match.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_profile_flags(
+        &self,
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectProfileFlags {
+            project_id,
+            flags,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one project's profile candidates and advance its harvest marks
+    /// in one transaction. Re-recording a candidate is a no-op; returns how
+    /// many were new.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_harvest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileHarvest {
+            workspace_id,
+            project_id,
+            candidates,
+            mark,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record the profile entries the harvester wrote into a profile scope,
+    /// in one transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileEntries {
+            workspace_id,
+            project_id,
+            entries,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Forget every profile harvest mark (`ai-memory profile rebuild`).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn clear_profile_harvest_marks(&self) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearProfileHarvestMarks { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Resolve the project a repository identity routes to, creating it when
     /// needed — see [`ops::resolve_project_by_identity`] for the rules.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
     /// propagates the SQL error.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_project_by_identity(
         &self,
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            false,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_project_by_identity_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
         name: impl Into<String>,
         repo_path: Option<String>,
         candidate: Option<ProjectId>,
@@ -950,10 +1105,118 @@ impl WriterHandle {
         self.send(WriteCmd::ResolveProjectByIdentity {
             workspace_id,
             identity,
+            style,
+            promote,
             name: name.into(),
             repo_path,
             candidate,
             creator,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve repository identity for capture and allow transactional
+    /// canonical-name promotion after authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_project_by_identity_for_capture(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            true,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
+    }
+
+    /// Resolve marker aliases inside one workspace and atomically authorize any
+    /// Phase 1 canonical-name promotion. Returns `None` when no alias exists.
+    pub async fn resolve_project_aliases_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical: impl Into<String>,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<Option<ops::ProjectAliasWriteResolution>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectAliasesForWrite {
+            workspace_id,
+            canonical: canonical.into(),
+            aliases,
+            repository,
+            principal,
+            distinguishes_operators,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    pub(crate) async fn resolve_project_name_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_project_name_for_write_without_promotion(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            false,
+        )
+        .await
+    }
+
+    async fn resolve_project_name_for_write_mode(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectNameForWrite {
+            workspace_id,
+            name: name.into(),
+            principal,
+            distinguishes_operators,
+            promote,
             reply: tx,
         })
         .await?;
@@ -1013,6 +1276,7 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         name: impl Into<String>,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EnsureProjectWithId {
@@ -1020,6 +1284,7 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            identity,
             reply: tx,
         })
         .await?;
@@ -3083,6 +3348,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Link the native session a later hook event of a managed run reported,
+    /// within the run's own project and operator boundary.
+    pub async fn link_managed_run_session_in_scope(
+        &self,
+        input: LinkManagedRunSessionInScope,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkManagedRunSessionInScope { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Acknowledge successful SessionStart delivery for a managed run.
     pub async fn accept_managed_run_context(&self, run_id: ManagedRunId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
@@ -3122,11 +3399,16 @@ impl WriterHandle {
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
     ) -> StoreResult<FinishedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::FinishWorkstreamRun { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::FinishWorkstreamRun {
+            authority,
+            input,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -3194,6 +3476,48 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = crate::grants::set_access_mode(&conn, project_id, mode);
                 send_or_warn(reply, result, "set_access_mode");
+            }
+            WriteCmd::SetProjectProfileFlags {
+                project_id,
+                flags,
+                reply,
+            } => {
+                let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
+                send_or_warn(reply, result, "set_project_profile_flags");
+            }
+            WriteCmd::RecordProfileHarvest {
+                workspace_id,
+                project_id,
+                candidates,
+                mark,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_harvest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &candidates,
+                    mark,
+                );
+                send_or_warn(reply, result, "record_profile_harvest");
+            }
+            WriteCmd::RecordProfileEntries {
+                workspace_id,
+                project_id,
+                entries,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_entries(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &entries,
+                );
+                send_or_warn(reply, result, "record_profile_entries");
+            }
+            WriteCmd::ClearProfileHarvestMarks { reply } => {
+                let result = crate::profile::clear_profile_harvest_marks(&conn);
+                send_or_warn(reply, result, "clear_profile_harvest_marks");
             }
             WriteCmd::Shutdown => {
                 // Dropping the receiver drains the queue, but a sender that
@@ -3267,6 +3591,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ResolveProjectByIdentity {
                 workspace_id,
                 identity,
+                style,
+                promote,
                 name,
                 repo_path,
                 candidate,
@@ -3277,6 +3603,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &mut conn,
                     &workspace_id,
                     &identity,
+                    style,
+                    promote,
                     &name,
                     repo_path.as_deref(),
                     candidate,
@@ -3284,6 +3612,45 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     new_project_mode,
                 );
                 send_or_warn(reply, result, "resolve_project_by_identity");
+            }
+            WriteCmd::ResolveProjectNameForWrite {
+                workspace_id,
+                name,
+                principal,
+                distinguishes_operators,
+                promote,
+                reply,
+            } => {
+                let result = ops::resolve_project_name_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                    promote,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "resolve_project_name_for_write");
+            }
+            WriteCmd::ResolveProjectAliasesForWrite {
+                workspace_id,
+                canonical,
+                aliases,
+                repository,
+                principal,
+                distinguishes_operators,
+                reply,
+            } => {
+                let result = ops::resolve_project_aliases_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &canonical,
+                    &aliases,
+                    &repository,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                );
+                send_or_warn(reply, result, "resolve_project_aliases_for_write");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
@@ -3302,6 +3669,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 name,
                 repo_path,
+                identity,
                 reply,
             } => {
                 let result = ops::ensure_project_with_id(
@@ -3310,6 +3678,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     workspace_id,
                     &name,
                     repo_path.as_deref(),
+                    identity.as_ref(),
                 );
                 send_or_warn(reply, result, "ensure_project_with_id");
             }
@@ -4330,6 +4699,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
                 send_or_warn(reply, result, "link_or_adopt_managed_run_session");
             }
+            WriteCmd::LinkManagedRunSessionInScope { input, reply } => {
+                let result = crate::workstream::link_native_session_in_scope(&mut conn, &input);
+                send_or_warn(reply, result, "link_managed_run_session_in_scope");
+            }
             WriteCmd::AcceptManagedRunContext { run_id, reply } => {
                 let result = crate::workstream::accept_context(&mut conn, run_id);
                 send_or_warn(reply, result, "accept_managed_run_context");
@@ -4382,8 +4755,12 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 })();
                 send_or_warn(reply, result, "accept_startup_context");
             }
-            WriteCmd::FinishWorkstreamRun { input, reply } => {
-                let result = crate::workstream::finish_run(&mut conn, &input);
+            WriteCmd::FinishWorkstreamRun {
+                authority,
+                input,
+                reply,
+            } => {
+                let result = crate::workstream::finish_run(&mut conn, &authority, &input);
                 send_or_warn(reply, result, "finish_workstream_run");
             }
             WriteCmd::RenameWorkstream { input, reply } => {

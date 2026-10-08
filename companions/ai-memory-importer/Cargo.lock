@@ -12,12 +12,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-memory-importer"
+name = "ai-memory-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
  "regex",
+ "serde_json",
+]
+
+[[package]]
+name = "ai-memory-importer"
+version = "0.1.0"
+dependencies = [
+ "ai-memory-client",
+ "anyhow",
+ "clap",
  "reqwest",
  "serde",
  "serde_json",

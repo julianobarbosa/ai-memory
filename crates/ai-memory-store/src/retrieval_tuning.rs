@@ -5,7 +5,7 @@
 //!
 //! * **Session-recall routing** — a zero-LLM lexical check that recognises
 //!   queries phrased as "find a past session / what did we do back then"
-//!   ("上次 / 之前那次…的会话 / last time / yesterday …"). Session pages
+//!   ("上次 / 之前那次…的会话 / last time / yesterday / última sessão …"). Session pages
 //!   otherwise carry a bounded authority penalty (kind `session` −0.15,
 //!   tier `episodic` −0.08, ×0.77 combined) because they are rarely the
 //!   right answer to a fact query — but a query that is *about* a past
@@ -117,6 +117,19 @@ const SESSION_RECALL_EN: &[&str] = &[
     "earlier we",
     "previously",
 ];
+// Require an explicit historical phrase: "sessão", "antes", or "ontem"
+// alone also occur in technical queries unrelated to recalling our work.
+const SESSION_RECALL_PT_BR: &[&str] = &[
+    "última sessão",
+    "ultima sessao",
+    "última sessao",
+    "ultima sessão",
+    "sessão anterior",
+    "sessao anterior",
+    "onde paramos ontem",
+    "decisão anterior",
+    "decisao anterior",
+];
 
 /// Route a query to session-recall retrieval by lexical markers. Deliberately
 /// zero-LLM: it gates a bounded ranking nudge, not a retrieval mode, and a
@@ -128,6 +141,7 @@ pub fn is_session_recall_query(query: &str) -> bool {
     SESSION_RECALL_ZH.iter().any(|m| lowered.contains(m))
         || SESSION_RECALL_EN
             .iter()
+            .chain(SESSION_RECALL_PT_BR.iter())
             .any(|m| padded.contains(&format!(" {m} ")))
 }
 
@@ -190,5 +204,53 @@ mod tests {
     fn latin_markers_respect_word_boundaries() {
         assert!(!is_session_recall_query("unknown snowfall"));
         assert!(is_session_recall_query("what did we ship yesterday"));
+    }
+
+    #[test]
+    fn detects_portuguese_session_recall_queries() {
+        for q in [
+            "o que fizemos na última sessão",
+            "o que fizemos na ultima sessao",
+            "o que fizemos na última sessao",
+            "o que fizemos na ultima sessão",
+            "onde paramos ontem",
+            "lembre a decisão anterior",
+            "lembre a decisao anterior",
+            "o que discutimos na sessão anterior",
+            "o que discutimos na sessao anterior",
+            "ONDE PARAMOS ONTEM?",
+            "lembre a (DECISÃO ANTERIOR), sobre SQLite",
+        ] {
+            assert!(is_session_recall_query(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn portuguese_markers_require_history_and_word_boundaries() {
+        for q in [
+            "erro na sessão do usuário",
+            "erro na sessao do usuario",
+            "a sessão passada para o middleware é nula",
+            "sessao passada como parametro",
+            "sessão expira",
+            "sessao expira",
+            "antes de salvar",
+            "sessão",
+            "sessao",
+            "antes",
+            "ontem",
+            "decisão",
+            "anterior",
+            "o que fizemos agora",
+            "onde paramos o serviço",
+            "penúltima sessão",
+            "penultima sessao",
+            "decisão anteriormente tomada",
+            "decisao anteriormente tomada",
+            "xonde paramos ontem",
+            "onde paramos ontemx",
+        ] {
+            assert!(!is_session_recall_query(q), "{q}");
+        }
     }
 }

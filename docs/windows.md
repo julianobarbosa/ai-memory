@@ -533,6 +533,11 @@ native on an i7-6700HQ). Notes:
   `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
+  For outage parity with the native hooks, both script bundles spool an
+  undeliverable event (connection failure, timeout, 5xx) to the same
+  `<data_dir>/hook-spool/` contract `ai-memory hook-drain` reads, and flush
+  the backlog after the next successful delivery; a terminal 4xx is not
+  retried.
 - `AI_MEMORY_HOOK_PLATFORM` accepts five values:
   - `windows-native` — Claude exec-form direct binary call (default on native Windows).
   - `windows` — PowerShell `-EncodedCommand` + staged `.ps1` script. The native
@@ -583,6 +588,11 @@ host agent. The warning never includes payload contents.
 | `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
 | `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after `session-end` |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
+| `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | 8 failed passes | non-negative integer | failed drain passes before dropping an event; `0` disables only attempt-count drops |
+
+The retry setting can also be written as `max_attempts` under `[hook_spool]` in
+`<data_dir>/config.toml`; the runtime environment wins when both are set. A zero
+value still leaves the 7-day age limit and 10,000-file spool cap active.
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
 zero values fall back to the built-in defaults; values above 60 are clamped. The
@@ -677,9 +687,10 @@ Windows agent builds.
 - MCP over HTTP should be less path-sensitive than hooks, but
   `install-mcp --apply` still writes to a client-specific config file;
   confirm the agent actually loads it.
-- OpenClaw, OpenCode (v1 `ai-memory.ts` plus the 2 beta's
-  `ai-memory-opencode2.ts`), OMP / Oh My Pi, and Pi use generated TypeScript
-  integrations rather than the shell hook bundle, so their Windows
+- OpenClaw, OpenCode (V1 `ai-memory.ts` or V2
+  `ai-memory-opencode2.ts`, selected from the resolved executable major), OMP /
+  Oh My Pi, and Pi use generated TypeScript integrations rather than the shell
+  hook bundle, so their Windows
   behavior depends on the host runtime loading those files correctly.
   Pi's generated extension also bridges MCP tools because Pi has no native
   `mcp.json` install surface.

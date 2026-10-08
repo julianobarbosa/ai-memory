@@ -6,8 +6,10 @@ Declare which workspace (and optionally which project) an agent's
 ## Why
 
 ai-memory namespaces every wiki page by `(workspace, project)`. By
-default, `workspace = "default"` and `project = basename($cwd)`. That
-works for a solo developer in `~/projects/<repo>` but breaks down
+default, `workspace = "default"`; a valid `upstream`/`origin` remote supplies
+the canonical hostless repository-path project name, and only a checkout
+without one uses `project = basename($cwd)`. That works for a solo developer in
+`~/projects/<repo>` but breaks down
 for the cases this marker file is built for:
 
 - **Multi-client consultancies** with `~/projects/<client>/<repo>` —
@@ -25,8 +27,9 @@ Static MCP clients also use the marker as the repository-owned source for
 explicit scope arguments. For safe concurrent use, declare both `workspace` and
 `project`: managed routing tells static clients to pass that pair on every
 project-scoped tool call because they cannot attach the real lifecycle-hook
-session id. If either value is absent, the agent must obtain it from the operator
-or server configuration rather than guessing from the checkout directory.
+session id. Without a marker override, static clients derive the project from normalized
+`upstream`, then `origin`, joining the full hostless path with the standard safe
+name mapping; only no-valid-remote checkouts use their folder basename.
 Session-aware bridges keep automatic current-project routing.
 
 ## Where to put it
@@ -36,9 +39,9 @@ walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and use the
 **first** marker found. When cwd is outside `$HOME`, the walk stops at the
 nearest checkout root (`.git` file or directory); outside a checkout, only cwd
 itself is checked. Closer markers override outer ones. When a marker is found,
-hook scripts also forward the current `cwd` so
-workspace-only markers can still resolve `project = basename(cwd)` for
-handoff lookups.
+hook scripts also forward the current `cwd` and normalized remote identity so
+workspace-only markers resolve the canonical repository-path project, with
+`basename(cwd)` retained only when no valid remote exists.
 
 A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
@@ -59,7 +62,14 @@ hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
 `identity` / `identity_src` when the checkout has a repository identity (see
-[Repository identity](#repository-identity)), with or without a marker.
+[Repository identity](#repository-identity)), with or without a marker, and
+an explicit `identity_style=path|host_path` alongside every remote identity.
+Current clients send `path` when no marker/home route overrides it; server-side
+omission stays legacy `host_path` for old-client compatibility.
+A marker `project` remains the canonical requested name. Its validated `aliases`
+travel as one percent-encoded JSON-array `aliases` query value on both hook and
+handoff requests, and are ignored unless the checkout supplies a normalized
+hostful git-remote identity.
 
 ## Schema
 
@@ -68,12 +78,12 @@ handoff lookup also sends `cwd` when no marker exists so the default
 workspace = "movvia"
 
 # Optional. When present, forces project = "pe-portais" for every
-# cwd inside this marker's tree. Omit it to let basename(cwd) drive
-# the project name.
+# cwd inside this marker's tree. Omit it to use the canonical remote path,
+# falling back to basename(cwd) when no valid remote exists.
 project = "pe-portais"
 
-# Optional. Omit it to preserve project = basename(cwd). Set it to
-# "repo-root" to derive project from the main git repository root, so
+# Optional. Set it to "repo-root" to derive a remote-less project's name
+# from the main git repository root, so
 # linked worktrees and subdirectories share one project. Ignored when
 # `project` is present.
 project_strategy = "repo-root"
@@ -86,6 +96,24 @@ project_strategy = "repo-root"
 # subdirectory that deserves its own. Case-folded. See "Repository
 # identity" below.
 identity = "acme/platform"
+
+# Optional. The default "path" names a remote-backed project from its whole
+# repository path without the host ("acme-api" for github.com/acme/api).
+# Set "host_path" to preserve the pre-v3 folder/split naming behavior.
+# Existing identity-backed projects can be promoted in place only by an
+# authorized capture/write. See "Naming projects by repository path" below.
+identity_style = "host_path"
+
+# Optional. Former names for this same repository in this workspace. At most
+# 16 entries, each at most 128 UTF-8 bytes and matching
+# ^[A-Za-z0-9][A-Za-z0-9._-]*$. Whitespace is trimmed and duplicates keep their
+# first position. A hostful upstream/origin identity must match the stored
+# project's identity; otherwise the aliases are refused. Reads use the
+# existing UUID without renaming. Hook capture may rename that UUID to the
+# canonical `project` above only after write authorization. Aliases are local
+# routing hints, are not persisted, never select another workspace, and remain
+# supported after the v3 dual-key compatibility window.
+aliases = ["former-name", "old-worktree-name"]
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
 # and the server accepts but does NOT store this project's subagent-session
@@ -135,6 +163,19 @@ inject_on_session_start = "true"
 # never traded for content. Clamped server-side to [1500, 20000];
 # defaults to 4000.
 max_chars = 4000
+
+# Optional. The cross-project profile (docs/cross-project-profile.md): your
+# usual choices from other projects, delivered at session start as defaults
+# below this repository's rules file. Both keys default to on.
+# `contribute = false` keeps this project out of the profile (client or NDA
+# work); `consume = false` keeps the profile digest out of its session starts
+# and the profile out of its queries. Forwarded by every hook client at
+# session start and recorded on the project, so removing a key turns the
+# setting back on. Quoted or bare; only an explicit false / "no" / "off" /
+# "0" turns a key off.
+[profile]
+contribute = false
+consume = false
 ```
 
 **Naming rules** for `workspace` and `project`, validated server-side:
@@ -146,8 +187,82 @@ Anything else is rejected at `get_or_create_workspace` / `_project`
 time, surfacing as a hook warning. The shell helper URL-encodes
 defensively but the server's regex is the source of truth.
 
+`aliases` is all-or-nothing and intentionally uses a portable subset shared by
+native Rust, POSIX shell, PowerShell, and generated TypeScript: exactly one
+root-level declaration on one line, containing a JSON-compatible array of
+unescaped strings. Duplicate declarations, table placement, multiline arrays,
+comments/trailing junk, trailing commas, path-like/control-bearing values,
+non-strings, oversized values, and over-count lists make hook and handoff
+routing fail closed without echoing their contents. An absent or empty list is
+inert. The canonical `project` still wins when it already resolves. Otherwise
+every local alias hit must deduplicate to one project carrying the checkout's
+exact hostful remote identity; a different identity or more than one project
+fails closed. Alias lookup never searches another workspace, and capture may
+rename only when `project` equals the canonical path-style name derived from
+that exact remote identity.
+
+### Operator-home routes
+
+The exact operator-home marker (`$AI_MEMORY_HOME/.ai-memory.toml`, otherwise
+`$HOME/.ai-memory.toml`, with `%USERPROFILE%` as the portable Windows fallback)
+may route many unrelated checkouts without placing a marker in each repository:
+
+```toml
+[routes.identity."github.com/acme/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_identity_style = "path"
+route_aliases = ["main"]
+
+[routes.path."~/src/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_aliases = ["old-api"]
+```
+
+Identity selectors must be exact normalized hostful remote identities; a
+hostless `acme/api` selector is invalid. Path selectors must be absolute or
+`~/`-relative. They are normalized lexically without resolving symlinks, support
+POSIX, Windows drive, and UNC roots, and match by path components: `/team-b`
+does not match `/team-bb`. A `~/` selector may normalize within HOME (for
+example `~/a/../b`) but is rejected if any `..` would escape above HOME;
+absolute selectors retain lexical root clamping. The longest path match wins, while an exact identity
+match wins over every path match. A reachable non-home local settings marker
+wins over all home routes. When no route matches, existing root-level settings
+in the home marker remain the fallback, followed by the default remote-path
+identity and then the installed/cwd fallback; explicit CLI scope always wins. A matched route replaces
+only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
+`project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
+`[recall]`, `[briefing]`, and `[profile]` settings still apply.
+
+A home route map is bounded to 64 routes, a 64 KiB file, 512 UTF-8 bytes per
+selector, and 512 UTF-8 bytes per scalar value. Its portable grammar permits
+only exact `[routes.identity."selector"]` and `[routes.path."selector"]` table
+headers followed by one declaration of each supported `route_*` field. Workspace
+and project are required; style and aliases are optional. Aliases must be a
+one-line JSON-compatible string array under the normal `MarkerAliases` limits.
+Duplicate raw selectors across either route kind, normalized duplicate paths,
+equal normalized identities, duplicate fields, multiline arrays, trailing
+commas, escapes, malformed selectors or fields, unknown route keys, invalid
+styles, and invalid aliases invalidate the whole route map rather than choosing
+a project. Recognizable route syntax includes `[routes`, `routes =`, `routes.`,
+and orphan `route_*` declarations; malformed root-only settings with none of
+those forms retain the historical line parser behavior. An invalid or oversized map never falls back to root-home scope:
+commands without a complete explicit workspace/project pair fail, while hooks
+accept the lifecycle call but drop it before spool or network. Route aliases use the same bounds and grammar as local
+marker aliases and are forwarded only with a discovered hostful git remote and
+`project_src=marker`. The `route_*` child names are deliberate: older line-based
+clients ignore them instead of treating route fields as root settings. Portable clients use `HOME`, then `USERPROFILE`; native CLI/hooks honor
+`AI_MEMORY_HOME` first. The Docker wrapper passes the host cwd, so path routes
+compare in the host namespace rather than `/work` while remote discovery may
+fall back to the mounted checkout.
+
 `project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
 values are ignored and behave like the default `basename(cwd)` strategy.
+
+`[profile] contribute` and `consume` are on unless the value is explicitly
+falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
+`[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
 `default_global` and `inject_on_session_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
@@ -155,14 +270,15 @@ parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
 
 The session-start brief is **project-scoped**: it draws only from the
-session's resolved `(workspace, project)`, and the reserved `_global` scope
-is deliberately *not* unioned into it. A standing rule placed in
-`_global/_rules/` therefore does not reach the brief. It stays reachable on
-demand through `memory_query` (which *does* union `_global`), and a durable
-always-on rule belongs in the agent's own rules file (`CLAUDE.md` /
-`AGENTS.md`) — see the "Rules vs facts" guidance in `docs/usage.md`. The brief
-is compiled as *untrusted history*, so it is deliberately the wrong channel
-for instructions the agent is expected to obey every turn.
+session's resolved `(workspace, project)`. Cross-project knowledge reaches
+the session through the **profile digest** instead, a separate fenced section
+after the brief (see `docs/cross-project-profile.md`): the profile's entries
+are delivered as defaults the agent applies when the user and the
+repository's rules file say nothing. A hard rule that must hold in this
+repository whatever the defaults say still belongs in the agent's own rules
+file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory — see the
+"Rules, memory and the profile" guidance in `docs/usage.md`. Other `_global`
+pages stay reachable on demand through `memory_query`, which unions them.
 
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's
@@ -447,6 +563,23 @@ printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit
       --server-url http://127.0.0.1:49374 --check-capture
 ```
 
+The same inspection also reports sanitized `scope` hints (`workspace`, `project`,
+`project_src`, `project_strategy`, `identity`, `identity_src`,
+`identity_style`, `server_may_remap`) and `scope_resolution`. These are local hints, not a
+server lookup: inspection creates no project and may report server-derived
+coordinates that the server later remaps. Partial marker scope fails closed.
+`event_admits_capture` reports lifecycle eligibility. External producers use
+`policy_admits_capture`, which also checks exclusions and server-profile
+resolution while ignoring `AI_MEMORY_CAPTURE_OWNER`. The existing
+`admits_capture` field still reports native capture admission. Each scope hint
+is limited to 512 bytes. Oversized names are omitted (`null`), report
+`scope_resolution: "unavailable"` and refuse producer admission; native
+routing remains unchanged.
+The native hook can derive a project for a marker that declares only
+`workspace`. Producer preflight is stricter: declare both names, or provide
+`repo-root` so both resolve locally. An absent cwd also returns unavailable
+scope and refuses producer admission.
+
 The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
@@ -521,8 +654,9 @@ If the marker lives inside the main checkout instead (for example
 out-of-tree worktree, or place a shared marker above the worktree parent
 directory as shown here.
 
-Without `project_strategy = "repo-root"`, those same paths keep the
-default behavior and resolve by their current directory basename.
+Without `project_strategy = "repo-root"`, a valid remote still gives every
+worktree the default canonical repository-path name. Only remote-less paths
+resolve by their current directory basename.
 
 Resolution is host-side: lifecycle hooks and generated TypeScript
 plugins follow the worktree's commondir pointer (`git rev-parse
@@ -537,8 +671,9 @@ a single `~/.ai-memory.toml` — to select the strategy.
 
 ### Repository identity
 
-A project's name comes from its folder, and folder names collide: two
-unrelated repositories both checked out as `api/` would otherwise share one
+A remote-backed project's default name now comes from its normalized repository
+path, while remote-less folders still use their basename. Folder names collide:
+two unrelated repositories both checked out as `api/` would otherwise share one
 project. On a server with per-project grants (#708) that means one grant, so
 every client resolves a **repository identity** for the checkout and sends it
 with each event. The first rung that yields one wins:
@@ -571,14 +706,69 @@ URL never leave the machine. Other remote names (`fork`, `mine`) are
 ignored on purpose: they differ per person, and would give one repository a
 different identity for each of them.
 
+#### Naming projects by repository path (`identity_style`)
+
+By default, an undeclared checkout with a valid `upstream` or `origin` remote is
+named from the remote's whole repository path without its host (#1033):
+
+```toml
+identity_style = "host_path"   # explicit pre-v3 compatibility opt-out
+```
+
+With the default `path` style, a project created from a remote is named from the whole
+repository path without the host, with `/` written as `-`
+(`git@github.com:acme/api.git` → `acme-api`,
+`https://gitlab.com/acme/group/api.git` → `acme-group-api`), so every
+worktree and clone agrees on the name. Only the name changes: captures still
+route by the full identity (`github.com/acme/api`), and the style rides along
+only with a remote identity — a declared `project` or `identity` keeps its
+own name.
+
+- **Existing projects keep their UUID.** Reads by the canonical path name or
+  the v2 basename are find-only and never rename. An authorized default-style
+  capture or explicit write through the canonical path name promotes only
+  `projects.name` in one transaction; pages, sessions, grants, handoffs and
+  every other dependent row remain attached to the same UUID. The v2 basename
+  remains readable through v3.
+- **Another forge is never merged in.** When the path name is already held by
+  a different repository — typically the same path on another forge
+  (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
+  back to the name it would get without the style.
+- Local marker aliases and operator-home identity/path routes keep their
+  documented precedence over the default and remain available for migration or
+  deliberate remapping.
+- Static CLI/MCP clients still pass only `workspace` + `project`. The thin CLI
+  derives the canonical path name when no marker/home route overrides it; other
+  static clients should use the same name from `upstream`, then `origin`. A valid
+  remote wins `project_strategy = "repo-root"`; the strategy applies only when
+  no valid remote exists. They may use
+  the canonical path name (`acme-api`) or the v2 basename (`api`) while it is
+  unambiguous. A hostless key shared by multiple forges fails closed.
+- `ai-memory doctor` combines the effective local marker and normalized
+  repository evidence with the server's read-only coordinate diagnosis. It
+  reports exact/canonical/legacy compatibility, missing or ambiguous status,
+  rename eligibility, and collision reasons. It parses the routing marker once,
+  honours CLI scope flags before marker names, and reports only a safe marker
+  status/source class; invalid marker TOML is ignored without echoing its
+  contents, raw marker paths are never rendered, and remote credentials never
+  leave the client. An ambiguous result can name the preferred identity-backed
+  candidate UUID/current name for context, but is never a unique resolution or
+  rename-eligible result.
+- The UUID-keyed project `_meta.md` persists optional `identity`,
+  `identity_source`, `canonical_name`, and `legacy_name` fields. A clean
+  `reindex` restores the original UUID/name and recomputes the indexed keys
+  from the validated identity. Older manifests without these fields remain
+  valid and rebuild an identity-less project.
+
 ### Single workspace, no per-repo overrides
 
 ```
 ~/.ai-memory.toml → workspace = "home"
 ```
 
-Every cwd under `$HOME` lands in workspace `home` with
-`project = basename(cwd)`. Useful when you just want to opt out of
+Every cwd under `$HOME` lands in workspace `home`; a valid remote uses its
+canonical path name, while a repository without one uses `project = basename(cwd)`.
+Useful when you just want to opt out of
 the `default` bucket entirely.
 
 ## Migrating existing projects
@@ -659,6 +849,19 @@ Two guarantees hold in **both** modes:
 Session-creating events are unaffected in both modes: opening a session in a
 plain non-git folder still names the project after that folder.
 
+Some harnesses keep reporting the parent session's cwd when a subagent uses a
+file tool in another checkout. Native `ai-memory hook` commands compensate for
+that case before applying `follow-cwd` or `sticky`: a fixture-backed file-tool
+schema with absolute target paths is routed from the target when every path
+proves the same repository or marker boundary. The destination's capture
+policy and `server` profile are authoritative, so a cross-project call cannot
+use the source repository's policy or credentials. Relative paths,
+mixed-project calls, unknown schemas, and absolute paths outside a recognized
+repository/marker keep the payload cwd. Free-form shell commands are not
+reinterpreted as project routing instructions. This changes raw observation
+attribution only; the session row and its compiled session page remain in the
+project where the session began.
+
 Independently of this setting, under `project_strategy = "repo-root"` a
 mid-session event whose cwd is outside any git repo *and* any marker (agent
 scratch directories, `/tmp`, data folders) already inherits the session's
@@ -687,9 +890,12 @@ split.
 Each field is resolved independently:
 
 1. The explicit flag (`--workspace` / `--project`).
-2. The nearest marker: `workspace`, and `project` — or the main repo root's
-   basename when only `project_strategy = "repo-root"` is set.
-3. The previous fallbacks: `default`, and the cwd-derived project name.
+2. The nearest marker: explicit `workspace`/`project`/`identity`; otherwise a
+   valid `upstream`/`origin` remote's canonical path name wins, even when
+   `project_strategy = "repo-root"` is set. The strategy selects the main repo
+   root only when no valid remote exists.
+3. The fallbacks: workspace `default` and the current cwd basename. A git
+   subdirectory does not imply repo-root without an explicit strategy.
 
 When rung 2 decides a field, the command prints one line to stderr naming
 the resolved scope, which half (or halves) the marker decided, and the

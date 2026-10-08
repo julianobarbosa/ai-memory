@@ -2,6 +2,7 @@
 
 use ai_memory_core::MemoryError;
 use ai_memory_store::StoreError;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Result alias used throughout the wiki crate.
@@ -14,6 +15,15 @@ pub enum WikiError {
     /// Filesystem I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A wiki filesystem path crossed a symbolic-link or reparse-point boundary.
+    #[error("wiki path confinement refused {path}: {reason}")]
+    Confinement {
+        /// Path that failed confinement.
+        path: PathBuf,
+        /// Stable classification of the refusal.
+        reason: &'static str,
+    },
 
     /// Atomic-write tempfile crate error.
     #[error(transparent)]
@@ -75,6 +85,16 @@ pub enum WikiError {
          (libgit2 owner check, code=Owner): {0}"
     )]
     GitOwner(String),
+}
+
+pub(crate) fn into_io_error(error: WikiError) -> std::io::Error {
+    match error {
+        WikiError::Io(error) => error,
+        error @ WikiError::Confinement { .. } => {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+        }
+        error => std::io::Error::other(error.to_string()),
+    }
 }
 
 impl From<serde_yaml::Error> for WikiError {

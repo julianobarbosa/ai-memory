@@ -156,7 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        companion: [ai-memory-importer, ai-memory-relay]
+        companion: [ai-memory-client, ai-memory-importer, ai-memory-relay, ai-memory-wikisync]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -355,6 +355,8 @@ jobs:
           --ignore RUSTSEC-2024-0320
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
       - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-client/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-wikisync/Cargo.lock
 
   gitleaks:
     name: gitleaks (secret scan)

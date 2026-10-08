@@ -747,6 +747,12 @@ ones who should keep access; nothing is granted automatically.
   having created it first grants nothing. To let a user maintain team-wide
   preferences: `ai-memory user grant --user alice --project _global --level
   write` (the scope must already exist; root creates it with its first write).
+- **The cross-project profile** (`docs/cross-project-profile.md`) is off on a
+  multi-user server until `[profile] enabled = true`. Then each user gets a
+  private profile in a `restricted` project named `_profile.<user id>`, which
+  only they (and root) can read or write; with `share = "workspace"` a
+  workspace's `_profile` is shared and write-gated exactly like the global
+  scope above.
 - **Gates entry, never rows.** Access decides which projects a user reaches;
   inside a project pages stay shared exactly as before (see below).
 - **Refusals are explicit.** A user outside a restricted project gets a 403

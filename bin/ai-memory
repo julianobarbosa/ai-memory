@@ -15,6 +15,9 @@
 #   ai-memory workstreams   Use that client to inspect the host checkout identity.
 #   ai-memory rename-workstream
 #                           Same: the rename is keyed on host repo identity.
+#   ai-memory mcp-bridge ...  Run the session-aware MCP bridge through that
+#                           client: its --server-url loopback only resolves on
+#                           the host, never inside the helper container.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         container image (default: docker.io/akitaonrails/ai-memory:latest)
@@ -585,6 +588,15 @@ case "${1:-}" in
         exec "${NATIVE_HOST_BIN}" "$@"
         ;;
     esac
+    ;;
+  mcp-bridge)
+    # The session-aware MCP bridge dials the explicit --server-url it was
+    # registered with, typically the host's 127.0.0.1:49374. Inside the
+    # helper container that loopback is the container itself (Docker Desktop
+    # has no host networking), so the bridge must run on the host through
+    # the same checksum-verified native client install-hooks uses.
+    NATIVE_HOST_BIN=$(native_host_binary)
+    exec "${NATIVE_HOST_BIN}" "$@"
     ;;
 esac
 

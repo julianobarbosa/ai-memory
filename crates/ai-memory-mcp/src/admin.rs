@@ -9,6 +9,7 @@
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/project-coordinate` — read-only exact/compatibility diagnosis.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent
 //!   (an exact `session_id` plus `include_ended=true` also matches an ended one).
 //! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
@@ -72,8 +73,7 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
     RejectAutoImproveProposal, ScopeResolutionError, SkippedProposal, StageAutoImproveRun,
-    StoreError, WriterHandle, create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
-    lookup_existing_workspace,
+    StoreError, WriterHandle, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{
     AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
@@ -585,6 +585,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
 /// - `GET  /admin/projects`
+/// - `GET  /admin/project-coordinate`
 /// - `GET  /admin/open-sessions`
 /// - `GET  /admin/sessions/by-agent`
 /// - `GET  /admin/activity/by-client`
@@ -666,6 +667,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/status", get(handle_status))
         .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/project-coordinate", get(handle_project_coordinate))
         .route("/admin/open-sessions", get(handle_open_sessions))
         .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
         .route("/admin/activity/by-client", get(handle_activity_by_client))
@@ -854,6 +856,9 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
 }
 
 async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::fs::File> {
+    let wiki_dir = state.data_dir.join("wiki");
+    ai_memory_wiki::validate_wiki_tree(&wiki_dir)
+        .map_err(|error| anyhow::anyhow!("validating wiki tree: {error}"))?;
     let staging = tempfile::tempdir()?;
     let snapshot_path = staging.path().join("memory.sqlite");
     info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
@@ -870,7 +875,8 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         tar.mode(tar::HeaderMode::Deterministic);
         tar.follow_symlinks(false);
 
-        let wiki_dir = state.data_dir.join("wiki");
+        ai_memory_wiki::validate_wiki_tree(&wiki_dir)
+            .map_err(|error| anyhow::anyhow!("validating wiki tree before archive: {error}"))?;
         if wiki_dir.is_dir() {
             tar.append_dir_all("wiki", &wiki_dir)
                 .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
@@ -947,11 +953,8 @@ async fn build_okf_bundle_file(
     proj: ai_memory_core::ProjectId,
     project_name: &str,
 ) -> anyhow::Result<tokio::fs::File> {
-    let bundle_dir = state
-        .data_dir
-        .join("wiki")
-        .join(ws.to_string())
-        .join(proj.to_string());
+    state.wiki.validate_project_tree(ws, proj)?;
+    let bundle_dir = state.wiki.project_root(ws, proj);
     if !bundle_dir.is_dir() {
         anyhow::bail!("project has no wiki directory yet");
     }
@@ -1436,6 +1439,76 @@ async fn handle_activity_by_client(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ProjectCoordinateQuery {
+    workspace: String,
+    project: String,
+    identity: Option<String>,
+    identity_source: Option<String>,
+    identity_style: Option<String>,
+}
+
+async fn handle_project_coordinate(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ProjectCoordinateQuery>,
+) -> impl IntoResponse {
+    if query.workspace.trim().is_empty() || query.project.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "workspace and project must be non-empty"
+            })),
+        );
+    }
+    let repository = match (query.identity.as_deref(), query.identity_source.as_deref()) {
+        (None, None) => None,
+        (Some(identity), Some(source)) => {
+            match ai_memory_core::repository_identity::accept_wire_identity(identity, source) {
+                Some(identity) => Some(identity),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "invalid repository identity" })),
+                    );
+                }
+            }
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "identity and identity_source must be provided together"
+                })),
+            );
+        }
+    };
+    let style = match query.identity_style.as_deref() {
+        None => ai_memory_core::repository_identity::IdentityStyle::HostPath,
+        Some(style) => {
+            match ai_memory_core::repository_identity::IdentityStyle::from_str_opt(style) {
+                Some(style) => style,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "invalid identity_style" })),
+                    );
+                }
+            }
+        }
+    };
+    match state
+        .reader
+        .diagnose_project_coordinate(query.workspace, query.project, repository, style)
+        .await
+    {
+        Ok(diagnostic) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(diagnostic).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(error) => internal_err(error.to_string()),
+    }
+}
+
 /// Query string for `GET /admin/sessions/by-agent` — how many sessions each
 /// agent CLI opened in one scope.
 ///
@@ -1851,15 +1924,51 @@ const OPERATOR: Option<ai_memory_core::UserId> = None;
 
 /// Resolve workspace + project IDs, creating them if absent. Returns
 /// either the IDs or a ready-to-return error response.
+struct AdminWriteScope {
+    scope: ai_memory_store::ResolvedScope,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+}
+
 async fn create_ws_proj(
     state: &AdminState,
     workspace: &str,
     project: &str,
-) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    create_explicit_scope(&state.writer, workspace, project)
+) -> Result<AdminWriteScope, (StatusCode, Json<serde_json::Value>)> {
+    let resolved = ai_memory_store::create_explicit_scope(&state.writer, workspace, project)
         .await
-        .map(ai_memory_store::ResolvedScope::as_tuple)
-        .map_err(scope_err)
+        .map_err(scope_err)?;
+    let manifest_warning = refresh_promoted_scope(state, &resolved).await;
+    Ok(AdminWriteScope {
+        scope: resolved.scope,
+        manifest_warning,
+    })
+}
+
+async fn refresh_promoted_scope(
+    state: &AdminState,
+    resolved: &ai_memory_store::ResolvedWriteScope,
+) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+    resolved.promoted_from.as_ref()?;
+    match state
+        .wiki
+        .refresh_renamed_scope(resolved.scope.workspace_id, resolved.scope.project_id)
+        .await
+    {
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace_id = %resolved.scope.workspace_id,
+                project_id = %resolved.scope.project_id,
+                "project name promotion committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            Some(
+                ai_memory_core::repository_identity::ManifestWarning::promotion_refresh_failed(
+                    error,
+                ),
+            )
+        }
+    }
 }
 
 /// Look up workspace + project by name **without** auto-creating them.
@@ -1885,6 +1994,16 @@ async fn lookup_ws_no_create(
     lookup_existing_workspace(&state.reader, workspace)
         .await
         .map_err(scope_err)
+}
+
+fn with_manifest_warning(
+    (status, Json(mut body)): (StatusCode, Json<serde_json::Value>),
+    warning: Option<&ai_memory_core::repository_identity::ManifestWarning>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let (Some(warning), Some(object)) = (warning, body.as_object_mut()) {
+        object.insert("manifest_warning".into(), serde_json::json!(warning));
+    }
+    (status, Json(body))
 }
 
 fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
@@ -1951,7 +2070,8 @@ async fn handle_bootstrap(
             })),
         ));
     }
-    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = target.scope.as_tuple();
 
     // Serialise live bootstrap runs. Two parallel `process_sources`
     // calls would race the wiki's `commit_all` (libgit2 ops on the
@@ -2002,11 +2122,17 @@ async fn handle_bootstrap(
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
-        Ok(outcome) => Ok((
-            StatusCode::OK,
-            Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+        Ok(mut outcome) => {
+            outcome.manifest_warning = target.manifest_warning.map(|warning| warning.to_string());
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+            ))
+        }
+        Err(e) => Err(with_manifest_warning(
+            bootstrap_error_response(e),
+            target.manifest_warning.as_ref(),
         )),
-        Err(e) => Err(bootstrap_error_response(e)),
     }
 }
 
@@ -2090,6 +2216,7 @@ fn dry_run_outcome(
         rationale: "(dry-run; LLM not invoked)".to_string(),
         dry_run: true,
         llm_chunks,
+        manifest_warning: None,
     };
     Ok((
         StatusCode::OK,
@@ -2362,7 +2489,8 @@ async fn auto_improve_new_proposals(
             title: p.title.clone(),
             confidence: f64::from(p.confidence),
             rationale: p.rationale.clone(),
-            evidence_json: serde_json::to_value(&p.evidence)
+            evidence_json: report
+                .proposal_evidence_json(p)
                 .map_err(|e| internal_err(e.to_string()))?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
@@ -2442,6 +2570,7 @@ async fn stage_auto_improve_report(
                     "max_rule_page_tokens": cfg.max_rule_page_tokens,
                     "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                     "eval": cfg.eval,
+                    "eval_results": report.eval_results(),
                 }),
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some(cfg.proposal_actor.clone()),
@@ -3442,6 +3571,11 @@ async fn build_reorg_plan(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "unknown".to_string());
+        // Capture never attributes to a reserved scope; a reorg must not
+        // either, or a directory named like one would create or fill it.
+        if ai_memory_core::profile::is_reserved_scope_project(&project_name) {
+            continue;
+        }
         let proj = state
             .writer
             .get_or_create_project(ws, project_name.clone(), repo_path_from_reorg_cwd(cwd))
@@ -3453,7 +3587,9 @@ async fn build_reorg_plan(
     let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
     let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
     for (session_id, old_project_id, cwd) in &sessions {
-        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
+        let Some((_, new_project_id, project_name)) = cwd_to_proj.get(cwd.as_str()) else {
+            continue;
+        };
         if *new_project_id == *old_project_id {
             continue;
         }
@@ -5389,6 +5525,9 @@ async fn delete_workspace_core(
         actor,
         ..Default::default()
     };
+    if let Err(error) = state.wiki.validate_workspace_tree(ws_id) {
+        return Err(internal_err(error.to_string()));
+    }
     let resolved_purge_ctx = match state
         .wiki
         .admit_purge_workspace(ws_id, Some(purge_ctx))
@@ -5592,6 +5731,9 @@ pub struct RenameProjectSummary {
     /// Post-rename checkpoint, if `_meta.md` changed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after the database rename committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
 }
 
 async fn handle_rename_project(
@@ -5653,23 +5795,29 @@ async fn handle_rename_project(
         }
     };
 
+    let (checkpoint, manifest_warning) = match state
+        .wiki
+        .refresh_renamed_scope(ws_id, proj_id)
+        .await
+    {
+        Ok(checkpoint) => (checkpoint, None),
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace_id = %ws_id,
+                project_id = %proj_id,
+                "rename-project committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            (None, Some(error.to_string()))
+        }
+    };
     let summary = RenameProjectSummary {
         workspace: req.workspace.clone(),
         from: req.from.clone(),
         to: req.to.clone(),
         pages,
-        checkpoint: {
-            if let Err(e) = state.wiki.backfill_scope_manifests().await {
-                warn!(error = %e, "rename-project: scope-manifest backfill failed after rename");
-            }
-            checkpoint_or_warn(
-                &state.wiki,
-                format!(
-                    "rename-project {}/{} -> {}",
-                    req.workspace, req.from, req.to
-                ),
-            )
-        },
+        checkpoint,
+        manifest_warning,
     };
     (
         StatusCode::OK,
@@ -5781,6 +5929,9 @@ pub struct MoveProjectReport {
     /// Post-move checkpoint, if the move changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// One same-path collision resolved by de-duplicating the source page's path.
@@ -5826,6 +5977,14 @@ async fn true_move_project(
     // A true move targets a FRESH destination, so its dir must not already
     // exist. Wiki::move_project_workspace repeats this check under the
     // exclusive mutation guard before it renames anything.
+    state
+        .wiki
+        .validate_project_tree(src_ws, src_proj)
+        .map_err(|error| internal_err(error.to_string()))?;
+    state
+        .wiki
+        .validate_project_tree(dst_ws, src_proj)
+        .map_err(|error| internal_err(error.to_string()))?;
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
         return Err((
@@ -5919,6 +6078,7 @@ async fn true_move_project(
         conflicts: Vec::new(),
         pre_checkpoint,
         checkpoint,
+        manifest_warning: None,
     };
     Ok(report)
 }
@@ -6116,6 +6276,21 @@ async fn move_project_core(
         ));
     }
 
+    // A private profile is found as `default/_profile.<user id>`; moving it to
+    // another workspace would orphan it. (A workspace `_profile` may move with
+    // its workspace: it lands in, or merges into, the target's own profile.)
+    if req
+        .project
+        .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "a private cross-project profile stays in the default workspace and cannot be moved"
+            })),
+        ));
+    }
+
     // Resolve the SOURCE without auto-creating — 404 on a typo.
     let (src_ws, src_proj) =
         lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
@@ -6140,14 +6315,12 @@ async fn move_project_core(
 
     // Detect MERGE: does the destination workspace already hold a same-named
     // project? (find_workspace may be None when the dest ws doesn't exist yet.)
-    let merged_into_existing = match state.reader.find_workspace(req.to_workspace.clone()).await {
-        Ok(Some(dst_ws)) => matches!(
-            state.reader.find_project(dst_ws, req.project.clone()).await,
-            Ok(Some(_))
-        ),
-        Ok(None) => false,
-        Err(e) => return Err(internal_err(e.to_string())),
-    };
+    let merged_into_existing =
+        match lookup_existing_scope(&state.reader, &req.to_workspace, &req.project).await {
+            Ok(_) => true,
+            Err(error) if error.is_not_found() => false,
+            Err(error) => return Err(scope_err(error)),
+        };
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -6172,8 +6345,10 @@ async fn move_project_core(
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let destination = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
+    let warning = destination.manifest_warning;
     copy_purge_merge(
         state,
         req,
@@ -6183,8 +6358,10 @@ async fn move_project_core(
         dst_proj,
         pre_checkpoint,
         actor,
+        warning.clone(),
     )
     .await
+    .map_err(|error| with_manifest_warning(error, warning.as_ref()))
 }
 
 // ---------------------------------------------------------------------
@@ -6320,6 +6497,9 @@ pub struct MoveSessionReport {
     /// Post-move checkpoint, if the move changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// Wire-format report for the batch form of `POST /admin/move-session`.
@@ -6348,6 +6528,9 @@ pub struct MoveSessionBatchReport {
     /// Post-move checkpoint, if the batch changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// One session move, resolved and validated, before any guard runs.
@@ -6374,16 +6557,28 @@ impl MoveSessionPlan {
 
 /// The destination of a move: an existing scope, or (dry run with `create`
 /// only) a scope that does not exist yet and would be created on confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MoveTarget {
-    Existing((WorkspaceId, ProjectId)),
+    Existing {
+        scope: (WorkspaceId, ProjectId),
+        manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+    },
     WouldCreate,
 }
 
 impl MoveTarget {
-    fn existing(self) -> Option<(WorkspaceId, ProjectId)> {
+    fn existing(&self) -> Option<(WorkspaceId, ProjectId)> {
         match self {
-            Self::Existing(scope) => Some(scope),
+            Self::Existing { scope, .. } => Some(*scope),
+            Self::WouldCreate => None,
+        }
+    }
+
+    fn manifest_warning(&self) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+        match self {
+            Self::Existing {
+                manifest_warning, ..
+            } => manifest_warning.clone(),
             Self::WouldCreate => None,
         }
     }
@@ -6456,10 +6651,16 @@ async fn resolve_move_session_target(
     if create && confirm {
         return create_ws_proj(state, workspace, project)
             .await
-            .map(MoveTarget::Existing);
+            .map(|target| MoveTarget::Existing {
+                scope: target.scope.as_tuple(),
+                manifest_warning: target.manifest_warning,
+            });
     }
     match lookup_existing_scope(&state.reader, workspace, project).await {
-        Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
+        Ok(scope) => Ok(MoveTarget::Existing {
+            scope: scope.as_tuple(),
+            manifest_warning: None,
+        }),
         Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
         Err(e) => Err(scope_err(e)),
     }
@@ -6668,6 +6869,10 @@ async fn move_planned_session(
         }
     }
 
+    state
+        .wiki
+        .validate_project_tree(plan.from.0, plan.from.1)
+        .map_err(move_session_wiki_err)?;
     let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
     let file_name = format!("{sid}.md");
     let src_file = state
@@ -6679,8 +6884,9 @@ async fn move_planned_session(
     // Dry run with `create` against an absent destination: nothing exists to
     // collide with, and the store cannot re-stamp into a scope that has no
     // row, so the counts come from a read-only preview.
-    let to = match plan.to {
-        MoveTarget::Existing(to) => to,
+    let manifest_warning = plan.to.manifest_warning();
+    let to = match &plan.to {
+        MoveTarget::Existing { scope, .. } => *scope,
         MoveTarget::WouldCreate => {
             debug_assert!(
                 !req.confirm,
@@ -6704,6 +6910,7 @@ async fn move_planned_session(
                 cwd_warning,
                 pre_checkpoint: None,
                 checkpoint: None,
+                manifest_warning,
             });
         }
     };
@@ -6712,6 +6919,10 @@ async fn move_planned_session(
     // too so the dry run predicts what the wiki re-checks under its lock. When
     // the source scope IS the destination (single-form re-home) there is no
     // file to move and the wiki skips the file step too.
+    state
+        .wiki
+        .validate_project_tree(to.0, to.1)
+        .map_err(move_session_wiki_err)?;
     let dst_file = state
         .wiki
         .project_root(to.0, to.1)
@@ -6750,6 +6961,7 @@ async fn move_planned_session(
             cwd_warning,
             pre_checkpoint: None,
             checkpoint: None,
+            manifest_warning: manifest_warning.clone(),
         });
     }
 
@@ -6790,6 +7002,7 @@ async fn move_planned_session(
         cwd_warning,
         pre_checkpoint: None,
         checkpoint: None,
+        manifest_warning,
     })
 }
 
@@ -6842,8 +7055,12 @@ async fn move_single_session(
         plan.to_label.workspace,
         plan.to_label.project
     );
-    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))?;
-    let mut report = move_planned_session(state, req, plan, author_id, &actor).await?;
+    let warning = plan.to.manifest_warning();
+    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
+    let mut report = move_planned_session(state, req, plan, author_id, &actor)
+        .await
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "move-session: scope-manifest backfill failed after move");
     }
@@ -6891,33 +7108,43 @@ async fn move_session_batch(
         workspace: to_workspace,
         project: req.project.clone(),
     };
+    let manifest_warning = to.manifest_warning();
     if to.existing() == Some(from) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "source and destination scopes are identical"
-            })),
+        return with_manifest_warning(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "source and destination scopes are identical"
+                })),
+            ),
+            manifest_warning.as_ref(),
         )
-            .into_response();
+        .into_response();
     }
     // Same guard as move-project: the project the hook router is writing to
     // is not emptied out from under it without an explicit `force`.
     if !req.force && state.active_project.contains_project(from.1) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!(
-                    "{}/{} is the active session's project; force the move (--force / \
-                     force: true) to move its sessions anyway",
-                    from_label.workspace, from_label.project
-                )
-            })),
+        return with_manifest_warning(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{}/{} is the active session's project; force the move (--force / \
+                         force: true) to move its sessions anyway",
+                        from_label.workspace, from_label.project
+                    )
+                })),
+            ),
+            manifest_warning.as_ref(),
         )
-            .into_response();
+        .into_response();
     }
     let sessions = match list_scope_sessions(&state.reader, from.0, from.1).await {
         Ok(v) => v,
-        Err(e) => return internal_err(e.to_string()).into_response(),
+        Err(e) => {
+            return with_manifest_warning(internal_err(e.to_string()), manifest_warning.as_ref())
+                .into_response();
+        }
     };
 
     let label = format!(
@@ -6927,7 +7154,9 @@ async fn move_session_batch(
     let pre_checkpoint = if req.confirm && !sessions.is_empty() {
         match checkpoint_or_500(&state.wiki, format!("pre-{label}")) {
             Ok(oid) => oid,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                return with_manifest_warning(e, manifest_warning.as_ref()).into_response();
+            }
         }
     } else {
         None
@@ -6955,7 +7184,7 @@ async fn move_session_batch(
             session_id,
             from: plan_from,
             from_label: plan_from_label,
-            to,
+            to: to.clone(),
             to_label: to_label.clone(),
             row_scope,
             cwd,
@@ -6993,6 +7222,9 @@ async fn move_session_batch(
             if let Some(oid) = checkpoint {
                 obj.insert("checkpoint".into(), serde_json::json!(oid));
             }
+            if let Some(warning) = manifest_warning.clone() {
+                obj.insert("manifest_warning".into(), serde_json::json!(warning));
+            }
         }
         return (status, Json(body)).into_response();
     }
@@ -7006,6 +7238,7 @@ async fn move_session_batch(
         sessions: reports,
         pre_checkpoint,
         checkpoint,
+        manifest_warning,
     };
     (StatusCode::OK, Json(json_or_empty(&report))).into_response()
 }
@@ -7119,6 +7352,7 @@ async fn copy_purge_merge(
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 ) -> Result<MoveProjectReport, MoveErr> {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
@@ -7356,6 +7590,7 @@ async fn copy_purge_merge(
             conflicts,
             pre_checkpoint,
             checkpoint,
+            manifest_warning: manifest_warning.clone(),
         };
         return Ok(report);
     }
@@ -7486,6 +7721,7 @@ async fn copy_purge_merge(
         conflicts,
         pre_checkpoint,
         checkpoint,
+        manifest_warning,
     };
     Ok(report)
 }
@@ -7680,6 +7916,9 @@ struct WritePageAdminRequest {
     /// kind when absent.
     #[serde(default)]
     kind: Option<String>,
+    // The explicit legacy kind field consumes that key before flattening.
+    #[serde(flatten)]
+    metadata: ai_memory_core::page::PageWriteMetadata,
     /// Tier name (`working`, `episodic`, `semantic`, `procedural`).
     #[serde(default = "default_write_tier")]
     tier: String,
@@ -7705,6 +7944,9 @@ struct WritePageResponse {
     /// Post-write checkpoint, if the write changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint: Option<String>,
+    /// Non-fatal committed promotion manifest/checkpoint failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 async fn handle_write_page(
@@ -7715,6 +7957,12 @@ async fn handle_write_page(
     headers: HeaderMap,
     Json(req): Json<WritePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let metadata = req.metadata.into_frontmatter().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
     let tier: Tier = req.tier.parse().map_err(|_| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -7737,9 +7985,11 @@ async fn handle_write_page(
         )
     })?;
 
-    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = target.scope.as_tuple();
+    let manifest_warning = target.manifest_warning;
 
-    let mut fm = serde_json::Map::new();
+    let mut fm = metadata;
     if let Some(title) = &req.title {
         fm.insert("title".into(), serde_json::Value::String(title.clone()));
     }
@@ -7801,7 +8051,9 @@ async fn handle_write_page(
             evidence: Vec::new(),
         })
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(|e| {
+            with_manifest_warning(internal_err(e.to_string()), manifest_warning.as_ref())
+        })?;
     let checkpoint = checkpoint_or_warn(
         &state.wiki,
         format!(
@@ -7819,6 +8071,7 @@ async fn handle_write_page(
                 page_id: page_id.to_string(),
                 path: path.to_string(),
                 checkpoint,
+                manifest_warning,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -8708,6 +8961,14 @@ async fn handle_project_access(
             "{project} is the shared preferences scope, read by every user; it cannot be restricted"
         )));
     }
+    // A profile project's mode is fixed by its kind: a private profile stays
+    // restricted to its owner, a workspace profile stays readable by the
+    // workspace. Changing either would expose or hide a profile wholesale.
+    if ai_memory_core::profile::is_profile_project(project) {
+        return Err(validation_error(format!(
+            "{project} is a cross-project profile; its access mode is fixed"
+        )));
+    }
     let (_, project_id) = lookup_ws_proj_no_create(&state, workspace, project).await?;
     let previous = state
         .writer
@@ -9278,8 +9539,8 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 2 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 2, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "counts are per agent, scoped, count-desc: {json}"
         );
@@ -9306,8 +9567,8 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 3 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 3, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "named callers see own plus shared sessions only: {json}"
         );
@@ -9334,9 +9595,9 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 3 },
-                { "agent": "codex", "sessions": 1 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 3, "mixed_capture_sessions": 0 },
+                { "agent": "codex", "sessions": 1, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "all_owners includes every operator: {json}"
         );
@@ -11382,6 +11643,22 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["rejected_candidates_count"], 1);
+        let run_id = json["run_id"]
+            .as_str()
+            .unwrap()
+            .parse::<ai_memory_core::AutoImproveRunId>()
+            .unwrap();
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let config: String = db.query_row(
+            "SELECT config_json FROM auto_improve_runs WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![run_id.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            |row| row.get(0),
+        ).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["eval_results"].as_array().unwrap().len(), 1);
+        assert_eq!(config["eval_results"][0]["status"], "failure");
+        assert!(config["eval_results"][0]["passed"].is_null());
+        assert_eq!(config["eval_results"][0]["reason"], "eval command is empty");
         let proposals = json["proposals"].as_array().unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
@@ -13070,6 +13347,11 @@ mod tests {
             ("GET", "/admin/status", serde_json::Value::Null),
             (
                 "GET",
+                "/admin/project-coordinate?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
                 "/admin/sessions/by-agent?workspace=default&project=scratch",
                 serde_json::Value::Null,
             ),
@@ -14464,7 +14746,8 @@ mod tests {
     }
 
     /// `POST /admin/projects/access` (#708): a mode is required and never
-    /// guessed, the shared preferences scope cannot be restricted, an unknown
+    /// guessed, the shared preferences scope cannot be restricted, a profile
+    /// project's mode is fixed (a private one is never opened), an unknown
     /// project creates nothing, repeating a mode reports no change, and only
     /// root may call it.
     #[tokio::test]
@@ -14480,6 +14763,8 @@ mod tests {
             serde_json::json!({"workspace": "default", "project": "client-work"}),
             serde_json::json!({"workspace": "default", "project": "client-work", "mode": "members"}),
             serde_json::json!({"workspace": "default", "project": "_global", "mode": "restricted"}),
+            serde_json::json!({"workspace": "default", "project": "_profile", "mode": "restricted"}),
+            serde_json::json!({"workspace": "default", "project": "_profile.00000000000000000000000000000001", "mode": "open"}),
         ] {
             let (status, json) = call("root-token", body.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {json}");

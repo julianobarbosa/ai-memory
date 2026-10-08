@@ -2,12 +2,13 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
+use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_memory_core::{
-    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NativeSessionIdentity, NewWorkstreamEvent,
+    Sanitizer, WorkstreamEventKind,
 };
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
@@ -20,7 +21,12 @@ use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
-const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
+/// `agy` cuts `display` near 8 KiB; 4-byte UTF-8 and JSON escaping stay well
+/// under this.
+const MAX_ANTIGRAVITY_HISTORY_LINE_BYTES: usize = 64 * 1024;
+/// A new conversation's first prompt is logged without an id, within a second
+/// of its `.db` being created.
+const ANTIGRAVITY_OPENING_PROMPT_WINDOW: Duration = Duration::from_secs(5);
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
@@ -56,9 +62,10 @@ struct FileCursor {
     flavor: Option<FileFlavor>,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
-    /// on rewind); Kiro's append-only behavior is not documented. Those
-    /// adapters validate this prefix before trusting the byte offset. Other
-    /// JSONL adapters remain offset-only.
+    /// on rewind); Kiro's append-only behavior is not documented; `agy` may
+    /// trim its shared Antigravity history. Those adapters validate this
+    /// prefix before trusting the byte offset. Other JSONL adapters remain
+    /// offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_sha256: Option<String>,
 }
@@ -123,15 +130,7 @@ pub async fn export_transcript(
         return export_crush(home, cwd, session_dir, native_session_id, source_cursor);
     }
     if harness == ManagedHarness::Antigravity {
-        // The conversation store keeps every step as an undocumented protobuf
-        // blob whose step-type enum is unversioned, so message text cannot be
-        // decoded without guessing at a schema that changes between `agy`
-        // releases. Conversation identity and workspace are read (they are
-        // stable fields observed in current metadata); the visible-event
-        // ledger for this harness comes from lifecycle-hook capture instead.
-        return Err(anyhow!(
-            "antigravity conversations expose no decodable transcript; this session's events come from hook capture"
-        ));
+        return export_antigravity(home, cwd, session_dir, native_session_id, source_cursor);
     }
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
@@ -280,27 +279,53 @@ pub fn claude_live_background_attach_id(
     })
 }
 
-/// Find the Claude Code background session that `native_session_id` attached
-/// to during this run, if any.
+/// Where a Claude Code launch's conversation went on, when it left the
+/// session the launcher started or resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeContinuation {
+    /// `/resume` attached to a background session the daemon hosts.
+    Background(String),
+    /// `/clear` started a new session in the same process.
+    Cleared(String),
+}
+
+impl ClaudeContinuation {
+    /// The native session the conversation continued in.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Background(id) | Self::Cleared(id) => id,
+        }
+    }
+}
+
+/// Find the session `native_session_id`'s Claude Code process continued in
+/// during this run, if it left it.
 ///
-/// `/resume` on a background session (one hosted by the Claude Code daemon)
-/// does not continue the foreground session: the conversation keeps going in
-/// the background session's own transcript, whose records carry
-/// `"sessionKind": "bg"` and name the attached foreground session in
-/// `session_id`. The daemon's hooks never see this run's id, so without this
-/// the workstream stays on the foreground session and the next launch resumes
-/// a transcript with no conversation in it.
+/// Every record a Claude Code process writes names the session the process
+/// launched with in `session_id`, while `sessionId` names the transcript's own
+/// session. Two moves leave that launch session behind:
 ///
-/// Only transcripts written since `started_at` are read, the newest first,
-/// and a record must also match this checkout. Transcripts without those
-/// fields (older Claude Code builds) never match.
-pub fn claude_attached_background_session(
+/// - `/resume` on a background session (one hosted by the Claude Code daemon)
+///   keeps going in the background session's transcript, whose records carry
+///   `"sessionKind": "bg"`. The daemon's hooks never see this run's id.
+/// - `/clear` starts a new session whose transcript records the `/clear`
+///   command itself.
+///
+/// Without this the workstream stays on the launch session, and the next
+/// launch resumes a transcript that holds none of the later conversation.
+///
+/// Only transcripts written since `started_at` are read, the newest first, so
+/// a chain of `/clear`s ends on the last one. A background record must match
+/// this checkout exactly; a cleared session may have moved into a directory
+/// below it. Transcripts without those fields (older Claude Code builds)
+/// never match.
+pub fn claude_continued_session(
     home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     native_session_id: &str,
     started_at: SystemTime,
-) -> Result<Option<String>> {
+) -> Result<Option<ClaudeContinuation>> {
     if !valid_native_session_id(native_session_id) {
         return Ok(None);
     }
@@ -315,42 +340,63 @@ pub fn claude_attached_background_session(
         if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
             break;
         }
-        if path
-            .file_stem()
-            .is_some_and(|stem| stem == std::ffi::OsStr::new(native_session_id))
-        {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem == native_session_id {
             continue;
         }
         let reader = BufReader::new(File::open(&path)?);
+        let mut cleared = false;
+        let mut cleared_in_checkout = false;
         for line in reader.lines() {
             let line = line?;
-            if !line.contains(&attached_marker) {
+            let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
+            if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            let background = value.get("sessionKind").and_then(Value::as_str) == Some("bg");
-            let attached =
-                value.get("session_id").and_then(Value::as_str) == Some(native_session_id);
-            let in_checkout = value
-                .get("cwd")
-                .and_then(Value::as_str)
-                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
                 continue;
             };
-            if background
-                && attached
-                && in_checkout
-                && session != native_session_id
-                && valid_native_session_id(session)
-            {
-                return Ok(Some(session.to_string()));
+            if session == native_session_id || !valid_native_session_id(session) {
+                continue;
             }
+            let recorded_cwd = value.get("cwd").and_then(Value::as_str).map(Path::new);
+            if clear_command && session == stem && is_claude_clear_command(&value) {
+                cleared = true;
+            }
+            if value.get("session_id").and_then(Value::as_str) != Some(native_session_id) {
+                continue;
+            }
+            if value.get("sessionKind").and_then(Value::as_str) == Some("bg") {
+                if recorded_cwd.is_some_and(|recorded| same_path(recorded, cwd)) {
+                    return Ok(Some(ClaudeContinuation::Background(session.to_string())));
+                }
+            } else if session == stem
+                && recorded_cwd.is_some_and(|recorded| path_within(recorded, cwd))
+            {
+                cleared_in_checkout = true;
+            }
+        }
+        if cleared && cleared_in_checkout {
+            return Ok(Some(ClaudeContinuation::Cleared(stem.to_string())));
         }
     }
     Ok(None)
+}
+
+const CLAUDE_CLEAR_COMMAND: &str = "<command-name>/clear</command-name>";
+
+/// The user record Claude Code writes for a `/clear` typed at its prompt.
+fn is_claude_clear_command(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        && value
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.trim_start().starts_with(CLAUDE_CLEAR_COMMAND))
 }
 
 /// List newest native sessions whose recorded working directory matches the
@@ -408,6 +454,60 @@ pub async fn list_native_sessions(
         }
     }
     Ok(sessions)
+}
+
+/// Resolve the on-disk directory holding this harness's native "memory"
+/// store for the given checkout, when the harness has one and a session
+/// recorded for this cwd can be found.
+///
+/// Claude Code keeps a `memory/` directory as a sibling of its own session
+/// transcripts, at `<home>/.claude/projects/<project-dir>/memory/` — the
+/// native store `ai-memory doctor` warns about capturing unless a marker's
+/// `ignore_paths` excludes it (harness-issue #1003). `<project-dir>`'s name
+/// is Claude Code's own encoding of the cwd, which is **not** the same
+/// encoding on every platform (native Windows also folds `\` and `:`, not
+/// only `/`), so this never re-derives that name. Instead it reuses the same
+/// content-based match [`list_native_sessions`] uses — read each session
+/// file's own recorded `cwd` until one matches — and returns that file's
+/// parent directory, which is correct on any platform by construction.
+///
+/// Callers should pass the checkout's **repository root**, not an arbitrary
+/// subdirectory: Claude Code keys this store by repository root, so a
+/// worktree or a subdirectory shares the root's `memory/` directory. This
+/// function itself does no such resolution -- it matches whatever `cwd` it
+/// is given against recorded session cwds -- so passing a subdirectory here
+/// finds nothing even when a `memory/` store genuinely exists for the
+/// repository.
+///
+/// Harnesses with no known native-memory convention return `None`
+/// unconditionally; callers should treat that as "nothing to report", not as
+/// an error.
+#[must_use]
+pub fn native_memory_dir(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if harness != ManagedHarness::Claude {
+        return None;
+    }
+    let mut files = collect_session_files(harness, home, session_dir).ok()?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    for path in files {
+        let Ok(Some((_, recorded_cwd))) = session_header_for_cwd(harness, &path, cwd) else {
+            continue;
+        };
+        if same_path(&recorded_cwd, cwd) {
+            let memory_dir = path.parent()?.join("memory");
+            return memory_dir.is_dir().then_some(memory_dir);
+        }
+    }
+    None
 }
 
 /// Whether the native store holds `native_session_id` for this checkout.
@@ -2847,6 +2947,407 @@ fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
 }
 
+/// Antigravity's conversation store keeps every step as an undocumented
+/// protobuf blob whose step-type enum is unversioned, so assistant and tool
+/// steps are never decoded. `agy` also appends each typed prompt to
+/// `history.jsonl` beside the store, and that is the only source read here.
+///
+/// The file is shared by every conversation and workspace, so a line is kept
+/// only when both its `conversationId` and its `workspace` match the validated
+/// conversation: resuming a conversation from another directory keeps its id
+/// but records that directory. A new conversation's first prompt is written
+/// before its id exists; it is attributed only when exactly one unlabelled
+/// prompt from this workspace was typed as the conversation's `.db` appeared.
+fn export_antigravity(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    let db = locate_session_file(ManagedHarness::Antigravity, home, cwd, session_dir, session)?
+        .ok_or_else(|| anyhow!("native transcript for {session} was not found"))?;
+    let mut losses = Vec::new();
+    let history = session_root(ManagedHarness::Antigravity, home, session_dir)
+        .parent()
+        .map(|dir| dir.join("history.jsonl"));
+    let opened = history.and_then(|path| {
+        let file = File::open(&path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Some((path, file, len))
+    });
+    let Some((history, mut file, len)) = opened else {
+        losses.push(
+            "Antigravity history.jsonl is missing or unreadable; no user prompts were imported"
+                .into(),
+        );
+        losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
+        return Ok(ExportedTranscript {
+            native_session_id: session.to_string(),
+            source_cursor: None,
+            events: Vec::new(),
+            losses,
+        });
+    };
+    // `agy` could trim or rewrite its history, so the offset is trusted only
+    // while the bytes before it are unchanged.
+    let cursor = source_cursor
+        .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
+        .filter(|cursor| Path::new(&cursor.path) == history && cursor.offset <= len);
+    let validated = if let Some(cursor) = cursor
+        && let Some(expected) = cursor.prefix_sha256.as_deref()
+        && let Some(hasher) = hash_file_prefix(&mut file, cursor.offset)?
+        && format!("{:x}", hasher.clone().finalize()) == expected
+    {
+        Some((cursor.offset, hasher))
+    } else {
+        None
+    };
+    let (start, mut prefix_hasher) = validated.unwrap_or_else(|| (0, Sha256::new()));
+    file.seek(SeekFrom::Start(start))?;
+
+    let created = birth_millis(&db);
+    let checkout = cwd.canonicalize().ok();
+    let in_checkout = |workspace: &str| {
+        checkout.is_some() && Path::new(workspace).canonicalize().ok() == checkout
+    };
+    let mut reader = BufReader::new(file);
+    let mut offset = start;
+    let mut line = Vec::new();
+    let mut prompts: Vec<HistoryPrompt> = Vec::new();
+    // Unlabelled prompts from this checkout that could have opened it.
+    let mut openers: Vec<HistoryPrompt> = Vec::new();
+    loop {
+        let read = match read_bounded_line(
+            &mut reader,
+            MAX_ANTIGRAVITY_HISTORY_LINE_BYTES,
+            session.as_bytes(),
+            &mut line,
+            &mut prefix_hasher,
+        )? {
+            BoundedLine::Eof | BoundedLine::Partial => break,
+            BoundedLine::Oversized { read, mentions } => {
+                offset += read;
+                if mentions {
+                    losses.push("oversized Antigravity history records were skipped".into());
+                }
+                continue;
+            }
+            BoundedLine::Line(read) => read,
+        };
+        let line_offset = offset;
+        offset += read;
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        // Only a record naming this conversation can be its loss; one naming
+        // another is skipped unparsed, and an unlabelled one is a possible
+        // opening prompt, skipped silently when unusable.
+        let names_session = contains_bytes(raw, session.as_bytes());
+        if !names_session && contains_bytes(raw, b"\"conversationId\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+            if names_session {
+                losses.push("malformed Antigravity history records were skipped".into());
+            }
+            continue;
+        };
+        if value
+            .get("conversationId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != session)
+        {
+            continue;
+        }
+        let entry = match antigravity_history_entry(&value) {
+            Ok(entry) => entry,
+            Err(loss) => {
+                if value.get("conversationId").is_some() {
+                    losses.push(loss.into());
+                }
+                continue;
+            }
+        };
+        let prompt = || HistoryPrompt {
+            offset: line_offset,
+            hash: format!("{:x}", Sha256::digest(raw)),
+            millis: entry.millis,
+            display: entry.display.to_string(),
+            metadata: json!({}),
+        };
+        match (entry.conversation, entry.kind) {
+            (Some(_), AntigravityHistoryKind::SlashCommand) => {
+                losses.push("Antigravity slash commands were intentionally excluded".into());
+            }
+            (Some(_), AntigravityHistoryKind::Shell) => {
+                losses.push("Antigravity shell commands were intentionally excluded".into());
+            }
+            (Some(_), AntigravityHistoryKind::Prompt) => {
+                if in_checkout(entry.workspace) {
+                    prompts.push(prompt());
+                } else {
+                    losses.push(
+                        "Antigravity prompts typed in another workspace were excluded".into(),
+                    );
+                }
+            }
+            // Without a creation time no window applies; only a read from
+            // the start can still hold the opening prompt worth reporting.
+            (None, AntigravityHistoryKind::Prompt)
+                if created.map_or(start == 0, |created| {
+                    opening_window_contains(created, entry.millis)
+                }) && in_checkout(entry.workspace) =>
+            {
+                openers.push(prompt());
+            }
+            (None, _) => {}
+        }
+    }
+    let opening = antigravity_opening_prompt(created, openers, |millis| {
+        antigravity_conversation_started_near(&db, cwd, millis)
+    });
+    match opening {
+        Ok(Some(mut opener)) => {
+            opener.metadata = json!({"attribution": "inferred"});
+            prompts.push(opener);
+            prompts.sort_by_key(|prompt| prompt.offset);
+        }
+        Ok(None) => {}
+        Err(loss) => losses.push(loss.into()),
+    }
+    let mut events = Vec::new();
+    for prompt in prompts {
+        push_event(
+            &mut events,
+            AgentKind::AntigravityCli,
+            session,
+            &format!("{}-{}", prompt.millis, prompt.hash),
+            0,
+            WorkstreamEventKind::Message,
+            Some("user"),
+            &prompt.display,
+            jiff::Timestamp::from_millisecond(prompt.millis)
+                .ok()
+                .map(|timestamp| timestamp.to_string()),
+            prompt.metadata,
+        );
+    }
+    losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
+    Ok(ExportedTranscript {
+        native_session_id: session.to_string(),
+        source_cursor: Some(serde_json::to_string(&FileCursor {
+            path: history.to_string_lossy().into_owned(),
+            offset,
+            flavor: None,
+            prefix_sha256: Some(format!("{:x}", prefix_hasher.finalize())),
+        })?),
+        events,
+        losses: deduplicate_losses(losses),
+    })
+}
+
+const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only user prompts from history.jsonl were imported";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityHistoryKind {
+    Prompt,
+    SlashCommand,
+    Shell,
+}
+
+#[derive(Debug)]
+struct AntigravityHistoryEntry<'a> {
+    conversation: Option<&'a str>,
+    kind: AntigravityHistoryKind,
+    workspace: &'a str,
+    display: &'a str,
+    millis: i64,
+}
+
+/// The file carries no version field, so each record is checked field by
+/// field; unknown keys are ignored and anything else unexpected is skipped.
+fn antigravity_history_entry(value: &Value) -> Result<AntigravityHistoryEntry<'_>, &'static str> {
+    let conversation = match value.get("conversationId") {
+        None => None,
+        Some(Value::String(id)) => Some(id.as_str()),
+        Some(_) => return Err("malformed Antigravity history records were skipped"),
+    };
+    let kind = match value.get("type").map(Value::as_str) {
+        None => AntigravityHistoryKind::Prompt,
+        Some(Some("slash_command")) => AntigravityHistoryKind::SlashCommand,
+        Some(Some("shell")) => AntigravityHistoryKind::Shell,
+        Some(_) => return Err("Antigravity history records of an unknown type were skipped"),
+    };
+    let display = value
+        .get("display")
+        .and_then(Value::as_str)
+        .filter(|display| !display.trim().is_empty())
+        .ok_or("Antigravity history records without a prompt were skipped")?;
+    let millis = value
+        .get("timestamp")
+        .and_then(Value::as_i64)
+        .filter(|millis| *millis > 0)
+        .ok_or("Antigravity history records without a valid timestamp were skipped")?;
+    let workspace = value
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|workspace| !workspace.is_empty())
+        .ok_or("Antigravity history records without a workspace were skipped")?;
+    Ok(AntigravityHistoryEntry {
+        conversation,
+        kind,
+        workspace,
+        display,
+        millis,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+struct HistoryPrompt {
+    offset: u64,
+    hash: String,
+    millis: i64,
+    display: String,
+    metadata: Value,
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn birth_millis(path: &Path) -> Option<i64> {
+    let created = fs::metadata(path)
+        .and_then(|metadata| metadata.created())
+        .ok()?;
+    i64::try_from(created.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+fn opening_window_contains(created_millis: i64, millis: i64) -> bool {
+    u128::from(created_millis.abs_diff(millis)) <= ANTIGRAVITY_OPENING_PROMPT_WINDOW.as_millis()
+}
+
+/// Pick the unlabelled prompt that opened the conversation from `candidates`,
+/// the ones from this checkout already inside the window around the `.db`
+/// creation time. It is attributed only when it is the single candidate and
+/// no other conversation of this checkout started near it, since that one
+/// could own it just as well. The first labelled prompt is no anchor: its
+/// time depends on how long the user took to type it.
+fn antigravity_opening_prompt(
+    created_millis: Option<i64>,
+    mut candidates: Vec<HistoryPrompt>,
+    other_started_near: impl FnOnce(i64) -> bool,
+) -> Result<Option<HistoryPrompt>, &'static str> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if created_millis.is_none() {
+        return Err(
+            "Antigravity opening prompt was not attributed: the conversation store records no creation time",
+        );
+    }
+    if candidates.len() > 1 {
+        return Err(
+            "Antigravity opening prompt was not attributed: several unlabelled prompts match the conversation start",
+        );
+    }
+    if other_started_near(candidates[0].millis) {
+        return Err(
+            "Antigravity opening prompt was not attributed: another conversation in this workspace started at the same time",
+        );
+    }
+    Ok(candidates.pop())
+}
+
+/// Whether another conversation of this checkout had its store created within
+/// the opening window of `millis`. An unreadable store counts, so doubt never
+/// attributes a prompt.
+fn antigravity_conversation_started_near(db: &Path, cwd: &Path, millis: i64) -> bool {
+    let Some(entries) = db.parent().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return false;
+    };
+    entries.flatten().take(MAX_SCAN_FILES).any(|entry| {
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return false;
+        };
+        path != db
+            && path.extension().is_some_and(|extension| extension == "db")
+            && birth_millis(&path).is_some_and(|born| opening_window_contains(born, millis))
+            && session_path_matches(ManagedHarness::Antigravity, &path, id, cwd).unwrap_or(true)
+    })
+}
+
+enum BoundedLine {
+    Eof,
+    /// Bytes after the last newline: a record still being written.
+    Partial,
+    Line(u64),
+    /// A complete record longer than the limit, consumed without buffering;
+    /// `mentions` tells whether it contains the needle anywhere.
+    Oversized {
+        read: u64,
+        mentions: bool,
+    },
+}
+
+/// Read one newline-terminated record into `line`, buffering at most `max`
+/// bytes of it; an oversized record is only searched for `needle`. `hasher` takes every byte of a complete record and none of a
+/// partial one, so it always covers exactly the committed prefix.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    max: usize,
+    needle: &[u8],
+    line: &mut Vec<u8>,
+    hasher: &mut Sha256,
+) -> std::io::Result<BoundedLine> {
+    line.clear();
+    let mut pending = hasher.clone();
+    let mut consumed = 0u64;
+    let mut oversized = false;
+    let mut mentions = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(if consumed == 0 {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Partial
+            });
+        }
+        let (chunk, done) = match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&buffer[..=index], true),
+            None => (buffer, false),
+        };
+        let used = chunk.len();
+        pending.update(chunk);
+        if !oversized && line.len() + used <= max + 1 {
+            line.extend_from_slice(chunk);
+        } else {
+            // Past the limit only a tail one byte shorter than `needle` is
+            // kept, so a needle split across chunks is still found.
+            oversized = true;
+            line.extend_from_slice(chunk);
+            mentions |= contains_bytes(line, needle);
+            line.drain(..line.len().saturating_sub(needle.len().saturating_sub(1)));
+        }
+        consumed += used as u64;
+        reader.consume(used);
+        if done {
+            *hasher = pending;
+            return Ok(if oversized {
+                BoundedLine::Oversized {
+                    read: consumed,
+                    mentions,
+                }
+            } else {
+                BoundedLine::Line(consumed)
+            });
+        }
+    }
+}
+
 /// Antigravity keeps one SQLite database per conversation, named
 /// `<conversation-id>.db`, so the id comes from the file name. The workspace it
 /// was opened on lives in `trajectory_metadata_blob`, a protobuf message whose
@@ -3695,13 +4196,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 fn valid_native_session_id(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_NATIVE_SESSION_ID_BYTES
+    NativeSessionIdentity::parse(value, &Sanitizer::builtin()).is_ok()
         && !value.starts_with('-')
         && value != "."
         && value != ".."
         && !value.contains(['/', '\\'])
-        && !value.chars().any(char::is_control)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -4546,7 +5045,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_attached_background_session_follows_only_this_checkouts_bg_records() {
+    fn claude_continued_session_follows_only_this_checkouts_bg_records() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
         let other = temp.path().join("other");
@@ -4577,7 +5076,9 @@ mod tests {
             value
         };
         let find = |id: &str| {
-            claude_attached_background_session(temp.path(), &cwd, None, id, started_at).unwrap()
+            claude_continued_session(temp.path(), &cwd, None, id, started_at)
+                .unwrap()
+                .map(|continuation| continuation.session_id().to_owned())
         };
 
         // The foreground transcript names itself; it is never the answer.
@@ -4621,6 +5122,126 @@ mod tests {
         );
         assert_eq!(find("fg").as_deref(), Some("bg"));
         assert_eq!(find("unrelated"), None);
+    }
+
+    #[test]
+    fn claude_continued_session_follows_only_this_launchs_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let nested = cwd.join("packages/app");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value], age: Duration| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+        };
+        // Claude Code's real shape: the `/clear` record carries no
+        // `session_id`; later records name the launch session there.
+        let clear = |session: &str, cwd: &Path| {
+            json!({
+                "type": "user",
+                "sessionId": session,
+                "cwd": cwd,
+                "message": {"role": "user", "content": format!(
+                    "{CLAUDE_CLEAR_COMMAND}\n            <command-message>clear</command-message>"
+                )},
+            })
+        };
+        let turn = |session: &str, launch: &str, cwd: &Path| json!({"type": "user", "sessionId": session, "session_id": launch, "cwd": cwd});
+        let find =
+            |id: &str| claude_continued_session(temp.path(), &cwd, None, id, started_at).unwrap();
+        let recent = Duration::from_secs(5);
+
+        write("launch", &[turn("launch", "launch", &cwd)], recent);
+        assert_eq!(find("launch"), None);
+
+        // A transcript that names the launch session without having been
+        // cleared is neither a clear nor a background continuation.
+        write("plain", &[turn("plain", "launch", &cwd)], recent);
+        // Text that merely quotes `/clear` is not the command record.
+        write(
+            "quoted",
+            &[
+                json!({"type": "user", "sessionId": "quoted", "cwd": cwd,
+                    "message": {"role": "user", "content": format!("what does {CLAUDE_CLEAR_COMMAND} do?")}}),
+                turn("quoted", "launch", &cwd),
+            ],
+            recent,
+        );
+        // Another checkout's clear, and a concurrent launch's clear here.
+        write(
+            "elsewhere",
+            &[
+                clear("elsewhere", &other),
+                turn("elsewhere", "launch", &other),
+            ],
+            recent,
+        );
+        write(
+            "concurrent",
+            &[
+                clear("concurrent", &cwd),
+                turn("concurrent", "other-launch", &cwd),
+            ],
+            recent,
+        );
+        // A subagent file holds the cleared session's records under its own
+        // stem; it is not a session to resume.
+        write(
+            "agent-1",
+            &[clear("subagent", &cwd), turn("subagent", "launch", &cwd)],
+            recent,
+        );
+        // A clear made before this run started is not read.
+        write(
+            "stale",
+            &[clear("stale", &cwd), turn("stale", "launch", &cwd)],
+            Duration::from_secs(600),
+        );
+        assert_eq!(find("launch"), None);
+        assert_eq!(
+            find("other-launch"),
+            Some(ClaudeContinuation::Cleared("concurrent".into()))
+        );
+
+        // The clear this launch made, even after moving below the checkout.
+        write(
+            "cleared",
+            &[clear("cleared", &cwd), turn("cleared", "launch", &nested)],
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared".into()))
+        );
+
+        // A second `/clear` in the same process: the newest one wins.
+        write(
+            "cleared-again",
+            &[
+                clear("cleared-again", &cwd),
+                turn("cleared-again", "launch", &cwd),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared-again".into()))
+        );
     }
 
     #[test]
@@ -5829,23 +6450,538 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
-    /// Every step payload is an undocumented protobuf blob, so the ledger for
-    /// this harness comes from hook capture. The failure has to say so.
-    #[tokio::test]
-    async fn antigravity_transcript_export_explains_why_it_is_unavailable() {
+    const AG_MINE: &str = "a0d5ac62-2501-4780-b783-76d159c56cb3";
+    const AG_THEIRS: &str = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
+    /// Far from any fixture `.db` creation time, so unlabelled lines at this
+    /// time are never opening-prompt candidates.
+    const AG_PAST: i64 = 1_780_000_000_000;
+
+    struct AntigravityFixture {
+        temp: tempfile::TempDir,
+        root: PathBuf,
+        cwd: PathBuf,
+        other: PathBuf,
+    }
+
+    /// A fake home holding this checkout's conversation `AG_MINE`.
+    fn antigravity_fixture() -> AntigravityFixture {
         let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        let cwd = temp.path().join("checkout");
+        let other = temp.path().join("elsewhere");
+        for dir in [&root, &cwd, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write_antigravity_conversation(&root, AG_MINE, &file_uri(&cwd));
+        AntigravityFixture {
+            temp,
+            root,
+            cwd,
+            other,
+        }
+    }
+
+    fn history_line(id: Option<&str>, workspace: &Path, display: &str, millis: i64) -> String {
+        let mut line = json!({
+            "display": display,
+            "timestamp": millis,
+            "workspace": workspace.to_string_lossy(),
+        });
+        if let Some(id) = id {
+            line["conversationId"] = json!(id);
+        }
+        line.to_string()
+    }
+
+    fn write_antigravity_history(root: &Path, lines: &[String]) {
+        let mut body = lines.join("\n");
+        body.push('\n');
+        fs::write(root.parent().unwrap().join("history.jsonl"), body).unwrap();
+    }
+
+    async fn export_antigravity_fixture(
+        fixture: &AntigravityFixture,
+        cursor: Option<&str>,
+    ) -> ExportedTranscript {
+        export_transcript(
+            ManagedHarness::Antigravity,
+            fixture.temp.path(),
+            &fixture.cwd,
+            None,
+            AG_MINE,
+            cursor,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn prompts(exported: &ExportedTranscript) -> Vec<&str> {
+        exported
+            .events
+            .iter()
+            .map(|event| {
+                assert_eq!(event.role.as_deref(), Some("user"));
+                assert_eq!(event.agent, AgentKind::AntigravityCli);
+                event.content.as_str()
+            })
+            .collect()
+    }
+
+    /// `history.jsonl` holds every conversation of every workspace. Only this
+    /// conversation's prompts typed in this checkout may come out.
+    #[tokio::test]
+    async fn antigravity_history_exports_only_this_conversations_prompts_in_this_workspace() {
+        let fixture = antigravity_fixture();
+        let (cwd, other) = (&fixture.cwd, &fixture.other);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), cwd, "own first", AG_PAST),
+                history_line(Some(AG_THEIRS), cwd, "canary-same-workspace", AG_PAST + 1),
+                history_line(
+                    Some(AG_THEIRS),
+                    other,
+                    "canary-other-workspace",
+                    AG_PAST + 2,
+                ),
+                history_line(None, other, "canary-unlabelled", AG_PAST + 3),
+                history_line(Some(AG_MINE), cwd, "own second", AG_PAST + 4),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own first", "own second"]);
+        assert!(
+            !exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "other conversations are not this session's losses: {:?}",
+            exported.losses
+        );
+    }
+
+    /// `agy --conversation=<id>` run from another directory keeps the id but
+    /// records that directory, so the id alone must not admit the line.
+    #[tokio::test]
+    async fn antigravity_history_drops_prompts_from_a_resumed_conversation_in_another_workspace() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), &fixture.other, "canary-resumed", AG_PAST),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// The conversation itself must belong to this checkout before any
+    /// history line is read, even when the history names this checkout.
+    #[tokio::test]
+    async fn antigravity_export_rejects_a_conversation_from_another_workspace() {
+        let fixture = antigravity_fixture();
+        write_antigravity_conversation(&fixture.root, AG_THEIRS, &file_uri(&fixture.other));
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_THEIRS),
+                &fixture.cwd,
+                "canary",
+                AG_PAST,
+            )],
+        );
+
         let error = export_transcript(
             ManagedHarness::Antigravity,
-            temp.path(),
-            temp.path(),
+            fixture.temp.path(),
+            &fixture.cwd,
             None,
-            "a0d5ac62-2501-4780-b783-76d159c56cb3",
+            AG_THEIRS,
             None,
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("hook capture"), "{error}");
+
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn antigravity_export_rejects_unknown_or_traversal_ids() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(Some("../x"), &fixture.cwd, "canary", AG_PAST)],
+        );
+        for id in ["11111111-1111-1111-1111-111111111111", "../x", "not-a-uuid"] {
+            let error = export_transcript(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None,
+                id,
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("not found"), "{id}: {error}");
+        }
+    }
+
+    /// The file has no version field: anything unexpected is skipped with a
+    /// loss, and unknown keys are ignored.
+    #[tokio::test]
+    async fn antigravity_history_skips_malformed_lines_with_losses() {
+        let fixture = antigravity_fixture();
+        let cwd = fixture.cwd.to_string_lossy();
+        let record = |extra: Value| {
+            let mut line = json!({
+                "conversationId": AG_MINE,
+                "workspace": cwd,
+                "display": "canary",
+                "timestamp": AG_PAST,
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                if value.is_null() {
+                    line.as_object_mut().unwrap().remove(key);
+                } else {
+                    line[key] = value.clone();
+                }
+            }
+            line.to_string()
+        };
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                format!(r#"{{"conversationId":"{AG_MINE}","display":"#),
+                record(json!({"timestamp": "1780000000000"})),
+                record(json!({"timestamp": -5})),
+                record(json!({"timestamp": 1.78e12})),
+                record(json!({"display": ""})),
+                record(json!({"display": null})),
+                record(json!({"workspace": null})),
+                record(json!({"type": "weird"})),
+                record(json!({"display": "own", "futureKey": {"nested": true}})),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        for expected in [
+            "malformed Antigravity history records",
+            "without a valid timestamp",
+            "without a prompt",
+            "without a workspace",
+            "of an unknown type",
+        ] {
+            assert!(
+                exported.losses.iter().any(|loss| loss.contains(expected)),
+                "missing {expected:?} in {:?}",
+                exported.losses
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_drops_slash_and_shell_entries() {
+        let fixture = antigravity_fixture();
+        let typed = |kind: &str| {
+            let mut line: Value =
+                serde_json::from_str(&history_line(Some(AG_MINE), &fixture.cwd, "/x", AG_PAST))
+                    .unwrap();
+            line["type"] = json!(kind);
+            line.to_string()
+        };
+        write_antigravity_history(&fixture.root, &[typed("slash_command"), typed("shell")]);
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty());
+        for expected in ["slash commands", "shell commands"] {
+            assert!(
+                exported.losses.iter().any(|loss| loss.contains(expected)),
+                "missing {expected:?} in {:?}",
+                exported.losses
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_skips_an_oversized_line_and_keeps_reading() {
+        let fixture = antigravity_fixture();
+        let huge = "x".repeat(MAX_ANTIGRAVITY_HISTORY_LINE_BYTES + 1);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), &fixture.cwd, &huge, AG_PAST),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("oversized")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// A missing history is a degraded source, not a failed import.
+    #[tokio::test]
+    async fn antigravity_history_missing_file_yields_no_events() {
+        let fixture = antigravity_fixture();
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty());
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("history.jsonl is missing")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// `agy` caps a prompt near 8 KiB; such a prompt in multibyte text stays
+    /// under the line limit and comes out whole, stamped from epoch ms.
+    #[tokio::test]
+    async fn antigravity_history_converts_millis_and_keeps_a_long_multibyte_prompt() {
+        let fixture = antigravity_fixture();
+        let long = "é🙂".repeat(4_096);
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_MINE),
+                &fixture.cwd,
+                &long,
+                1_780_000_000_123,
+            )],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), [long.as_str()]);
+        assert_eq!(
+            exported.events[0].occurred_at.as_deref(),
+            Some("2026-05-28T20:26:40.123Z")
+        );
+        assert_eq!(exported.events[0].metadata, json!({}));
+    }
+
+    fn opener(millis: i64) -> HistoryPrompt {
+        HistoryPrompt {
+            offset: 0,
+            hash: String::new(),
+            millis,
+            display: "opening".into(),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn antigravity_opening_prompt_takes_the_single_candidate() {
+        assert_eq!(
+            antigravity_opening_prompt(Some(AG_PAST), vec![opener(AG_PAST + 400)], |_| false),
+            Ok(Some(opener(AG_PAST + 400)))
+        );
+        assert_eq!(
+            antigravity_opening_prompt(Some(AG_PAST), Vec::new(), |_| true),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn antigravity_opening_prompt_rejects_ambiguous_or_contested_candidates() {
+        assert!(
+            antigravity_opening_prompt(
+                Some(AG_PAST),
+                vec![opener(AG_PAST), opener(AG_PAST + 100)],
+                |_| false
+            )
+            .unwrap_err()
+            .contains("several")
+        );
+        assert!(
+            antigravity_opening_prompt(Some(AG_PAST), vec![opener(AG_PAST)], |millis| {
+                millis == AG_PAST
+            })
+            .unwrap_err()
+            .contains("another conversation")
+        );
+    }
+
+    /// The missing creation time is reported only when a prompt was left
+    /// unattributed because of it.
+    #[test]
+    fn antigravity_opening_prompt_needs_a_creation_time_only_for_a_candidate() {
+        assert!(
+            antigravity_opening_prompt(None, vec![opener(AG_PAST)], |_| false)
+                .unwrap_err()
+                .contains("no creation time")
+        );
+        assert_eq!(
+            antigravity_opening_prompt(None, Vec::new(), |_| false),
+            Ok(None)
+        );
+    }
+
+    /// A conversation of one prompt has no labelled line at all; its prompt is
+    /// found from the `.db` creation time alone. Skipped where the filesystem
+    /// records no birth time.
+    #[tokio::test]
+    async fn antigravity_opening_prompt_covers_a_single_prompt_conversation() {
+        let fixture = antigravity_fixture();
+        let db = fixture.root.join(format!("{AG_MINE}.db"));
+        let Ok(created) = fs::metadata(&db).and_then(|metadata| metadata.created()) else {
+            return;
+        };
+        let created =
+            i64::try_from(created.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(None, &fixture.cwd, "canary-before-window", created - 6_000),
+                history_line(None, &fixture.other, "canary-other-workspace", created),
+                history_line(None, &fixture.cwd, "opening", created + 300),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["opening"]);
+        assert_eq!(
+            exported.events[0].metadata,
+            json!({"attribution": "inferred"})
+        );
+    }
+
+    /// A conversation opened without a typed prompt (`agy -p`) must not take
+    /// the opening prompt of another conversation of this checkout started at
+    /// the same moment. Skipped where the filesystem records no birth time.
+    #[tokio::test]
+    async fn antigravity_opening_prompt_is_refused_when_another_conversation_started_with_it() {
+        let fixture = antigravity_fixture();
+        write_antigravity_conversation(&fixture.root, AG_THEIRS, &file_uri(&fixture.cwd));
+        let Some(created) = birth_millis(&fixture.root.join(format!("{AG_MINE}.db"))) else {
+            return;
+        };
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                None,
+                &fixture.cwd,
+                "canary-theirs-opening",
+                created,
+            )],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another conversation")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// Unusable records of other conversations, or unlabelled ones, are not
+    /// this conversation's losses.
+    #[tokio::test]
+    async fn antigravity_history_reports_no_losses_for_foreign_records() {
+        let fixture = antigravity_fixture();
+        let huge = "x".repeat(MAX_ANTIGRAVITY_HISTORY_LINE_BYTES + 1);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                format!(r#"{{"conversationId":"{AG_THEIRS}","display":"#),
+                history_line(Some(AG_THEIRS), &fixture.cwd, &huge, AG_PAST),
+                json!({"conversationId": AG_THEIRS, "display": "x", "timestamp": AG_PAST})
+                    .to_string(),
+                json!({"display": "shell", "timestamp": AG_PAST, "type": "shell"}).to_string(),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert_eq!(
+            exported.losses,
+            [ANTIGRAVITY_PROMPTS_ONLY],
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_cursor_returns_only_appended_prompts() {
+        let fixture = antigravity_fixture();
+        let first = history_line(Some(AG_MINE), &fixture.cwd, "first", AG_PAST);
+        write_antigravity_history(&fixture.root, std::slice::from_ref(&first));
+        let initial = export_antigravity_fixture(&fixture, None).await;
+        assert_eq!(prompts(&initial), ["first"]);
+
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                first,
+                history_line(Some(AG_MINE), &fixture.cwd, "second", AG_PAST + 1),
+            ],
+        );
+        let next = export_antigravity_fixture(&fixture, initial.source_cursor.as_deref()).await;
+
+        assert_eq!(prompts(&next), ["second"]);
+    }
+
+    /// A trimmed or rewritten history invalidates the byte offset, so the
+    /// read starts over instead of skipping or splitting records.
+    #[tokio::test]
+    async fn antigravity_history_cursor_restarts_after_truncation_or_rewrite() {
+        let fixture = antigravity_fixture();
+        let line =
+            |display: &str, millis: i64| history_line(Some(AG_MINE), &fixture.cwd, display, millis);
+        write_antigravity_history(
+            &fixture.root,
+            &[line("aaaa", AG_PAST), line("bbbb", AG_PAST + 1)],
+        );
+        let cursor = export_antigravity_fixture(&fixture, None)
+            .await
+            .source_cursor;
+
+        write_antigravity_history(&fixture.root, &[line("cccc", AG_PAST + 2)]);
+        let truncated = export_antigravity_fixture(&fixture, cursor.as_deref()).await;
+        assert_eq!(prompts(&truncated), ["cccc"]);
+
+        let cursor = truncated.source_cursor;
+        write_antigravity_history(&fixture.root, &[line("dddd", AG_PAST + 3)]);
+        let rewritten = export_antigravity_fixture(&fixture, cursor.as_deref()).await;
+        assert_eq!(prompts(&rewritten), ["dddd"]);
     }
 
     const KIRO_SESSION_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
@@ -6250,5 +7386,111 @@ mod tests {
         assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
         // A ten-byte varint may carry only one payload bit in its final byte.
         assert_eq!(protobuf_varint(&[0xff; 10]), None);
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_sibling_memory_directory_for_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        // Claude Code's own project-directory name is irrelevant here -- the
+        // whole point of this function is to find it by content, never by
+        // guessing the encoding (which differs between POSIX and native
+        // Windows).
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+        let memory_dir = project_dir.join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            Some(memory_dir)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_memory_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+
+        // A real session was found, but it never created a memory/ store.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_session_matches_this_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": other})),
+        )
+        .unwrap();
+        fs::create_dir_all(project_dir.join("memory")).unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_for_harnesses_with_no_known_convention() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // Codex has no established native-memory convention today, so this
+        // must return None unconditionally rather than guess at a location.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_identity_adapter_preserves_exact_and_rejects_privacy_changes() {
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+            "native\u{feff}tail",
+        ] {
+            assert!(
+                !valid_native_session_id(id),
+                "adapter must reject dirty identity"
+            );
+        }
+        for id in ["session_vendor-01", "native-界-01"] {
+            assert!(valid_native_session_id(id));
+        }
+        for id in ["../session", "-selector", "a/b", "a\\b", ".", ".."] {
+            assert!(!valid_native_session_id(id));
+        }
     }
 }

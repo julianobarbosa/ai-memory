@@ -291,10 +291,84 @@ async fn project_is_empty(
         // yet, so the no-create lookup answers 404 — which is the strongest
         // possible "empty", and the common case for a first-time backfill.
         Err(error) if super::is_scope_not_found(&error) => Ok(true),
+        // A multi-user server keeps `/admin/*` for the operator, so a
+        // developer's own key is refused here. Ask the grant-checked web API
+        // instead: it answers for the sessions this caller can see.
+        Err(error) if is_forbidden(&error) => {
+            project_is_empty_for_member(endpoint, workspace, project).await
+        }
         Err(error) => Err(error).with_context(|| {
             format!("checking whether {workspace}/{project} already has captured sessions")
         }),
     }
+}
+
+fn is_forbidden(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::http_client::ServerResponseError>()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::FORBIDDEN)
+}
+
+/// The sessions the web API lists for a project, open ones included.
+#[derive(Debug, Deserialize)]
+struct SessionListResponse {
+    sessions: Vec<serde_json::Value>,
+}
+
+/// [`project_is_empty`] through `GET /api/v1/workspaces/{ws}/projects/{p}/sessions`,
+/// which any member may read. Its 404 means the project does not exist (or is
+/// not this caller's to see); either way the hook ingress, not this check,
+/// decides whether an import may write there. A 404 whose body is not a JSON
+/// error — a server without the web API — stays an error: guessing "empty"
+/// there could import history twice.
+async fn project_is_empty_for_member(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+) -> Result<bool> {
+    let path = member_sessions_path(workspace, project)?;
+    match get_json::<SessionListResponse>(
+        endpoint,
+        &path,
+        &[("limit", "1"), ("include_open", "true")],
+    )
+    .await
+    {
+        Ok(response) => Ok(response.sessions.is_empty()),
+        Err(error) if is_json_not_found(&error) => Ok(true),
+        Err(error) => Err(error).with_context(|| {
+            format!("checking whether {workspace}/{project} already has captured sessions")
+        }),
+    }
+}
+
+/// The path with each name percent-encoded as one segment, so a name can
+/// never reach another route.
+fn member_sessions_path(workspace: &str, project: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse("http://placeholder/")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("placeholder URL cannot hold a path"))?
+        .clear()
+        .extend([
+            "api",
+            "v1",
+            "workspaces",
+            workspace,
+            "projects",
+            project,
+            "sessions",
+        ]);
+    Ok(url.path().to_owned())
+}
+
+fn is_json_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::http_client::ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::NOT_FOUND
+                && serde_json::from_str::<serde_json::Value>(response.body())
+                    .is_ok_and(|body| body.get("error").is_some())
+        })
 }
 
 /// Enumerate local native sessions for `cwd` across every scanned harness.
@@ -751,6 +825,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new", "mid"],
             "newest first, capped to 2"
+        );
+    }
+
+    #[test]
+    fn member_sessions_path_encodes_each_name_as_one_segment() {
+        assert_eq!(
+            member_sessions_path("team", "app").unwrap(),
+            "/api/v1/workspaces/team/projects/app/sessions"
+        );
+        assert_eq!(
+            member_sessions_path("a/b", "c d?").unwrap(),
+            "/api/v1/workspaces/a%2Fb/projects/c%20d%3F/sessions"
         );
     }
 

@@ -20,6 +20,7 @@ use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
+use crate::openai::REQUEST_ID_HEADER;
 use crate::provider::LlmProvider;
 
 /// LLM providers available to ai-memory.
@@ -402,13 +403,26 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
+            // The openai-compat provider sends `x-request-id` itself, with
+            // the logical operation id on every chat attempt. A static
+            // operator value cannot serve that role, and `reqwest` would
+            // append a second value; refuse the conflict at startup, the
+            // same fail-closed way reserved headers are refused.
+            if extra_headers.contains(REQUEST_ID_HEADER) {
+                return Err(LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS must not set {REQUEST_ID_HEADER}: the \
+                     openai-compat provider sends it itself on every chat attempt \
+                     with the logical operation id"
+                )));
+            }
             let extra_headers = with_default_openrouter_headers(&base, extra_headers);
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
-                    .with_extra_headers(extra_headers),
+                    .with_extra_headers(extra_headers)
+                    .with_request_id_header(),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -635,5 +649,125 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
+    }
+
+    fn compat_config(extra_headers: crate::ExtraHeaders) -> ProviderConfig {
+        ProviderConfig {
+            provider: ProviderChoice::OpenAiCompat,
+            model: "qwen3.8-27b".into(),
+            auth: ProviderAuth::optional_api_key_from_env("LLM_API_KEY", None),
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            compat_strict: true,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
+            extra_headers,
+        }
+    }
+
+    /// A static `x-request-id` in `AI_MEMORY_LLM_HEADERS` cannot coexist
+    /// with the dynamic one — the conflict is refused at startup, before
+    /// any send, rather than letting two values (or the operator's stale
+    /// value) reach the gateway.
+    #[test]
+    fn openai_compat_refuses_a_static_request_id_header() {
+        let headers = crate::ExtraHeaders::parse(["x-request-id: static-1"]).expect("valid");
+        let err = match build_provider(compat_config(headers)) {
+            Ok(_) => panic!("the conflicting entry must be refused at startup"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(matches!(err, LlmError::NotConfigured(_)), "{rendered}");
+        assert!(rendered.contains(REQUEST_ID_HEADER), "{rendered}");
+        assert!(rendered.contains("openai-compat"), "{rendered}");
+    }
+
+    /// Case insensitivity is on the wire: a mixed-case operator entry is the
+    /// same conflict and gets the same refusal.
+    #[test]
+    fn openai_compat_refuses_a_mixed_case_static_request_id_header() {
+        let headers = crate::ExtraHeaders::parse(["X-Request-Id: static-1"]).expect("valid");
+        assert!(
+            build_provider(compat_config(headers)).is_err(),
+            "the wire treats header names case-insensitively"
+        );
+    }
+
+    /// The refusal is scoped to the provider that owns the header: the same
+    /// static entry is a legitimate operator configuration everywhere else.
+    #[test]
+    fn a_static_request_id_header_is_allowed_for_other_providers() {
+        let headers = crate::ExtraHeaders::parse(["x-request-id: static-1"]).expect("valid");
+        let cfg = ProviderConfig {
+            provider: ProviderChoice::OpenAi,
+            model: "gpt-4o-mini".into(),
+            auth: ProviderAuth::required_api_key_from_env(
+                "OPENAI_API_KEY",
+                Some(secrecy::SecretString::from("sk-test")),
+            ),
+            base_url: None,
+            compat_strict: false,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
+            extra_headers: headers,
+        };
+        assert!(
+            build_provider(cfg).is_ok(),
+            "only openai-compat owns the header"
+        );
+    }
+
+    /// End to end: the provider the factory builds for the configured
+    /// `openai-compat` choice sends exactly one `x-request-id` per chat
+    /// attempt, carrying the operation's id — this is the gateway-facing
+    /// contract the whole slice exists for.
+    #[tokio::test]
+    async fn the_factory_built_compat_provider_sends_the_operation_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "model-x",
+                    "choices": [{ "message": { "content": "ok" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = compat_config(crate::ExtraHeaders::default());
+        cfg.base_url = Some(server.uri());
+        let provider = build_provider(cfg).expect("provider builds");
+        let operation_id = crate::LlmOperationId::new();
+        provider
+            .complete_with_operation_id(crate::ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(operation_id.to_string().as_str()),
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get_all(REQUEST_ID_HEADER)
+                .into_iter()
+                .count(),
+            1
+        );
+        // The layered defaults still apply alongside the new header.
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::DEFAULT_USER_AGENT),
+        );
     }
 }

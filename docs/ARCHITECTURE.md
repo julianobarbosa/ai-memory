@@ -55,9 +55,16 @@ from hook paths.
    Agent hot paths never block on the network; saturated servers return HTTP
    429 instead of queueing unbounded work.
    For supported native commands and generated OpenCode/OMP/Pi/OpenClaw
-   integrations, the nearest-marker capture policy runs first: a dropped
-   recognized file-tool event never enters spool, queue, transport, logs, or
-   storage. See [Capture exclusions](marker-file.md#capture-exclusions).
+    integrations, the nearest-marker capture policy runs first: a dropped
+    recognized file-tool event never enters spool, queue, transport, logs, or
+    storage. The separate nearest settings marker may also forward a bounded
+    JSON-array `aliases` query value on both capture and SessionStart handoff
+    lookup. The router accepts it only with marker provenance and the checkout's
+    normalized hostful git-remote identity, and resolves names inside the
+    selected workspace; the cache key includes aliases, provenance, and
+    read/write mode. See
+    [the marker reference](marker-file.md).
+
 2. Server's hook router sanitises the payload (the only path from
    untrusted text into the store), assigns an [`ObservationKind`], and
    enqueues a `WriteCmd` to the writer actor. For native keyed events, the
@@ -72,6 +79,11 @@ from hook paths.
    wiki commit, durable provider job, and pending key without appending another
    observation. `log.md` gets an appended
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
+   Inline `/hook/batch` ACKs include an outcome per acknowledged index.
+   Process-lifetime counters distinguish stored events, replays, recovery and
+   ignored endings. `last_persisted_ms` advances after a durable write or terminal
+   effect; retries and no-op endings do not advance it. Normal checkpoints reuse
+   the observation write timestamp; only recovery checks for a new page version.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. One SQLite transaction inserts that
@@ -94,7 +106,17 @@ from hook paths.
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
    prompts preserve the source material's dominant natural language and ask
-   the model to connect related pages with path-based wikilinks.
+   the model to connect related pages with path-based wikilinks. The default
+   single-page and batch prompts lead the user content with their stable
+   blocks — the fixed batch text (header + field schema) and the project
+   instructions — followed by the current body / slot and title state, and
+   only then the session id and observation dump, so providers with prefix
+   caching can reuse the stable prefix. In the single-page prompt the current
+   body is the session's own page body (`sessions/<id>.md`), so it varies per
+   session: the prefix shared across sessions of one project is the system
+   prompt plus the instructions block when present, and the titles block
+   follows the variable body. The input budget remains an approximate
+   character estimate; cache eligibility is not a measured hit.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
    newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
@@ -177,6 +199,36 @@ from hook paths.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+**Cross-project profile:** after the project brief, SessionStart appends a
+fenced, byte-budgeted, byte-stable digest of the user's usual choices from other
+projects (`docs/cross-project-profile.md`), filtered by the stack the project's
+activity shows, with a larger baseline for a project that has no pages yet. It
+is on by default for a single-operator server and off for a multi-user one.
+Entries are learned by the profile pass (`ai_memory_consolidate::profile`), run
+by a server worker shortly after startup, a debounced moment after every
+SessionEnd (`HookState::profile_notify`), hourly, and on
+`POST /admin/profile/rebuild`. It **harvests** each contributing project past
+its marks (`profile_harvest_marks`): preference-shaped sentences of
+`user-prompt` observations (never tool output), the project's `_rules/`,
+`decisions/`, `gotchas/` and `procedures/` pages, and its stack signals, into
+`profile_candidates`. It then **converges** per profile scope: candidates group
+by topic-token overlap across projects; a group stated as general or seen in
+`min_projects` projects becomes a `profile/<category>/<slug>.md` page written
+through `Wiki::write_page`, the newest statement winning (the replaced version
+stays in the supersession chain). Pages it did not write, or whose body changed
+since it wrote them, are never rewritten; `profile_entry_ledger` keeps a removed
+entry removed until newer evidence arrives. With an LLM provider and
+`[profile] llm`, classification and the per-entry merge use JSON-schema
+structured calls and fall back to the zero-LLM path on any error. A private
+profile converges only its operator's own candidates from projects they can
+read; a shared profile on a multi-user server skips restricted projects.
+`ai-memory profile apply` reads `GET /admin/profile/apply` (the digest's
+selection, capped at `apply_max_lines`, empty for a `consume = false` project)
+and writes it between `<!-- ai-memory:profile:start/end -->` delimiters in the
+repository's rules file through `apply_atomic` (tmp + rename + fsync, backup
+under `<data_dir>/backups/profile-apply/`); it is the only profile path that
+writes outside the wiki, and only when the user runs it.
+
 **Optional managed-workstream loop:** `ai-memory run` opens a lease for the
 current repository/worktree workstream, resolves an explicit harness or the
 newest usable local/linked harness, creates or resumes that harness's native
@@ -187,9 +239,16 @@ imports the native transcript tail and a Git checkpoint when the child exits.
 Every injected packet starts with a versioned origin marker. The Claude
 transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
-An explicitly pending handoff is delivered before the managed event range;
-their single-use delivery claims share one writer transaction after the
-complete startup response has been assembled. Manual handoffs take precedence;
+An explicitly pending handoff is considered before the managed event range.
+By default their single-use delivery claims share one writer transaction after
+the complete startup response has been assembled. With server-wide
+`[handoff].claim_on_session_start = false`, SessionStart instead emits a
+metadata-only notice naming the exact handoff id and leaves the row open for
+an explicit `memory_handoff_accept`; the managed event range is still claimed.
+With server-wide `[handoff].create_on_session_end = false`, session end writes
+the summary page and enqueues consolidation but skips creating an automatic
+baton, and an OpenCode root-turn checkpoint refreshes the page without one
+(#1043). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -231,6 +290,14 @@ normalises them to exactly one of these `ObservationKind` values:
 | `session-end` | Agent session ended; summary/handoff path may run. |
 | `other` | Unknown or unsupported hook event. |
 
+Native hook clients correct one otherwise invisible cross-project case before
+spooling: if a recognized file-tool payload names only absolute paths in one
+other repository/marker boundary, that destination becomes the event cwd.
+Destination capture policy, server profile, and scope therefore travel
+together. Relative, mixed-project, unsupported, and non-project targets keep
+the harness cwd. Session identity and compiled-session ownership do not move;
+only the raw observations are attributed to the touched project (#932).
+
 Antigravity CLI has no native SessionStart event. Its `PreInvocation` hook
 fires before every model call, so the bridge maps only the documented
 `invocationNum = 0` payload to `session-start`; later invocations are ignored
@@ -253,6 +320,34 @@ handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
 for provenance and stable, namespaced `ingest_key` values for retries. See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
+
+Session summaries expose the latest consolidation generation's state and
+attempt count, selected in the same scoped, owner-filtered query. HTTP session
+reads and MCP `memory_read_session_observations` share that summary type; neither
+response includes provider diagnostics.
+
+Tools can use MCP directly to write pages, query knowledge and claim handoffs.
+With `--enable-api` (or `--enable-web`, which implies it), incremental `recent`
+pages use a bounded `(updated_at, path)` query in the authorized scope. API-only
+mode mounts no browser routes. See [programmatic memory](programmatic-memory.md).
+
+`GET /identity` is a machine-authenticated route mounted independently of the
+web UI. `ai-memory doctor` uses it to show caller identity and capture ownership;
+its per-agent counts flag sessions with multiple capture sources (native events
+or distinct extensions, including backfill).
+The mixed-source count is computed in the same scoped, owner-filtered SQL query.
+`GET /admin/project-coordinate` is a root/admin read-only diagnostic over the
+same bounded exact/canonical/legacy indexes used by scope resolution. It returns
+typed status and collision metadata but never creates, claims, renames, audits,
+or writes a scope manifest. An `ambiguous` result may include the preferred
+identity-backed candidate's UUID/current name as context; that is not unique
+resolution and never makes the request rename-eligible. The endpoint omits the
+stored identity value and reports only its safe source/style and derived
+candidate names. `doctor` adds a safe marker
+status/source class and credential-stripped repository evidence from one shared
+local inspection before rendering that response. If compatibility resolution is
+ambiguous, local session rows remain visible while captured counts are marked
+unavailable rather than rendered as zero.
 
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
@@ -309,7 +404,7 @@ prunable rather than only after it ages in place.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. Phase-5 clients explicitly send `IdentityStyle::Path` (#1033) for remote-backed projects, naming them from the full repository path without the host (`acme-api`), and send explicit `host_path` for the pre-v3 opt-out. Server-side omission remains `HostPath` because old clients omitted that historical default; no new wire field is needed. Creation or authorized capture promotion uses that canonical name only when no different hostful identity claims it; otherwise resolution falls back to the existing hostful/legacy-safe name. V76 stores indexed canonical and v2-basename keys derived from that full identity: reads are no-create/no-rename, while an authorized explicit write through the canonical name promotes only `projects.name` in the same resolve-or-create writer transaction and preserves the UUID. Project `_meta.md` carries the optional full identity/source plus derived keys; clean reindex validates them and rebuilds the same UUID/name/coordinate lookup, while older manifests without identity remain valid. Ambiguous cross-forge or multi-candidate keys fail closed. A local marker may additionally send up to 16 validated former names as one transient `aliases` JSON-array query value: lookup stays inside its selected workspace, requires the checkout's full hostful git-remote identity to equal the stored row, returns reads without rename, and lets capture perform only the same authorized UUID-preserving canonical promotion. Aliases are not stored and remain distinct in the hook routing cache. The exact operator-home marker may additionally define bounded `[routes.identity."host/path"]` and `[routes.path."absolute-or-tilde-path"]` blocks: an exact hostful remote match wins the longest component-wise lexical path match, any reachable non-home local settings marker wins both, malformed or ambiguous route maps fail closed, and selected fields reuse the existing marker wire without a server/schema change. `AI_MEMORY_HOME` is authoritative for native callers; portable clients use `HOME`/`USERPROFILE`, and Docker compares its forwarded host cwd. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them — `docs/cross-project-profile.md`. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
@@ -454,6 +549,21 @@ invariants below.
 
 ## MCP tool surface (23 tools)
 
+Every registered tool carries explicit MCP annotations for its human-readable
+title and read-only, destructive, idempotent, and open-world behavior. These
+are client-facing hints, not authorization: clients must treat annotations
+from an untrusted server as untrusted, and every runtime auth, ownership, scope,
+and admission check remains authoritative. The handshake puts its complete
+scope and trust contract before the detailed routing reference so clients that
+truncate server instructions at 2,048 characters still receive the essentials.
+The rest of #920 remains deliberately unshipped: description shortening needs
+tool-selection evaluation before removing self-contained guidance from MCP-only
+clients; `response_format` variants would enlarge each read schema while
+removing identifiers needed by follow-up calls; and compatibility-period scope
+unions would advertise both old and new shapes at once. Splitting the server
+source is an internal maintainability decision, not a token-cost feature, and
+does not need to ride on the public protocol change.
+
 | Tool | Hint | Purpose |
 |---|---|---|
 | `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; single-project calls (project implicit or named with `workspace`+`project`) also union the reserved `_global` preferences scope as `global_scope_hits`, and only an explicit multi-`scopes` set opts out (#930); `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. `include_superseded=true` also returns superseded (non-latest) page versions across the FTS/entity/vector/graph streams, each hit labelled `superseded: true` (the current version is never marked); default-off is byte-identical to the latest-only behaviour, and `global=true` / `as_of` are unaffected. `pin_first=true` prepends the project's bounded pinned latest pages (`ReaderPool::list_pinned_pages`, cap 10) ahead of the fused hits, deduped by page id (a pinned page that also matches appears once, marked `pinned: true`) and re-truncated to the requested limit; it applies to single-project searches (default or `workspace`+`project`), is ignored on `scopes`/`global`/`as_of`, and default-off is byte-identical. `answer=true` (opt-in, off by default) additionally synthesizes a cited natural-language answer over the top hits via the configured LLM provider (`complete_structured`, JSON-schema `{ answer, citations }`), attached as `answer: { text, citations }`; with no provider configured it returns the hits plus an `answer_unavailable` note instead of erroring, and with `answer` unset/`false` no provider is accessed and the response is byte-identical (invariant #13). It applies to the normal single-project/`scopes` path; `global`/`as_of` ignore it. Answer quality is not yet eval-validated. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) tunes the synthesis effort: `ChatRequest` carries no per-request reasoning field (the provider-level `reasoning_effort` is fixed at construction from config), so the tier maps to a per-tier max-token budget scaled off the path's base (answer base 2 000; `minimal` = 1x = byte-identical, `low` 1.5x, `medium` 2x, `high` 3x, `max` 4x). The tier is inert unless the `answer` LLM path runs (invariant #13); an unknown value is rejected by the schema (invariant #7). |
@@ -481,8 +591,8 @@ long-lived entry appearing there is that policy working rather than a fault.
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out; an update whose path names an existing pinned page is skipped (`_slots/` excepted). Omitting `session_id` (or sending a blank one) consolidates the latest completed session in the resolved project; the same omission on a project with none fails as `no completed session in <scope>`. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
-| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
-| `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
+| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope and `scope: "profile"` into the caller's cross-project profile (path placed under `profile/`); optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job. |
+| `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate" — at/above the max is A3 dedup, below the min unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. On a single-language or single-domain store, background similarity between unrelated pages already sits well above the default floor, so the band measures domain proximity more than conflict and produces noisy findings — raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) for such a store. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
@@ -553,27 +663,28 @@ wiki browser and JSON APIs stay behind the route class above.
 ## CLI subcommand surface
 
 ```
-init                 status               run
-show                 continue             resume
-workstreams          rename-workstream    workstream-search
-audit-contamination  search               read-page
-write-page           delete-page          serve
-reset                backup               restore
-reindex              install-hooks        hook
-install-mcp          commit               checkpoints
-restore-page         llm-test             forget-sweep
-lint                 curator              auto-improve-report
-auto-improve         finalize-session     pending-writes
-embed                generate-auth-token  setup-agent
-bootstrap            install-instructions install-skills
-reorg                purge-project        rename-project
-move-project         move-session         uninstall
-upgrade              auth                 user
-completions          handoffs             purge-session
-compact              api-key              export-okf
-message              doctor               backfill
-project              reclaim-ledger-versions               repair-backfill-timestamps
-server
+init                        status               list-projects
+run                         show                 continue
+resume                      workstreams          rename-workstream
+workstream-search           audit-contamination  search
+read-page                   write-page           delete-page
+serve                       reset                backup
+restore                     reindex              install-hooks
+hook                        install-mcp          commit
+checkpoints                 restore-page         llm-test
+forget-sweep                lint                 curator
+auto-improve-report         auto-improve         finalize-session
+pending-writes              embed                generate-auth-token
+setup-agent                 bootstrap            install-instructions
+install-skills              reorg                purge-project
+rename-project              move-project         move-session
+uninstall                   upgrade              auth
+user                        completions          handoffs
+purge-session               compact              api-key
+export-okf                  message              doctor
+backfill                    project              reclaim-ledger-versions
+repair-backfill-timestamps  server               backup-agents
+restore-agents              profile
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -704,6 +815,15 @@ release_base_url = ""              # override the GitHub releases base URL that 
                                    # For hermetic tests / mirrors, not day-to-day installs.
                                    # Env: AI_MEMORY_RELEASE_BASE_URL.
 
+[run.profiles.work.env]            # env-only launch profile for `ai-memory run --profile
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"  # work <harness>` (#922): same reach as
+                                   # `--env` (child, native-session lookup, auto-wire),
+                                   # layered under `--env-file` and `--env`. Values are
+                                   # literal (use absolute paths); names and keys are
+                                   # validated at load, and an unknown name fails before
+                                   # lease, auto-wire or launch. TOML only: the
+                                   # AI_MEMORY_* overlay lowercases env-derived keys.
+
 [maintenance]                      # scheduled server jobs (run outside hook latency)
 enabled = true                     # master switch for the scheduled jobs below
 forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
@@ -758,6 +878,22 @@ dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
+
+[handoff]                         # optional server-wide handoff policy
+claim_on_session_start = true     # false offers metadata; explicit accept claims
+create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode turn checkpoints
+
+[profile]                         # cross-project profile (docs/cross-project-profile.md)
+enabled = "auto"                  # auto: on for single-user, off for multi-user; true / false
+share = "auto"                    # auto | global | workspace | user | off
+                                  # auto: global (all workspaces) single-user, user (private) multi-user
+min_projects = 2                  # distinct projects a choice must appear in to join the profile
+inject_on_session_start = true    # fenced digest after the project brief
+digest_max_bytes = 3000           # UTF-8 bytes, clamped 1500..12000
+baseline_max_bytes = 6000         # digest budget for a project with no pages yet, clamped 2000..20000
+apply_max_lines = 40              # most lines `profile apply` writes into a rules file
+llm = true                        # use the configured provider when there is one
+                                  # env: AI_MEMORY_PROFILE__<KEY>, e.g. AI_MEMORY_PROFILE__SHARE=workspace
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
@@ -816,8 +952,8 @@ enabled = false                  # true: skip low-information session pages from
 
 [retrieval]                       # opt-in ranking signals; all off by default
 query_intent = false              # lexical session-recall routing: queries phrased as
-                                  # "上次 / …的会话 / last time / yesterday" hand session
-                                  # pages back their default kind/tier authority penalty
+                                  # "上次 / …的会话 / last time / yesterday / última sessão"
+                                  # hand session pages back their default kind/tier authority penalty
 session_recall_bonus = 0.25       # extra authority on top of the cancelled penalty;
                                   # lower it (e.g. 0.15) if rank drift on
                                   # "之前/上次"-prefixed fact queries matters more
@@ -898,7 +1034,23 @@ idle_window_secs = 300            # operator must be quiet this long before a ru
 # max_eps = 0.15                  # conservative eps ceiling (cosine distance; 0 ⇒ default)
 # max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
 # min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
+
+[hook_spool]
+max_attempts = 8                  # failed drain passes before dropping an event; 0 disables
+                                  # only this limit. Age (7 days) and spool size (10,000 files)
+                                  # still bound retention. Runtime env wins when set:
+                                  # AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS
 ```
+
+The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
+history phrases: "o que fizemos na última sessão", "onde paramos ontem", and
+"lembre a decisão anterior", plus "sessão anterior".
+Accented and unaccented spellings are accepted, including "ultima sessao" and
+"decisao anterior". Latin markers match whole words. Technical queries such as
+"erro na sessão do usuário", "sessão expira", "antes de salvar", and bare
+"sessão" or "antes" do not trigger routing. It remains off by default; enabling
+it reuses the existing session authority adjustment without changing FTS
+stopwords or adding a ranking signal.
 
 **LLM provider env** (opt-in):
 ```
@@ -935,6 +1087,9 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
+                           `x-request-id` is additionally refused at
+                           initialization for the `openai-compat` provider,
+                           which sends the operation's request id itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.

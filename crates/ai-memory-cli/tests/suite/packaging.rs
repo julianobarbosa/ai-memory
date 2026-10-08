@@ -818,6 +818,29 @@ fn dev_loop_is_wired_consistently() {
 }
 
 #[cfg(unix)]
+#[test]
+fn hook_installer_normalizes_the_open_code_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "open-code", "--to"])
+        .arg(tmp.path().join("hooks"))
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("install-hooks --agent opencode --apply"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unsupported agent"), "{stdout}");
+}
+
+#[cfg(unix)]
 fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);
@@ -1313,12 +1336,47 @@ fn skip_pre_push_tests<T>(reason: &str) -> Option<T> {
 fn resolve_in_path(path: &std::ffi::OsStr, tool: &str) -> Option<PathBuf> {
     std::env::split_paths(path).find_map(|dir| {
         let bare = dir.join(tool);
-        if bare.is_file() {
+        if is_executable_candidate(&bare) {
             return Some(bare);
         }
         let exe = dir.join(format!("{tool}.exe"));
-        exe.is_file().then_some(exe)
+        is_executable_candidate(&exe).then_some(exe)
     })
+}
+
+#[cfg(any(unix, windows))]
+fn is_executable_candidate(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        path.is_file()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pre_push_fixture_path_skips_non_executable_shadows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let shadow_dir = temp.path().join("shadow");
+    let executable_dir = temp.path().join("executable");
+    std::fs::create_dir(&shadow_dir).unwrap();
+    std::fs::create_dir(&executable_dir).unwrap();
+    let shadow = shadow_dir.join("env");
+    std::fs::write(&shadow, "not executable").unwrap();
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let executable = executable_dir.join("env");
+    std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([shadow_dir.as_os_str(), executable_dir.as_os_str()]).unwrap();
+
+    assert_eq!(resolve_in_path(&path, "env"), Some(executable));
 }
 
 /// macOS hands back `/var/folders/...` while Git reports `/private/var/...`.
@@ -1390,7 +1448,7 @@ fn fixture_path(bin: &Path) -> Option<std::ffi::OsString> {
         let Some(real) = dirs
             .iter()
             .map(|dir| dir.join(tool))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_candidate(candidate))
         else {
             return skip_pre_push_tests(&format!("{tool} was not found on PATH"));
         };

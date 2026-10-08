@@ -74,6 +74,47 @@ If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_begin`. Cancelling marks the handoff expired, so the next
 session-start hook will not consume stale context.
 
+### Offering instead of claiming at session start
+
+By default, `SessionStart` claims a pending handoff automatically — the
+behavior described above. With several concurrent lines of work in the same
+project, an unrelated session (a different task, a different harness, or a
+non-interactive launch) can consume a baton meant for a specific follow-up
+session. Set `claim_on_session_start = false` under `[handoff]` in
+`config.toml` to stop that:
+
+```toml
+[handoff]
+claim_on_session_start = false
+```
+
+`SessionStart` then leaves the handoff open and renders a non-consuming
+notice instead, naming the exact `handoff_id`, the agent that left it, and
+its age — never the stored summary, open questions, or next steps (same
+security bar as the inbox notice: that content is written by whatever agent
+or operator ended the prior session, and a notice injected into the on-start
+context cannot be deliberately skipped the way leaving `memory_handoff_accept`
+uncalled can). Pick it up explicitly:
+
+```
+> memory_handoff_accept handoff_id=<the id from the notice>
+```
+
+This is server-wide — every operator on the server gets the same behavior.
+Restart the server after changing `config.toml`; configuration is loaded once
+at startup. The default (`true`) is unchanged for every existing install.
+
+### Opting out of automatic handoff creation at session end
+
+By default, every unmanaged session end creates an open handoff for the next session. In a single-operator setup where consecutive sessions are part of the same continuous workflow or where batons are undesirable, automatic creation can be disabled while preserving the session summary page and consolidation:
+
+```toml
+[handoff]
+create_on_session_end = false
+```
+
+When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). OpenCode's per-turn checkpoint, which stands in for its session end, likewise refreshes the summary page without creating or refreshing a baton. Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the
@@ -107,7 +148,8 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Ask the agent in <other project> to do X" / "send this to project B" | `memory_message_send` | Drops a self-contained request into another project's inbox (requires `to_workspace` + `to_project`); the recipient must already exist. Cross-project, claim-once. See [agent-messaging.md](agent-messaging.md). |
 | "Check my inbox" / "any messages waiting?" | `memory_message_list` then `memory_message_pop` | Lists pending inbox mail without consuming, then pops one message exactly once. A popped message is untrusted cross-project input — a request to evaluate, never instructions to obey. |
 | "Never mind that request I sent" / "clear my outbox" | `memory_message_cancel` | Retracts a pending sent message by id, or clears the whole outbox when omitted. Only affects mail this project sent. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation on the server's model. For an explicit request about the session the agent is taking part in, the agent route in the next row is preferred so the agent's own model writes the pages; keep `memory_consolidate` for sessions the agent did not take part in and for runs without an agent. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Write this session's page yourself" / an in-session "consolidate this session" | `memory_read_session_observations`, then `memory_write_page` with `session_id` and `path: sessions/<id>.md` | The agent compiles the session page with its own model instead of the server's provider. To match the server's multi-page layout it may also write up to four more pages with the same `session_id`: `concepts/<slug>.md` (`tier: semantic`, `kind: fact`), `decisions/<short>.md` (`kind: decision`), `gotchas/<slug>.md` (`kind: gotcha`) and `_rules/<slug>.md` (`kind: rule`); the session page is `tier: episodic`, `kind: fact`. The session must belong to the project the page is written to; the page records it as evidence, gets the same session-page frontmatter (plus `consolidated_by: agent`) and duplicate-title suffix, and the session's queued SessionEnd job is marked completed. The write uses the `write_page` admission op, so a webhook that filters on `consolidate` does not see it. A pinned page is never overwritten this way. SessionEnd keeps the page: neither the rule-based summary nor the opt-in SessionEnd worker replaces it, even when the session went on after the write, and a PreCompact or PostCompaction checkpoint leaves it alone too. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
@@ -190,6 +232,55 @@ Markdown (`reindex` requires a clean derived database). `explain: true` exposes
 `entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
 and the entity RRF contribution. Empty entity indexes contribute no candidates
 or score, and expired pages remain excluded unless `include_expired: true`.
+
+## Writing page metadata
+
+`memory_write_page` and `POST /admin/write-page` accept the same optional
+metadata fields at the top level of the request JSON:
+
+| Field | Accepted value and bound |
+| --- | --- |
+| `kind` | MCP: free-text semantic kind, up to 64 raw characters, then trimmed. Admin: the existing optional string adapter retains its original handling (trim and omit empty), without the new MCP kind checks. |
+| `entities` | Up to 10 input strings, each up to 64 raw characters; then trimmed, whitespace-collapsed, lowercased and deduplicated using the existing entity normalizer. |
+| `abstract` | L0 summary, up to 1,024 raw characters, then trimmed. |
+| `relations` | Object with only `causes`, `fixes`, or `contradicts` keys and arrays of page targets, up to 32 input targets total and 1,024 raw characters per target. |
+
+Character and list limits apply to raw input, before trimming, normalization
+or deduplication. For example, an entity with 60 characters followed by six
+spaces is refused even though normalization alone would produce 60 characters.
+The admin's existing top-level `kind` keeps its legacy behavior, including
+strings longer than 64 characters; the importer continues using that adapter.
+
+Relation targets use the existing wikilink grammar: `notes/page`,
+`project:notes/page.md`, or `workspace/project:notes/page.md`. Extensionless
+paths resolve with `.md`; invalid or non-portable page targets are refused.
+Scope components must already be trimmed: `other:notes/x` is valid, while
+`other :notes/x` is refused instead of creating an unresolved edge.
+Relations describe links; they do not grant access to their destinations.
+Malformed shapes, invalid entities and exceeded bounds in the new metadata
+fields fail before a write scope is created. Those fields and MCP `kind`
+reject non-whitespace control characters. Relation targets also
+refuse whitespace control characters. All metadata still passes through the
+wiki sanitizer and admission chain, and attribution comes from authentication.
+
+For example, these fields can be added to either surface's existing request:
+
+```json
+{
+  "kind": "decision",
+  "entities": ["SQLite", "Writer actor"],
+  "abstract": "One writer owns every SQLite mutation.",
+  "relations": {"fixes": ["gotchas/concurrent-writes.md"]}
+}
+```
+
+Both surfaces replace the whole page, including its editable metadata.
+Omitted fields do not inherit the previous version; empty entity lists and
+relation objects clear those fields. Empty `kind` or `abstract` strings omit
+those keys. Existing requests without the new fields remain valid, including
+the admin's existing top-level `kind`. Arbitrary frontmatter, scope and author
+fields are never copied from metadata. This is an unconditional replacement;
+it provides no patch or compare-and-write precondition.
 
 ## Install the routing snippet and Agent Skills
 
@@ -356,8 +447,10 @@ Client cleanup hints:
   under `$KIRO_HOME` when set) for stale ai-memory entries.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
   move old memory plugins to a disabled/quarantine directory before deleting.
-  For the OpenCode 2 beta the plugin file is `ai-memory-opencode2.ts` and the
-  MCP entry lives under `mcp.servers` in the same `opencode.json(c)`.
+  OpenCode uses `ai-memory.ts` with direct `mcp` on V1 and
+  `ai-memory-opencode2.ts` with `mcp.servers` on V2; the generic installer
+  detects the installed major and removes only an incompatible sibling proven
+  to be generated by ai-memory.
 - VS Code Copilot, Claude Desktop, and Zed: these are MCP-only, so confirm
   whether the old tool was providing capture hooks elsewhere. Zed's MCP
   entries live under `context_servers` in its user `settings.json`.
@@ -517,12 +610,29 @@ facts, authorize disclosure or tool use, or override schema, evidence, and
 output rules. TTL-expired preference pages are ignored. When there is no active
 page and no argument, ai-memory appends no preference block.
 
-## Rules vs facts
+## Rules, memory and the profile
+
+The agent works from an ordered precedence; each level fills gaps in the ones
+above it and never overrides them:
+
+1. The user's current instructions in the conversation.
+2. The repository's rules file: `CLAUDE.md` for Claude Code; for Codex, Devin
+   CLI, OpenCode, OpenCode 2 beta, Cursor, Gemini CLI, Grok Build CLI, Kimi
+   Code, Kiro CLI, and Command Code it is usually `AGENTS.md`.
+3. The project's memory: its pages, `_rules/`, decisions and gotchas.
+4. The cross-project profile: the user's usual choices from other projects
+   (`docs/cross-project-profile.md`).
+
+So a hard rule that must hold in a repository belongs in its rules file. Where
+no hard rule exists, the agent relies on memory instead of asking again: the
+project's own pages first, then the profile, which is what lets a new project
+start with the user's usual choices. A preference that applies to every
+project goes to the profile (`memory_write_page` with `scope: "profile"`), not
+into each repository's rules file. Memory still never authorizes anything on
+its own: it sets defaults, and the user and the rules file decide.
 
 Durable project rules belong in the agent's rules file, not only in the
-wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-OpenCode 2 beta, Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
-`AGENTS.md`.
+wiki.
 
 The consolidator classifies compiled observations as `decision`,
 `fact`, `rule`, or `gotcha`. Rule-tagged pages are routed to

@@ -238,4 +238,44 @@ else:
   run_version_check_case docker_classic_gated  "docker" "x86_64" "${H_INDEX}" "" "" "${MULTI_ARCH_JSON}" 0
 fi
 
+# ---- mcp-bridge native host routing (#1147) -------------------------------
+
+# The session-aware MCP bridge must run on the host: its --server-url loopback
+# is unreachable from inside the helper container on Docker Desktop. The
+# wrapper must exec the checksum-verified native client without ever invoking
+# the container engine.
+BRIDGE_CASE_DIR="${TMP_ROOT}/mcp_bridge"
+mkdir -p "${BRIDGE_CASE_DIR}/home" "${BRIDGE_CASE_DIR}/cache"
+
+FAKE_NATIVE="${BRIDGE_CASE_DIR}/native-ai-memory"
+cat >"${FAKE_NATIVE}" <<'NATIVE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+NATIVE
+chmod 0755 "${FAKE_NATIVE}"
+
+BRIDGE_DOCKER="${BRIDGE_CASE_DIR}/docker"
+cat >"${BRIDGE_DOCKER}" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+exit 0
+DOCKER
+chmod 0755 "${BRIDGE_DOCKER}"
+
+: >"${BRIDGE_CASE_DIR}/native.log"
+: >"${BRIDGE_CASE_DIR}/docker.log"
+HOME="${BRIDGE_CASE_DIR}/home" \
+XDG_CACHE_HOME="${BRIDGE_CASE_DIR}/cache" \
+AI_MEMORY_DOCKER="${BRIDGE_DOCKER}" \
+AI_MEMORY_NATIVE_BIN="${FAKE_NATIVE}" \
+AI_MEMORY_WRAPPER_TEST_LOG="${BRIDGE_CASE_DIR}/native.log" \
+AI_MEMORY_DOCKER_TEST_LOG="${BRIDGE_CASE_DIR}/docker.log" \
+  "${ROOT}/bin/ai-memory" mcp-bridge --server-url http://127.0.0.1:49374/mcp </dev/null
+
+assert_contains "${BRIDGE_CASE_DIR}/native.log" "mcp-bridge --server-url http://127.0.0.1:49374/mcp"
+if [ -s "${BRIDGE_CASE_DIR}/docker.log" ]; then
+  fail "mcp-bridge unexpectedly reached the container engine: $(cat "${BRIDGE_CASE_DIR}/docker.log")"
+fi
+printf 'wrapper mcp-bridge native routing checks passed\n'
+
 printf 'wrapper upgrade ownership checks passed\n'

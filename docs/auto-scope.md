@@ -54,8 +54,18 @@ Scope resolution is centralized in `ai_memory_store::ScopeResolver` and its
 explicit helpers:
 
 - `lookup_existing_scope` for read, search, maintenance, retention, embed, and
-  destructive paths. It never creates workspaces or projects.
-- `create_explicit_scope` for explicit write/create paths only.
+  destructive paths. It never creates workspaces, projects, or renames. Within
+  the named workspace it accepts an exact project name, the canonical
+  path-style name derived from a stored hostful git identity, or the v2
+  basename only when that compatibility key identifies one UUID.
+- `create_explicit_scope` for explicit write/create paths only. Existing
+  identity-backed rows are authorized and may be promoted to the canonical
+  name inside one writer transaction; unrelated or ambiguous candidates are
+  never merged. The promoting APIs return `ResolvedWriteScope` metadata rather
+  than silently discarding it; runtime callers ask Wiki to refresh/checkpoint
+  that scope's `_meta.md` after the SQL commit, and disclose failures for
+  startup manifest repair. Reserved profile/global helpers use a no-promotion
+  resolver because those names cannot be repository compatibility keys.
 - `resolve_many_existing_scopes` for multi-project search scopes, with
   deduplication and max-scope validation.
 - `ScopeResolver::resolve_read_args` and `resolve_write_args` for MCP tools
@@ -115,6 +125,12 @@ The composite `(identity, session_id)` key namespaces only these active-project
 pointers. The durable `SessionId` stored for hook observations remains global:
 if another owner reuses an already-owned id, ai-memory drops that hook before it
 can append observations or publish a pointer for the foreign actor.
+
+Pointers hold project ids, not names, so the default repository-path project
+name ([`identity_style`](marker-file.md#naming-projects-by-repository-path-identity_style),
+#1033) is published and resolved exactly like any other. Static clients derive
+that name from normalized `upstream`, then `origin`; only a checkout without a
+valid remote uses its folder basename.
 
 Owner and agent are what identify a session; scope is not. The same operator's
 session legitimately produces events in another project when its cwd moves, so

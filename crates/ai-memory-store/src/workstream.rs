@@ -3,8 +3,8 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NewWorkstreamEvent, ProjectId, WorkspaceId, WorkstreamEvent,
-    WorkstreamEventKind, WorkstreamId,
+    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -28,6 +28,124 @@ pub enum WorkstreamSelection {
     Named(String),
     /// Create and select a fresh named workstream.
     New(String),
+}
+
+impl WorkstreamSelection {
+    /// Validate caller-controlled selection data before any scope mutation.
+    pub fn validate(&self) -> StoreResult<()> {
+        match self {
+            Self::Current => Ok(()),
+            Self::Named(name) | Self::New(name) => validate_workstream_name(name),
+        }
+    }
+}
+
+/// Authenticated authority for a managed-run mutation: finish (its preflight
+/// and its import transaction), cancel, heartbeat, native-session link and
+/// context acceptance.
+///
+/// Construct only from middleware extensions, never transcript metadata. Owner
+/// filters are derived here so this boundary cannot request `OwnerFilter::Any`.
+#[derive(Debug, Clone)]
+pub struct ManagedRunAuthority {
+    principal: crate::ProjectPrincipal,
+    owner: ai_memory_core::OwnerFilter,
+    distinguishes_operators: bool,
+    project_policy: RunProjectPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RunProjectPolicy {
+    Grants,
+    TrustedProxyLegacy,
+}
+
+impl ManagedRunAuthority {
+    /// Reduce the actual HTTP auth extensions to one immutable finish authority.
+    /// A DB user's attribution id remains authoritative without a viewer marker.
+    #[must_use]
+    pub fn from_auth(
+        level: ai_memory_core::AuthLevel,
+        viewer: Option<ai_memory_core::AuthorizedViewer>,
+        user_id: Option<ai_memory_core::UserId>,
+        actor: &ai_memory_core::ActorContext,
+        trusted_proxy_identity: bool,
+    ) -> Self {
+        use ai_memory_core::AuthLevel;
+        let user = viewer
+            .map(ai_memory_core::AuthorizedViewer::user)
+            .or(user_id);
+        let principal = match level {
+            AuthLevel::Root => crate::ProjectPrincipal::root(),
+            AuthLevel::User => user.map_or_else(
+                crate::ProjectPrincipal::anonymous,
+                crate::ProjectPrincipal::user,
+            ),
+            AuthLevel::Anonymous => crate::ProjectPrincipal::anonymous(),
+        };
+        let owner = if level == AuthLevel::Anonymous {
+            ai_memory_core::OwnerFilter::Unattributed
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(actor)
+        };
+        // The real proxy middleware has an identity and User capability, but
+        // no DB principal. Preserve its viewer-less project policy only when
+        // this server actually enables trusted proxy authentication.
+        let project_policy = match (level, user, actor.identity_key(), trusted_proxy_identity) {
+            (AuthLevel::User, None, Some(_), true) => RunProjectPolicy::TrustedProxyLegacy,
+            _ => RunProjectPolicy::Grants,
+        };
+        Self {
+            principal,
+            owner,
+            distinguishes_operators: trusted_proxy_identity || level == AuthLevel::User,
+            project_policy,
+        }
+    }
+}
+
+/// Resolve only the real run scope and owner, without creating a scope or
+/// changing the active-project pointer. Both callers supply a SQL snapshot.
+pub(crate) fn authorize_run_mutation(
+    conn: &Connection,
+    run_id: ManagedRunId,
+    authority: &ManagedRunAuthority,
+) -> StoreResult<()> {
+    let (owner, workspace, project) = conn
+        .query_row(
+            "SELECT r.owner_user, w.workspace_id, w.project_id FROM managed_runs r \
+             LEFT JOIN workstreams w ON w.id = r.workstream_id WHERE r.id = ?1",
+            params![run_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound("managed run not found".into()))?;
+    if !authority.owner.admits(owner.as_deref()) {
+        return Err(StoreError::Forbidden(
+            "managed run belongs to another operator",
+        ));
+    }
+    let workspace = WorkspaceId::from_slice(&workspace)?;
+    let project = ProjectId::from_slice(&project)?;
+    let project_authz = crate::project_authz::resolve_project_authz_strict(
+        conn,
+        workspace,
+        project,
+        &authority.principal,
+        authority.distinguishes_operators,
+    )?;
+    match authority.project_policy {
+        RunProjectPolicy::TrustedProxyLegacy => Ok(()),
+        RunProjectPolicy::Grants => project_authz
+            .authorize(crate::ProjectAccess::Write)
+            .map_err(|failure| StoreError::Forbidden(failure.message())),
+    }
 }
 
 /// Store-level input for opening a managed run.
@@ -113,9 +231,32 @@ pub struct LinkOrAdoptManagedRunSession {
     pub owner_user: Option<String>,
 }
 
+/// Scope a later hook event of a managed run resolved to.
+///
+/// The SessionStart binding goes through [`LinkOrAdoptManagedRunSession`];
+/// every later event carrying the run id goes through this, and both enforce
+/// the same run boundary.
+#[derive(Debug, Clone)]
+pub struct LinkManagedRunSessionInScope {
+    /// Run id the hook event carried.
+    pub run_id: ManagedRunId,
+    /// Workspace the event was admitted to.
+    pub workspace_id: WorkspaceId,
+    /// Project the event was admitted to.
+    pub project_id: ProjectId,
+    /// Harness reporting the native session.
+    pub agent: AgentKind,
+    /// Harness-native session id to bind.
+    pub native_session_id: String,
+    /// Topology-aware qualified operator identity, or shared `None`.
+    pub owner_user: Option<String>,
+}
+
 /// Store-level finish input after the raw segment has been made durable.
 #[derive(Debug, Clone)]
 pub struct FinishWorkstreamRun {
+    /// Configured, reusable privacy strip for the provenance storage boundary.
+    pub sanitizer: Sanitizer,
     /// Managed invocation.
     pub run_id: ManagedRunId,
     /// Actual native session, when observed.
@@ -269,6 +410,48 @@ struct ManagedRunBoundaryRow {
     cwd: String,
     agent: String,
     owner_user: Option<String>,
+    native_session: Option<String>,
+}
+
+impl ManagedRunBoundaryRow {
+    const SELECT: &str = "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, \
+                mr.owner_user, mr.native_session_id \
+         FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
+         WHERE mr.id = ?1";
+
+    fn read(tx: &Transaction<'_>, run_id: ManagedRunId) -> StoreResult<Option<Self>> {
+        Ok(tx
+            .query_row(Self::SELECT, params![run_id.as_bytes()], |row| {
+                Ok(Self {
+                    state: row.get(0)?,
+                    workspace: row.get(1)?,
+                    project: row.get(2)?,
+                    cwd: row.get(3)?,
+                    agent: row.get(4)?,
+                    owner_user: row.get(5)?,
+                    native_session: row.get(6)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The scope and operator a native session may join this run from: the
+    /// run's own project and its launching operator (a shared run admits only
+    /// shared callers). SessionStart also pins the checkout `cwd`; a later
+    /// event's `cwd` follows the agent around the checkout, so it is not
+    /// compared there.
+    fn admits(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd: Option<&str>,
+        owner_user: Option<&str>,
+    ) -> bool {
+        self.workspace.as_slice() == workspace_id.as_bytes()
+            && self.project.as_slice() == project_id.as_bytes()
+            && cwd.is_none_or(|cwd| self.cwd == cwd)
+            && self.owner_user.as_deref() == owner_user
+    }
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
@@ -570,12 +753,14 @@ pub(crate) fn link_native_session(
     agent: AgentKind,
     native_session_id: &str,
 ) -> StoreResult<bool> {
-    if native_session_id.trim().is_empty() {
-        return Ok(false);
-    }
+    let native_identity =
+        match NativeSessionIdentity::parse(native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let linked = link_native_session_in_transaction(&tx, run_id, agent, native_session_id, now)?;
+    let linked = link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now)?;
     tx.commit()?;
     Ok(linked)
 }
@@ -584,9 +769,10 @@ fn link_native_session_in_transaction(
     tx: &Transaction<'_>,
     run_id: ManagedRunId,
     agent: AgentKind,
-    native_session_id: &str,
+    native_session_id: &NativeSessionIdentity,
     now: i64,
 ) -> StoreResult<bool> {
+    let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, \
@@ -681,34 +867,23 @@ pub(crate) fn link_or_adopt_native_session(
         return Ok(ManagedRunSessionLink::Refused);
     }
 
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::Refused),
+        };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let supplied: Option<ManagedRunBoundaryRow> = tx
-        .query_row(
-            "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, mr.owner_user \
-             FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
-             WHERE mr.id = ?1",
-            params![input.supplied_run_id.as_bytes()],
-            |row| {
-                Ok(ManagedRunBoundaryRow {
-                    state: row.get(0)?,
-                    workspace: row.get(1)?,
-                    project: row.get(2)?,
-                    cwd: row.get(3)?,
-                    agent: row.get(4)?,
-                    owner_user: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
+    let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
 
     let selected = match supplied {
         Some(run) if run.state == "active" => {
-            let boundary_matches = run.workspace.as_slice() == input.workspace_id.as_bytes()
-                && run.project.as_slice() == input.project_id.as_bytes()
-                && run.cwd == input.cwd
-                && run.agent == input.agent.as_str()
-                && run.owner_user == input.owner_user;
+            let boundary_matches = run.admits(
+                input.workspace_id,
+                input.project_id,
+                Some(&input.cwd),
+                input.owner_user.as_deref(),
+            ) && run.agent == input.agent.as_str();
             if !boundary_matches {
                 tx.commit()?;
                 return Ok(ManagedRunSessionLink::Refused);
@@ -756,13 +931,7 @@ pub(crate) fn link_or_adopt_native_session(
         }
     };
 
-    if !link_native_session_in_transaction(
-        &tx,
-        selected.0,
-        input.agent,
-        &input.native_session_id,
-        now,
-    )? {
+    if !link_native_session_in_transaction(&tx, selected.0, input.agent, &native_identity, now)? {
         tx.commit()?;
         return Ok(ManagedRunSessionLink::Refused);
     }
@@ -771,6 +940,62 @@ pub(crate) fn link_or_adopt_native_session(
         ManagedRunSessionLink::Adopted(selected.0)
     } else {
         ManagedRunSessionLink::Exact(selected.0)
+    })
+}
+
+/// Bind the native session a later hook event of a managed run reported.
+///
+/// The event's admitted scope and operator must match the run's boundary, as
+/// at SessionStart: a run id alone, obtained out of band, must not let another
+/// operator or another project repoint the run's current session. A boundary
+/// mismatch that would change nothing (the run already holds this session) is
+/// a quiet no-op rather than a refusal.
+pub(crate) fn link_native_session_in_scope(
+    conn: &mut Connection,
+    input: &LinkManagedRunSessionInScope,
+) -> StoreResult<ManagedRunSessionLink> {
+    if input
+        .owner_user
+        .as_deref()
+        .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::NoMatch),
+        };
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let Some(run) =
+        ManagedRunBoundaryRow::read(&tx, input.run_id)?.filter(|run| run.state == "active")
+    else {
+        tx.commit()?;
+        return Ok(ManagedRunSessionLink::NoMatch);
+    };
+    if !run.admits(
+        input.workspace_id,
+        input.project_id,
+        None,
+        input.owner_user.as_deref(),
+    ) {
+        tx.commit()?;
+        return Ok(
+            if run.native_session.as_deref() == Some(native_identity.as_str()) {
+                ManagedRunSessionLink::NoMatch
+            } else {
+                ManagedRunSessionLink::Refused
+            },
+        );
+    }
+    let linked =
+        link_native_session_in_transaction(&tx, input.run_id, input.agent, &native_identity, now)?;
+    tx.commit()?;
+    Ok(if linked {
+        ManagedRunSessionLink::Exact(input.run_id)
+    } else {
+        ManagedRunSessionLink::NoMatch
     })
 }
 
@@ -826,10 +1051,12 @@ fn accept_context_in_transaction(
 /// Index one immutable source segment and close the run atomically.
 pub(crate) fn finish_run(
     conn: &mut Connection,
+    authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \
@@ -887,9 +1114,24 @@ pub(crate) fn finish_run(
         .as_deref()
         .or(linked_session.as_deref());
 
+    let sanitizer = Sanitizer::builtin();
+    let validate = |id: &str| {
+        NativeSessionIdentity::parse(id, &sanitizer).map_err(|_| {
+            StoreError::InvalidState(
+                "native session identity is UNKNOWN; refusing managed binding".into(),
+            )
+        })
+    };
+    let native_identity = native_session.map(validate).transpose()?;
+    let native_session = native_identity.as_ref().map(NativeSessionIdentity::as_str);
+    let event_identities = input
+        .events
+        .iter()
+        .map(|event| validate(&event.native_session_id))
+        .collect::<StoreResult<Vec<_>>>()?;
     let mut latest = latest_before;
     let mut imported = 0_usize;
-    for event in &input.events {
+    for (event, event_identity) in input.events.iter().zip(event_identities) {
         if event.agent != agent {
             return Err(StoreError::InvalidState(format!(
                 "event {} belongs to {}, managed run expects {}",
@@ -906,25 +1148,44 @@ pub(crate) fn finish_run(
                 event.event_id, event.native_session_id
             )));
         }
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workstream_events \
-             WHERE workstream_id = ?1 AND event_id = ?2)",
-            params![workstream, event.event_id],
-            |row| row.get(0),
-        )?;
-        if exists {
+        let existing: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind FROM workstream_events \
+             WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            // Privacy patterns and bounds can change between uploads. Replay
+            // keeps the first indexed data and compares only stable identity.
+            if existing.0 != event.agent.as_str()
+                || existing.1 != event.native_session_id
+                || existing.2 != event.kind.as_str()
+            {
+                return Err(StoreError::InvalidState(
+                    "workstream event id reused with different identity".into(),
+                ));
+            }
             continue;
         }
-        latest += 1;
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let metadata_json = serde_json::to_string(&metadata)?;
         // Store-boundary bound (defense in depth): the hook layer already
-        // scrubs and normalizes event content, but the store is the last gate
-        // before durable persistence — bound the free-text `content` so a
-        // caller that ever forgets cannot write unbounded prose to the DB.
-        // `metadata_json` is left intact: it is structured JSON and
-        // truncating the serialized form would corrupt it; its size is
-        // bounded by the event schema, not free text.
-        let content =
-            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
+        // scrubs and caps event content, but the store is the last gate
+        // before durable persistence — scrub with the caller's sanitizer and
+        // then bound the free-text `content`, so a caller that ever forgets
+        // cannot write unbounded prose (or a secret straddling the cap, cut
+        // into an unmatched prefix, #1113) to the DB.
+        let content = ai_memory_core::truncate_utf8_bytes(
+            &input.sanitizer.scrub(&event.content),
+            WORKSTREAM_CONTENT_MAX_BYTES,
+        );
+        latest += 1;
         tx.execute(
             "INSERT INTO workstream_events( \
                  workstream_id, sequence, event_id, agent_kind, native_session_id, \
@@ -936,13 +1197,13 @@ pub(crate) fn finish_run(
                 latest,
                 event.event_id,
                 event.agent.as_str(),
-                event.native_session_id,
-                event.source_record_id,
+                event_identity.as_str(),
+                source_record_id,
                 event.kind.as_str(),
                 event.role,
                 content,
                 event.occurred_at,
-                serde_json::to_string(&event.metadata)?,
+                metadata_json,
                 input.segment_path,
                 now,
             ],
@@ -1069,8 +1330,10 @@ pub(crate) fn list_recent(
     repo_fingerprint: &str,
     worktree_fingerprint: &str,
     limit: usize,
+    offset: usize,
 ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let mut statement = conn.prepare(
         "WITH scoped AS ( \
              SELECT id, name, created_at, selected_at, updated_at \
@@ -1084,7 +1347,7 @@ pub(crate) fn list_recent(
                     EXISTS(SELECT 1 FROM current_workstream \
                            WHERE current_workstream.id = scoped.id) AS is_current \
              FROM scoped \
-              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 \
+              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 OFFSET ?6 \
          ) \
          SELECT recent.id, recent.name, recent.created_at, recent.updated_at, \
                 recent.is_current, native.agent_kind \
@@ -1101,6 +1364,7 @@ pub(crate) fn list_recent(
             repo_fingerprint,
             worktree_fingerprint,
             limit,
+            offset,
         ],
         |row| {
             Ok((
@@ -1305,6 +1569,8 @@ pub(crate) fn run_context(
             event_id,
             agent: AgentKind::from_wire(&agent),
             native_session_id,
+            source_record_id: None,
+            metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::from_str(&kind)?,
             role,
             content,
@@ -1332,6 +1598,7 @@ pub(crate) fn search_events(
     query: &str,
     limit: usize,
     stopwords: &crate::fts_query::FtsStopwords,
+    sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
     let free_text = query
@@ -1340,65 +1607,92 @@ pub(crate) fn search_events(
         .replace("content:", "");
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
-        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
+        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
+                source_record_id, metadata_json \
          FROM workstream_events WHERE workstream_id = ?1 ORDER BY sequence DESC LIMIT ?2"
     } else {
         "SELECT e.sequence, e.event_id, e.agent_kind, e.native_session_id, e.kind, \
-                e.role, e.content, e.occurred_at \
+                e.role, e.content, e.occurred_at, e.source_record_id, e.metadata_json \
          FROM workstream_events_fts f \
          JOIN workstream_events e ON e.rowid = f.rowid \
          WHERE workstream_events_fts MATCH ?2 AND e.workstream_id = ?1 \
          ORDER BY f.rank LIMIT ?3"
     };
     let mut statement = conn.prepare(sql)?;
-    let read_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
-        ))
-    };
     let mut events = Vec::new();
     if fts_query.is_empty() {
-        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_row)?;
+        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_event_row)?;
         for row in rows {
-            events.push(stored_event(row?)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     } else {
         let rows = statement.query_map(
             params![workstream_id.as_bytes(), fts_query, limit],
-            read_row,
+            read_event_row,
         )?;
         for row in rows {
-            events.push(stored_event(row?)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     }
     Ok(events)
 }
 
-fn stored_event(
-    row: (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    ),
-) -> StoreResult<WorkstreamEvent> {
-    let (sequence, event_id, agent, native_session_id, kind, role, content, occurred_at) = row;
+type EventRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamEvent> {
+    let (
+        sequence,
+        event_id,
+        agent,
+        native_session_id,
+        kind,
+        role,
+        content,
+        occurred_at,
+        source,
+        metadata,
+    ) = row;
+    // Oversized or malformed legacy dumps carry no trusted correlation data.
+    let metadata = if metadata.len() <= 16 * 1024 {
+        serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    let (source_record_id, metadata) =
+        scrub_workstream_provenance(sanitizer, source.as_deref(), &metadata);
     Ok(WorkstreamEvent {
         sequence,
         event_id,
         agent: AgentKind::from_wire(&agent),
-        native_session_id,
+        native_session_id: NativeSessionIdentity::project(&native_session_id, sanitizer),
+        source_record_id,
+        metadata,
         kind: WorkstreamEventKind::from_str(&kind)?,
         role,
         content,

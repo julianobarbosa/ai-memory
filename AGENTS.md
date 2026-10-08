@@ -14,9 +14,11 @@ for cross-session continuity.
   connecting that hook session id to MCP requests) must pass `workspace` and
   `project` together on every project-scoped call, including requests about "this
   project", "here", or "our work". Read the exact names from the nearest
-  `.ai-memory.toml` when it declares both. If it does not, obtain the names from
-  the operator or server configuration; never guess them from a directory name
-  and never rely on the server's last active project.
+  `.ai-memory.toml` when it declares both. Without a marker override, derive the
+  project from the normalized `upstream` remote, then `origin`, using the full
+  repository path without its host (`github.com/acme/api` → `acme-api`); use the
+  folder basename only when no valid remote exists. Never rely on the server's
+  last active project.
 
 This rule applies only to project-scoped calls. For cross-project retrieval,
 `global=true` must omit `workspace`, `project`, and `scopes`. For a standing
@@ -81,9 +83,9 @@ session start and reaches Claude Code only if the agent opens the file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
-to ai-memory's reserved global scope instead — the durable-pages skill
-covers how. Default memory reads surface global-scope pages in every
-project automatically.
+to ai-memory's cross-project profile instead (`scope: "profile"`) — the
+durable-pages skill covers how. Every project receives the profile as
+defaults at session start, below its own rules file.
 
 ### Refreshing this snippet
 
@@ -310,7 +312,12 @@ no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
-  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
+  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`,
+  `scripts/check-nix-packaging.sh` (Nix flake output).
+- `.github/workflows/nix.yml`: path-filtered PRs always run `x86_64-linux`
+  (package + NixOS module eval / sandbox-parity). `aarch64-darwin` and the
+  privileged NixOS container smoke run on schedule, `workflow_dispatch`, or
+  a PR labelled `nix` / `full-ci`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
   listed in `ci.yml`), and differential gitleaks scanning.
@@ -540,8 +547,10 @@ Additional boundary rules:
   macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
   manual dispatch — and running them is **mandatory right before a
   release**: dispatch `ci` (macOS legs) and `windows` on the exact
-  release-candidate SHA and wait for green before tagging. Never tag a
-  release whose SHA lacks a green full matrix.
+  release-candidate SHA and wait for green before tagging. Nix follows the
+  same rule: Darwin nix build and the privileged NixOS container smoke need
+  `nix` / `full-ci`, schedule, or dispatch (not every `Cargo.lock` bump).
+  Never tag a release whose SHA lacks a green full matrix.
 - **Every release updates the Homebrew tap — do not forget it.** After
   `release.yml` publishes the GitHub release and its per-target tarballs,
   update `~/Projects/homebrew-tap/Formula/ai-memory.rb`: bump `version` and
@@ -618,3 +627,8 @@ Additional boundary rules:
   agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).
+- [`docs/desktop/`](docs/desktop/) — research notes and phased plan for
+  GUI/desktop-app support (Claude Desktop, Codex desktop, Antigravity IDE,
+  ChatGPT/Grok desktop, Zed): verified per-app mechanics, capture/dedup
+  design, installer + CLI coexistence. Reconciles RFC #878; read before
+  any desktop-capture or tray/installer work.

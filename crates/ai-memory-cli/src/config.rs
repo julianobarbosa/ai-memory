@@ -6,6 +6,8 @@
 //! guard read `process.env` while the rest of the codebase used
 //! `getMergedEnv()`, masking the bug for weeks).
 
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +35,9 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
+
+/// Default number of failed hook-spool drain passes before dropping an event.
+pub const DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS: u32 = 8;
 
 /// Placeholder credential that lets `Config::load` validate a fallback
 /// profile whose `api_key_env` is absent from this process. Never reaches a
@@ -406,6 +411,11 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
+    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Profiles deliberately do not carry executable paths, native argv, or
+    /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
+    #[serde(default)]
+    pub run: RunSettings,
     /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
     /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
     /// injecting `--settings` that forces `bypassPermissions` over any
@@ -548,6 +558,17 @@ pub struct Config {
     /// Both approve validated proposals by default unless `require_approval` is
     /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
+    /// Session-start handoff delivery (design: #959). Default keeps today's
+    /// automatic-claim behavior unchanged.
+    pub handoff: HandoffSettings,
+    /// `[profile]` — the cross-project profile: how this user usually works,
+    /// delivered to every project as defaults below the repository's rules
+    /// file (`docs/design-cross-project-profile.md`,
+    /// `docs/cross-project-profile.md`). `enabled = "auto"` (the default)
+    /// turns it on for a single-operator server, shared across every
+    /// workspace, and leaves it off for a multi-user one. Settable via
+    /// `AI_MEMORY_PROFILE__<KEY>` (for example `AI_MEMORY_PROFILE__SHARE`).
+    pub profile: ai_memory_core::profile::ProfileSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -569,6 +590,8 @@ pub struct Config {
     /// Default `follow-cwd` preserves the historical per-event resolution;
     /// `sticky` keeps the session's project. See [`RoutingSettings`].
     pub routing: RoutingSettings,
+    /// Client-side hook spool retry policy.
+    pub hook_spool: HookSpoolSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -618,6 +641,18 @@ pub struct Config {
     pub runtime_env: RuntimeEnv,
 }
 
+#[derive(Clone, Default)]
+struct CapturedProcessEnv(Vec<(OsString, OsString)>);
+
+impl std::fmt::Debug for CapturedProcessEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedProcessEnv")
+            .field("entries", &self.0.len())
+            .finish()
+    }
+}
+
 /// Environment-only values captured once by [`Config::load`].
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
@@ -632,6 +667,8 @@ pub struct RuntimeEnv {
     scope_cwd: Option<String>,
     ignore_marker: bool,
     project_strategy: Option<String>,
+    process_env: CapturedProcessEnv,
+    capture_owner_active: bool,
     claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
@@ -646,11 +683,14 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    hook_spool_max_attempts: Option<String>,
+    run_require_server: Option<String>,
 }
 
 impl RuntimeEnv {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         let platform_home = dirs::home_dir();
+        let process_env = CapturedProcessEnv(std::env::vars_os().collect());
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: resolve_operator_home(
@@ -674,6 +714,9 @@ impl RuntimeEnv {
             // --project-strategy` bakes into the generated hook commands.
             // Consulted only when a marker does not pin one.
             project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
+            process_env,
+            capture_owner_active: env_string("AI_MEMORY_CAPTURE_OWNER")
+                .is_some_and(|value| !value.trim().is_empty()),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
@@ -698,7 +741,19 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
+            // A flat env var (not `AI_MEMORY_RUN__REQUIRE_SERVER`, which
+            // figment's `__` split would map onto `run.require_server`) so it
+            // reads the same way as `AI_MEMORY_RUN_AUTOWIRE`; applied in
+            // `load_with_runtime_env` instead of figment for that reason.
+            run_require_server: std::env::var("AI_MEMORY_RUN_REQUIRE_SERVER").ok(),
         }
+    }
+
+    /// Data directory captured from the process environment, if present.
+    #[must_use]
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Host cwd forwarded by the docker wrapper, if present.
@@ -732,16 +787,53 @@ impl RuntimeEnv {
         self.project_strategy.as_deref()
     }
 
+    /// Complete process environment captured by the single config-read path.
+    #[must_use]
+    pub fn process_env(&self) -> &[(OsString, OsString)] {
+        &self.process_env.0
+    }
+
+    /// Whether this invocation delegates native capture to an external producer.
+    #[must_use]
+    pub fn capture_owner_active(&self) -> bool {
+        self.capture_owner_active
+    }
+
     /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.
     #[must_use]
     pub fn claude_code_session_id(&self) -> Option<&str> {
         self.claude_code_session_id.as_deref()
     }
 
+    /// Hook-spool attempt override captured from the process environment.
+    #[must_use]
+    pub fn hook_spool_max_attempts(&self) -> Option<&str> {
+        self.hook_spool_max_attempts.as_deref()
+    }
+
+    /// Managed-launch fail-closed override captured from the process
+    /// environment.
+    #[must_use]
+    pub fn run_require_server(&self) -> Option<&str> {
+        self.run_require_server.as_deref()
+    }
+
     #[cfg(test)]
     pub fn with_host_cwd_for_tests(host_cwd: impl Into<String>) -> Self {
         Self {
             host_cwd: Some(host_cwd.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_host_cwd_and_home_for_tests(
+        host_cwd: impl Into<String>,
+        home_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_cwd: Some(host_cwd.into()),
+            home_dir: Some(home_dir.into()),
             ..Self::default()
         }
     }
@@ -936,6 +1028,41 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// Client-side hook spool retry policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HookSpoolSettings {
+    /// Failed drain passes before an event is dropped; zero disables this limit.
+    #[serde(
+        default = "default_hook_spool_max_attempts",
+        deserialize_with = "deserialize_hook_spool_max_attempts"
+    )]
+    pub max_attempts: u32,
+}
+
+impl Default for HookSpoolSettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_hook_spool_max_attempts(),
+        }
+    }
+}
+
+const fn default_hook_spool_max_attempts() -> u32 {
+    DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS
+}
+
+fn deserialize_hook_spool_max_attempts<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -961,6 +1088,7 @@ impl Default for Config {
             capture_assistant: false,
             backfill_on_start: true,
             run_autowire: true,
+            run: RunSettings::default(),
             claude_true_yolo: false,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
@@ -981,10 +1109,13 @@ impl Default for Config {
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
+            handoff: HandoffSettings::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
+            hook_spool: HookSpoolSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -993,6 +1124,74 @@ impl Default for Config {
             runtime_env: RuntimeEnv::default(),
         }
     }
+}
+
+/// `[run]` settings for the managed harness launcher.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunSettings {
+    /// Persisted env-only launch profiles, selected with `run --profile`.
+    pub profiles: BTreeMap<String, RunProfile>,
+    /// Fail a managed launch when the server is unreachable instead of
+    /// degrading to a serverless launch (`docs/managed-workstreams.md`).
+    /// Off by default; the `--require-server` flag and
+    /// `AI_MEMORY_RUN_REQUIRE_SERVER=true` request it per launch or per
+    /// environment.
+    pub require_server: bool,
+}
+
+/// One named managed-launch preset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfile {
+    /// Environment overrides applied before `--env-file` and `--env`.
+    pub env: BTreeMap<String, String>,
+}
+
+fn validate_run_profiles(run: &RunSettings) -> Result<()> {
+    const MAX_PROFILES: usize = 128;
+    const MAX_PROFILE_NAME: usize = 64;
+    const MAX_ENV_PER_PROFILE: usize = 128;
+    const MAX_ENV_KEY: usize = 256;
+    const MAX_ENV_VALUE: usize = 64 * 1024;
+
+    if run.profiles.len() > MAX_PROFILES {
+        anyhow::bail!("run.profiles may contain at most {MAX_PROFILES} profiles");
+    }
+    for (name, profile) in &run.profiles {
+        if name.is_empty()
+            || name.len() > MAX_PROFILE_NAME
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            anyhow::bail!(
+                "invalid run profile name {name:?}; use 1-{MAX_PROFILE_NAME} ASCII letters, digits, '.', '_' or '-'"
+            );
+        }
+        if profile.env.len() > MAX_ENV_PER_PROFILE {
+            anyhow::bail!(
+                "run profile {name:?} may contain at most {MAX_ENV_PER_PROFILE} environment entries"
+            );
+        }
+        let mut folded = HashSet::with_capacity(profile.env.len());
+        for (key, value) in &profile.env {
+            if key.is_empty() || key.len() > MAX_ENV_KEY || key.contains(['=', '\0']) {
+                anyhow::bail!("run profile {name:?} has invalid environment key {key:?}");
+            }
+            if value.len() > MAX_ENV_VALUE || value.contains('\0') {
+                anyhow::bail!(
+                    "run profile {name:?} environment value for {key:?} is invalid or exceeds {MAX_ENV_VALUE} bytes"
+                );
+            }
+            if !folded.insert(key.to_ascii_uppercase()) {
+                anyhow::bail!(
+                    "run profile {name:?} repeats environment key {key:?} with different ASCII case"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1027,6 +1226,50 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        }
+    }
+}
+
+/// `[handoff]` session handoff delivery and creation settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandoffSettings {
+    /// When `true` (default — unchanged behavior), a `SessionStart` that
+    /// finds a pending handoff claims it automatically, exactly as before
+    /// this setting existed.
+    ///
+    /// When `false`, `SessionStart` does not claim the handoff. It instead
+    /// renders a non-consuming notice naming the exact `handoff_id`, the
+    /// `from_agent`, and its age — mirroring the existing inbox notice
+    /// (`render_inbox_notice`): metadata only, never the stored summary
+    /// text, since a handoff's summary is written by whatever agent or
+    /// operator ended the prior session and a non-consuming notice cannot be
+    /// deliberately skipped the way `memory_handoff_accept` can be left
+    /// uncalled. The agent (or operator) picks it up explicitly with
+    /// `memory_handoff_accept` using that id. This fixes an unrelated next
+    /// session (or a non-interactive launch) silently consuming a baton
+    /// meant for a different session (#959).
+    ///
+    /// Server-wide: applies to every operator on this server. A per-project
+    /// override is intentionally left for a follow-up change.
+    pub claim_on_session_start: bool,
+    /// When `true` (default — unchanged behavior), ending an unmanaged session
+    /// creates an automatic open handoff for the next session.
+    ///
+    /// When `false`, `SessionEnd` writes the session summary page and
+    /// enqueues consolidation as usual, but does not create an automatic
+    /// handoff (#1043). Explicit handoffs created via `memory_handoff_begin`
+    /// and managed runs are unaffected.
+    ///
+    /// Server-wide: applies to every operator on this server.
+    pub create_on_session_end: bool,
+}
+
+impl Default for HandoffSettings {
+    fn default() -> Self {
+        Self {
+            claim_on_session_start: true,
+            create_on_session_end: true,
         }
     }
 }
@@ -1606,6 +1849,24 @@ fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
     );
 }
 
+fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    config.hook_spool.max_attempts = raw
+        .trim()
+        .parse()
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
+}
+
+/// `AI_MEMORY_RUN_REQUIRE_SERVER` only ever turns the fail-closed behavior
+/// on: an absent, blank, or non-truthy value leaves whatever `config.toml`
+/// selected, and only an explicit truthy spelling overrides it to on.
+fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    if crate::marker::is_truthy(raw) {
+        config.run.require_server = true;
+    }
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1613,8 +1874,14 @@ impl Config {
     /// Returns an error if the config file is malformed or any required
     /// field is missing.
     pub fn load(config_path: Option<&Path>, cli_data_dir: Option<PathBuf>) -> Result<Self> {
-        let runtime_env = RuntimeEnv::from_process();
+        Self::load_with_runtime_env(config_path, cli_data_dir, RuntimeEnv::from_process())
+    }
 
+    pub(crate) fn load_with_runtime_env(
+        config_path: Option<&Path>,
+        cli_data_dir: Option<PathBuf>,
+        runtime_env: RuntimeEnv,
+    ) -> Result<Self> {
         // Figure out where the config file *would* live so we can read it
         // before knowing the final data dir. CLI > env > default.
         let probe_data_dir = cli_data_dir
@@ -1682,6 +1949,8 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
+        apply_run_require_server_env(&mut config, runtime_env.run_require_server());
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -1701,6 +1970,8 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        validate_run_profiles(&config.run)?;
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -2890,6 +3161,7 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
             cfg.llm_timeout_secs,
@@ -3049,6 +3321,155 @@ mod tests {
     /// A configured list parses verbatim and resolves to exactly those
     /// words (lowercased), replacing the default outright rather than
     /// extending it.
+    #[test]
+    fn hook_spool_max_attempts_config_and_runtime_override_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(from_config.hook_spool.max_attempts, 3);
+
+        let overridden = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                hook_spool_max_attempts: Some("0".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.hook_spool.max_attempts, 0);
+    }
+
+    #[test]
+    fn run_require_server_config_and_runtime_env() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let off = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(!off.run.require_server, "off by default");
+
+        std::fs::write(&config_path, "[run]\nrequire_server = true\n").unwrap();
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(from_config.run.require_server);
+
+        // The env var only turns it on; it never turns a config-file on back
+        // off, and a non-truthy spelling is inert.
+        for raw in ["", "false", "no", "0"] {
+            let inert = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    run_require_server: Some(raw.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert!(inert.run.require_server, "{raw:?} must stay inert");
+        }
+        let truthy = Config::load_with_runtime_env(
+            Some(&config_path),
+            None,
+            RuntimeEnv {
+                run_require_server: Some("true".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(truthy.run.require_server);
+    }
+
+    #[test]
+    fn loader_hook_spool_runtime_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_CONFIG_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(config.hook_spool.max_attempts, 0);
+            println!("runtime-override-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::loader_hook_spool_runtime_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("runtime-override-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn invalid_hook_spool_max_attempts_values_use_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        for invalid in ["-1", "\"invalid\""] {
+            std::fs::write(
+                &config_path,
+                format!("[hook_spool]\nmax_attempts = {invalid}\n"),
+            )
+            .unwrap();
+            let config = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                config.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid config value {invalid} must use the default"
+            );
+        }
+
+        std::fs::remove_file(&config_path).unwrap();
+        for invalid in ["invalid", "-1", ""] {
+            let invalid_env = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    hook_spool_max_attempts: Some(invalid.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                invalid_env.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid env value {invalid:?} must use the default"
+            );
+        }
+    }
+
     #[test]
     fn configured_search_fts_stopwords_list_parses_and_replaces_default() {
         let tmp = TempDir::new().unwrap();
@@ -3718,6 +4139,10 @@ mod tests {
             [auth]
             secure_cookie = true
 
+            [handoff]
+            claim_on_session_start = false
+            create_on_session_end = false
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -3772,6 +4197,8 @@ mod tests {
         assert_eq!(cfg.contradiction_band_min, 0.5);
         assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
+        assert!(!cfg.handoff.claim_on_session_start);
+        assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -3807,6 +4234,61 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn profile_defaults_are_auto_and_parse_from_file_and_env() {
+        use ai_memory_core::profile::{EffectiveProfileShare, ProfileEnabled, ProfileShare};
+        let defaults = Config::default().profile;
+        assert_eq!(defaults.enabled, ProfileEnabled::Auto);
+        assert_eq!(defaults.share, ProfileShare::Auto);
+        assert!(defaults.inject_on_session_start);
+        assert_eq!(
+            defaults.effective_share(false),
+            Some(EffectiveProfileShare::Global)
+        );
+        assert_eq!(defaults.effective_share(true), None);
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = true\nshare = \"workspace\"\nmin_projects = 3\n\
+             inject_on_session_start = false\ndigest_max_bytes = 4000\n\
+             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.enabled, ProfileEnabled::On);
+        assert_eq!(cfg.profile.share, ProfileShare::Workspace);
+        assert_eq!(cfg.profile.min_projects, 3);
+        assert!(!cfg.profile.inject_on_session_start);
+        assert_eq!(cfg.profile.digest_max_bytes, 4_000);
+        assert_eq!(cfg.profile.baseline_max_bytes, 8_000);
+        assert_eq!(cfg.profile.apply_max_lines, 20);
+        assert!(!cfg.profile.llm);
+        assert_eq!(
+            cfg.profile.effective_share(true),
+            Some(EffectiveProfileShare::Workspace)
+        );
+
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = \"auto\"\nshare = \"off\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.effective_share(false), None);
+    }
+
+    #[test]
+    fn handoff_claim_on_session_start_defaults_to_true() {
+        assert!(Config::default().handoff.claim_on_session_start);
+    }
+
+    #[test]
+    fn handoff_create_on_session_end_defaults_to_true() {
+        assert!(Config::default().handoff.create_on_session_end);
     }
 
     #[test]
@@ -4862,6 +5344,34 @@ mod tests {
     #[test]
     fn llm_provider_chain_none_when_no_llm_is_configured() {
         assert!(Config::default().llm_provider_chain().unwrap().is_none());
+    }
+
+    #[test]
+    fn run_profiles_parse_from_config_and_reject_ambiguous_names_and_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nCLAUDE_CONFIG_DIR = '/accounts/work'\nMODEL = 'opus'\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap();
+        assert_eq!(
+            config.run.profiles["work"].env["CLAUDE_CONFIG_DIR"],
+            "/accounts/work"
+        );
+
+        std::fs::write(&config_path, "[run.profiles.'bad name'.env]\nFOO = 'bar'\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("invalid run profile name"));
+
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nPATH = '/one'\nPath = '/two'\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("different ASCII case"));
     }
 
     #[test]

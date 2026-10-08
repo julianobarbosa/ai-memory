@@ -48,7 +48,7 @@ use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstr
 /// the decay-candidate walk deliberately do NOT use this — reads
 /// annotate expiry instead of hiding it, and the sweep must see
 /// expired rows to delete them.
-fn not_expired(table: &str, now_param: &str) -> String {
+pub(crate) fn not_expired(table: &str, now_param: &str) -> String {
     format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
 }
 
@@ -71,7 +71,7 @@ fn latest_only(table: &str, include_superseded: bool) -> String {
 
 /// Current wall-clock in microseconds, for binding against
 /// [`not_expired`] fragments.
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     Timestamp::now().as_microsecond()
 }
 
@@ -195,6 +195,7 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
                 WHEN {path_column} LIKE 'concepts/%' THEN 'concept' \
                 WHEN {path_column} LIKE 'procedures/%' THEN 'procedure' \
                 WHEN {path_column} LIKE 'notes/%' THEN 'note' \
+                WHEN {path_column} LIKE 'profile/%' THEN 'preference' \
                 ELSE 'fact' \
             END \
         )"
@@ -350,7 +351,7 @@ impl PageAuthority {
 
         let kind_adjust = match kind {
             "rule" | "decision" => 0.15,
-            "procedure" | "gotcha" => 0.12,
+            "procedure" | "gotcha" | "preference" => 0.12,
             "concept" | "slot" => 0.07,
             "session" => -0.15,
             _ => 0.0,
@@ -837,6 +838,15 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Public state and attempt count for the latest scoped consolidation job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsolidationSummary {
+    /// Latest generation state, without provider diagnostics.
+    pub state: String,
+    /// Provider attempts spent on this generation.
+    pub attempts: u32,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -856,6 +866,8 @@ pub struct SessionSummary {
     pub observation_count: u64,
     /// Operator the session belongs to, as stored on the `sessions` row.
     pub actor_user: Option<String>,
+    /// Latest consolidation generation in the requested scope, if present.
+    pub consolidation: Option<SessionConsolidationSummary>,
 }
 
 /// Aggregate MCP tool-call counts for one client, from
@@ -882,6 +894,8 @@ pub struct AgentSessionCount {
     pub agent: String,
     /// Sessions this agent opened in the window, ended or still open.
     pub sessions: u64,
+    /// Sessions with multiple admitted capture namespaces in this scope.
+    pub mixed_capture_sessions: u64,
 }
 
 /// How a `SessionEnd` event should treat its target session — see
@@ -1459,6 +1473,94 @@ pub struct WorkspaceScopeRow {
     pub workspace_name: String,
 }
 
+/// How a requested project coordinate relates to stored projects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCoordinateStatus {
+    /// The requested name is the project's current stored name.
+    Exact,
+    /// The requested name matched the canonical path-style compatibility key.
+    CanonicalCompat,
+    /// The requested name matched the v2 basename compatibility key.
+    LegacyCompat,
+    /// No workspace/project candidate exists.
+    Missing,
+    /// More than one project UUID matched the requested coordinate.
+    Ambiguous,
+}
+
+impl std::fmt::Display for ProjectCoordinateStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Exact => "exact",
+            Self::CanonicalCompat => "canonical_compat",
+            Self::LegacyCompat => "legacy_compat",
+            Self::Missing => "missing",
+            Self::Ambiguous => "ambiguous",
+        })
+    }
+}
+
+/// Why a coordinate cannot be safely promoted or adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCoordinateCollisionReason {
+    /// Different remote identities share one hostless path-style key.
+    CrossForgeCollision,
+    /// Different project UUIDs matched exact/canonical/legacy probes.
+    MultipleProjects,
+    /// The canonical target name is held by another project.
+    CanonicalTargetOccupied,
+    /// The requested exact name is held by a different identity-backed project.
+    CrossIdentityOccupied,
+    /// The exact-name holder has no repository identity and cannot be adopted diagnostically.
+    UnclaimedIdentitylessProject,
+}
+
+impl std::fmt::Display for ProjectCoordinateCollisionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CrossForgeCollision => "cross_forge_collision",
+            Self::MultipleProjects => "multiple_projects",
+            Self::CanonicalTargetOccupied => "canonical_target_occupied",
+            Self::CrossIdentityOccupied => "cross_identity_occupied",
+            Self::UnclaimedIdentitylessProject => "unclaimed_identityless_project",
+        })
+    }
+}
+
+/// Read-only diagnostic for one requested workspace/project coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCoordinateDiagnostic {
+    /// Workspace requested by the caller.
+    pub workspace: String,
+    /// Project name requested by the caller.
+    pub requested_name: String,
+    /// Typed resolution status.
+    pub status: ProjectCoordinateStatus,
+    /// Existing project UUID when one candidate is preferred for context.
+    /// An ambiguous status may prefer the supplied identity's project; this
+    /// does not imply unique resolution or rename eligibility.
+    pub project_id: Option<ProjectId>,
+    /// Current name of the preferred contextual candidate, when present.
+    /// Interpret this together with `status`, never as a successful resolution.
+    pub current_name: Option<String>,
+    /// Canonical path-style candidate when known.
+    pub canonical_candidate: Option<String>,
+    /// Legacy basename candidate when known.
+    pub legacy_candidate: Option<String>,
+    /// Safe identity source, never the identity or remote URL.
+    pub identity_source: Option<String>,
+    /// Naming style implied by the current/canonical relationship.
+    pub identity_style: Option<String>,
+    /// Whether an authorized write through this requested name could rename in place.
+    pub rename_eligible: bool,
+    /// Typed reason that safe promotion/adoption is unavailable.
+    pub collision_reason: Option<ProjectCoordinateCollisionReason>,
+    /// Candidate count after project-UUID deduplication.
+    pub candidate_count: usize,
+}
+
 /// One `(workspace, project)` scope with the ids + repo_path needed to write
 /// its self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_scopes`]; consumed by `Wiki::backfill_scope_manifests`.
@@ -1474,6 +1576,14 @@ pub struct ScopeRow {
     pub project_name: String,
     /// Filesystem path the project's cwd-based routing resolves to, if any.
     pub repo_path: Option<String>,
+    /// Stable hostful repository identity, when the project has one.
+    pub identity: Option<String>,
+    /// Source spelling for `identity`, when present.
+    pub identity_source: Option<String>,
+    /// Canonical path-style compatibility key derived from the identity.
+    pub canonical_name: Option<String>,
+    /// Legacy basename compatibility key derived from the identity.
+    pub legacy_name: Option<String>,
 }
 
 /// One row per workspace with aggregate stats.
@@ -1883,6 +1993,24 @@ impl ReaderPool {
         .await
     }
 
+    /// Check a managed run's owner and current Write access in one read
+    /// snapshot, before any mutation of the run.
+    ///
+    /// # Errors
+    /// Refuses a foreign owner, insufficient access, absent run or invalid scope;
+    /// SQL failures propagate without degrading authorization to open.
+    pub async fn authorize_managed_run(
+        &self,
+        run_id: ManagedRunId,
+        authority: crate::ManagedRunAuthority,
+    ) -> StoreResult<()> {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            crate::workstream::authorize_run_mutation(&tx, run_id, &authority)
+        })
+        .await
+    }
+
     /// Return the current state of one `ai-memory run` invocation.
     pub async fn managed_run_status(
         &self,
@@ -1909,10 +2037,18 @@ impl ReaderPool {
         workstream_id: WorkstreamId,
         query: String,
         limit: usize,
+        sanitizer: ai_memory_core::Sanitizer,
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         let stopwords = self.fts_stopwords.clone();
         self.with_conn(move |conn| {
-            crate::workstream::search_events(conn, workstream_id, &query, limit, &stopwords)
+            crate::workstream::search_events(
+                conn,
+                workstream_id,
+                &query,
+                limit,
+                &stopwords,
+                &sanitizer,
+            )
         })
         .await
     }
@@ -1926,6 +2062,28 @@ impl ReaderPool {
         worktree_fingerprint: String,
         limit: usize,
     ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        self.recent_workstreams_page(
+            workspace_id,
+            project_id,
+            repo_fingerprint,
+            worktree_fingerprint,
+            limit,
+            0,
+        )
+        .await
+    }
+
+    /// List one bounded page for an exact repository/worktree, preserving the
+    /// current-first order and every linked harness on each returned row.
+    pub async fn recent_workstreams_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
         self.with_conn(move |conn| {
             crate::workstream::list_recent(
                 conn,
@@ -1934,6 +2092,7 @@ impl ReaderPool {
                 &repo_fingerprint,
                 &worktree_fingerprint,
                 limit,
+                offset,
             )
         })
         .await
@@ -3164,7 +3323,12 @@ impl ReaderPool {
                 ""
             };
             let sql = format!(
-                "SELECT agent_kind, COUNT(*) AS n FROM sessions \
+                "SELECT agent_kind, COUNT(*) AS n, \
+                 SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
+                     THEN 'native' ELSE 'extension:' || o.extension END) \
+                     FROM observations o WHERE o.session_id = sessions.id \
+                       AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
+                 FROM sessions \
                  WHERE workspace_id = :ws AND project_id = :proj\
                  {since_clause}{owner_clause} \
                  GROUP BY agent_kind \
@@ -3186,14 +3350,15 @@ impl ReaderPool {
             let rows = stmt.query_map(named.as_slice(), |row| {
                 let agent: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
-                Ok((agent, n))
+                Ok((agent, n, row.get::<_, i64>(2)?))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (agent, n) = row?;
+                let (agent, n, mixed) = row?;
                 out.push(AgentSessionCount {
                     agent,
                     sessions: u64::try_from(n).unwrap_or(0),
+                    mixed_capture_sessions: u64::try_from(mixed).unwrap_or(0),
                 });
             }
             Ok(out)
@@ -3473,8 +3638,14 @@ impl ReaderPool {
                 "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
                         (SELECT COUNT(*) FROM observations o \
                          WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n \
+                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                        j.state, j.attempts \
                  FROM sessions s \
+                 LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
+                   AND j.workspace_id = :ws AND j.project_id = :proj \
+                   AND j.generation = (SELECT MAX(latest.generation) \
+                     FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
+                       AND latest.workspace_id = :ws AND latest.project_id = :proj) \
                  WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
                  ORDER BY s.started_at DESC, s.id DESC \
                  LIMIT :limit OFFSET :offset"
@@ -3506,12 +3677,30 @@ impl ReaderPool {
                 let actor_user: Option<String> = row.get(5)?;
                 let n: i64 = row.get(6)?;
                 Ok((
-                    id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n,
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<u32>>(8)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n) = row?;
+                let (
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    state,
+                    attempts,
+                ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();
@@ -3526,6 +3715,9 @@ impl ReaderPool {
                     ended_at,
                     observation_count: u64::try_from(n).unwrap_or(0),
                     actor_user,
+                    consolidation: state
+                        .zip(attempts)
+                        .map(|(state, attempts)| SessionConsolidationSummary { state, attempts }),
                 });
             }
             Ok(out)
@@ -7342,9 +7534,13 @@ impl ReaderPool {
     /// version of a page identified by `(workspace_id, project_id, path)`.
     ///
     /// Both ends are constrained to `is_latest = 1`, so superseded versions
-    /// never leak into the link panel. Returns empty lists when the page is
-    /// missing or has no links. `viewer` drops links whose far end is in a
-    /// repository that user may not read; `None` keeps them all.
+    /// never leak into the link panel, and to [`not_expired`] so a TTL'd
+    /// neighbour is hidden the same way search / recent / briefing /
+    /// [`Self::graph_neighbors_for_project`] already hide it. The seed
+    /// lookup is an exact-path read and still finds an expired page.
+    /// Returns empty lists when the page is missing or has no links.
+    /// `viewer` drops links whose far end is in a repository that user may
+    /// not read; `None` keeps them all.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7369,14 +7565,18 @@ impl ReaderPool {
                 return Ok(PageLinks::default());
             };
 
-            // Outgoing: latest pages this page links to. Incoming: latest
-            // pages that link here. Both reuse the path-inference `kind`
-            // fallback so untagged pages still classify.
+            // Outgoing: latest unexpired pages this page links to.
+            // Incoming: latest unexpired pages that link here. Both reuse
+            // the path-inference `kind` fallback so untagged pages still
+            // classify. `?2` is the retrieval TTL cutoff; the viewer
+            // predicate inlines its id, so the placeholder is free.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             // A link into a repository the viewer cannot read would show them
             // its name and a page title and path inside it — the same leak as a
             // graph edge — so the far end is filtered like one.
             let visible = readable_repository_predicate("pg.project_id", viewer);
+            let ttl = not_expired("pg", "?2");
+            let now = now_us();
             let outgoing = format!(
                 "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
                             ws.name, pr.name \
@@ -7384,7 +7584,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -7394,13 +7594,13 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
 
             let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
                 let mut stmt = conn.prepare(sql)?;
-                let rows = stmt.query_map(params![id_bytes], |row| {
+                let rows = stmt.query_map(params![id_bytes, now], |row| {
                     Ok(RelatedPage {
                         path: row.get(0)?,
                         title: row.get(1)?,
@@ -7430,9 +7630,12 @@ impl ReaderPool {
     /// This is the multi-hop generalisation of [`Self::page_links`]: depth 1
     /// returns exactly the seed's direct neighbours (the union of `links` and
     /// `backlinks`), and each further hop expands the frontier by one edge.
-    /// Like `page_links`, both ends are constrained to `is_latest = 1`, and
-    /// neighbours in sibling projects/workspaces resolve and carry their real
-    /// coordinate — the walk is cross-project aware.
+    /// Like `page_links`, both ends are constrained to `is_latest = 1` and
+    /// [`not_expired`], so an expired neighbour is neither returned nor
+    /// walked through. Neighbours in sibling projects/workspaces resolve
+    /// and carry their real coordinate — the walk is cross-project aware.
+    /// The seed lookup is an exact-path read and still starts from an
+    /// expired page.
     ///
     /// Bounds (all enforced regardless of the caller):
     /// - `depth` is clamped into `1..=`[`RELATED_WALK_MAX_DEPTH`].
@@ -7448,7 +7651,7 @@ impl ReaderPool {
     /// end: a page in a project the viewer cannot read is neither returned
     /// nor walked through, so nothing reachable only through it is returned
     /// either. `None` (root, or per-repository authorization off) walks every
-    /// latest page.
+    /// latest unexpired page.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7476,17 +7679,20 @@ impl ReaderPool {
             };
 
             // Per-node expansion reuses the exact `page_links` resolution
-            // (latest-only, cross-project) but also selects `pg.id` so the walk
-            // can continue from each neighbour.
+            // (latest-only, unexpired, cross-project) but also selects
+            // `pg.id` so the walk can continue from each neighbour. One
+            // cutoff for every hop of this walk.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             let visible = readable_repository_predicate("pg.project_id", viewer);
+            let ttl = not_expired("pg", "?2");
+            let now = now_us();
             let outgoing = format!(
                 "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -7495,7 +7701,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let mut out_stmt = conn.prepare(&outgoing)?;
@@ -7512,7 +7718,7 @@ impl ReaderPool {
                     // Outgoing edges are labelled "link", incoming "backlink";
                     // a node reachable both ways keeps its first-reached label.
                     for (direction, stmt) in [("link", &mut out_stmt), ("backlink", &mut in_stmt)] {
-                        let rows = stmt.query_map(params![node], |row| {
+                        let rows = stmt.query_map(params![node, now], |row| {
                             let id: Vec<u8> = row.get(0)?;
                             Ok((
                                 id,
@@ -7681,17 +7887,25 @@ impl ReaderPool {
                 readable_repository_predicate("fp.project_id", viewer),
                 readable_repository_predicate("tp.project_id", viewer),
             );
-            let base = format!(
-                "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
-                 FROM links l \
-                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
-                 JOIN projects fpr ON fpr.id = fp.project_id \
-                 JOIN workspaces fw ON fw.id = fp.workspace_id \
-                 JOIN projects tpr ON tpr.id = tp.project_id \
-                 JOIN workspaces tw ON tw.id = tp.workspace_id \
-                 WHERE fp.project_id != tp.project_id{visible}"
-            );
+            // An edge to or from an expired page is hidden like the page
+            // itself (#1141); `now` is bound at the placeholder each query
+            // passes in.
+            let base = |now_param: &str| {
+                format!(
+                    "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                     JOIN projects fpr ON fpr.id = fp.project_id \
+                     JOIN workspaces fw ON fw.id = fp.workspace_id \
+                     JOIN projects tpr ON tpr.id = tp.project_id \
+                     JOIN workspaces tw ON tw.id = tp.workspace_id \
+                     WHERE fp.project_id != tp.project_id{visible}",
+                    from_ttl = not_expired("fp", now_param),
+                    to_ttl = not_expired("tp", now_param),
+                )
+            };
+            let now = now_us();
             let map_row = |row: &rusqlite::Row<'_>| {
                 Ok(CrossProjectEdge {
                     from_workspace: row.get(0)?,
@@ -7704,17 +7918,19 @@ impl ReaderPool {
             };
             let mut out = Vec::new();
             if let Some((_ws, proj)) = scope {
-                let sql =
-                    format!("{base} AND (fp.project_id = ?1 OR tp.project_id = ?1) ORDER BY fw.name, fpr.name, fp.path");
+                let sql = format!(
+                    "{} AND (fp.project_id = ?1 OR tp.project_id = ?1) ORDER BY fw.name, fpr.name, fp.path",
+                    base("?2")
+                );
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(params![proj.as_bytes()], map_row)?;
+                let rows = stmt.query_map(params![proj.as_bytes(), now], map_row)?;
                 for r in rows {
                     out.push(r?);
                 }
             } else {
-                let sql = format!("{base} ORDER BY fw.name, fpr.name, fp.path");
+                let sql = format!("{} ORDER BY fw.name, fpr.name, fp.path", base("?1"));
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map([], map_row)?;
+                let rows = stmt.query_map(params![now], map_row)?;
                 for r in rows {
                     out.push(r?);
                 }
@@ -7819,31 +8035,62 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> StoreResult<Option<ScopeRow>> {
-        // (ws_name, proj_name, repo_path) — the ids are already known.
-        type RawScope = (String, String, Option<String>);
+        type RawScope = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let raw: Option<RawScope> = self
             .with_conn(move |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT w.name, p.name, p.repo_path \
+                        "SELECT w.name, p.name, p.repo_path, NULLIF(p.identity, ''), \
+                         NULLIF(p.identity_source, ''), NULLIF(p.canonical_name, ''), \
+                         NULLIF(p.legacy_name, '') \
                          FROM projects p JOIN workspaces w ON w.id = p.workspace_id \
                          WHERE p.id = ?1 AND p.workspace_id = ?2",
                         params![project_id.as_bytes(), workspace_id.as_bytes()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 Ok(row)
             })
             .await?;
-        Ok(
-            raw.map(|(workspace_name, project_name, repo_path)| ScopeRow {
+        Ok(raw.map(
+            |(
+                workspace_name,
+                project_name,
+                repo_path,
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+            )| ScopeRow {
                 workspace_id,
                 workspace_name,
                 project_id,
                 project_name,
                 repo_path,
-            }),
-        )
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+            },
+        ))
     }
 
     /// Return every `(workspace, project)` scope with its ids, names and
@@ -7854,12 +8101,23 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn list_all_scopes(&self) -> StoreResult<Vec<ScopeRow>> {
-        // (ws_id, ws_name, proj_id, proj_name, repo_path) as raw SQL columns.
-        type RawScope = (Vec<u8>, String, Vec<u8>, String, Option<String>);
+        type RawScope = (
+            Vec<u8>,
+            String,
+            Vec<u8>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let raw: Vec<RawScope> = self
             .with_conn(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT w.id, w.name, p.id, p.name, p.repo_path \
+                    "SELECT w.id, w.name, p.id, p.name, p.repo_path, \
+                     NULLIF(p.identity, ''), NULLIF(p.identity_source, ''), \
+                     NULLIF(p.canonical_name, ''), NULLIF(p.legacy_name, '') \
                      FROM projects p JOIN workspaces w ON w.id = p.workspace_id",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -7869,6 +8127,10 @@ impl ReaderPool {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 })?;
                 let out: rusqlite::Result<Vec<_>> = rows.collect();
@@ -7876,15 +8138,21 @@ impl ReaderPool {
             })
             .await?;
         raw.into_iter()
-            .map(|(wi, wn, pi, pn, rp)| {
-                Ok(ScopeRow {
-                    workspace_id: WorkspaceId::from_slice(&wi)?,
-                    workspace_name: wn,
-                    project_id: ProjectId::from_slice(&pi)?,
-                    project_name: pn,
-                    repo_path: rp,
-                })
-            })
+            .map(
+                |(wi, wn, pi, pn, rp, identity, identity_source, canonical_name, legacy_name)| {
+                    Ok(ScopeRow {
+                        workspace_id: WorkspaceId::from_slice(&wi)?,
+                        workspace_name: wn,
+                        project_id: ProjectId::from_slice(&pi)?,
+                        project_name: pn,
+                        repo_path: rp,
+                        identity,
+                        identity_source,
+                        canonical_name,
+                        legacy_name,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -8065,6 +8333,59 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Bounded incremental latest-page summaries, ordered by timestamp and path.
+    /// Expired pages are omitted; this is an update listing, not a deletion feed.
+    /// `since_us` is exclusive; `after` resumes strictly after a returned pair.
+    ///
+    /// # Errors
+    /// Propagates SQL and pool errors.
+    pub async fn incremental_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        since_us: i64,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let (after_us, after_path) = after.unwrap_or((since_us, String::new()));
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.path, pg.title, {kind_expr}, pg.tier, pg.updated_at
+                 FROM pages pg WHERE pg.workspace_id = ?1 AND pg.project_id = ?2
+                   AND pg.is_latest = 1 AND pg.updated_at > ?3
+                   AND (pg.updated_at > ?4 OR (pg.updated_at = ?4 AND pg.path > ?5))
+                   AND (pg.expires_at IS NULL OR pg.expires_at > ?6)
+                 ORDER BY pg.updated_at ASC, pg.path ASC LIMIT ?7"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    since_us,
+                    after_us,
+                    after_path,
+                    jiff::Timestamp::now().as_microsecond(),
+                    limit.clamp(1, 100) as i64 + 1
+                ],
+                |row| {
+                    let updated_us: i64 = row.get(4)?;
+                    Ok(PageSummary {
+                        path: row.get(0)?,
+                        title: row.get(1)?,
+                        kind: row.get(2)?,
+                        tier: row.get(3)?,
+                        updated_at: jiff::Timestamp::from_microsecond(updated_us)
+                            .map(|ts| ts.to_string())
+                            .unwrap_or_default(),
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await
     }
@@ -8755,6 +9076,152 @@ impl ReaderPool {
         .await
     }
 
+    /// Diagnose a requested project coordinate without creating, claiming, or renaming.
+    ///
+    /// The lookup uses the same bounded exact/canonical/legacy indexes as normal
+    /// compatibility resolution, but retains probe provenance and conflicting
+    /// candidates for operator diagnostics.
+    pub async fn diagnose_project_coordinate(
+        &self,
+        workspace: String,
+        requested_name: String,
+        repository: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+        requested_style: ai_memory_core::repository_identity::IdentityStyle,
+    ) -> StoreResult<ProjectCoordinateDiagnostic> {
+        let canonical_candidate = repository
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::path_style_name);
+        let legacy_candidate = repository
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+        let local_source = repository.as_ref().map(|identity| identity.source);
+        let requested = requested_name.clone();
+        let workspace_name = workspace.clone();
+        self.with_conn(move |conn| {
+            let workspace_id = conn
+                .query_row(
+                    "SELECT id FROM workspaces WHERE name = ?1",
+                    params![workspace_name],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .map(|bytes| WorkspaceId::from_slice(&bytes))
+                .transpose()?;
+            let Some(workspace_id) = workspace_id else {
+                return Ok(ProjectCoordinateDiagnostic {
+                    workspace,
+                    requested_name,
+                    status: ProjectCoordinateStatus::Missing,
+                    project_id: None,
+                    current_name: None,
+                    canonical_candidate,
+                    legacy_candidate,
+                    identity_source: local_source.map(|source| source.as_str().to_owned()),
+                    identity_style: local_source.map(|_| requested_style.as_str().to_owned()),
+                    rename_eligible: false,
+                    collision_reason: None,
+                    candidate_count: 0,
+                });
+            };
+
+            let matches = crate::project_coordinates::matches(
+                conn,
+                workspace_id,
+                &requested,
+                repository.as_ref(),
+            )?;
+            let requested_matches = matches
+                .iter()
+                .filter(|candidate| candidate.provenance.requested())
+                .collect::<Vec<_>>();
+            let identity_match = matches
+                .iter()
+                .find(|candidate| candidate.provenance.identity);
+            let exact_match = requested_matches
+                .iter()
+                .copied()
+                .find(|candidate| candidate.provenance.exact);
+            let canonical_collision = identity_match.and_then(|identity| {
+                matches.iter().find(|candidate| {
+                    candidate.provenance.canonical_target && candidate.id != identity.id
+                })
+            });
+            let identity_conflict = repository.as_ref().is_some_and(|repository| {
+                exact_match.is_some_and(|candidate| {
+                    candidate
+                        .identity
+                        .as_deref()
+                        .is_some_and(|stored| stored != repository.identity)
+                })
+            });
+            let identityless_collision = repository.is_some()
+                && exact_match.is_some_and(|candidate| candidate.identity.is_none());
+            let ambiguous = requested_matches.len() > 1
+                || identity_conflict
+                || identityless_collision
+                || (identity_match.is_some()
+                    && exact_match
+                        .is_some_and(|exact| Some(exact.id) != identity_match.map(|row| row.id)));
+
+            let primary = identity_match.or_else(|| requested_matches.first().copied());
+            let status = if ambiguous {
+                ProjectCoordinateStatus::Ambiguous
+            } else if let Some(candidate) = requested_matches.first() {
+                if candidate.provenance.exact {
+                    ProjectCoordinateStatus::Exact
+                } else if candidate.provenance.canonical_compat {
+                    ProjectCoordinateStatus::CanonicalCompat
+                } else {
+                    ProjectCoordinateStatus::LegacyCompat
+                }
+            } else {
+                ProjectCoordinateStatus::Missing
+            };
+            let collision_reason = if identityless_collision {
+                Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+            } else if let Some(holder) = canonical_collision {
+                Some(if holder.identity_source.as_deref() == Some("git_remote") {
+                    ProjectCoordinateCollisionReason::CrossForgeCollision
+                } else {
+                    ProjectCoordinateCollisionReason::CanonicalTargetOccupied
+                })
+            } else if identity_conflict {
+                Some(ProjectCoordinateCollisionReason::CrossIdentityOccupied)
+            } else if requested_matches.len() > 1 && identity_match.is_some() {
+                Some(ProjectCoordinateCollisionReason::CrossForgeCollision)
+            } else if ambiguous {
+                Some(ProjectCoordinateCollisionReason::MultipleProjects)
+            } else {
+                None
+            };
+            let rename_eligible = requested_matches.len() == 1
+                && requested_matches.first().is_some_and(|candidate| {
+                    crate::project_coordinates::promotion_target(candidate, &requested).is_some()
+                })
+                && collision_reason.is_none();
+
+            Ok(ProjectCoordinateDiagnostic {
+                workspace,
+                requested_name,
+                status,
+                project_id: primary.map(|candidate| candidate.id),
+                current_name: primary.map(|candidate| candidate.current_name.clone()),
+                canonical_candidate: canonical_candidate
+                    .or_else(|| primary.and_then(|candidate| candidate.canonical_name.clone())),
+                legacy_candidate: legacy_candidate
+                    .or_else(|| primary.and_then(|candidate| candidate.legacy_name.clone())),
+                identity_source: local_source
+                    .map(|source| source.as_str().to_owned())
+                    .or_else(|| primary.and_then(|candidate| candidate.identity_source.clone())),
+                identity_style: local_source.map(|_| requested_style.as_str().to_owned()),
+                rename_eligible,
+                collision_reason,
+                candidate_count: matches.len(),
+            })
+        })
+        .await
+    }
+
     /// Look up a project id by `(workspace_id, name)` without creating it.
     ///
     /// Returns `None` when no project with the given name exists in the workspace.
@@ -8780,6 +9247,42 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| ProjectId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Resolve an existing project by its exact, canonical path-style, or v2
+    /// legacy basename key without creating or renaming anything.
+    pub(crate) async fn resolve_existing_project_name(
+        &self,
+        workspace_id: WorkspaceId,
+        name: String,
+    ) -> StoreResult<Option<ProjectId>> {
+        self.with_conn(move |conn| {
+            crate::project_coordinates::resolve(conn, workspace_id, &name)
+                .map(|matched| matched.map(|matched| matched.id))
+        })
+        .await
+    }
+
+    /// Resolve a local marker's former names inside one workspace, requiring
+    /// the selected row to carry the checkout's full git-remote identity.
+    pub async fn resolve_existing_project_aliases(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical: String,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+    ) -> StoreResult<Option<ProjectId>> {
+        self.with_conn(move |conn| {
+            crate::project_coordinates::resolve_aliases(
+                conn,
+                workspace_id,
+                &canonical,
+                &aliases,
+                &repository,
+            )
+            .map(|matched| matched.map(|matched| matched.id))
         })
         .await
     }
@@ -9614,6 +10117,149 @@ impl ReaderPool {
             return Ok(true);
         }
         self.users_exist().await
+    }
+
+    /// The `[profile]` flags stored on a project (both on when it has none).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn project_profile_flags(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<crate::ProjectProfileFlags> {
+        self.with_conn(move |conn| {
+            crate::profile::project_profile_flags(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// Projects whose marker keeps them out of the profile.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_contribute_opt_outs(&self) -> StoreResult<Vec<crate::ProfileOptOut>> {
+        self.with_conn(crate::profile::contribute_opt_outs).await
+    }
+
+    /// The current entries of a profile scope, at most `limit`
+    /// ([`crate::PROFILE_ENTRIES_LIMIT`] caps it).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<ai_memory_core::profile::ProfileEntry>> {
+        self.with_conn(move |conn| {
+            crate::profile::profile_entries(conn, workspace_id, project_id, limit)
+        })
+        .await
+    }
+
+    /// Every project the profile harvester may read, with its marks.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_harvest_projects(&self) -> StoreResult<Vec<crate::ProfileHarvestProject>> {
+        self.with_conn(crate::profile::profile_harvest_projects)
+            .await
+    }
+
+    /// What the harvester reads next from one project: user prompts and
+    /// curated pages past its marks, at most `limit` of each.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_harvest_inputs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mark: crate::ProfileHarvestMark,
+        limit: usize,
+    ) -> StoreResult<(
+        Vec<crate::ProfilePromptRow>,
+        Vec<crate::ProfilePageRow>,
+        std::collections::BTreeSet<String>,
+    )> {
+        self.with_conn(move |conn| {
+            Ok((
+                crate::profile::profile_prompts_since(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    mark.observations_until,
+                    limit,
+                )?,
+                crate::profile::profile_pages_since(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    mark.pages_until,
+                    limit,
+                )?,
+                crate::profile::project_stack_tags(conn, workspace_id, project_id)?,
+            ))
+        })
+        .await
+    }
+
+    /// The newest recorded profile candidates of contributing projects.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_candidates(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::ProfileCandidateRow>> {
+        self.with_conn(move |conn| crate::profile::profile_candidates(conn, limit))
+            .await
+    }
+
+    /// Every current `profile/` page of a scope, raw, and the harvester's
+    /// ledger of the entries it wrote there, from one connection checkout.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_scope_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<(Vec<crate::ProfileScopePage>, Vec<crate::ProfileLedgerEntry>)> {
+        self.with_conn(move |conn| {
+            Ok((
+                crate::profile::profile_scope_pages(conn, workspace_id, project_id)?,
+                crate::profile::profile_entry_ledger(conn, workspace_id, project_id)?,
+            ))
+        })
+        .await
+    }
+
+    /// The digest inputs for a session in `project` reading the profile held
+    /// in `profile_scope`, from one connection checkout.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_digest_inputs(
+        &self,
+        profile_scope: (WorkspaceId, ProjectId),
+        project: (WorkspaceId, ProjectId),
+    ) -> StoreResult<crate::ProfileDigestInputs> {
+        self.with_conn(move |conn| {
+            Ok(crate::ProfileDigestInputs {
+                entries: crate::profile::profile_entries(
+                    conn,
+                    profile_scope.0,
+                    profile_scope.1,
+                    crate::PROFILE_ENTRIES_LIMIT,
+                )?,
+                project_tags: crate::profile::project_stack_tags(conn, project.0, project.1)?,
+                project_has_pages: crate::profile::project_has_pages(conn, project.0, project.1)?,
+            })
+        })
+        .await
     }
 
     /// Return the last successful global maintenance completion for `job`.
@@ -10827,6 +11473,10 @@ mod tests {
         assert_eq!(row.workspace_name, "acme");
         assert_eq!(row.project_name, "webapp");
         assert_eq!(row.repo_path.as_deref(), Some("/repo/webapp"));
+        assert!(row.identity.is_none());
+        assert!(row.identity_source.is_none());
+        assert!(row.canonical_name.is_none());
+        assert!(row.legacy_name.is_none());
 
         assert!(
             store

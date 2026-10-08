@@ -1,5 +1,8 @@
 # Design: Promoting Memory into Governed AGENTS.md Rules
 
+*Cross-project sharing (deferred in §8 below) is designed and implemented by
+the profile: see `docs/design-cross-project-profile.md`.*
+
 *Status: design proposal — not implemented. (Originally scoped against the 2.1
 line; that and 2.2 shipped without it, so it is un-targeted and still open —
 this is the balance research the feature needs before code.)*

@@ -32,6 +32,8 @@ struct WritePageBody {
 struct WritePageResponseBody {
     page_id: String,
     path: String,
+    #[serde(default)]
+    manifest_warning: Option<String>,
 }
 
 /// Run the `write-page` subcommand.
@@ -75,6 +77,9 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     .await
     .context("writing page via server")?;
 
+    if let Some(warning) = resp.manifest_warning.as_deref() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
     let short_id = &resp.page_id[..resp.page_id.len().min(8)];
     println!(
         "✓ wrote {} (page_id={}) under {}/{}",

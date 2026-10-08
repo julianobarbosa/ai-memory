@@ -29,6 +29,9 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     });
     let summary: serde_json::Value = post_json(&endpoint, "/admin/rename-project", &body).await?;
     let pages = summary["pages"].as_u64().unwrap_or(0);
+    if let Some(warning) = summary["manifest_warning"].as_str() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
     if let Err(error) = super::project_registry::rekey_scope(
         config, &endpoint, &workspace, &from, &workspace, &args.to,
     ) {

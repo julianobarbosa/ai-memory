@@ -387,7 +387,9 @@ fn split_scope(target: &str) -> LinkKey {
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return (None, None, target.to_string());
     }
@@ -551,14 +553,20 @@ fn resolve_local_wikilink(
     // source page — `page_path` is unused on this branch of
     // `normalize_link_target`/`resolve_relative`), `.md` appended,
     // traversal collapsed.
-    let target = normalize_link_target(&path_part, page_path, true)?;
+    // Split off a trailing #anchor/?query so it survives the rewrite.
+    let (clean_path, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part.as_str(), ""),
+    };
+    let target = normalize_link_target(clean_path, page_path, true)?;
     let page_dir: Vec<&str> = page_path
         .as_str()
         .rsplit_once('/')
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let href = relative_href(&page_dir, &target);
+    let mut href = relative_href(&page_dir, &target);
+    href.push_str(suffix);
     let display = label.map_or(target_part, str::trim).to_string();
     Some((href, display))
 }
@@ -779,7 +787,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     if lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return None;
     }
@@ -1072,6 +1082,26 @@ mod tests {
     }
 
     #[test]
+    fn extract_links_file_and_vbscript_schemes_are_not_scopes() {
+        // `/web` already leaves these literal. Without the same prefixes
+        // here, `[[file:notes/x.md]]` peels `file` as a project scope and
+        // indexes a cross-project edge no page write can satisfy.
+        let links = extract_links(
+            "[[file:notes/x.md]] [[vbscript:msgbox]] [[file:///etc/passwd]]",
+            &page(),
+        );
+        assert!(
+            links.is_empty(),
+            "file/vbscript schemes are not wiki links: {links:?}"
+        );
+        let md = extract_links("[x](file:notes/x.md) [y](vbscript:msgbox)", &page());
+        assert!(
+            md.is_empty(),
+            "file/vbscript markdown destinations are not wiki links: {md:?}"
+        );
+    }
+
+    #[test]
     fn parses_frontmatter_and_body() {
         let src = "---\ntitle: Hello\ntags:\n  - a\n  - b\n---\nThe body.\n";
         let md = parse(src).unwrap();
@@ -1283,6 +1313,27 @@ mod tests {
         assert_eq!(
             rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
             "[the decision](../decisions/b.md)"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_preserves_anchor_and_query_fragments() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("See [[decisions/b.md#context]].", &path, "proj"),
+            "See [decisions/b.md#context](../decisions/b.md#context)."
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#context|the decision]]", &path, "proj"),
+            "[the decision](../decisions/b.md#context)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, "proj"),
+            "[decisions/b.md?v=1#part-2](../decisions/b.md?v=1#part-2)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#my section|My Section]]", &path, "proj"),
+            "[My Section](<../decisions/b.md#my section>)"
         );
     }
 

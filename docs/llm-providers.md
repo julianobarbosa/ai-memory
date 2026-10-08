@@ -226,6 +226,24 @@ provider that exposes a real `/v1/embeddings` endpoint is the practical choice.
 The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
 alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 
+> [!TIP]
+> **`openai-compat` sends `X-Request-Id` on every chat attempt.** Each HTTP
+> attempt of one logical operation — including the strict-to-tolerant
+> fallback — carries the same operation id (a 36-character UUID v7) in the
+> `X-Request-Id` header, so a gateway that records it (for example as
+> `req=<id>`) can correlate every attempt of the same operation and forward
+> it to the engine (vLLM). The id is generated fresh by the caller of the
+> operation — the consolidation invocation or the auto-improve review — and
+> is never the agent's session id, so a gateway never sees two operations
+> of one session, or a crash-resumed run, as one. Crash re-entry is exactly
+> one new operation: a process restart or a queue re-claim mints a new id
+> for the calls it makes. The official `openai` provider and `opencode` do
+> not send this header — `opencode` keeps its own `x-opencode-session`
+> contract. Because ai-memory owns the header on the `openai-compat` path, a
+> static `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at
+> startup for that provider; the dynamic value must not be shadowed or
+> duplicated.
+
 ### Security and gotchas
 
 - **Bind address vs. port publish.** When running inside a container, the

@@ -19,19 +19,21 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, repository_admits_capture,
+    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_file_tool_paths,
+    repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
+use crate::config::{Config, RuntimeEnv};
 use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
-    marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
-    url_encode,
+    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, hook_scope,
+    marker_query_suffix, marker_query_suffix_without_briefing, marker_requests_briefing,
+    resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -186,6 +188,17 @@ fn briefed_marker_path(
     data_dir.join("briefed").join(key)
 }
 
+/// The once-per-session profile-digest marker beside a brief marker: same
+/// key, `profile-` prefix, so the two gates never share a file. The shell and
+/// PowerShell hooks name it the same way.
+fn profile_digest_marker_path(brief_marker: PathBuf) -> PathBuf {
+    let name = brief_marker
+        .file_name()
+        .map(|name| format!("profile-{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "profile-".to_owned());
+    brief_marker.with_file_name(name)
+}
+
 fn sanitize_briefed_key(raw: &str) -> String {
     raw.chars()
         .map(|c| {
@@ -320,7 +333,16 @@ fn after_background_drain_event_enqueue(
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
 pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let dd = resolve_data_dir(data_dir.as_deref());
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    // The hook path never runs a full `Config::load` (see the fast-path
+    // contract in `lib.rs`): an invalid config section elsewhere must not
+    // fail the drainer. Only the spool retry policy is needed, loaded
+    // tolerantly — any load error falls back to defaults.
+    let config =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd.clone()), runtime_env)
+            .unwrap_or_default();
+    let max_attempts = hook_spool::MaxAttempts::new(config.hook_spool.max_attempts);
     let spool = hook_spool::spool_dir(&dd);
     match hook_spool::drain_until_quiescent(
         &spool,
@@ -328,6 +350,7 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         background_drain_budget(),
         drain_event_timeout(),
         hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+        max_attempts,
     )
     .await
     {
@@ -522,6 +545,12 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
                 "ephemeralMessage": handoff,
             }]
         })
+    } else if agent == AgentKind::CopilotCli {
+        // Copilot CLI requires the SessionStart output envelope itself, rather
+        // than Claude Code's nested hookSpecificOutput shape.
+        serde_json::json!({
+            "additionalContext": handoff,
+        })
     } else {
         serde_json::json!({
             "hookSpecificOutput": {
@@ -551,6 +580,15 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     .await
 }
 
+/// [`run`] with the payload and output sink injected, so tests drive the hook
+/// implementation directly without stdin/stdout.
+///
+/// Hooks deliberately bypass the full `Config::load` (the fast-path contract
+/// in `lib.rs`): an unrelated invalid config section must never fail the hook
+/// or add stdout noise. The spool retry policy is the only config needed, and
+/// it is loaded tolerantly — a malformed config falls back to defaults rather
+/// than erroring. The process environment is captured once, here, and
+/// threaded down as data.
 async fn run_with_payload<W, S>(
     data_dir: Option<PathBuf>,
     args: HookArgs,
@@ -562,6 +600,12 @@ where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    let spool_policy =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
+            .unwrap_or_default();
+    let max_attempts = hook_spool::MaxAttempts::new(spool_policy.hook_spool.max_attempts);
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
@@ -578,7 +622,10 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(&resolve_data_dir(data_dir.as_deref()), agent_kind);
+            clear_session_id(
+                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                agent_kind,
+            );
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -597,13 +644,13 @@ where
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
-    if !should_process_hook_event(agent_kind, hook_event, &json)
-        || is_redundant_cursor_copy(
+    let event_admits_capture = should_process_hook_event(agent_kind, hook_event, &json)
+        && !is_redundant_cursor_copy(
             agent_kind,
             &json,
             super::install_hooks::cursor_native_hooks_installed,
-        )
-    {
+        );
+    if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -638,10 +685,31 @@ where
     {
         payload = serde_json::to_string(&json)?;
     }
-    let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let tool_event = is_tool_event(&args.event);
+    // Some harnesses keep a subagent's parent cwd in every payload even when
+    // a file tool operates in another checkout (#932). A recognized absolute
+    // target may select that checkout, but only when every path proves the
+    // same repository/marker boundary. This must precede capture policy and
+    // server-profile resolution so the destination's privacy and credentials
+    // remain authoritative.
+    let file_routing_cwd = payload_cwd.as_deref().and_then(|cwd| {
+        tool_event
+            .then(|| file_tool_routing_cwd(agent_kind, &json, cwd))
+            .flatten()
+    });
+    if let Some(cwd) = file_routing_cwd.as_deref()
+        && let Some(object) = json.as_object_mut()
+    {
+        // `HookEnvelope` deliberately gives the native body cwd precedence
+        // over the query fallback. Stamp the proven destination into that
+        // canonical field too, or a URL-only reroute would be cosmetic.
+        object.insert("cwd".into(), cwd.into());
+        payload = serde_json::to_string(&json)?;
+    }
+    let policy_cwd = file_routing_cwd.or(payload_cwd);
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
-    let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
         policy.inspect(
             AgentKind::from_wire(&args.agent),
@@ -649,7 +717,7 @@ where
             inspection_cwd.as_deref().unwrap_or(""),
         )
     });
-    let dd = resolve_data_dir(data_dir.as_deref());
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
     // persisted per-install mode; otherwise the historical default.
     let capture_mode = args.capture_mode.map_or_else(
@@ -662,13 +730,41 @@ where
     let marker_present = policy_cwd
         .as_deref()
         .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
+    let routing_valid = policy_cwd
+        .as_deref()
+        .is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok());
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
+        let scope = policy_cwd.as_deref().map(|cwd| {
+            hook_scope(
+                cwd,
+                args.project_strategy
+                    .and_then(crate::cli::ProjectStrategyArg::baked),
+            )
+        });
+        let scope_resolution = match scope.as_ref() {
+            None => "unavailable",
+            Some(scope) if !scope.is_inspectable() => "unavailable",
+            Some(scope) if scope.is_partial() => "partial",
+            Some(scope) if scope.is_explicit() => "explicit",
+            Some(_) => "server-derived",
+        };
+        let policy_admits_capture = admits_capture
+            && routing_valid
+            && event_admits_capture
+            && !matches!(route, HookRoute::Rejected { .. })
+            && scope_resolution != "partial"
+            && scope_resolution != "unavailable"
+            && protocol.is_none_or(|p| p.disposition() != CaptureDisposition::Drop);
         let mut output = serde_json::json!({
             "capture_mode": capture_mode,
             "marker_present": marker_present,
             "admits_capture": admits_capture && !external_capture,
+            "policy_admits_capture": policy_admits_capture,
+            "event_admits_capture": event_admits_capture,
+            "scope": scope,
+            "scope_resolution": scope_resolution,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -708,7 +804,7 @@ where
     // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
     // `CaptureDisposition` alone would still spool prompt text from an
     // opted-out repository while reporting it as excluded.
-    if !admits_capture {
+    if !admits_capture || !routing_valid {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -741,10 +837,15 @@ where
         }
     }
 
-    let qs = cwd_query_suffix(
-        &args.agent,
-        &json,
-        args.project_strategy.and_then(|s| s.baked()),
+    let qs = policy_cwd.as_deref().map_or_else(
+        || {
+            cwd_query_suffix(
+                &args.agent,
+                &json,
+                args.project_strategy.and_then(|s| s.baked()),
+            )
+        },
+        |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
@@ -829,6 +930,7 @@ where
                 INCREMENTAL_DRAIN_BUDGET,
                 INCREMENTAL_DRAIN_BUDGET,
                 hook_spool::DrainLockWait::NoWait,
+                max_attempts,
             )
             .await;
         }
@@ -860,6 +962,7 @@ where
                 &dd,
                 start_drain_budget(),
                 drain_event_timeout(),
+                max_attempts,
             )
             .await;
         }
@@ -933,6 +1036,19 @@ where
                     policy_cwd.as_deref(),
                 )
             });
+        // The profile digest rides the first prompt the same way, gated on its
+        // own marker because it is on by default rather than an opt-in.
+        let profile_path = profile_digest_marker_path(briefed_marker_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        ));
+        let profile_qs = if profile_path.is_file() {
+            "&profile_digest=0"
+        } else {
+            ""
+        };
         let handoff_qs = if briefed_path.as_ref().is_some_and(|path| path.is_file()) {
             policy_cwd
                 .as_deref()
@@ -947,7 +1063,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
             args.agent
         );
         let handoff =
@@ -960,6 +1076,7 @@ where
         if let Some(path) = briefed_path.as_deref() {
             mark_briefed(path);
         }
+        mark_briefed(&profile_path);
         if let Some(handoff) = handoff {
             writeln!(stdout, "{handoff}")?;
         }
@@ -1062,6 +1179,65 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             session_id,
         )
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRouteAnchor {
+    marker: Option<PathBuf>,
+    repository: Option<PathBuf>,
+}
+
+/// Find the existing directory that can establish routing for a file target.
+/// New files may name one or more not-yet-created parent directories.
+fn existing_target_dir(path: &Path) -> Option<PathBuf> {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        candidate = candidate.parent()?.to_path_buf();
+    }
+}
+
+fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
+    let cwd_text = cwd.to_string_lossy();
+    FileRouteAnchor {
+        marker: crate::marker::find_marker(&cwd_text),
+        repository: ai_memory_consolidate::discover_main_repo_root(cwd).ok(),
+    }
+}
+
+/// Pick a destination cwd only when absolute file-tool paths prove a single
+/// repository/marker boundary different from the payload cwd.
+fn file_tool_routing_cwd(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    payload_cwd: &str,
+) -> Option<String> {
+    let paths = absolute_file_tool_paths(agent, raw, payload_cwd)?;
+    let source_dir = existing_target_dir(Path::new(payload_cwd))?;
+    let source_anchor = file_route_anchor(&source_dir);
+    let mut selected: Option<(FileRouteAnchor, PathBuf)> = None;
+    for path in paths {
+        let dir = existing_target_dir(Path::new(&path))?;
+        let anchor = file_route_anchor(&dir);
+        // An arbitrary absolute path is not a project and must not mint a new
+        // scope merely because a file tool happened to inspect it.
+        if anchor.marker.is_none() && anchor.repository.is_none() {
+            return None;
+        }
+        match &selected {
+            Some((expected, _)) if *expected != anchor => return None,
+            Some(_) => {}
+            None => selected = Some((anchor, dir)),
+        }
+    }
+    let (target_anchor, dir) = selected?;
+    (target_anchor != source_anchor).then(|| dir.to_string_lossy().into_owned())
 }
 
 /// Where one event is delivered (#992).
@@ -1186,13 +1362,18 @@ fn is_tool_event(event: &str) -> bool {
     )
 }
 
-/// Resolve the data dir cheaply, without loading the full config (the hook
-/// fast-path skips config for latency). Mirrors `config.rs`: explicit
-/// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
+/// Resolve the data dir for tests that exercise the hook implementation
+/// directly: explicit `--data-dir`, then the captured runtime environment, then
+/// the platform local-data directory.
+#[cfg(test)]
 fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
+    resolve_data_dir_with(data_dir, &RuntimeEnv::from_process())
+}
+
+fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> PathBuf {
     let dir = data_dir
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("AI_MEMORY_DATA_DIR").map(PathBuf::from))
+        .or_else(|| runtime_env.data_dir().map(Path::to_path_buf))
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -2302,6 +2483,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absolute_file_target_uses_destination_scope_and_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"destination\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let excluded = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("secret/private.txt")},
+            "tool_response": {"content": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            excluded.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a dropped tool event must not start a drainer"),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let public = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")},
+            "tool_response": {"content": "public"}
+        });
+        run_with_payload(
+            Some(data_dir),
+            args,
+            public.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a tool event below the threshold must only spool"),
+        )
+        .await
+        .unwrap();
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(query_param(&entries[0].url, "workspace"), Some("shared"));
+        assert_eq!(query_param(&entries[0].url, "project"), Some("destination"));
+        assert_eq!(
+            query_param(&entries[0].url, "cwd"),
+            Some(url_encode(destination.to_str().unwrap()).as_str())
+        );
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["cwd"], destination.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn absolute_file_target_cannot_escape_a_destination_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "server = \"unregistered\"\nworkspace = \"shared\"\nproject = \"destination\"\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let raw = serde_json::json!({
+            "session_id": "cross-profile",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")}
+        });
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a refused destination route must not start a drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+            0,
+            "the event must not fall back to the source repository's server"
+        );
+    }
+
+    #[test]
+    fn file_target_routing_refuses_relative_external_and_mixed_project_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join(".ai-memory.toml"), "project = \"source\"\n").unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "project = \"destination\"\n",
+        )
+        .unwrap();
+        let cwd = source.to_str().unwrap();
+        let relative = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "../destination/file.txt"}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &relative, cwd),
+            None,
+            "a relative path cannot independently prove a destination"
+        );
+
+        let external_dir = tmp.path().join("not-a-project");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": external_dir.join("file.txt")}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &external, cwd),
+            None,
+            "an arbitrary absolute path must not mint a project"
+        );
+
+        let mixed = serde_json::json!({
+            "tool_name": "read",
+            "tool_input": {"paths": [
+                source.join("one.txt"),
+                destination.join("two.txt")
+            ]}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &mixed, cwd),
+            None,
+            "one event cannot be attributed to two projects"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_command_reading_an_ignored_path_is_dropped_before_spool() {
         for (command, spooled) in [("cat ./secret/*.md | head", 0), ("cat public/readme.md", 1)] {
             for event in ["pre-tool-use", "post-tool-use"] {
@@ -2585,10 +2930,14 @@ mod tests {
                 "admits_capture",
                 "capture_mode",
                 "disposition",
+                "event_admits_capture",
                 "extraction_state",
                 "marker_present",
                 "path_count",
+                "policy_admits_capture",
                 "policy_state",
+                "scope",
+                "scope_resolution",
                 "server_profile",
                 "server_resolution",
                 "tool_family",
@@ -2597,6 +2946,123 @@ mod tests {
         );
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn check_capture_refuses_partial_scope_and_excluded_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let marker = tmp.path().join(".ai-memory.toml");
+        for (declaration, path, admits, resolution) in [
+            ("workspace = \"team\"\n", "public.txt", false, "partial"),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "secret/token.txt",
+                false,
+                "explicit",
+            ),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "public.txt",
+                true,
+                "explicit",
+            ),
+        ] {
+            std::fs::write(
+                &marker,
+                format!("{declaration}[capture]\nignore_paths = [\"secret/**\"]\n"),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":path,"content":"PRIVATE_CONTENT_SENTINEL"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(report["scope_resolution"], resolution);
+            assert_eq!(report["scope"]["workspace"], "team");
+            let printed = String::from_utf8(stdout).unwrap();
+            assert!(!printed.contains("PRIVATE_CONTENT_SENTINEL"));
+            assert!(!printed.contains("token.txt"));
+            assert!(!data_dir.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_bounds_marker_hints_and_refuses_oversized_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        for (workspace, identity, admits) in [
+            ("x".repeat(513), "app".to_owned(), false),
+            ("team".to_owned(), "y".repeat(513), false),
+            ("team".to_owned(), "y".repeat(512), true),
+        ] {
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                format!(
+                    "workspace = \"{workspace}\"\nproject = \"app\"\nidentity = \"{identity}\"\n"
+                ),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":"public.txt"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(
+                report["scope_resolution"],
+                if admits { "explicit" } else { "unavailable" }
+            );
+            assert_eq!(report["scope"]["project"], "app");
+            let printed = String::from_utf8(stdout).unwrap();
+            for (field, value) in [("workspace", &workspace), ("identity", &identity)] {
+                if value.len() > 512 {
+                    assert!(report["scope"][field].is_null(), "{report}");
+                    assert!(!printed.contains(value));
+                } else {
+                    assert_eq!(report["scope"][field], value.as_str());
+                }
+            }
+            assert!(!data_dir.exists());
+            // Inspection bounds do not change the native routing contract.
+            let suffix = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+            assert!(suffix.contains(&workspace));
+            assert!(suffix.contains(&format!("&identity={identity}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_reports_rejected_lifecycle_without_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("session-start");
+        args.agent = "antigravity-cli".into();
+        args.check_capture = true;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({"cwd":tmp.path(),"invocationNum":4}).to_string(),
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("inspection must not spawn")),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(report["event_admits_capture"], false);
+        assert_eq!(report["policy_admits_capture"], false);
+        assert!(!data_dir.exists());
     }
 
     #[tokio::test]
@@ -2809,6 +3275,19 @@ mod tests {
         }
     }
 
+    fn copilot_cli_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "copilot-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
     fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -2965,6 +3444,48 @@ mod tests {
                 request.starts_with("GET /handoff?")
                     && request.contains("agent=kiro-cli")
                     && request.contains("session_id=kiro-session")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_cli_session_start_prints_top_level_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "COPILOT-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            copilot_cli_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "copilot-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"additionalContext": "COPILOT-HANDOFF"})
+        );
+        assert!(
+            envelope.get("hookSpecificOutput").is_none(),
+            "Copilot reads the top-level SessionStart envelope"
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=copilot-cli")
+                    && request.contains("session_id=copilot-session")
             }),
             "{recorded:?}"
         );
@@ -3156,6 +3677,7 @@ mod tests {
             let stdout = run_prompt(&data_dir, args, cwd).await;
             let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
             assert_eq!(output["server_resolution"], resolution, "{}", cwd.display());
+            assert_eq!(output["policy_admits_capture"], resolution == "marker");
             let printed = String::from_utf8(stdout).unwrap();
             for secret in ["tok-", "https://", &*tmp.path().to_string_lossy()] {
                 assert!(!printed.contains(secret), "{printed}");
@@ -3426,6 +3948,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("INSTALL-TOKEN"),
+            hook_spool::MaxAttempts::new(crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS),
         )
         .await;
         assert_eq!(result.sent, 2, "{result:?}");
@@ -3740,7 +4263,42 @@ mod tests {
         let request = first_request(&mut requests).await.unwrap();
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
-        assert!(!data_dir.join("briefed").exists());
+        // Only the profile digest's own gate is written; no brief marker.
+        let markers: Vec<String> = std::fs::read_dir(data_dir.join("briefed"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(markers, vec!["profile-session_abc".to_owned()]);
+    }
+
+    /// Kimi re-fetches on every prompt, so the profile digest rides the first
+    /// prompt only: later prompts of the session send `profile_digest=0`.
+    #[tokio::test]
+    async fn kimi_delivers_the_profile_digest_on_the_first_prompt_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let prompt = || {
+            serde_json::json!({ "session_id": "session_k", "cwd": cwd, "prompt": "hi" }).to_string()
+        };
+        for _ in 0..2 {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                kimi_hook_args("user-prompt-submit", &base),
+                prompt(),
+                &mut stdout,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        }
+        let first = first_request(&mut requests).await.unwrap();
+        let second = first_request(&mut requests).await.unwrap();
+        assert!(!first.contains("profile_digest"), "{first}");
+        assert!(second.contains("&profile_digest=0"), "{second}");
     }
 
     #[tokio::test]

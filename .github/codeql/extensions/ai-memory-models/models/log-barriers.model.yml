@@ -1,0 +1,17 @@
+# CodeQL's sensitive-data heuristic treats any name matching `session.?(id|key)`
+# as account information, so every `eprintln!` of a native session id raised a
+# `rust/cleartext-logging` alert. A session id is a routing identifier shown on
+# the operator's own terminal, not a credential.
+#
+# `display_session_id` is the one helper that renders a session id for
+# terminal output; declaring its return value a log barrier clears those
+# alerts while a real secret (an `api_key`, a token) logged anywhere else is
+# still reported. Route any new session-id output through it rather than
+# adding more rows here; the CLI test `codeql_model_targets_exist` fails if a
+# modeled function is renamed or moved.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      - ["ai_memory_cli::commands::run::display_session_id", "ReturnValue", "log-injection", "manual"]

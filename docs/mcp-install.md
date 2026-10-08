@@ -1,5 +1,8 @@
 # MCP install guide - additional clients
 
+For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
+It shows direct MCP writes, queries and handoffs without a native hook adapter.
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
@@ -17,7 +20,17 @@
 > --http-stateful` to restore rmcp's session mode.
 
 This page documents how to register ai-memory as an MCP server with
-agent CLIs beyond the README quick start.
+agent CLIs beyond the README quick start. For OpenCode, the generic
+`install-mcp --client opencode` command probes `opencode --version` and writes
+the matching V1 direct `mcp` or V2 nested `mcp.servers` entry. Strict semantic
+major 1 and 2 outputs are accepted; malformed, timed-out, and future-major
+probes fail rather than guessing. During a V1/V2 transition, hook and MCP
+installers reuse an ownership-verified endpoint and bearer from either known
+schema; conflicting generated entries fail for explicit resolution, and custom
+entries are preserved. The `opencode2`, `opencode-v2`, and `open-code2`
+spellings remain force-V2 compatibility aliases. A Docker
+container cannot inspect the host executable; use `setup-agent --agent opencode
+--opencode-dialect v1|v2` there to print the selected plugin and MCP artifacts.
 
 The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
 have automatic capture integrations (host-native commands for supported local
@@ -41,7 +54,8 @@ manual container/script extraction and explicit compatibility overrides.
 Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+Claude Desktop's ordinary Chat surface, VS Code Copilot, Zed, and Muse Code
+are **MCP-only** here:
 they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -138,7 +152,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed / muse
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse
 > ```
 
 ---
@@ -218,6 +232,63 @@ native HTTP or generated bridge paths.
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
+
+---
+
+## GitHub Copilot CLI
+
+**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
+at `SessionStart` yet (see below), and there is no managed workstream
+(`ai-memory run copilot`).
+
+**Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
+`$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
+defaults to `~/.copilot`). Not to be confused with `--client vscode-copilot`
+(alias `copilot`), the VS Code agent-mode client below.
+
+```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges the documented remote entry into the root
+`mcpServers` map, preserving other servers (including your own `github`
+entry):
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+The equivalent interactive registration is `copilot mcp add --transport http
+ai-memory http://homelab:49374/mcp` (add `--header "Authorization: Bearer
+<token>"` when bearer auth is on). Copilot also reads project-level
+`.mcp.json` and `.github/mcp.json` files; pass that path via `--config-file` to
+write one, keeping in mind that `.github/mcp.json` is meant to be committed,
+so it should not carry a bearer token. `install-hooks --agent copilot-cli`
+run without `--server-url` reads the URL and token back from this entry.
+
+The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
+with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+payload; native installs spool events locally and enforce capture exclusions. The
+`SessionStart` hook delivers the prior session's handoff: Copilot reads a
+top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
+`hookSpecificOutput` envelope), and the hook prints exactly that, or `{}` when
+nothing is pending.
+
+- Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
+  <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,
+  <https://docs.github.com/en/copilot/reference/hooks-reference>
 
 ---
 
@@ -463,9 +534,11 @@ stdio shim. Requires Node.js installed on the same machine.
   `.mcpb` desktop extensions. The ai-memory CLI manages the local
   JSON-config path because it works with localhost/LAN servers and does
   not require publishing an HTTPS connector.
-- Claude Desktop exposes MCP tools but no lifecycle hooks, so automatic
-  prompt/tool capture and session-boundary handoffs are not possible
-  unless Anthropic adds a desktop hook/plugin surface.
+- Claude Desktop's ordinary Chat surface exposes MCP tools but does not run
+  plugin lifecycle hooks, so ai-memory cannot automatically capture its
+  prompts/tools or inject session-boundary handoffs. Cowork is a distinct
+  surface: Anthropic documents that Cowork plugins can run hooks, but ai-memory
+  does not yet ship a Cowork plugin or claim its event/payload semantics.
 - If the MCP indicator doesn't appear after restart, check the logs:
   `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
   `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
@@ -480,6 +553,7 @@ stdio shim. Requires Node.js installed on the same machine.
   pass `--config-file` pointed at the `LocalCache` path directly.
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://support.claude.com/en/articles/13837440-use-plugins-in-claude>,
   <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---
@@ -1264,9 +1338,17 @@ validation is identical in every dialect — only the advertised schema changes.
 
 | Marker | Config key | What it changes | Who needs it |
 | --- | --- | --- | --- |
-| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kimi Code (Moonshot); appended by `install-mcp` |
-| `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
-| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus inlines every `#/$defs/*` reference and drops the emptied `$defs` table | Kimi Code (Moonshot); appended by `install-mcp` |
+| `?flavor=bedrock` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kiro CLI (Bedrock); appended by `install-mcp` |
+| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+
+Moonshot's validator never resolves `$ref` — any reference, at the root or
+nested, fails the request with "detected infinite recursion without termination
+condition" — while inline combinators such as the nullable union on
+`Option<T>` arguments pass. Codex forwards MCP input schemas into Responses
+`tools.function.parameters` verbatim, so it needs the Moonshot marker even
+though it is not Kimi Code. `?flavor=bedrock` and `?flavor=gemini` keep
+`$defs`/`$ref` pairs, which their upstreams resolve.
 
 `install-mcp` appends the first two itself for the clients whose upstream is
 fixed. For any other client, pass the dialect explicitly:
