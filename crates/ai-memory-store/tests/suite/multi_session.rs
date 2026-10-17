@@ -17,13 +17,13 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
-    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
-    owner_stamp,
+    ActorContext, AgentKind, FeedbackKind, HandoffAcceptance, HandoffState, IdentityKey,
+    NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier,
+    UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ConditionalUpsert, LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PagePrecondition,
-    PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
+    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PagePrecondition, PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -928,6 +928,30 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
         .await
         .unwrap();
     assert!(found.is_empty());
+
+    // An expired page is never reported as live.
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired page");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let mut future_exp = page(ws, proj, "notes/future.md", "Future", "future page");
+    future_exp.expires_at = Some(jiff::Timestamp::from_second(4_102_444_800).unwrap());
+    store.writer.upsert_page(future_exp).await.unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/expired.md".to_string(),
+                "notes/future.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["notes/future.md"]);
 }
 
 /// The link guard's path probe is no existence oracle for a restricted
@@ -4238,4 +4262,53 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
             .unwrap()
             .is_empty()
     );
+}
+
+/// Open feedback findings ignore feedback attached to expired pages.
+#[tokio::test]
+async fn open_feedback_findings_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let live = page(ws, proj, "notes/live.md", "Live", "active content");
+    store.writer.upsert_page(live).await.unwrap();
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/live.md").unwrap(),
+            FeedbackKind::Stale,
+            Some("live page is stale".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/expired.md").unwrap(),
+            FeedbackKind::Wrong,
+            Some("expired page was wrong".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    let findings = store.reader.open_feedback_findings(ws, proj).await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].path, "notes/live.md");
+    assert_eq!(findings[0].kind, "stale");
+    assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
 }

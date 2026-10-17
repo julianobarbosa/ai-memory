@@ -12,6 +12,7 @@ mod backfill_e2e;
 mod backfill_failures;
 mod backfill_member;
 mod backup_agents;
+mod backup_download;
 mod completions;
 mod cross_origin_e2e;
 mod doctor_e2e;

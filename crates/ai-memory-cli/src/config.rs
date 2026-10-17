@@ -3134,9 +3134,10 @@ impl Config {
     /// Base URL for `provider`, from the two sources that can supply one.
     ///
     /// An explicit ai-memory setting (`llm_base_url` in `config.toml`, or
-    /// `AI_MEMORY_LLM_BASE_URL`) configures any provider: naming ai-memory is
-    /// how an operator says they mean it, and proxying a vendor endpoint is a
-    /// legitimate deployment.
+    /// `AI_MEMORY_LLM_BASE_URL`) configures every HTTP API provider: naming
+    /// ai-memory is how an operator says they mean it, and proxying a vendor
+    /// endpoint is a legitimate deployment. The ChatGPT backend
+    /// (`openai-oauth`, `codex`) and `cursor`'s CLI take no override.
     ///
     /// The bare `LLM_BASE_URL` is different in kind — a cross-tool convention
     /// an operator exports once for a local Ollama and forgets. It reaches

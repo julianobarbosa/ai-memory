@@ -131,6 +131,9 @@ pub async fn run_curator_report_with_breadth(
         if c.tier != Tier::Episodic || c.pinned || frontmatter_pinned(&c.frontmatter_json) {
             continue;
         }
+        if c.expires_at_us.is_some_and(|us| us <= now_us) {
+            continue;
+        }
         // A2: a page already tiered down (its V65 marker set) is a deliberately
         // short compacted residue, not a fresh cold candidate. The sweep will
         // never touch it again, so the curator must not report it as cold —
@@ -173,7 +176,9 @@ pub async fn run_curator_report_with_breadth(
     cold.sort_by(|a, b| a.message.cmp(&b.message));
     findings.extend(cold.into_iter().take(params.max_findings_per_kind));
 
-    let pages = reader.list_pages(workspace_name, project_name).await?;
+    let pages = reader
+        .list_unexpired_pages(workspace_name, project_name)
+        .await?;
     let mut stale_slots = Vec::new();
     let mut titles: HashMap<String, Vec<String>> = HashMap::new();
     for page in &pages {

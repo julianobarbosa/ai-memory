@@ -12,6 +12,72 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
+  now omits expired pages before evaluating episodic staleness, rule suggestions,
+  duplicate titles, and vector or LLM contradiction candidates, preventing
+  findings for expired pages that are pending forget-sweep deletion.
+  ([#1390](https://github.com/akitaonrails/ai-memory/pull/1390))
+- Fixed curator reporting TTL-expired pages as cold episodic candidates,
+  stale slots, or title collisions. The curator now filters out expired pages
+  before evaluating episodic retention scores, and uses `list_unexpired_pages`
+  when evaluating slot staleness and title uniqueness.
+  ([#1389](https://github.com/akitaonrails/ai-memory/pull/1389))
+- Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
+- Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
+- Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
+  pages. The store query now filters out expired page targets against the
+  current timestamp, preventing `memory_lint` from emitting `feedback_flagged`
+  findings for expired pages that are pending forget-sweep deletion.
+  ([#1388](https://github.com/akitaonrails/ai-memory/pull/1388))
+- Fixed `existing_latest_paths` ignoring page TTL expiration. The query now
+  filters out expired pages against the current timestamp, preventing the
+  consolidation link guard from keeping wikilinks or typed relations targeting
+  expired pages that are pending forget-sweep deletion.
+  ([#1387](https://github.com/akitaonrails/ai-memory/pull/1387))
+- Fixed `page_belief_inputs` counting contradictions against TTL-expired target
+  pages as active live contradictions. When a page declares a `contradicts`
+  relation to a target whose `expires_at` TTL has passed, the declaration is
+  stale and must not weaken belief strength or reduce confidence in retrieval
+  ranking. `contradiction_sql` now applies the `not_expired` guard on the target
+  page, aligning belief input aggregation with the lint's resolved/stale split.
+  ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
+- Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+
+## [3.1.1] - 2026-10-17
+
+### Fixed
+- Prevented the Windows executable from overflowing its small default main
+  thread stack as the async CLI command tree grows. The top-level dispatch now
+  runs on an explicitly sized stack on Windows; the native Windows suite had
+  reached the point where every integration test that launched `ai-memory`
+  aborted before handling its command.
+- Fixed native hook events getting stranded forever when a harness killed the
+  process after the spool file was synced but before its atomic rename. A later
+  drain adopts complete, valid `*.json.tmp` entries after a five-minute grace
+  period and removes malformed old remnants. Claude Code settings installs now
+  give `SessionEnd` a 15-second timeout instead of its 1.5-second default budget;
+  plugin hooks rely on recovery because Claude does not let plugin timeouts
+  raise that budget. (#1377)
+- Hardened OIDC credential transport after CodeQL alert #176: the shared
+  refresh-grant sink now requires a typed TLS-or-loopback endpoint, and device
+  authorization and token polling revalidate their endpoints immediately
+  before each request. A caller-mutated discovery object can no longer bypass
+  the login-time HTTPS check.
+- On Windows, `setup` now starts the logon host with a plain executable path,
+  and the host passes plain drive/UNC data-directory and config arguments to the
+  supervisor and server it launches, instead of the `\\?\` verbatim prefix a
+  canonical path carries. The `Run` value was already plain (3.1.0); this covers
+  the command lines built from `current_exe()` and the canonical data dir. This
+  path cleanup does not by itself resolve Bitdefender's behavioral detection.
+  (#1280)
+- Fixed an explicit `llm_base_url` (or `AI_MEMORY_LLM_BASE_URL`) being dropped
+  for the `anthropic` and `openai` providers. Config resolved the override for
+  every provider, as documented, but the provider factory never applied it to
+  those two, so requests and the API key went straight to api.anthropic.com or
+  api.openai.com with nothing in the log. A gateway or reverse proxy set in front
+  of either vendor now receives the traffic. The docs now name the backends that
+  take no override: the ChatGPT backend behind `openai-oauth` and `codex`, and
+  `cursor`'s CLI. (#1347)
 - Corrected the `ExtractionState::NotApplicable` documentation and aligned the
   generated OpenCode capture policy with the native evaluator: only an active
   policy dropping a search/list tool reports `not-applicable`; an invalid
@@ -1244,7 +1310,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.1...HEAD
+[3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0
 [3.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.0.1
 [3.0.0]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...v3.0.0

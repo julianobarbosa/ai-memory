@@ -666,6 +666,124 @@ async fn web_links_percent_encode_route_segments() {
 }
 
 #[tokio::test]
+async fn encoded_markdown_links_resolve_and_remain_in_the_source_scope() {
+    let (_tmp, store, wiki) = setup().await;
+    let home_ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(home_ws, "scratch", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(home_ws, "other", None)
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "scratch", None)
+        .await
+        .unwrap();
+    for (ws, project, title) in [
+        (home_ws, home, "Home target"),
+        (home_ws, sibling, "Sibling target"),
+        (other_ws, foreign, "Foreign target"),
+    ] {
+        wiki.write_page(wiki_req(ws, project, "notes/my note.md", title))
+            .await
+            .unwrap();
+    }
+    wiki.write_page(wiki_req(
+        home_ws,
+        home,
+        "encoded-source.md",
+        "[note](notes/my%20note.md)",
+    ))
+    .await
+    .unwrap();
+    let links = store
+        .reader
+        .page_links(home_ws, home, "encoded-source.md".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(links.links.len(), 1);
+    assert_eq!(links.links[0].path, "notes/my note.md");
+    assert_eq!(links.links[0].workspace, "default");
+    assert_eq!(links.links[0].project, "scratch");
+    for (ws, project) in [(home_ws, sibling), (other_ws, foreign)] {
+        let target = store
+            .reader
+            .page_links(ws, project, "notes/my note.md".into(), None)
+            .await
+            .unwrap();
+        assert!(
+            target.backlinks.is_empty(),
+            "a home link cannot become a foreign backlink"
+        );
+    }
+    wiki.write_page(wiki_req(
+        home_ws,
+        home,
+        "blocked.md",
+        "[outside](%2e%2e/notes/my%20note.md) [other](other%3Anotes/my%20note.md)",
+    ))
+    .await
+    .unwrap();
+    let blocked = store
+        .reader
+        .page_links(home_ws, home, "blocked.md".into(), None)
+        .await
+        .unwrap();
+    assert!(blocked.links.is_empty());
+    let app = router(store.reader.clone(), wiki.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/encoded-source.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(
+        html.contains("href=\"w/default/scratch/p/notes/my%20note.md\""),
+        "{html}"
+    );
+    assert!(!html.contains("notes/my%2520note.md"), "{html}");
+    let target = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/notes/my%20note.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(target.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(target.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("Home target"));
+    assert!(!html.contains("Sibling target") && !html.contains("Foreign target"));
+}
+
+#[tokio::test]
 async fn smoke_page_not_found_returns_404() {
     let (_tmp, store, wiki) = setup().await;
     let _ws = store

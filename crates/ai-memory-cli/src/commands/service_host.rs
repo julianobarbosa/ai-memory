@@ -279,17 +279,28 @@ fn sleep_unless_stopped(delay: Duration, stop_requested: &dyn Fn() -> bool) {
     }
 }
 
-/// The global arguments that point a child at this install.
+/// The global arguments that point a child at this install. Paths are passed
+/// in their plain spelling, the one the logon entry uses: the data dir is
+/// canonical, and its `\\?\` prefix otherwise reaches the command lines of
+/// the supervisor and the server, where an EDR trace showed it (#1280).
 pub(crate) fn install_args(config: &Config, config_path: Option<&Path>) -> Vec<std::ffi::OsString> {
-    let mut args = vec![
-        "--data-dir".into(),
-        config.data_dir.clone().into_os_string(),
-    ];
+    let mut args = vec!["--data-dir".into(), plain_arg(&config.data_dir)];
     if let Some(path) = config_path {
         args.push("--config".into());
-        args.push(path.as_os_str().to_owned());
+        args.push(plain_arg(path));
     }
     args
+}
+
+/// `path` without a `\\?\` verbatim prefix. A path that is not UTF-8 is
+/// passed as it is.
+fn plain_arg(path: &Path) -> std::ffi::OsString {
+    match path.to_str() {
+        Some(text) => super::path_util::strip_windows_verbatim_prefix(text)
+            .into_owned()
+            .into(),
+        None => path.as_os_str().to_owned(),
+    }
 }
 
 /// Run `service-host`.
@@ -304,7 +315,10 @@ pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Pa
              setup` installs a systemd user unit or a LaunchAgent instead"
         );
     }
+    // `current_exe()` can return a `\\?\` verbatim path; the host launches
+    // itself and the server with it, so strip the prefix there too (#1280).
     let exe = std::env::current_exe().context("locating the running ai-memory binary")?;
+    let exe = std::path::PathBuf::from(plain_arg(&exe));
     let install = install_args(config, config_path);
     if !args.supervise {
         let mut host_args = install.clone();
@@ -797,6 +811,40 @@ mod tests {
         assert_eq!(
             install_args(&config, None),
             ["--data-dir", "/data"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+    }
+
+    /// The data dir is canonical, so on Windows it carries a `\\?\` prefix;
+    /// the supervisor and the server get the plain spelling (#1280).
+    #[test]
+    fn children_get_plain_paths() {
+        let config = Config {
+            data_dir: PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"),
+            ..Config::default()
+        };
+        let config_path = Path::new(r"\\?\C:\Users\me\AppData\Local\ai-memory\config.toml");
+        assert_eq!(
+            install_args(&config, Some(config_path)),
+            [
+                "--data-dir",
+                r"C:\Users\me\AppData\Local\ai-memory",
+                "--config",
+                r"C:\Users\me\AppData\Local\ai-memory\config.toml",
+            ]
+            .map(std::ffi::OsString::from)
+            .to_vec()
+        );
+
+        // A data dir on a share keeps its UNC spelling, and spaces survive.
+        let config = Config {
+            data_dir: PathBuf::from(r"\\?\UNC\server\share\ai memory"),
+            ..Config::default()
+        };
+        assert_eq!(
+            install_args(&config, None),
+            ["--data-dir", r"\\server\share\ai memory"]
                 .map(std::ffi::OsString::from)
                 .to_vec()
         );

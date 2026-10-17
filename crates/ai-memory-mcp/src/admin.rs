@@ -10624,6 +10624,48 @@ mod tests {
         assert!(on_disk.contains("[[decisions/b.md]]"));
     }
 
+    #[tokio::test]
+    async fn export_okf_labels_preserve_links_when_the_bundle_is_reindexed() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/seed.md", "seed").await;
+        let project = scratch_project_dir(tmp.path());
+        std::fs::create_dir_all(project.join("concepts")).unwrap();
+        std::fs::write(
+            project.join("concepts/a.md"),
+            "---\ntype: Concept\n---\n\nSee [[notes/seed.md|array[0] access]].\n",
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        let mut exported = String::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().display().to_string() == "concepts/a.md" {
+                use std::io::Read as _;
+                entry.read_to_string(&mut exported).unwrap();
+            }
+        }
+        let document = ai_memory_wiki::parse(&exported).unwrap();
+        let path = ai_memory_core::PagePath::new("concepts/a.md").unwrap();
+        let links = ai_memory_wiki::extract_links(&document.body, &path);
+        assert_eq!(links.len(), 1, "{exported}");
+        assert_eq!(links[0].path.as_str(), "notes/seed.md");
+    }
+
     /// Post-audit regression: the things a REAL deployment's tree holds
     /// beside concept pages — typed scope manifests and _pending
     /// proposal sidecars — must not block the export. Sidecars are

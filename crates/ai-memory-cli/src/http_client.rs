@@ -12,8 +12,6 @@
 
 use std::fmt;
 use std::io::{BufWriter, Write as _};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -530,7 +528,11 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 ///
 /// Intended for routes whose response is binary (e.g. `POST /admin/backup`
 /// returns an `application/gzip` tarball). On non-2xx the response body is
-/// consumed and returned as an error string. Returns bytes written.
+/// consumed and returned as an error string. Returns bytes written. A completed
+/// download atomically replaces the destination path; a destination symlink is
+/// replaced rather than modifying the file it points to. Replacement symlinks
+/// and new destinations use private permissions; only existing regular files
+/// retain their permissions.
 ///
 /// # Errors
 /// Returns an error when the connection fails, the response is non-2xx,
@@ -544,9 +546,10 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
     let mut resp = require_success(reqwest::Method::POST, resp).await?;
-    let file = private_output_file(dest)
-        .with_context(|| format!("creating output file {}", dest.display()))?;
-    let mut writer = BufWriter::new(file);
+    let permissions = checked_output_permissions(dest)?;
+    let mut temporary = private_output_file(dest)
+        .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
+    let mut writer = BufWriter::new(temporary.as_file_mut());
     let mut written = 0_u64;
     while let Some(chunk) = resp
         .chunk()
@@ -561,18 +564,72 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     writer
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
+    drop(writer);
+    // A failed response must leave the previous archive usable. The temporary
+    // file stays private until the entire response has arrived.
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("preserving permissions for {}", dest.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary output beside {}", dest.display()))?;
+    let persisted = temporary
+        .persist(dest)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replacing output file {}", dest.display()))?;
+    persisted
+        .sync_all()
+        .with_context(|| format!("syncing output file {}", dest.display()))?;
+    if let Ok(directory) = std::fs::File::open(output_parent(dest)) {
+        let _ = directory.sync_all();
+    }
     Ok(written)
 }
 
-/// Open a downloaded backup output file with private permissions before the
-/// first response bytes are written. Existing user-selected output files keep
-/// their existing permissions when overwritten.
-fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path)
+/// Atomic replacement still requires permission to write an existing regular
+/// file. Opening without create or truncate checks OS permissions and ACLs
+/// without changing the archive before the response is complete.
+fn checked_output_permissions(dest: &Path) -> Result<Option<std::fs::Permissions>> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(None),
+        Ok(metadata) if metadata.is_file() => {
+            let probe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .with_context(|| {
+                    format!(
+                        "checking output file write permission for {}",
+                        dest.display()
+                    )
+                })?;
+            drop(probe);
+            Ok(Some(metadata.permissions()))
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            anyhow::bail!("output path is a directory: {}", dest.display());
+        }
+        Ok(_) => anyhow::bail!("output path is not a regular file: {}", dest.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("reading output file permissions"),
+    }
+}
+
+/// Download beside the destination so publication is an atomic rename on the
+/// same filesystem. NamedTempFile removes an incomplete response on every exit.
+fn private_output_file(path: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(".ai-memory-download.")
+        .tempfile_in(output_parent(path))
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(test)]
@@ -599,6 +656,19 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn output_write_permission_probe_never_truncates_existing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        std::fs::write(&output, b"previous usable archive").unwrap();
+        assert!(
+            super::checked_output_permissions(&output)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous usable archive");
+    }
+
     #[cfg(unix)]
     #[test]
     fn downloaded_backup_output_is_private_when_created() {
@@ -606,9 +676,13 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("backup.tar.gz");
-        private_output_file(&output).unwrap();
+        let temporary = private_output_file(&output).unwrap();
+        assert!(
+            !output.exists(),
+            "download is not published before completion"
+        );
         assert_eq!(
-            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            temporary.as_file().metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
     }

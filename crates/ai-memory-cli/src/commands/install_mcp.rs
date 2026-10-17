@@ -3866,7 +3866,12 @@ mod tests {
 
     #[test]
     fn bridge_entries_are_recognized_by_bare_name_or_absolute_path() {
-        for command in ["ai-memory", "/opt/ai-memory/ai-memory"] {
+        #[cfg(windows)]
+        let absolute_command = r"C:\opt\ai-memory.exe";
+        #[cfg(not(windows))]
+        let absolute_command = "/opt/ai-memory/ai-memory";
+
+        for command in ["ai-memory", absolute_command] {
             let entry =
                 json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
             assert_eq!(bridge_entry_url(&entry), Some("http://h/mcp"), "{command}");
@@ -4233,8 +4238,10 @@ mod tests {
         let mut doc = toml_edit::DocumentMut::new();
         grok_upsert_mcp_server(&mut doc, &grok).unwrap();
         let text = doc.to_string();
-        assert!(
-            text.contains(&format!("command = {:?}", bridge_command())),
+        let expected_command = bridge_command();
+        assert_eq!(
+            doc["mcp_servers"]["ai-memory"]["command"].as_str(),
+            Some(expected_command.as_str()),
             "{text}"
         );
         assert!(!text.contains("url ="), "{text}");

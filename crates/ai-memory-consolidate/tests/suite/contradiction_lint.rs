@@ -322,3 +322,46 @@ async fn no_embeddings_is_a_clean_no_op() {
         without_coord.findings
     );
 }
+
+/// An expired semantic page in the contradiction band must not produce a
+/// contradiction finding against an active page.
+#[tokio::test]
+async fn contradiction_pass_skips_expired_pages() {
+    let fx = seed_fixture().await;
+    let live = write_semantic(&fx, "concepts/live-claim.md", "The retry budget is 5.").await;
+    let expired = write_semantic(&fx, "concepts/expired-claim.md", "The retry budget is 3.").await;
+    seed_embedding(&fx, live, &[1.0, 0.0]);
+    seed_embedding(&fx, expired, &[0.6, 0.8]);
+
+    {
+        let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+        conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+        conn.execute(
+            "UPDATE pages SET expires_at = 1 \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                fx.ws.as_bytes(),
+                fx.proj.as_bytes(),
+                "concepts/expired-claim.md"
+            ],
+        )
+        .unwrap();
+    }
+
+    let report = run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        None,
+        fx.ws,
+        fx.proj,
+        options(coord()),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !report.findings.iter().any(|f| f.kind == "contradiction"),
+        "expired pages must not produce contradiction findings: {:?}",
+        report.findings
+    );
+}

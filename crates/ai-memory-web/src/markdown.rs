@@ -114,10 +114,22 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
         Some(i) => (&trimmed[..i], &trimmed[i..]),
         None => (trimmed, ""),
     };
-    if path_part.is_empty() || path_part.contains("..") {
-        return dest; // don't rewrite traversal; safe_url/router will reject
+    let Some(decoded) = ai_memory_wiki::decode_markdown_destination_path(path_part) else {
+        return CowStr::Borrowed("#");
+    };
+    let decoded_path = decoded.as_ref();
+    if decoded_path.is_empty()
+        || decoded_path.contains("..")
+        || decoded_path.starts_with('/')
+        || decoded_path.contains(['\\', ':'])
+    {
+        return if decoded_path == path_part {
+            dest
+        } else {
+            CowStr::Borrowed("#")
+        };
     }
-    let mut path_part = path_part.trim_end_matches('/');
+    let mut path_part = decoded_path.trim_end_matches('/');
     while let Some(rest) = path_part.strip_prefix("./") {
         path_part = rest;
     }
@@ -978,6 +990,53 @@ mod tests {
         assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
         assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
         assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
+    }
+
+    #[test]
+    fn markdown_url_destinations_are_decoded_once_before_route_encoding() {
+        let html = render(
+            "[space](notes/my%20note.md#part) [literal percent](notes/my%2520note.md) \
+             [separator](notes%2Fmy%20note.md) [unicode](notes/%E6%97%A5%E6%9C%AC.md)",
+            "default",
+            "scratch",
+        );
+        for href in [
+            "w/default/scratch/p/notes/my%20note.md#part",
+            "w/default/scratch/p/notes/my%2520note.md",
+            "w/default/scratch/p/notes/%E6%97%A5%E6%9C%AC.md",
+        ] {
+            assert!(html.contains(href), "{html}");
+        }
+        let wiki = render("[[notes/my%20note.md]]", "default", "scratch");
+        assert!(
+            wiki.contains("w/default/scratch/p/notes/my%2520note.md"),
+            "{wiki}"
+        );
+    }
+
+    #[test]
+    fn decoded_markdown_destinations_cannot_change_the_web_scope() {
+        for destination in [
+            "%2e%2e/secret.md",
+            "%2Fadmin/backup",
+            "notes%5Csecret.md",
+            "other%3Anotes/secret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            let html = render(&format!("[note](<{destination}>)"), "default", "scratch");
+            assert!(html.contains("href=\"#\""), "{destination}: {html}");
+        }
+        let html = render(
+            "[note](%77/foreign/project/p/secret.md)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains("w/default/scratch/p/w/foreign/project/p/secret.md"),
+            "{html}"
+        );
     }
 
     #[test]

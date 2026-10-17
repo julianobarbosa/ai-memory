@@ -76,6 +76,9 @@ const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
 /// (the cap is a soft bound), never discarded.
 const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+/// A live enqueuer may still own its `*.json.tmp`; only recover one after a
+/// much longer interval than the hook's normal write and fsync latency.
+const STRANDED_TEMP_GRACE_MS: u64 = 5 * 60 * 1000;
 const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_TOMBSTONES: usize = 512;
 const MAX_RECOVERY_SWEEP_DIRS: usize = 1_024;
@@ -397,6 +400,99 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = opts.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TempRecovery {
+    adopted: usize,
+    dropped: usize,
+    unreadable: usize,
+}
+
+/// Recover complete enqueue files left between `sync_all` and the atomic
+/// rename. The age gate keeps an in-flight writer out; the filename and body
+/// checks keep unrelated temp files out. Malformed old files cannot become
+/// deliverable and are deleted so private partial capture does not accumulate.
+fn recover_stranded_temp_entries(spool: &Path, now: u64) -> std::io::Result<TempRecovery> {
+    let entries = match std::fs::read_dir(spool) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TempRecovery::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut result = TempRecovery::default();
+    let mut examined = 0usize;
+    for item in entries {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => {
+                result.unreadable += 1;
+                continue;
+            }
+        };
+        let path = item.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(final_name) = name.strip_suffix(".tmp") else {
+            continue;
+        };
+        let Some(created_ms) = created_ms_from_name(final_name) else {
+            continue;
+        };
+        examined += 1;
+        if examined > MAX_SPOOL_FILES || now.saturating_sub(created_ms) < STRANDED_TEMP_GRACE_MS {
+            continue;
+        }
+        let bytes = match read_spool_entry_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                if std::fs::remove_file(&path).is_ok() {
+                    result.dropped += 1;
+                } else {
+                    result.unreadable += 1;
+                }
+                continue;
+            }
+            Err(_) => {
+                result.unreadable += 1;
+                continue;
+            }
+        };
+        let valid = serde_json::from_slice::<SpoolEntry>(&bytes)
+            .is_ok_and(|entry| entry.created_ms == created_ms);
+        if !valid {
+            if std::fs::remove_file(&path).is_ok() {
+                result.dropped += 1;
+            } else {
+                result.unreadable += 1;
+            }
+            continue;
+        }
+        let final_path = spool.join(final_name);
+        if final_path.exists() {
+            // The atomic rename may have completed before a copied/stale temp
+            // appeared. Remove only a byte-identical duplicate; never replace
+            // a different queued event.
+            match read_spool_entry_bytes(&final_path) {
+                Ok(final_bytes) if final_bytes == bytes => {
+                    if std::fs::remove_file(&path).is_ok() {
+                        result.adopted += 1;
+                    } else {
+                        result.unreadable += 1;
+                    }
+                }
+                _ => result.unreadable += 1,
+            }
+            continue;
+        }
+        match std::fs::rename(&path, &final_path) {
+            Ok(()) => result.adopted += 1,
+            Err(_) => result.unreadable += 1,
+        }
+    }
+    Ok(result)
 }
 
 /// Build a [`SpoolEntry`] for the current event, choosing the auth mode from
@@ -1343,6 +1439,28 @@ pub async fn drain_with_live_token(
     live_token: Option<&str>,
     max_attempts: MaxAttempts,
 ) -> DrainResult {
+    let recovery = match recover_stranded_temp_entries(spool, now_ms()) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            eprintln!(
+                "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
+                spool.display()
+            );
+            TempRecovery {
+                unreadable: 1,
+                ..TempRecovery::default()
+            }
+        }
+    };
+    if recovery.adopted > 0 || recovery.dropped > 0 || recovery.unreadable > 0 {
+        eprintln!(
+            "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
+            recovery.adopted,
+            recovery.dropped,
+            recovery.unreadable,
+            if recovery.unreadable == 1 { "y" } else { "ies" }
+        );
+    }
     let (mut files, unreadable) = match list_entries(spool) {
         Ok(listed) => listed,
         Err(e) => {
@@ -1369,7 +1487,11 @@ pub async fn drain_with_live_token(
     let started = Instant::now();
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
-    let mut result = DrainResult::default();
+    let mut result = DrainResult {
+        remaining: unreadable.saturating_add(recovery.unreadable),
+        dropped: recovery.dropped,
+        ..DrainResult::default()
+    };
     let max_attempts = max_attempts.0;
 
     let mut idx = 0;
@@ -2402,6 +2524,79 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stranded_complete_temp_entry_is_adopted_only_after_the_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        create_spool_dir(&spool).unwrap();
+        let created_ms = 1_000_000;
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=session-end&agent=claude-code".into(),
+            body: r#"{"session_id":"native-1"}"#.into(),
+            created_ms,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let final_name = format!("{created_ms:013}-42-0000000000000001-key.json");
+        let tmp_path = spool.join(format!("{final_name}.tmp"));
+        write_private(&tmp_path, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            recover_stranded_temp_entries(
+                &spool,
+                created_ms + STRANDED_TEMP_GRACE_MS.saturating_sub(1)
+            )
+            .unwrap(),
+            TempRecovery::default(),
+            "a possibly live writer is left alone"
+        );
+        assert!(tmp_path.is_file());
+
+        assert_eq!(
+            recover_stranded_temp_entries(&spool, created_ms + STRANDED_TEMP_GRACE_MS).unwrap(),
+            TempRecovery {
+                adopted: 1,
+                ..TempRecovery::default()
+            }
+        );
+        assert!(!tmp_path.exists());
+        assert!(spool.join(final_name).is_file());
+        assert_eq!(spool_len(&spool), 1);
+    }
+
+    #[test]
+    fn stranded_malformed_or_mismatched_temp_entries_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        create_spool_dir(&spool).unwrap();
+        let created_ms = 1_000_000;
+        let malformed = spool.join(format!("{created_ms:013}-42-0000000000000001-key.json.tmp"));
+        write_private(&malformed, b"{not complete").unwrap();
+        let mismatched = spool.join(format!("{created_ms:013}-42-0000000000000002-key.json.tmp"));
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=session-end&agent=claude-code".into(),
+            body: r#"{"session_id":"native-1"}"#.into(),
+            created_ms: created_ms + 1,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        write_private(&mismatched, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            recover_stranded_temp_entries(&spool, created_ms + STRANDED_TEMP_GRACE_MS).unwrap(),
+            TempRecovery {
+                dropped: 2,
+                ..TempRecovery::default()
+            }
+        );
+        assert!(!malformed.exists());
+        assert!(!mismatched.exists());
+    }
 
     #[test]
     fn correlated_session_entries_quarantine_and_restore_without_touching_others() {
@@ -5176,6 +5371,40 @@ mod tests {
             1,
             "three events ride ONE /hook/batch request (RTT amortized)"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_adopts_and_delivers_a_complete_stranded_temp_entry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let created_ms = now_ms().saturating_sub(STRANDED_TEMP_GRACE_MS + 1);
+        let mut entry = entry_for(
+            format!("http://{addr}/hook?event=session-end"),
+            r#"{"session_id":"native-1"}"#.into(),
+            None,
+            false,
+        );
+        entry.created_ms = created_ms;
+        let temp_path = spool.join(format!("{created_ms:013}-42-0000000000000001-key.json.tmp"));
+        write_private(&temp_path, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        let result = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(result.dropped, 0);
+        assert!(!temp_path.exists());
+        assert_eq!(spool_len(&spool), 0);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

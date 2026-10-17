@@ -382,7 +382,7 @@ fn render_windows(spec: &ServiceSpec) -> Result<ServiceUnit> {
         path: unit_path(ServiceManager::WindowsRun, &spec.home, None),
         contents,
         host: Some(HostLaunch {
-            exe: spec.exe.clone(),
+            exe: PathBuf::from(exe),
             args: ["--data-dir", data_dir, "--config", config, SERVICE_HOST]
                 .map(str::to_owned)
                 .to_vec(),
@@ -1864,6 +1864,15 @@ mod windows_entry_tests {
             ),
             "{}",
             unit.contents
+        );
+        // `setup` starts the host with this command line too, and the
+        // verbatim program path showed up in an EDR's process tree there.
+        let host = unit.host.unwrap();
+        assert_eq!(host.exe, PathBuf::from(r"C:\Users\me\ai\ai-memory.exe"));
+        assert!(
+            host.args.iter().all(|arg| !arg.contains(r"\\?\")),
+            "{:?}",
+            host.args
         );
     }
 

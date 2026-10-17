@@ -49,6 +49,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
+/// A settings-file timeout raises that budget (up to Claude's 60-second cap),
+/// leaving room for a slow local spool fsync without making other hooks wait.
+pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
+
 /// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
 /// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
 /// fires `PostToolUse` on successful calls only and reports failures
@@ -680,7 +685,7 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -692,7 +697,7 @@ pub(crate) fn build_claude_code_payload(
             None,
             None,
         ),
-    )
+    ))
 }
 
 pub(crate) fn build_claude_code_payload_with_data_dir(
@@ -743,7 +748,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     capture_assistant: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -752,7 +757,20 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
             .with_capture_assistant(capture_assistant),
-    )
+    ))
+}
+
+fn with_claude_session_end_timeout(mut payload: Value) -> Value {
+    if let Some(handler) = payload
+        .pointer_mut("/hooks/SessionEnd/0/hooks/0")
+        .and_then(Value::as_object_mut)
+    {
+        handler.insert(
+            "timeout".into(),
+            Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS),
+        );
+    }
+    payload
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
@@ -3520,6 +3538,14 @@ if (inheritOnly) {
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
+        assert_eq!(
+            v.pointer("/hooks/SessionEnd/0/hooks/0/timeout"),
+            Some(&Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS))
+        );
+        assert!(
+            v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
+            "only the cancellation-prone SessionEnd budget is raised"
+        );
     }
 
     #[test]

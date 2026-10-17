@@ -764,31 +764,45 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
 }
 
 fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
-    let mut start_at = 0;
-    while let Some(rel_start) = line[start_at..].find('[') {
-        let start = start_at + rel_start;
-        if start > 0 && line.as_bytes()[start - 1] == b'!' {
-            start_at = start + 1;
-            continue;
+    // Track labels in one pass: rescanning an unmatched outer label would
+    // make repeated `[` quadratic and hide valid inner links.
+    let mut labels = Vec::new();
+    let mut last_escaped = None;
+    let mut pos = 0;
+    while pos < line.len() {
+        match line.as_bytes()[pos] {
+            b'\\' => {
+                pos += 1;
+                if let Some(next) = line[pos..].chars().next() {
+                    last_escaped = Some(pos);
+                    pos += next.len_utf8();
+                }
+            }
+            b'[' => {
+                labels.push(
+                    pos > 0 && line.as_bytes()[pos - 1] == b'!' && last_escaped != Some(pos - 1),
+                );
+                pos += 1;
+            }
+            b']' => {
+                let image = labels.pop();
+                pos += 1;
+                if let Some(image) = image
+                    && line.as_bytes().get(pos) == Some(&b'(')
+                    && let Some((raw, target_end)) = parse_link_destination(&line[pos + 1..])
+                {
+                    if !image && let Some(path) = normalize_link_target(raw, page_path, false) {
+                        out.insert((None, None, path));
+                    }
+                    pos += target_end + 2;
+                    // Images may appear in a link's label; links may not.
+                    if !image {
+                        labels.clear();
+                    }
+                }
+            }
+            _ => pos += 1,
         }
-        let after_start = start + 1;
-        let Some(rel_close) = line[after_start..].find(']') else {
-            break;
-        };
-        let close = after_start + rel_close;
-        if !line[close + 1..].starts_with('(') {
-            start_at = close + 1;
-            continue;
-        }
-        let target_start = close + 2;
-        let Some((raw, target_end)) = parse_link_destination(&line[target_start..]) else {
-            start_at = close + 1;
-            continue;
-        };
-        if let Some(path) = normalize_link_target(raw, page_path, false) {
-            out.insert((None, None, path));
-        }
-        start_at = target_start + target_end + 1;
     }
 }
 
@@ -883,6 +897,48 @@ fn closing_paren_after_destination(tail: &str) -> Option<usize> {
     None
 }
 
+/// Decode the path portion of an ordinary Markdown URL destination once.
+///
+/// Split literal query and fragment delimiters before calling this helper:
+/// an encoded `%23` or `%3F` names a character in the filename. Wikilinks
+/// name literal page paths and must not go through URL decoding. Invalid
+/// escape spellings stay literal; invalid UTF-8 and encoded control bytes
+/// have no portable page-path representation and are refused.
+#[must_use]
+pub fn decode_markdown_destination_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !path.contains('%') {
+        return Some(std::borrow::Cow::Borrowed(path));
+    }
+    let mut decoded = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes
+                    .get(pos + 1)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+                bytes
+                    .get(pos + 2)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+            )
+        {
+            let byte = (hi * 16 + lo) as u8;
+            if byte.is_ascii_control() {
+                return None;
+            }
+            decoded.push(byte);
+            pos += 3;
+        } else {
+            decoded.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(std::borrow::Cow::Owned)
+}
+
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
     let target = raw
         .split_once('|')
@@ -890,26 +946,27 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
         .trim()
         .trim_matches('<')
         .trim_matches('>');
-    if target.is_empty() || target.starts_with('#') || target.contains("://") {
+    if target.is_empty() || target.starts_with('#') {
         return None;
     }
+    let path = target.split(['#', '?']).next()?.trim();
+    let decoded = if wikilink {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        decode_markdown_destination_path(path)?
+    };
+    let target = decoded.as_ref();
     let lower = target.to_ascii_lowercase();
-    if lower.starts_with("mailto:")
+    if target.is_empty()
+        || target.contains("://")
+        || target.contains('\\')
+        || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
         || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
         || lower.starts_with("file:")
     {
-        return None;
-    }
-
-    let target = target.split_once('#').map_or(target, |(path, _)| path);
-    let target = target
-        .split_once('?')
-        .map_or(target, |(path, _)| path)
-        .trim();
-    if target.is_empty() || target.contains('\\') {
         return None;
     }
 
@@ -1963,6 +2020,59 @@ mod tests {
     }
 
     #[test]
+    fn extract_links_handles_nested_and_escaped_labels() {
+        for label in [
+            "array[0] access",
+            r"array\[0\] access",
+            r"closing \] bracket",
+            r"literal \\ [index]",
+            "日本語 [索引]",
+            "outer [middle [inner]] label",
+        ] {
+            assert_eq!(linked(&format!("[{label}](b.md)")), ["b.md"], "{label}");
+        }
+        assert_eq!(linked("[unclosed [inner](b.md)"), ["b.md"]);
+        assert_eq!(linked("[outer [inner](b.md)](c.md)"), ["b.md"]);
+        assert!(linked(r"\[literal](b.md)").is_empty());
+        assert!(linked("![array[0] access](b.md)").is_empty());
+        assert_eq!(linked("[outer ![icon](image.png)](b.md)"), ["b.md"]);
+        assert_eq!(linked(r"\![label](b.md)"), ["b.md"]);
+        assert!(linked("`[array[0] access](b.md)`").is_empty());
+        assert!(linked("[unclosed [label]").is_empty());
+    }
+
+    #[test]
+    fn export_labels_keep_their_link_when_reindexed() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        for label in ["array[0] access", r"C:\work\notes", "日本語 [索引]"] {
+            let source = format!("[[notes/array.md|{label}]]");
+            let rewritten = rewrite_local_wikilinks(&source, &path, "proj");
+            assert_eq!(
+                extract_links(&rewritten, &path)
+                    .iter()
+                    .map(|link| link.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["notes/array.md"],
+                "{rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_links_stays_linear_on_nested_and_unclosed_labels() {
+        let root = PagePath::new("here.md").unwrap();
+        let started = std::time::Instant::now();
+        for body in [
+            "[".repeat(256 * 1024),
+            format!("{}[kept](b.md)", "[".repeat(256 * 1024)),
+            format!("{}{}(b.md)", "[".repeat(128 * 1024), "]".repeat(128 * 1024)),
+        ] {
+            let _ = extract_links(&body, &root);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
     fn extract_links_rejects_pointy_destination_followed_by_junk() {
         assert!(linked("[a](<b.md>zzz)").is_empty());
         // A title must be separated from the destination by whitespace.
@@ -2054,5 +2164,54 @@ mod tests {
         // Without whitespace or parens a bare destination holds them fine.
         let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, "proj");
         assert!(bare.ends_with("](../notes/a>b.md)"), "{bare}");
+    }
+
+    #[test]
+    fn markdown_url_paths_decode_once_before_link_resolution() {
+        for (destination, expected) in [
+            ("notes/my%20note.md", "notes/my note.md"),
+            ("notes/%E6%97%A5%E6%9C%AC.md", "notes/日本.md"),
+            ("notes/my%23note.md#section", "notes/my#note.md"),
+            ("notes/my%3Fnote.md?view=1", "notes/my?note.md"),
+            ("notes/my%2520note.md", "notes/my%20note.md"),
+            ("notes%2Fmy%20note.md", "notes/my note.md"),
+            ("notes/%zz.md", "notes/%zz.md"),
+            ("notes/%2.md", "notes/%2.md"),
+        ] {
+            let root = PagePath::new("source.md").unwrap();
+            let links = extract_links(&format!("[note](<{destination}>)"), &root);
+            assert_eq!(links.len(), 1, "{destination}");
+            assert_eq!(links[0].path.as_str(), expected, "{destination}");
+            assert_eq!(links[0].workspace, None);
+            assert_eq!(links[0].project, None);
+        }
+        assert_eq!(linked("[[notes/my%20note.md]]"), ["notes/my%20note.md"]);
+    }
+
+    #[test]
+    fn decoded_markdown_paths_cannot_escape_or_change_scope() {
+        let root = PagePath::new("source.md").unwrap();
+        for destination in [
+            "%2e%2e/secret.md",
+            "notes/%2e%2e/%2e%2e/secret.md",
+            "notes%5Csecret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "%66ile%3Asecret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            assert!(
+                extract_links(&format!("[note](<{destination}>)"), &root).is_empty(),
+                "{destination} must not become a page target"
+            );
+        }
+        let links = extract_links("[note](other%3Anotes/secret.md)", &root);
+        assert!(
+            links
+                .iter()
+                .all(|link| link.workspace.is_none() && link.project.is_none())
+        );
+        let links = extract_links("[note](notes/%2e%2e/inside.md)", &root);
+        assert_eq!(links[0].path.as_str(), "inside.md");
     }
 }

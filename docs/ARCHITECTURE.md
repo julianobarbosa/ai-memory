@@ -1310,8 +1310,10 @@ ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
                            opencode (defaults to the Go endpoint, set
                            https://opencode.ai/zen/v1 for Zen's catalogue).
-                           Applies to any provider: naming ai-memory is how an
-                           operator says a vendor endpoint is proxied on purpose
+                           Applies to every HTTP API provider: naming ai-memory
+                           is how an operator says a vendor endpoint is proxied
+                           on purpose. The ChatGPT backend (openai-oauth, codex)
+                           and cursor's CLI have no override
 LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
                            openai-compat and opencode only. Providers with a
                            fixed vendor endpoint (anthropic, openai, gemini,

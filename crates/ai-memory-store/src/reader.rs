@@ -5603,8 +5603,8 @@ impl ReaderPool {
     /// `reconsolidation` kinds — the breadth signal — and `newest_evidence_us`
     /// is `MAX(created_at)`. The contradiction count is the number of
     /// `contradicts` edges the page declares whose target resolves to a *live*
-    /// (latest) page; a stale (dangling) contradiction does not weaken the
-    /// belief, matching the lint's resolved/stale split.
+    /// (latest unexpired) page; a stale (dangling or expired) contradiction does
+    /// not weaken the belief, matching the lint's resolved/stale split.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -5658,22 +5658,29 @@ impl ReaderPool {
             }
 
             // Live contradictions each page declares. Only edges whose target
-            // resolves to a latest page count — a dangling `contradicts` is
-            // stale, not an active disagreement (mirrors the lint split).
+            // resolves to a latest unexpired page count — a dangling or
+            // expired `contradicts` is stale, not an active disagreement
+            // (mirrors the lint split).
+            let now = now_us();
+            let to_ttl = not_expired("tp", "?");
             let contradiction_sql = format!(
                 "SELECT l.from_page_id, COUNT(*) \
                  FROM links l \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
                  WHERE l.link_type = 'contradicts' \
                    AND l.from_page_id IN ({placeholders}) \
                  GROUP BY l.from_page_id"
             );
             let mut stmt = conn.prepare(&contradiction_sql)?;
-            let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((id, n))
-            })?;
+            let now_val = Value::Integer(now);
+            let rows = stmt.query_map(
+                params_from_iter(std::iter::once(&now_val).chain(page_id_blobs.iter())),
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((id, n))
+                },
+            )?;
             for r in rows {
                 let (id, n) = r?;
                 let entry = out.entry(PageId::from_slice(&id)?).or_default();
@@ -5909,7 +5916,7 @@ impl ReaderPool {
         .await
     }
 
-    /// Return `stale` / `wrong` feedback still attached to a *current*
+    /// Return `stale` / `wrong` feedback still attached to a *current* unexpired
     /// page version in one project, grouped by (page, kind) — the input
     /// for the lint pass's `feedback_flagged` findings. Rewriting a
     /// flagged page supersedes the version the feedback points at, so
@@ -5924,21 +5931,24 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<FeedbackFinding>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let ttl = not_expired("pg", "?3");
+            let sql = format!(
                 "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
                         (SELECT reason FROM page_feedback r \
                           WHERE r.page_id = f.page_id AND r.kind = f.kind \
                             AND r.reason IS NOT NULL \
                           ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
                  FROM page_feedback f \
-                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1{ttl} \
                  WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
                    AND f.kind IN ('stale', 'wrong') \
                  GROUP BY f.page_id, pg.path, f.kind \
                  ORDER BY latest DESC, pg.path ASC, f.kind ASC",
-            )?;
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let path: String = row.get(0)?;
                     let kind: String = row.get(1)?;
@@ -9636,8 +9646,8 @@ impl ReaderPool {
 
     /// All `is_latest = 1` pages under a given (workspace, project),
     /// ordered by path ascending, TTL-expired pages included: a project
-    /// move copies every current page, and the curator reports on every
-    /// one. A listing shown to a reader uses [`Self::list_unexpired_pages`].
+    /// move copies every current page. Reader-facing listings and curator
+    /// reports use [`Self::list_unexpired_pages`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -10091,8 +10101,8 @@ impl ReaderPool {
         .await
     }
 
-    /// Return the subset of `paths` that name a latest page in this scope, in
-    /// a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
+    /// Return the subset of `paths` that name a latest unexpired page in this
+    /// scope, in a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
     /// for callers that need to know *which* paths resolve — the consolidation
     /// link guard validates proposed cross-scope wikilinks against it (#1218).
     ///
@@ -10121,11 +10131,12 @@ impl ReaderPool {
             let placeholders = std::iter::repeat_n("?", distinct.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let ttl = not_expired("pg", "?3");
             let sql = format!(
                 "SELECT pg.path FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = p.workspace_id \
-                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1 \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{ttl} \
                    AND (p.access_mode <> 'restricted' \
                         OR (w.name = '{global_ws}' AND p.name = '{global_proj}')) \
                    AND pg.path IN ({placeholders})",
@@ -10135,9 +10146,11 @@ impl ReaderPool {
             let mut stmt = conn.prepare(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
-            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            let now = now_us();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 3);
             binds.push(ws_bytes as &dyn rusqlite::ToSql);
             binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            binds.push(&now as &dyn rusqlite::ToSql);
             for p in &distinct {
                 binds.push(p as &dyn rusqlite::ToSql);
             }
