@@ -765,3 +765,64 @@ async fn mixed_capture_count_scopes_observations_and_preserves_owner_and_window(
             .is_empty()
     );
 }
+
+/// The health panel's server-wide queue read: counts per state, the newest
+/// completion and the oldest pending request. No ids, scopes or error text.
+#[tokio::test]
+async fn consolidation_queue_counts_states_and_bounds_times() {
+    let (_tmp, store) = open_seeded();
+    assert_eq!(
+        store.reader.session_consolidation_queue().await.unwrap(),
+        ai_memory_store::SessionConsolidationQueue::default(),
+        "an empty queue reports nothing"
+    );
+    let conn = Connection::open(store.db_path()).unwrap();
+    for (sid, proj, generation, state, requested, completed, error) in [
+        (10, proj_a(), 1, "completed", NOW, Some(NOW + 5), None),
+        (10, proj_a(), 2, "pending", NOW + 10, None, None),
+        (11, proj_a(), 1, "pending", NOW + 3, None, None),
+        (12, proj_b(), 1, "completed", NOW + 1, Some(NOW + 9), None),
+        (
+            12,
+            proj_b(),
+            2,
+            "failed",
+            NOW + 2,
+            Some(NOW + 20),
+            Some("sk-provider-body"),
+        ),
+        (13, proj_a(), 1, "running", NOW + 4, None, None),
+        (13, proj_a(), 2, "superseded", NOW + 4, None, None),
+    ] {
+        conn.execute(
+            "INSERT INTO session_consolidation_jobs \
+             (session_id, workspace_id, project_id, generation, state, requested_at, \
+              next_attempt_at, completed_at, attempts, last_error) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1, ?8)",
+            params![
+                session(sid).as_bytes(),
+                ws().as_bytes(),
+                proj.as_bytes(),
+                generation,
+                state,
+                requested,
+                completed,
+                error
+            ],
+        )
+        .unwrap();
+    }
+    let queue = store.reader.session_consolidation_queue().await.unwrap();
+    assert_eq!(
+        queue,
+        ai_memory_store::SessionConsolidationQueue {
+            pending: 2,
+            running: 1,
+            completed: 2,
+            failed: 1,
+            // The failed job's later `completed_at` is not a completion.
+            last_completed_at_us: Some(NOW + 9),
+            oldest_pending_requested_at_us: Some(NOW + 3),
+        }
+    );
+}

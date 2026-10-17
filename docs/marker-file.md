@@ -12,12 +12,12 @@ without one uses `project = basename($cwd)`. That works for a solo developer in
 `~/projects/<repo>` but breaks down
 for the cases this marker file is built for:
 
-- **Multi-client consultancies** with `~/projects/<client>/<repo>` —
+- **Multi-client consultancies** with `~/projects/<client>/<repo>`:
   every client should land in a dedicated workspace, not "default".
 - **Work / personal / open-source separation** for solo developers
   who want isolation by life context.
 - **Mono-repos** where you'd like all packages under one project
-  (instead of basename-of-each-package buckets) — or each package
+  (instead of basename-of-each-package buckets), or each package
   under its own project, your call.
 
 The marker file lets you declare these mappings without forking
@@ -70,6 +70,28 @@ A marker `project` remains the canonical requested name. Its validated `aliases`
 travel as one percent-encoded JSON-array `aliases` query value on both hook and
 handoff requests, and are ignored unless the checkout supplies a normalized
 hostful git-remote identity.
+
+## Create a marker interactively
+
+Run this from anywhere inside a checkout to create a marker at the current
+worktree root:
+
+```bash
+ai-memory project init
+```
+
+The command asks for `workspace` and `project`. Each default is the scope the
+CLI and hooks already resolve for the checkout: an inherited marker's value,
+else the project derived from the normalized `upstream`, then `origin`, remote
+(`github.com/acme/api` → `default` / `acme-api`), else the root directory name.
+Accepting the defaults therefore pins the scope your memory already lives in.
+Outside Git, the marker is written to the current directory.
+
+A name may not contain `/`, `\`, whitespace or control characters. The
+command needs an interactive terminal, never overwrites an existing marker,
+and writes only `workspace` and `project`, so every other key keeps its
+default until you add it. In a repository, commit the file so every checkout
+and worktree routes the same way.
 
 ## Schema
 
@@ -139,9 +161,9 @@ default_global = "true"
 # Optional. Inject a compiled project brief at session start (and after a
 # context clear — Claude Code re-fires SessionStart on /clear): the
 # session-start handoff fetch also returns this project's pinned /
-# `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
-# page titles, so the agent starts with the architecture context instead
-# of re-exploring the codebase. Appended AFTER any pending handoff, and
+# `_rules/` / `_slots/` wiki pages plus recently-updated page titles, so the
+# agent starts with the architecture context instead of re-exploring the
+# codebase. Appended AFTER any pending handoff, and
 # unlike the handoff it is not consumed — it is recomposed every opted-in
 # session start. Only agents whose session-start hook injects stdout as
 # context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
@@ -155,12 +177,17 @@ default_global = "true"
 inject_on_session_start = "true"
 
 # Optional. Char budget for the WHOLE brief (~4 chars per token), headers
-# and footers included. Bodies over budget are truncated with a visible
-# note; crowded-out core pages are listed by path so the agent can
-# `memory_query` them, degrading to a count when even the paths do not
-# fit. Page bodies are served first, then those pointer sections out of
-# what is left; the security notice and the untrusted-history markers are
-# never traded for content. Clamped server-side to [1500, 20000];
+# and footers included. Every core page first gets a short excerpt (its
+# frontmatter `abstract:` or `summary:`, else the prose it opens with); what is
+# left deepens pages to longer excerpts and then whole bodies, pinned and
+# `_slots/` pages first, then the cheapest bodies. A body is shown whole or
+# not at all, and a body shorter than its excerpt is always shown whole.
+# Four or more unpinned excerpts from one folder (`_rules/`, `gotchas/`,
+# `decisions/`, `procedures/`) share a heading. Pages the budget cannot
+# cover are listed by path so the agent can `memory_read_page` them,
+# degrading to a count when even the paths do not fit. Pin a page to give
+# it depth first. The security notice and the untrusted-history markers
+# are never traded for content. Clamped server-side to [1500, 20000];
 # defaults to 4000.
 max_chars = 4000
 
@@ -178,14 +205,16 @@ contribute = false
 consume = false
 ```
 
-**Naming rules** for `workspace` and `project`, validated server-side:
-
-- Lowercase ASCII, digits, dots, dashes, underscores
-- Regex: `^[a-z0-9][a-z0-9._-]*$`
-
-Anything else is rejected at `get_or_create_workspace` / `_project`
-time, surfacing as a hook warning. The shell helper URL-encodes
-defensively but the server's regex is the source of truth.
+**Naming** for `workspace` and `project`: the server stores both names
+as given and does not validate their characters. Stick to lowercase ASCII
+letters, digits, dots, dashes and underscores (`^[a-z0-9][a-z0-9._-]*$`)
+anyway: names like that need no quoting in URLs, shells or tool arguments.
+Hook clients URL-encode whatever a repository marker declares. The
+operator-home route map below is stricter: a `route_workspace` or
+`route_project` outside that pattern invalidates the whole map. Names never
+become filesystem paths, because the wiki stores each project under
+`<data_dir>/wiki/<workspace_id>/<project_id>/`. A name such as `../x` is
+an odd label, not a path.
 
 `aliases` is all-or-nothing and intentionally uses a portable subset shared by
 native Rust, POSIX shell, PowerShell, and generated TypeScript: exactly one
@@ -264,8 +293,14 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
+`[recall] default_global` applies to an agent's unscoped `memory_query` and
+`memory_recent` calls. The `ai-memory search` terminal command does not read
+it: that command stays scoped to the current project and searches every
+project only when you pass `--global` (see
+[usage.md](usage.md#search-from-the-terminal)).
+
 `default_global` and `inject_on_session_start` accept a truthy value
-(`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
+(`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
 
@@ -276,7 +311,7 @@ after the brief (see `docs/cross-project-profile.md`): the profile's entries
 are delivered as defaults the agent applies when the user and the
 repository's rules file say nothing. A hard rule that must hold in this
 repository whatever the defaults say still belongs in the agent's own rules
-file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory — see the
+file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory. See the
 "Rules, memory and the profile" guidance in `docs/usage.md`. Other `_global`
 pages stay reachable on demand through `memory_query`, which unions them.
 
@@ -295,7 +330,7 @@ others on a shared instance.
 
 ## Allowlist mode: the marker as an opt-in
 
-By default this file is optional — a repository without one is still captured,
+By default this file is optional: a repository without one is still captured,
 and the marker only *narrows* what is taken. An install can invert that:
 
 ```bash
@@ -303,8 +338,8 @@ ai-memory install-hooks --apply --capture-mode allowlist
 ```
 
 Under allowlist mode the presence of a `.ai-memory.toml` **is** the opt-in. A
-repository without one emits no lifecycle event at all — prompts, tool calls
-and session boundaries alike — dropped in the hook process before anything
+repository without one emits no lifecycle event at all. Prompts, tool calls
+and session boundaries alike are dropped in the hook process before anything
 reaches the local spool or the wire. No extra key is needed: an existing marker
 already opts its repository in, whatever else it configures.
 
@@ -317,7 +352,7 @@ The mode is stored per install rather than per agent, and a later bare
 `install-hooks --apply` (including an upgrade refresh) leaves it in place.
 
 It is enforced both by native `ai-memory hook` commands and by the generated
-TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`) —
+TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`);
 each bakes the selected mode in and carries the same marker-presence gate
 before it ever POSTs. Only the raw script-fallback paths (the
 `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
@@ -459,9 +494,20 @@ out of capture:
 ignore_paths = ["private/**", "~/personal-notes/**"]
 ```
 
-A repository that keeps its decision records in the tree — an ADR directory,
+> **`ignore_paths` is a best-effort filter for shell commands and unknown
+> tools.** File tools are matched on their explicit path fields, but a shell
+> command is only read lexically and a tool the matcher does not list is not
+> read at all. The [gaps listed below](#capture-exclusion-residuals) stay
+> open: shell variables (`$VAR`), a `cd` inside a command, symlinks, a
+> recursive search of a parent directory, unknown tools, and scripts that a
+> command reads from a file or a heredoc. For a sensitive project, use
+> **allowlist capture mode** (`install-hooks --capture-mode allowlist`, above)
+> and leave that repository without a marker. That mode is the strict
+> guarantee: nothing from an unmarked repository is captured at all.
+
+A repository that keeps its decision records in the tree (an ADR directory,
 a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
-`context/` tree — belongs here too: `ignore_paths = ["docs/adr/**"]` or
+`context/` tree) belongs here too: `ignore_paths = ["docs/adr/**"]` or
 `["context/**"]`. The repo owns that record; without the exclusion an agent's
 read of it is captured and consolidation compiles it into wiki pages that do
 not follow the repo, so the copy is stale the moment the record is superseded
@@ -471,7 +517,12 @@ The **nearest** `.ai-memory.toml` is authoritative; marker sections do not
 merge. A missing `[capture]` section or `ignore_paths = []` is inactive and
 preserves current behavior. `[capture]` accepts only `ignore_paths`: unknown
 keys, invalid types/globs/roots, unreadable markers, or a marker over 64 KiB
-invalidate the whole capture policy rather than partially applying it.
+invalidate the whole capture policy rather than partially applying it. Any
+TOML spelling of the table works (`[ capture ]`, `["capture"]`, or a top-level
+dotted `capture.ignore_paths = [...]`), and the shapes TOML does not make a
+plain table (an inline `capture = { ignore_paths = [...] }`, `[[capture]]`, a
+`[capture.x]` subtable, a second `[capture]`) are invalid. The native hook and
+the generated TypeScript integrations reach the same decision for each.
 
 Patterns match an entire lexically normalized path, not a substring. Use only
 `*`, `?`, and `**`; relative patterns are rooted at the marker directory,
@@ -482,53 +533,315 @@ case-insensitive. Bounds are 128 patterns, 1,024 characters per pattern, 32
 direct candidates and 4,096 characters per candidate, and 1,000,000 bounded
 pattern/candidate comparisons.
 
+A `**/` matches one or more directories, never zero, unlike `.gitignore`:
+`**/.env` matches `sub/.env` but not the `.env` at the marker directory, and
+`docs/**/x.md` does not match `docs/x.md`. List both forms when you mean both
+(`[".env", "**/.env"]`). A trailing `/**` does match the directory itself
+(`secrets/**` covers `secrets`).
+
 For fixture-proven direct file tools, ai-memory reads only explicit path fields
 and documented direct arrays for multi-file calls. If any candidate matches, the
 entire event is **dropped locally** before spool, queue, network, transport
 logs, or server storage. With an active policy, recognized search/list tools are
 dropped conservatively; missing or malformed recognized file candidates, an
-unsupported recognized schema, or an invalid policy become **metadata-only**.
+unsupported recognized schema, or an invalid policy (for file, search/list and
+shell tools) become **metadata-only**.
 That form contains only bounded routing/tool/decision metadata, never paths,
-patterns, arguments, output, errors, titles, or nested payload. Unknown tools
-retain current behavior.
+patterns, arguments, output, errors, titles, or nested payload. Tools that read
+back output of a command started by an earlier call (Claude Code `BashOutput`
+and `TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw `process`, GitHub
+Copilot CLI `read_bash`/`write_bash` and their PowerShell twins) become
+metadata-only under an active or invalid policy, because nothing proves the
+command they read missed every ignored path. For the same reason, a file or
+shell tool that reads a file the harness saved an earlier tool's output to is
+metadata-only under an active or invalid policy: Claude Code's saved large
+results (`~/.claude/projects/<project>/<session>/tool-results/…`) and
+background task output (`<tmp>/claude-<uid>/<project>/<session>/tasks/<id>.output`),
+OpenCode's truncated output (`<data>/opencode/tool-output/…`) and Pi's
+(`<tmp>/pi-bash-<id>.log`). A glob that could match such a file counts too
+(`cat ~/.claude/projects/*/*/tool-results/*`): each glob segment fits a
+directory or file name it shares a match with, and at least one fitting segment
+must spell part of that name's distinctive text (`claude`, `projects`,
+`tool-results`, `tasks`, `.output`, `opencode`, `tool-output`, `pi-bash-`)
+literally, at least three characters in a row: `tool-res*` and `/tmp/pi-*`
+count, while `ls src/*`, `tail -n 50 log/*.log` and `cat /tmp/*.log` (whose
+wildcard stands where `pi-bash-` would be) are ordinary globs. Other unknown tools
+retain current behavior. GitHub Copilot CLI's runtime `view`, `create` and
+`str_replace_editor` names are file tools read from their `path` argument.
 
-Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
-have no path field, so the command line is split into words lexically, the way
+Gemini CLI's `read_many_files` is a file tool whose `include` entries (`paths`
+in older releases) are globs that Gemini expands case-insensitively, with `**`
+reaching any depth. ai-memory reads every entry and drops the whole call when
+any one names an ignored path or could expand into one, matching case-insensitively
+like Gemini: `docs/adr/x.md`, `docs/*/x.md`, `docs/**` and `**/*.md` are
+all dropped under `docs/adr/**`, while `src/**/*.rs` and a root-level `*.md`
+are not. A `..` after a `**` is read both ways, since `**` can match no
+directory as well as many. Gemini reads an entry that names a directory recursively, and the
+matcher cannot tell a directory from a file, so an entry that could contain an
+ignored path drops the call too: `docs`, `.` and `docs/` are dropped under
+`docs/adr/**`, while `src` and `README.md` are not. Its `exclude` list never
+subtracts an ignored path. An entry using glob
+syntax the matcher cannot evaluate (`[…]`, `{…}`, `(…)`, `!`) makes the call
+**metadata-only**.
+
+Recognized shell tools (`Bash`, `PowerShell`, `shell`, `exec`, `execute_bash`,
+`terminal`, Gemini CLI's `run_shell_command`, …) have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
 Codex shell calls, including its `exec_command` path, reach hooks as `Bash`
 with the command in `tool_input.command`.
 A command given as an argument vector keeps each element as one word (a path
 with spaces stays whole, up to 256 characters) and also splits each element on
-its own, so a `bash -lc "<script>"` script is read like any command line. Each
-argument that is not a flag, plus the value of a `--flag=value` or
-`NAME=value` word, is resolved like a file-tool path: from the tool's own
-`workdir` argument when it has one, otherwise from the event's `cwd`. If
+its own. Any word that holds more than one word is split again the same way,
+whether it is an argument vector element, a quoted script (`bash -c '…'`,
+`sh -c "…"`), or a command substitution inside double quotes (`"$(…)"` or
+backquotes), so a script is read like any command line, up to four quoting
+levels; a script nested deeper is **metadata-only**. A quoted message that
+mentions an ignored path (`git commit -m "…docs/adr/…"`) therefore drops the
+event too. An ANSI-C string (`$'…'`) is decoded, a backslash before an
+ordinary letter is dropped, and a backslash-newline outside single quotes
+joins the two lines, as the shell does. A word with a parameter default
+(`${X:-docs/x.md}`, also `:=`, `:+` and the forms without `:`) is also read
+with the operand in its place. Under the `PowerShell` tool, or on a Windows
+host, the command is also read without PowerShell's backquote and cmd's caret
+escape characters. Each
+argument that is not a flag, plus the value of a `--flag=value`, `NAME=value`,
+or PowerShell `-Param:value` word, plus a value glued to a short flag
+(`-fdocs/x.md`), plus the local path of a `file:` URL in any case (cut at its
+`?` query or `#` fragment, then ASCII percent-escapes decoded), is resolved like a file-tool path: from the tool's own
+`workdir` argument (Gemini CLI's `dir_path`, Antigravity's `Cwd`) when it has one, otherwise from the event's `cwd`.
+`~/` (and PowerShell's `~\`) is the home directory and `~+` the working
+directory. An argument under `~-`, `~N` or `~name` (the previous directory,
+the directory stack, another account's home) names a directory only the
+running shell knows, so the command is **metadata-only** under an active
+policy. Only a tilde the shell expands counts: a quoted one
+(`git commit -m "fix ~approx"`, `grep '~[a-z]+'`), one inside an argument
+vector element, or one in a quoted message is literal; one in a script run by
+`sh -c` or a command substitution is read. PowerShell resolves `~` itself, so
+under the `PowerShell` tool or on a Windows host every tilde counts. A
+parameter default nested deeper than four levels makes the command
+**metadata-only**, and a backslash escape inside a default
+(`${X:-d\ocs/x.md}`) is read as the shell reads it.
+The path in a git object name (`HEAD:docs/x.md`, `:docs/x.md`) is resolved
+from both the `cwd` and the marker directory, because git reads it from the
+repository root. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
-`docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
-the match budget is dropped. Variables, command substitution, `cd` state, and
+`docs/adr/**`, `cat *.md` at the repository root is not. A `**` matches no
+directory as well as many under zsh and bash's `globstar`, so a `..` after it
+is read both ways. bash before 5.2 (macOS ships 3.2) also lets a pattern that
+starts with a dot match the `..` entry, so a directory segment that could
+(a dot followed by `*`, `?` or a class admitting a dot) is read as `..` as
+well. A command that exceeds
+the match budget is dropped. A command that no argument matches outright is
+**metadata-only** when it uses syntax the matcher does not evaluate: an
+unquoted brace expansion (`docs/{adr,x}/1.md`, `{1..3}`), a bracket class
+(`docs/ad[r]/1.md`, including one that starts with `]`), a zsh glob group or
+extglob (`docs/(a|b)/1.md`, `@(…)`), or a numeric or control escape in an
+ANSI-C string. The same holds for those inside a script run by `sh -c`
+(also past shell options and their values, as in `bash -o pipefail -c`),
+`su -c`, `script -c`, `eval` or a command substitution, but not inside a quoted message or pattern
+(`git log --format='%h {a,b}'`). Quoted or escaped braces and brackets,
+`${…}`, `{}`, `[ -f x ]`, `$(…)`, `<(…)` and a `( … )` subshell are
+unaffected; a word glued to a parenthesis (`f()`, `(a|b)x`) also counts as a
+glob group. Inline interpreter code (`python3 -c`, `node -e`, `ruby -e`,
+`perl -e`, `php -r`, `lua -e`, `Rscript -e`, `osascript -e`, `deno eval`,
+also after options that take a value, as in `python3 -W ignore -c`) is
+**metadata-only** under an active policy
+unless one of its words names an ignored path outright, which drops it:
+code can build a path at run time (`'docs/' + name`), so no lexical match can
+rule one out. Hermes Agent's `execute_code` tool, which runs program source
+it is given, is metadata-only under an active policy for the same reason.
+Running a script file or a module (`python3 -m pytest`,
+`node build.js`) is unaffected. A shell command longer than 1 MiB (1,048,576
+characters, summed over the elements of an argument vector) is not read at
+all: it is metadata-only under an active policy, and its marker lookup
+(below) counts as unprovable, which makes it metadata-only even in a
+directory without a marker. Variables, command substitution, `cd` state, and
 commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
 their output is still captured. An invalid policy makes a shell command
 **metadata-only**, like a file tool, because a broken marker cannot prove its
 arguments miss every ignored path; this holds even when the command cannot be
-read. An older server drops that metadata-only shell event, so upgrade the
-server before the clients. Excluding content before transport
+read. On macOS, whose default filesystem ignores case, the native hook and the
+generated integrations match file-tool and shell paths without regard to case
+(`NOTES/X.md` matches `notes/**`, `ÄRGER/x.md` matches `ärger/**`) and treat a
+decomposed accent like the composed letter, as its filesystem does; other POSIX
+hosts compare case-sensitively, and Windows paths always ignore ASCII case.
+
+In a Windows session (the event's `cwd` is a drive or UNC path), a file-tool
+path, shell argument or `workdir` is read as the file Windows opens, so other
+spellings of an ignored file match its pattern too: Git Bash, MSYS2 and Cygwin
+`/c/Users/me/repo/x` and `/cygdrive/c/...` are `C:\Users\me\repo\x`; a rooted
+path without a drive (`/repo/x`, `\repo\x`) is on the `cwd`'s drive; the
+`\\?\`, `\\.\` and `\??\` prefixes and the local administrative share
+(`\\localhost\C$\...`, `\\127.0.0.1\C$\...`) name the drive itself; an
+alternate data stream suffix (`private.md::$DATA`, `private.md:stream`) and the
+trailing dots and spaces of each segment (`private.md.`, `secrets. \x`) are
+dropped. Any other device path (`\\.\pipe\x`) makes a file tool
+metadata-only. A native tool reads `/c/x` from the root of the `cwd`'s drive
+(`D:\c\x` from `D:\repo`) rather than as Git Bash does, so both readings are
+checked and either one matching drops the call. The `cwd`, the marker's
+directory and an absolute pattern are read the same way, so a session started
+from `\\?\C:\repo`, `\\?\UNC\server\share\repo` or `\\localhost\C$\repo`
+matches `docs/private/**` against `C:\repo\docs\private\a.md`, and a pattern
+spelled `\\?\C:\repo\docs\private\**` matches it from `C:\repo`. PowerShell
+and cmd do not escape with a backslash, so a shell command is also read with
+every backslash kept: `Get-Content \\server\share\x`, bare or double-quoted,
+names the UNC path. PowerShell's provider prefix is dropped first:
+`FileSystem::C:\repo\x` and `Microsoft.PowerShell.Core\FileSystem::C:\repo\x`
+(any case) name `C:\repo\x`. A shell argument or `workdir` the matcher cannot
+place makes the command metadata-only: a drive-relative path (`C:docs\x`, or a
+bare `C:`), which Windows resolves from that drive's own current directory, and
+a device path that names no drive or share (`\\?\GLOBALROOT\Device\...`,
+`\\.\HarddiskVolume3\...`, `\\?\Volume{...}\...`). A flag such as `/s`, a URL
+and an ordinary path stay placeable. A Windows marker cannot hold a POSIX
+absolute pattern (`/c/repo/docs/**`, `/docs/**`): no Windows candidate could
+match it, so the marker is invalid and fails closed; spell it relative to the
+marker or with a drive (`C:/repo/docs/**`). None of this applies to a POSIX session, where `/c/x`, a
+trailing dot or a colon is part of the name.
+
+A checkout's exclusions protect its files wherever a call is made from. For
+every file-tool target (for `apply_patch`, the files its `*** Add File:`,
+`*** Update File:`, `*** Delete File:` and `*** Move to:` headers name, read
+after leading whitespace as Codex reads them), every directory, file and
+path-like glob argument of a search/list tool (Grep, Glob, LS, `grep_search`,
+`glob`, `list_directory`, `search_file_content`, Hermes `search_files` with its
+`file_glob` filter, and the other agents' equivalents; a grep `pattern` is a
+regular expression and is not read), and every shell argument that spells a
+path (one with a separator, after `~/` expansion) plus the tool's `workdir`, the native hook and the
+generated integrations find the marker that governs that location, by the
+same lexical walk as the event's own, and when it is another checkout's (or the
+event's directory has none) apply that marker's policy as well: `cat
+../other/secrets.env` or a Grep of `../other/secrets.env` from a sibling
+checkout, or a Hermes terminal call from an unmarked directory, is dropped when
+`other` ignores `secrets.env` (a search reaching a checkout with an active
+policy is dropped, as in its own checkout), and a broken marker there makes the
+call metadata-only. Each directory is looked up once, and what one lookup
+learns about a directory serves every other location below it, so many paths
+in a deep tree cost one check per directory. A call naming more than 4,096
+path locations or 16 other markers is metadata-only, and so is a file tool
+whose target cannot be read or resolved. The lookups share the glob walk's
+budget below (50 ms, and at most 16,384 file checks); a glob's leading
+directories are looked up before the walk below them. Locations outside the
+event's own checkout are looked up first, and running out of budget there makes
+the call metadata-only; inside the own checkout the event's own policy already
+applies, so running out there ends the lookup and the call keeps its
+disposition.
+
+A location with glob syntax in a directory name (`cat ../*/secrets.env`, `cat
+*/secrets.env` from a parent folder, `../{a,b}/x`, `../[ab]/x`)
+is looked up from its literal leading directories. When those lie outside the
+event's own checkout (the directory holding `.git`), every directory the glob
+could pass through is checked for a marker of its own: a `*`/`?` segment lists
+the child directories whose names it matches (ignoring ASCII case), a class,
+brace or group segment lists every child, and a `**` lists the whole subtree
+except the event's own checkout, so `ls ../**/README.md` does not list the
+checkout it runs in. A glob whose leading directories lie
+inside the event's own checkout is not walked, so `cat packages/*/package.json`
+in a monorepo costs nothing however many packages it has. A `.git` at or above
+your home directory (a dotfiles repository) or at the filesystem root does not
+make that directory the own checkout for these rules, so `cat */secrets.env`
+from `~/Projects` is still checked against the checkouts it reaches. Symlinks
+are never followed. The walk reads at most 32,768 directory entries, visits at
+most 256 directories and runs at most 50 ms per call; past any bound the call
+is metadata-only, and so is glob syntax that can leave its leading directories:
+a brace or group spanning a separator, a `..` or `~` alternative, a brace
+expansion that builds one, or a brace-built directory name that older bash
+expands to `..` (`.{*,x}/`). A brace expansion too large to list (more than 64
+words) counts as leaving only when its pieces could build such a word; integer
+and letter sequences cannot, so `touch test/file{1..200}.txt` and `cat
+data/{a..h}{1..9}.csv` are walked like any other glob. A `..` after a `**`,
+and a dot-glob directory segment that older bash can expand to `..` (`.*`,
+`.?`, a class such as `.[[:punct:]]`, or an extglob such as `.@(.)` or
+`.+(.)`), are looked up in both readings, and a zsh glob group or an ANSI-C
+numeric escape is looked up as the shell expands it, also inside a
+double-quoted script (`bash -c "cat \$'…'"`, `eval "…"`), whose backslash
+before `$` the outer shell removes. An older server drops these metadata-only shell and output-reader
+events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
 This is a lexical capture boundary, **not complete DLP**. It does not resolve
 symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands are
-matched only lexically (above), and free-form patches are not parsed; prompts,
+matched only lexically (above), and a patch is read only for its file headers; prompts,
 assistant text, notifications, and quoted content are not path-attributable.
-A copy of a file's content under another path is not linked back to it either:
-Claude Code saves a large tool result to
-`~/.claude/projects/<project>/<session>/tool-results/<id>.txt` and reads it back
-with its file tool, and that read no longer matches the original path. Add
-`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` to exclude those
-re-reads too (for every file, not only the ignored ones). Add each relevant visible alias
+A copy of a file's content under another path is not linked back to it either.
+The harness output files listed above are read back metadata-only under a
+policy; to drop those re-reads entirely, add for example
+`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` (for every file,
+not only the ignored ones). Add each relevant visible alias
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
+
+<a id="capture-exclusion-residuals"></a>These gaps are inherent to lexical matching and stay open:
+
+- shell variables (`$VAR`) are not expanded, and a command substitution's
+  output is not known (its own words are read);
+- a `cd` inside a command is not followed (the tool's own `workdir` is);
+- symlinks are not resolved, by design;
+- a recursive search of a parent directory through a shell (`grep -r x docs`,
+  `rg x`) names no ignored path, so its output is kept;
+- a script read from a file (`bash run.sh`, `python3 tool.py`) is not read,
+  and a heredoc fed to an interpreter (`python3 - <<EOF`) is read only for the
+  words it spells out;
+- git resolves `REV:path` from the repository root, which is approximated by
+  the marker directory and the `cwd`, and a tool's own directory option
+  (`git -C dir`, `make -C dir`) is not followed;
+- script runners and interpreters the matcher does not list (`awk` with
+  `getline`, `watch`, `flock … -c`, `su user -c`) are read only for the words
+  they spell out: an ignored path named there still drops the event, but
+  brace expansion or inline code inside them is not recognized;
+- a bare word naming another checkout's directory (`grep -r x other`) is not
+  looked up for that checkout's marker, only arguments that spell a path
+  separator are; a recursive search of a literal directory (a Grep whose
+  `path` is `..`) does not walk into the checkouts below it, a glob whose
+  leading directories lie inside the event's own checkout is not walked, so a
+  checkout nested inside it is reached only by a path that names it, and a
+  glob is not followed through a symlinked directory; a parameter expansion
+  next to glob syntax (`${X}/*/x`) is not walked; a harness output file kept at a
+  location other than the defaults listed above (a Claude Code config
+  directory whose name lacks `claude`) is read as an ordinary file;
+- a saved-output glob counts only when it spells three characters of the
+  output file's distinctive name in a row, so a glob with no such literal run
+  (`/tmp/p?-b*`) is read as an ordinary glob; requiring the literal text is
+  what keeps `cat /tmp/*.log` and `tail log/*.log` ordinary;
+- the own checkout is decided after the command ran, so a command that creates
+  a `.git` (`touch .git; cat */x`) makes its directory the own checkout and its
+  globs are not walked; a `.git` at or above the home directory never counts,
+  but one in any other directory does;
+- a marker nested inside the own checkout is found only while the lookup
+  budget lasts (the shallowest paths are looked up first); past it the
+  event's own policy governs the remaining paths;
+- a value glued to a short flag is read after the flag's first letter only,
+  not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
+  are not decoded;
+- in a Windows session a shell tool's `workdir` spelled `/c/x` is read only
+  as Git Bash reads it (`C:\x`), so arguments resolved from it miss a native
+  tool's reading (`D:\c\x` from a `cwd` on `D:`); a file-tool path or shell
+  argument spelled that way is read both ways;
+- the generated TypeScript integrations check the `[capture]` table as
+  strictly as the native hook and reject the marker's structural errors
+  anywhere in the file (a line that is neither a header nor a key/value pair,
+  an array or inline table left open), but they do not validate other values'
+  TOML (an unquoted `x = nope`, a duplicate key in another table), so such an
+  error invalidates the policy only in the native hook;
+- on Windows only `localhost` and `127.0.0.1` are read as the local machine:
+  another loopback or host alias for an administrative share (`\\127.0.0.2\c$`,
+  `\\127.1\c$`, `\\<hostname>\c$`) or a `\\wsl$\...` path is matched as the
+  UNC path it spells, not as the drive it reaches (administrative shares
+  usually need an elevated process);
+- Windows matching folds ASCII case only, so a pattern and a path that differ
+  in the case of a non-ASCII letter (`É` and `é`) do not match on Windows;
+- in a Windows session a drive-relative argument counts as placed when the
+  same command also holds a placeable path whose POSIX-shell reading (each
+  backslash escaping the next character) spells it, the way Git Bash reads
+  `C:\repo\x` as `C:repox`; and a harmless word shaped like `X:y`
+  (`sed s:a:b:`) or a device path such as `\\.\NUL` or `\\.\pipe\x` makes a
+  Windows command metadata-only;
+- tools the matcher does not list keep their current behavior.
+
+For a project whose content must never be captured, use allowlist capture mode
+(above) and leave that repository without a marker.
 
 ### Supported integrations and refresh
 
@@ -600,7 +913,7 @@ Stop/assistant-message capture is disabled by default and never persisted; it is
 available only through the explicit double opt-in described in the install guide
 (`install-hooks --capture-assistant` on the client plus `capture_assistant` on
 the server), where the excerpt is sanitized on both sides and capped. It is not
-gated by this marker file — assistant text is not path-attributable, so a
+gated by this marker file: assistant text is not path-attributable, so a
 `.ai-memory.toml` cannot narrow it. The metadata header is closed; the
 PostToolUse response/error excerpt remains the existing bounded content capture.
 Capture exclusions are evaluated only where paths have a proven schema, so they
@@ -666,8 +979,8 @@ This means it works even when the worktree directory lives **outside**
 the main repo tree (some tools keep worktrees in a separate directory,
 so the worktree has no `.ai-memory.toml` ancestor of its own) and even
 when the server runs in a container that cannot see the host checkout.
-Put the marker anywhere on the walk-up path from the worktree — commonly
-a single `~/.ai-memory.toml` — to select the strategy.
+Put the marker anywhere on the walk-up path from the worktree (commonly
+a single `~/.ai-memory.toml`) to select the strategy.
 
 ### Repository identity
 
@@ -685,9 +998,9 @@ with each event. The first rung that yields one wins:
 4. the folder name.
 
 Only rungs 1 and 3 change routing. A declared `project` routes by name as it
-always has — a statement outranks the remote, so a fork whose marker names
-its own project is never filed under the repository it forked from — and a
-bare folder name routes exactly as before. What routes by identity is an
+always has, because a statement outranks the remote: a fork whose marker names
+its own project is never filed under the repository it forked from. A bare
+folder name routes exactly as before. What routes by identity is an
 undeclared checkout with a remote, or a checkout with an explicit
 `identity`:
 
@@ -721,7 +1034,7 @@ repository path without the host, with `/` written as `-`
 `https://gitlab.com/acme/group/api.git` → `acme-group-api`), so every
 worktree and clone agrees on the name. Only the name changes: captures still
 route by the full identity (`github.com/acme/api`), and the style rides along
-only with a remote identity — a declared `project` or `identity` keeps its
+only with a remote identity. A declared `project` or `identity` keeps its
 own name.
 
 - **Existing projects keep their UUID.** Reads by the canonical path name or
@@ -731,8 +1044,8 @@ own name.
   every other dependent row remain attached to the same UUID. The v2 basename
   remains readable through v3.
 - **Another forge is never merged in.** When the path name is already held by
-  a different repository — typically the same path on another forge
-  (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
+  a different repository (typically the same path on another forge,
+  `gitlab.com/acme/api` after `github.com/acme/api`), the newcomer falls
   back to the name it would get without the style.
 - Local marker aliases and operator-home identity/path routes keep their
   documented precedence over the default and remain available for migration or
@@ -794,14 +1107,14 @@ ai-memory install-hooks --apply --agent claude-code --project-strategy repo-root
 ```
 
 Every session for that install then resolves its project from the main git
-repo root — so an agent that runs `mkdir sub && cd sub` and stays there no
+repo root, so an agent that runs `mkdir sub && cd sub` and stays there no
 longer forks the rest of the session into a phantom project named `sub`.
 
 This is **install-time config**, written into the agent's hook command (and
-the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
+the generated OpenCode / OMP / Pi / OpenClaw plugins), with the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
-`basename` (the new-install default — bakes nothing) or `repo-root`. A later
+`basename` (the new-install default, which bakes nothing) or `repo-root`. A later
 `install-hooks --apply` without the flag preserves the value already baked into
 ai-memory's hooks; pass `--project-strategy basename` explicitly to remove it.
 
@@ -842,23 +1155,31 @@ Two guarantees hold in **both** modes:
   name while honoring a declared one. A client older than v1.27 sends no
   provenance, and its overrides stay authoritative.
 - **Broad anchors never stick.** A session rooted at `/` or at `$HOME` is not
-  a meaningful anchor, so it never captures events beneath it — otherwise one
+  a meaningful anchor, so it never captures events beneath it. Otherwise one
   stray session started in `$HOME` would fold every project into a single
   bucket.
 
 Session-creating events are unaffected in both modes: opening a session in a
 plain non-git folder still names the project after that folder.
 
-Some harnesses keep reporting the parent session's cwd when a subagent uses a
-file tool in another checkout. Native `ai-memory hook` commands compensate for
-that case before applying `follow-cwd` or `sticky`: a fixture-backed file-tool
-schema with absolute target paths is routed from the target when every path
-proves the same repository or marker boundary. The destination's capture
-policy and `server` profile are authoritative, so a cross-project call cannot
-use the source repository's policy or credentials. Relative paths,
-mixed-project calls, unknown schemas, and absolute paths outside a recognized
-repository/marker keep the payload cwd. Free-form shell commands are not
-reinterpreted as project routing instructions. This changes raw observation
+Some harnesses report a cwd other than where a tool ran: a subagent keeps its
+parent session's cwd while using a file tool in another checkout, and Hermes
+Agent always reports its own process directory (usually `~`) while each tool
+call names its repository through `workdir` or `path`. Native `ai-memory hook`
+commands compensate before applying `follow-cwd` or `sticky`: a tool call's
+absolute location (a fixture-backed file tool's target paths, a search/list
+tool's explicit `path`, or a shell command's structured `workdir`) routes the
+event when every path proves the same repository or marker boundary. That
+destination's marker decides allowlist admission, and its capture policy and
+`server` profile apply, so a cross-project call cannot use the source
+repository's credentials. The source's exclusions still bind: if the payload
+cwd's own `ignore_paths` would drop the event (a pattern can name a path
+outside its checkout, and a command can name a source file while its `workdir`
+points elsewhere), the event is not rerouted and that exclusion drops it.
+Relative paths and workdirs, mixed-project calls, unknown schemas, and absolute
+paths outside a recognized repository/marker keep the payload cwd. Free-form
+shell command text is never reinterpreted as a project routing instruction;
+only the structured `workdir` field counts. This changes raw observation
 attribution only; the session row and its compiled session page remain in the
 project where the session began.
 
@@ -876,14 +1197,14 @@ Both entry points, as of v1.20:
 - **Lifecycle hooks** forward the marker's fields to the server on every
   event, so session captures land in the declared scope.
 - **Client CLI commands** resolve `(workspace, project)` locally before
-  calling the server — `run`, `bootstrap`, `search`, `read-page`,
+  calling the server: `run`, `bootstrap`, `search`, `read-page`,
   `write-page`, `lint`, `curator`, `embed`, `pending-writes`,
   `forget-sweep`, `auto-improve`, `purge-project`, `rename-project`,
   `move-project` and `move-session --from-project` (source side), and friends.
 
 Before v1.20 only the hooks read it. A checkout declaring
 `workspace = "acme"` therefore had its captures land in `acme` while every
-CLI command resolved into `default` — the same repository split across two
+CLI command resolved into `default`: the same repository split across two
 scopes, with `ai-memory run`'s managed workstream on the wrong side of the
 split.
 
@@ -908,7 +1229,7 @@ ai-memory: scope acme/api (workspace + project from /Users/dev/projects/acme/.ai
 
 `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 for one invocation, restoring the
 pre-v1.20 resolution without editing or leaving the marker's tree. It
-applies to **client commands only** — the lifecycle hooks still forward the
+applies to **client commands only**. The lifecycle hooks still forward the
 marker's fields on every event, so an invocation run with it set resolves
 into a different scope than the session captures around it. Use it for
 one-off reads, not as a way to relocate a repository's memory.
@@ -919,21 +1240,21 @@ hook events that arrive without a usable one.
 
 ## What the marker file does NOT do
 
-- ❌ No glob patterns. Walk-up by literal ancestry only.
-- ❌ No merge of ancestor markers. Closest wins. (`server` is the one key
+- No glob patterns. Walk-up by literal ancestry only.
+- No merge of ancestor markers. Closest wins. (`server` is the one key
   inherited from the nearest marker that declares it; see above.)
-- ❌ No automatic migration of `default`-workspace projects.
-- ❌ No automatic repo-root collapsing. Worktrees and subdirectories only
+- No automatic migration of `default`-workspace projects.
+- No automatic repo-root collapsing. Worktrees and subdirectories only
   share a project when `project_strategy = "repo-root"` is explicitly set
-  (per marker, or baked install-wide — see above).
-- ❌ No URL or token in the marker. `server = "<name>"` selects a server
+  (per marker, or baked install-wide; see above).
+- No URL or token in the marker. `server = "<name>"` selects a server
   profile registered locally with `ai-memory server add`; it cannot introduce a
   new destination or carry a credential. Otherwise use the existing env vars
   (`AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_HOOK_URL`). (A repo-root
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)
-- ❌ No reach outside the trust boundary. The walk stops at `$HOME`; a
+- No reach outside the trust boundary. The walk stops at `$HOME`; a
   checkout outside it stops at that checkout's root and needs a marker inside
   the checkout. A non-git directory outside `$HOME` needs a marker in its
   exact cwd.
@@ -943,7 +1264,7 @@ hook events that arrive without a usable one.
 **My marker isn't being picked up.** Walk through:
 
 1. File is named exactly `.ai-memory.toml` (note the leading dot).
-2. File is in an **ancestor** of the cwd — not a sibling, not a
+2. File is in an **ancestor** of the cwd, not a sibling or a
    descendant.
 3. There isn't a closer marker overriding it. Run
    `find ~/projects -maxdepth 5 -name '.ai-memory.toml'` to see all

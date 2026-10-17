@@ -25,16 +25,18 @@ struct Harness {
     _tmp: TempDir,
 }
 
-async fn user(store: &Store, name: &str, byte: u8) -> UserId {
+async fn user(store: &Store, name: &str) -> UserId {
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: name.into(),
                 name: None,
                 email: None,
             },
-            [byte; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap()
@@ -53,8 +55,8 @@ async fn harness() -> Harness {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    let writer = user(&store, "writer", 1).await;
-    let reader = user(&store, "reader", 2).await;
+    let writer = user(&store, "writer").await;
+    let reader = user(&store, "reader").await;
     let project = store
         .writer
         .resolve_project_by_identity(

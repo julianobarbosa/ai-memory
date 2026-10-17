@@ -47,7 +47,8 @@ fn hook(root: &Path, agent: &str, event: &str, owner: Option<&str>, check: bool)
 #[test]
 fn external_capture_owner_suppresses_only_the_opted_in_process() {
     for owner in [None, Some(""), Some(" \t\n"), Some("orchestrator-a")] {
-        let tmp = tempfile::tempdir().unwrap().keep();
+        let guard = tempfile::tempdir().unwrap();
+        let tmp = guard.path().to_path_buf();
         let output = hook(
             tmp.as_path(),
             "claude-code",
@@ -75,7 +76,8 @@ fn external_capture_owner_suppresses_only_the_opted_in_process() {
 
 #[test]
 fn external_devin_end_still_clears_native_identity() {
-    let root = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let root = guard.path().to_path_buf();
     let state = root.join("data/hook-state/devin-session-id");
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, "completed-execution").unwrap();
@@ -92,7 +94,8 @@ fn external_devin_end_still_clears_native_identity() {
 
 #[test]
 fn capture_inspection_reports_external_ownership_without_side_effects() {
-    let tmp = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let tmp = guard.path().to_path_buf();
     std::fs::write(
         tmp.join(".ai-memory.toml"),
         "workspace = \"demo\"\nproject = \"app\"\n",
@@ -136,6 +139,8 @@ mod slow {
         root: PathBuf,
         client: reqwest::Client,
         base: String,
+        // Last field: drops after the server has stopped using the tree.
+        _guard: tempfile::TempDir,
     }
 
     fn command(root: &Path) -> Command {
@@ -163,7 +168,8 @@ mod slow {
 
     impl Fixture {
         async fn start() -> Self {
-            let root = tempfile::tempdir().unwrap().keep();
+            let guard = tempfile::tempdir().unwrap();
+            let root = guard.path().to_path_buf();
             for dir in ["home", "data", "project"] {
                 std::fs::create_dir(root.as_path().join(dir)).unwrap();
             }
@@ -201,6 +207,7 @@ mod slow {
                 root,
                 client,
                 base,
+                _guard: guard,
             }
         }
 
@@ -281,6 +288,82 @@ mod slow {
             assert!(output.stderr.is_empty(), "{output:?}");
             String::from_utf8(output.stdout).unwrap()
         }
+    }
+
+    impl Fixture {
+        /// A CodeBuddy SessionStart, run from inside the project, whose payload
+        /// carries `cwd` only when given one.
+        fn codebuddy_start(&self, cwd: Option<&Path>, project_dir: Option<&Path>) -> Output {
+            let mut cmd = command(self.root.as_path());
+            cmd.args([
+                "hook",
+                "--agent",
+                "codebuddy",
+                "--event",
+                "session-start",
+                "--server-url",
+                &self.base,
+                "--auth-token",
+                TOKEN,
+            ])
+            .env_remove("CODEBUDDY_PROJECT_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            if let Some(dir) = project_dir {
+                cmd.env("CODEBUDDY_PROJECT_DIR", dir);
+            }
+            let mut body = json!({"session_id": SessionId::new(), "source": "startup"});
+            if let Some(cwd) = cwd {
+                body["cwd"] = json!(cwd);
+            }
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(body.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            output
+        }
+    }
+
+    /// Security boundary 6c: a SessionStart that names no directory must not
+    /// claim a handoff. The server would resolve such a claim to its default
+    /// project, here the one holding the baton, so an agent opened anywhere
+    /// else would consume it. The hook process runs inside that project on
+    /// purpose: its own directory is not evidence of where CodeBuddy is.
+    /// Controls: the payload's `cwd`, or `CODEBUDDY_PROJECT_DIR`, claims it.
+    #[tokio::test]
+    async fn codebuddy_start_without_a_directory_leaves_the_default_projects_handoff() {
+        let fixture = Fixture::start().await;
+        let project = fixture.root.as_path().join("project");
+        fixture.seed_handoff().await;
+
+        let unscoped = fixture.codebuddy_start(None, None);
+        let stdout = String::from_utf8_lossy(&unscoped.stdout);
+        assert!(!stdout.contains(MARKER), "unscoped claim: {stdout}");
+        assert!(
+            String::from_utf8_lossy(&unscoped.stderr).contains("memory_handoff_accept"),
+            "{unscoped:?}"
+        );
+
+        let scoped = fixture.codebuddy_start(Some(&project), None);
+        let stdout = String::from_utf8_lossy(&scoped.stdout);
+        assert!(
+            stdout.contains(MARKER),
+            "the handoff must still be open for its own project: {stdout}"
+        );
+        assert!(stdout.contains("additionalContext"), "{stdout}");
+
+        fixture.seed_handoff().await;
+        let from_env = fixture.codebuddy_start(None, Some(&project));
+        assert!(
+            String::from_utf8_lossy(&from_env.stdout).contains(MARKER),
+            "{from_env:?}"
+        );
     }
 
     #[tokio::test]

@@ -146,6 +146,10 @@ mod slow {
         .expect("doctor --json report");
         assert_eq!(report["capture_owner_active"], false);
         assert_eq!(report["identity"]["level"], "anonymous");
+        assert_eq!(
+            report["auth_posture"], "none_loopback",
+            "an open loopback server is reported with the `auth enable` fix"
+        );
         assert_eq!(report["project_coordinate"]["server"]["status"], "exact");
         assert_eq!(
             report["project_coordinate"]["server"]["requested_name"],

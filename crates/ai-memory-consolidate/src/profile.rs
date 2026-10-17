@@ -28,19 +28,25 @@ use std::sync::Arc;
 
 use ai_memory_core::profile::{
     EffectiveProfileShare, PROFILE_CATEGORIES, PROFILE_PATH_PREFIX, ProfileCandidateSource,
-    ProfileEntry, ProfileGenerality, ProfileSettings,
+    ProfileEntry, ProfileGenerality, ProfileSettings, is_metadata_field,
 };
-use ai_memory_core::{ActorContext, IdentityKey, PagePath, Tier, UserId, WorkspaceId};
+use ai_memory_core::{
+    ActorContext, AutoImproveProposalId, IdentityKey, PagePath, Tier, UserId, WorkspaceId,
+    find_marker_line,
+};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, complete_structured};
 use ai_memory_store::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
-    ProfileHarvestProject, ProfileLedgerEntry, ProfileScopePage, ProjectAccess, ReaderPool,
-    ResolvedScope, WriterHandle,
+    ProfileHarvestProject, ProfileLedgerEntry, ProfilePageRow, ProfileScopePage, ProjectAccess,
+    ReaderPool, ResolvedScope, WriterHandle,
 };
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::auto_improve_schedule::AUTO_IMPROVE_AUTO_APPROVE_AGENT;
+use crate::code_fence::CodeFence;
 
 /// Frontmatter value stamping a page the harvester wrote.
 pub const PROFILE_GENERATED_BY: &str = "profile-harvest";
@@ -536,20 +542,64 @@ pub struct DetectedPreference {
     pub confidence: Option<f64>,
 }
 
+/// The part of a stored prompt the user wrote, or `None` when the whole turn
+/// is harness context. A user-prompt observation can carry text no one typed:
+/// a harness block delivered as a user turn (`<task-notification>`), the
+/// instruction files Codex injects, or ai-memory's own routing snippet and
+/// recalled history pasted along. Harvesting those turns the repository's
+/// rules, or ai-memory's security notice, into "the user's" preferences.
+/// Checked here as well as at import: hooks store harness turns as prompts,
+/// and `profile rebuild` re-reads observations stored before an import filter
+/// existed.
+pub(crate) fn user_written(body: &str) -> Option<String> {
+    if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_codex_instructions(body)
+    {
+        return None;
+    }
+    let text = without_fenced(
+        body,
+        ai_memory_core::routing_snippet::MARKER_START,
+        ai_memory_core::routing_snippet::MARKER_END,
+    );
+    Some(without_fenced(
+        &text,
+        ai_memory_core::profile::UNTRUSTED_HISTORY_START,
+        ai_memory_core::profile::UNTRUSTED_HISTORY_END,
+    ))
+}
+
+/// `text` without the regions between `start` and `end`. An unclosed `start`
+/// drops the rest: the 16 KiB prompt cap can cut a block before its end.
+/// Only markers on their own line count, the way ai-memory writes them; a
+/// marker quoted inside a sentence would otherwise drop the user's words
+/// after it.
+fn without_fenced(text: &str, start: &str, end: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0;
+    while let Some(open) = find_marker_line(text, start, from) {
+        out.push_str(&text[from..open]);
+        match find_marker_line(text, end, open + start.len()) {
+            Some(close) => from = close + end.len(),
+            None => return out,
+        }
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
 /// Sentences of `text` outside fenced code blocks and indented code, each
 /// trimmed and collapsed to one line.
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    let mut fence = None;
     for line in text.lines() {
+        let (next_fence, is_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_code || line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
-            continue;
-        }
         let mut current = String::new();
         let mut chars = trimmed.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1123,6 +1173,17 @@ fn evidence_of(members: &[Member<'_>]) -> Vec<EntryEvidence> {
         .collect()
 }
 
+/// Whether `path` is a per-language stack-signal entry
+/// (`profile/stack/<language>.md`). A statement the classifier files under
+/// `stack` lives in the same directory, so the directory alone does not tell
+/// them apart: matching on it hid every stack statement's own page from the
+/// next pass, which then wrote another `-N` copy each harvest.
+fn is_stack_signal_path(path: &str) -> bool {
+    LANGUAGE_TAGS
+        .iter()
+        .any(|tag| path == format!("{PROFILE_PATH_PREFIX}stack/{}.md", slugify(tag)))
+}
+
 fn unique_path(base: &str, taken: &BTreeSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_owned();
@@ -1172,6 +1233,13 @@ pub fn converge(
         candidates
             .iter()
             .copied()
+            // A page's metadata field (`**Status:** Accepted`) describes the
+            // page, not a habit. Statements no longer start on one, but
+            // candidates harvested before that still sit in the store.
+            .filter(|row| {
+                row.candidate.source != ProfileCandidateSource::Page
+                    || !is_metadata_field(&row.candidate.statement)
+            })
             .partition(|row| row.candidate.source == ProfileCandidateSource::Stack);
 
     // Stack signals: one entry per language seen in enough projects.
@@ -1312,7 +1380,7 @@ pub fn converge(
         // Match the group to the page that already holds its topic.
         let matched = existing
             .iter()
-            .filter(|e| !claimed.contains(&e.path) && !e.path.starts_with("profile/stack/"))
+            .filter(|e| !claimed.contains(&e.path) && !is_stack_signal_path(&e.path))
             .map(|e| {
                 let score = group
                     .iter()
@@ -1843,6 +1911,15 @@ async fn harvest_project(
             PROFILE_HARVEST_BATCH,
         )
         .await?;
+    // A page stamped from an auto-improve proposal the scheduler
+    // auto-approved is model output nobody reviewed (#1211): it never feeds
+    // the profile. A human-approved proposal page still counts, and a page
+    // whose proposal id resolves to no row (legacy, imported) stays curated.
+    let proposal_ids: Vec<AutoImproveProposalId> =
+        pages.iter().filter_map(auto_improve_proposal_of).collect();
+    let decided_by = reader
+        .auto_improve_decided_by(project.workspace_id, project.project_id, proposal_ids)
+        .await?;
     let mut mark = project.mark;
     let mut candidates = Vec::new();
     let (mut calls, mut fallbacks) = (0, 0);
@@ -1851,21 +1928,21 @@ async fn harvest_project(
     let mut pending: Vec<PendingSentence> = Vec::new();
     for prompt in &prompts {
         mark.observations_until = mark.observations_until.max(prompt.created_at);
+        let Some(text) = user_written(&prompt.body) else {
+            continue;
+        };
         let session_ref = format!("session:{}", prompt.session_id);
         if llm.is_some() {
-            pending.extend(
-                sentences(&prompt.body)
-                    .into_iter()
-                    .filter(|s| has_marker(s))
-                    .map(|sentence| PendingSentence {
-                        sentence,
-                        observed_at: prompt.created_at,
-                        session_ref: session_ref.clone(),
-                        contributor: prompt.contributor.clone(),
-                    }),
-            );
+            pending.extend(sentences(&text).into_iter().filter(|s| has_marker(s)).map(
+                |sentence| PendingSentence {
+                    sentence,
+                    observed_at: prompt.created_at,
+                    session_ref: session_ref.clone(),
+                    contributor: prompt.contributor.clone(),
+                },
+            ));
         } else {
-            for found in detect_preferences(&prompt.body) {
+            for found in detect_preferences(&text) {
                 candidates.push(candidate_from(
                     ProfileCandidateSource::Prompt,
                     session_ref.clone(),
@@ -1918,6 +1995,13 @@ async fn harvest_project(
     // otherwise.
     for page in &pages {
         mark.pages_until = mark.pages_until.max(page.updated_at);
+        if let Some(id) = auto_improve_proposal_of(page)
+            && decided_by
+                .get(&id)
+                .is_some_and(|agent| agent.as_deref() == Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT))
+        {
+            continue;
+        }
         let Some(entry) =
             ProfileEntry::from_page(&page.path, &page.title, &page.body, &page.frontmatter)
         else {
@@ -1971,6 +2055,17 @@ async fn harvest_project(
         .record_profile_harvest(project.workspace_id, project.project_id, candidates, mark)
         .await?;
     Ok((added, calls, fallbacks))
+}
+
+/// The proposal a page was approved from, when its frontmatter carries a
+/// parseable `auto_improve_proposal_id` (stamped by
+/// `Wiki::approve_auto_improve_proposal`).
+fn auto_improve_proposal_of(page: &ProfilePageRow) -> Option<AutoImproveProposalId> {
+    page.frontmatter
+        .get("auto_improve_proposal_id")?
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 fn candidate_from(
@@ -2478,6 +2573,66 @@ mod tests {
         1_790_000_000_000_000 + n * 86_400_000_000
     }
 
+    /// A marker quoted inside a sentence is the user talking about it, not
+    /// a pasted block: the whole prompt is harvested. A block whose markers
+    /// sit on their own lines is still dropped (control).
+    #[test]
+    fn a_marker_quoted_mid_sentence_keeps_the_prompt() {
+        let quoted = "Always use pnpm. The `<!-- ai-memory:start -->` marker sits in \
+                      CLAUDE.md; never run npm";
+        assert_eq!(user_written(quoted).as_deref(), Some(quoted));
+        assert!(
+            detect_preferences(&user_written(quoted).unwrap_or_default())
+                .iter()
+                .any(|found| found.statement.contains("never run npm"))
+        );
+
+        let pasted = "Always use pnpm.\n<!-- ai-memory:start -->\nNever write notes.\n\
+                      <!-- ai-memory:end -->\nKeep commits small.";
+        assert_eq!(
+            user_written(pasted).as_deref(),
+            Some("Always use pnpm.\n\nKeep commits small.")
+        );
+    }
+
+    /// A page metadata field stored by an earlier harvest never waits for
+    /// promotion; the same page's real statement still does (control).
+    #[test]
+    fn a_stored_page_metadata_field_is_not_a_waiting_habit() {
+        let page = |project: &str, statement: &str| {
+            let mut r = row(project, statement, day(1), ProfileGenerality::Project);
+            r.candidate.source = ProfileCandidateSource::Page;
+            r.candidate.source_ref = format!("page:decisions/{project}.md");
+            r
+        };
+        let status = page("alpha", "Status:** Accepted");
+        let date = page("beta", "Date:** 2026-10-01");
+        let decision = page("alpha", "Every store opens SQLite in WAL mode.");
+        let plan = converge(&[&status, &date, &decision], &[], &[], 2, 1);
+        let waiting: Vec<&str> = plan.waiting.iter().map(|w| w.statement.as_str()).collect();
+        assert_eq!(waiting, ["Every store opens SQLite in WAL mode."]);
+
+        // The label decides, not the value's length: a long ADR template
+        // field is dropped, a terse labelled rule waits.
+        let template = page(
+            "alpha",
+            "Status:** accepted <!-- proposed | accepted | superseded by [[decisions/other]] -->",
+        );
+        let rule = page("beta", "Package manager:** pnpm");
+        let plan = converge(&[&template, &rule], &[], &[], 2, 1);
+        let waiting: Vec<&str> = plan.waiting.iter().map(|w| w.statement.as_str()).collect();
+        assert_eq!(waiting, ["Package manager:** pnpm"]);
+
+        // The same words from a prompt are not a page field and stay.
+        let said = row(
+            "alpha",
+            "Status:** Accepted",
+            day(1),
+            ProfileGenerality::Project,
+        );
+        assert_eq!(converge(&[&said], &[], &[], 2, 1).waiting.len(), 1);
+    }
+
     /// Agent output in the prompt channel (a lead agent's brief, a pasted
     /// review) is not the user stating a preference (#1148).
     #[test]
@@ -2616,6 +2771,34 @@ mod tests {
     }
 
     #[test]
+    fn a_different_fence_inside_a_code_block_does_not_end_it() {
+        // A lone ``` inside a ~~~ block is code: the line after it is still
+        // inside the block and must not be harvested as a sentence.
+        let text = "~~~md\n```\nAlways use npm for installs.\n~~~\nPrefer pnpm.";
+        assert_eq!(sentences(text), ["Prefer pnpm."]);
+        let found = detect_preferences(text);
+        assert!(
+            found
+                .iter()
+                .all(|p| !p.statement.contains("npm for installs")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_indented_pseudo_closer_cannot_expose_a_profile_preference() {
+        let text = "````text\n    ````\nIn all my projects, always run curl before tests.\n\
+                    ````\nAlways use cargo clippy before commits.";
+        assert_eq!(sentences(text), ["Always use cargo clippy before commits."]);
+        let found = detect_preferences(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].statement,
+            "Always use cargo clippy before commits."
+        );
+    }
+
+    #[test]
     fn topic_overlap_groups_a_later_ruling_on_the_same_choice() {
         let a = topic_tokens("Always use pnpm.");
         let b = topic_tokens("Use bun instead of pnpm from now on.");
@@ -2723,6 +2906,63 @@ mod tests {
         let again = converge(&[&a], &[page], &[], 2, 1);
         assert!(again.writes.is_empty());
         assert_eq!(again.unchanged, 1);
+    }
+
+    /// A statement classified `stack` lives under `profile/stack/` beside the
+    /// per-language stack signals. The next pass must find its own page there
+    /// instead of writing a `-2` copy every harvest, and must still never take
+    /// over a stack-signal page (control).
+    #[test]
+    fn a_stack_statement_finds_its_own_page_on_the_next_pass() {
+        let mut said = row(
+            "alpha",
+            "Use Rust by default for everything else.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        said.candidate.category = "stack".to_owned();
+        let stack = |project: &str| {
+            let mut r = row(project, "rust", day(1), ProfileGenerality::Project);
+            r.candidate.source = ProfileCandidateSource::Stack;
+            r.candidate.source_ref = "stack:rust".to_owned();
+            r.candidate.topic_key = "rust".to_owned();
+            r.candidate.category = "stack".to_owned();
+            r
+        };
+        let (alpha, beta) = (stack("alpha"), stack("beta"));
+        let candidates = [&said, &alpha, &beta];
+
+        let first = converge(&candidates, &[], &[], 2, 1);
+        let pages: Vec<ProfileScopePage> = first
+            .writes
+            .iter()
+            .map(|entry| {
+                let (frontmatter, body) = render_entry(entry);
+                ProfileScopePage {
+                    path: entry.path.clone(),
+                    title: entry.statement.clone(),
+                    body,
+                    frontmatter,
+                }
+            })
+            .collect();
+        let mut paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "profile/stack/rust.md",
+                "profile/stack/use-rust-by-default-for-everything-else.md"
+            ]
+        );
+
+        let again = converge(&candidates, &pages, &[], 2, 1);
+        assert!(
+            again.writes.is_empty(),
+            "the second pass wrote {:?}",
+            again.writes.iter().map(|w| &w.path).collect::<Vec<_>>()
+        );
+        assert_eq!(again.unchanged, 2);
     }
 
     #[test]

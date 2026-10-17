@@ -1,9 +1,8 @@
 //! JSON routes for third-party read-only frontends.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use ai_memory_core::{ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{ObservationKind, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_store::{
     BriefingSnapshot, HealthPage, ObservationOrder, ObservationPage, ObservationRecord, PageHit,
     RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope_guarded,
@@ -42,6 +41,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route(
             "/search",
             axum::routing::get(search_handler).post(search_post_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/history/{*path}",
+            axum::routing::get(history_handler),
         )
         .route(
             "/workspaces/{workspace}/projects/{project}/recent",
@@ -172,7 +175,7 @@ async fn pages_handler(
     let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let pages = state
         .reader
-        .list_pages(&workspace, &project)
+        .list_unexpired_pages(&workspace, &project)
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -216,6 +219,7 @@ async fn page_handler(
         .map_err(internal_error)?;
 
     let page = ApiPage {
+        id: meta.id.to_string(),
         backlinks: links.backlinks,
         body_markdown: markdown.body,
         created_at: meta.created_at,
@@ -282,39 +286,97 @@ async fn page_handler(
     Ok(resp)
 }
 
+/// A page's stored versions, newest first, and a unified diff between two of
+/// them (default: the newest against the version it replaced). See
+/// `routes/history.rs`; the HTML view renders the same data.
+async fn history_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Path((workspace, project, path)): Path<(String, String, String)>,
+    Query(query): Query<super::history::HistoryQuery>,
+) -> Result<Response, Response> {
+    use super::history::HistoryError;
+    let history = super::history::load(
+        &state,
+        viewer_of(viewer),
+        &workspace,
+        &project,
+        &path,
+        &query,
+    )
+    .await
+    .map_err(|err| match err {
+        HistoryError::Scope(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            project, ..
+        }) => not_found(format!("project '{project}' not found")),
+        HistoryError::Scope(other) => scope_error_response(other),
+        HistoryError::BadRequest(message) => json_error(StatusCode::BAD_REQUEST, message),
+        HistoryError::NotFound(message) => not_found(message),
+        HistoryError::Internal(error) => internal_error(error),
+    })?;
+    let side = |side: &super::history::DiffSide| ApiHistorySide {
+        id: side.id.to_string(),
+        title: side.title.clone(),
+        created_at: side.created_at.clone(),
+    };
+    let (status, reason, truncated, hunks) = match history.diff {
+        crate::diff::Diff::Same => ("same", None, false, Vec::new()),
+        crate::diff::Diff::TooLarge(why) => ("too_large", Some(why), false, Vec::new()),
+        crate::diff::Diff::Changed { hunks, truncated } => ("changed", None, truncated, hunks),
+    };
+    Ok(with_no_store(
+        Json(ApiHistory {
+            workspace,
+            project,
+            path,
+            total: history.total,
+            offset: history.offset,
+            limit: history.limit,
+            diff: ApiHistoryDiff {
+                from: history.from.as_ref().map(side),
+                to: side(&history.to),
+                status,
+                reason,
+                truncated,
+                hunks,
+            },
+            versions: history.versions,
+        })
+        .into_response(),
+    ))
+}
+
 async fn search_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
-// NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
-// RRF-fuses FTS5 + entity matching + cosine over stored embeddings + link-graph
-// expansion, but it needs a query embedding — and `WebState` is read-only
-// (reader + wiki), with no embedder. Wiring true semantic search means injecting
-// an embedding client into `WebState` (touching `lib.rs`/`serve.rs`/`Cargo.toml`)
-// and confirming the embedding provider (Ollama) is reachable from the
-// deployment. Until then this handler stays FTS5-only. Link-graph "related
-// pages" already ship via the page-view `links`/`backlinks`
-// (`ReaderPool::page_links`).
+// A global search is FTS5 over every readable repository, as
+// `memory_query(global=true)` is. A scoped one (one project or `scopes`)
+// runs the hybrid ranker `memory_query` runs, with the server's embedder
+// and reranker (`crate::recall`), so the two surfaces agree on order.
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
     viewer: Option<ai_memory_core::UserId>,
+    owner: &ai_memory_core::OwnerFilter,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -339,7 +401,16 @@ async fn search_with_request(
     }
     let hits = match scoped_search_mode(state, &request, viewer).await? {
         SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
-        SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
+        SearchMode::Scoped(scopes) => {
+            let scopes: Vec<(WorkspaceId, ProjectId)> = scopes
+                .iter()
+                .map(|scope| (scope.workspace_id, scope.project_id))
+                .collect();
+            let filter = ai_memory_store::PageFilter::default();
+            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner, filter)
+                .await
+                .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
+        }
     }
     .map_err(internal_error)?;
 
@@ -412,45 +483,6 @@ async fn resolve_scopes(
             .collect()
     })
     .map_err(scope_error_response)
-}
-
-async fn search_scopes(
-    state: &WebState,
-    scopes: Vec<ResolvedSearchScope>,
-    term: String,
-    limit: usize,
-) -> ai_memory_store::StoreResult<Vec<PageHit>> {
-    let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
-    for scope in scopes {
-        let hits = state
-            .reader
-            .search_pages_for_project(
-                scope.workspace_id,
-                scope.project_id,
-                term.clone(),
-                limit,
-                None,
-            )
-            .await?;
-        for hit in hits {
-            hits_by_id
-                .entry(hit.id)
-                .and_modify(|existing| {
-                    if hit.rank < existing.rank {
-                        *existing = hit.clone();
-                    }
-                })
-                .or_insert(hit);
-        }
-    }
-    let mut hits: Vec<PageHit> = hits_by_id.into_values().collect();
-    hits.sort_by(|a, b| {
-        a.rank
-            .partial_cmp(&b.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    hits.truncate(limit);
-    Ok(hits)
 }
 
 #[derive(Deserialize)]
@@ -552,7 +584,7 @@ async fn recent_handler(
     if query.updated_since.is_none() && query.cursor.is_none() {
         let mut pages = state
             .reader
-            .list_pages(&workspace, &project)
+            .list_unexpired_pages(&workspace, &project)
             .await
             .map_err(internal_error)?;
         pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -777,7 +809,7 @@ async fn overview_handler(
 /// may leave `user` empty, and reading `user` here would file that operator as
 /// unattributed while the auth layer calls them a user — hiding their own
 /// handoffs, and the bodies of the shared ones, from them in their own UI.
-fn owner_filter_for(
+pub(crate) fn owner_filter_for(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> ai_memory_core::OwnerFilter {
     ai_memory_core::OwnerFilter::for_actor_context(
@@ -1065,8 +1097,8 @@ async fn project_overview_handler(
 /// `memory_read_session_observations` tool so a frontend and an agent see
 /// the same page sizes and body caps.
 const SESSION_LIST_MAX_LIMIT: usize = 100;
-const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
-const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
+pub(crate) const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
+pub(crate) const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
@@ -1207,7 +1239,7 @@ async fn session_observations_handler(
 /// `ai_memory_consolidate::projection::cap_text_with_marker`, which the MCP
 /// tool uses; duplicated here because the web crate does not depend on the
 /// consolidation pipeline.
-fn cap_body(body: &str, max_chars: usize) -> String {
+pub(crate) fn cap_body(body: &str, max_chars: usize) -> String {
     let total = body.chars().count();
     if total <= max_chars {
         return body.to_owned();
@@ -1464,6 +1496,40 @@ struct SessionObservationsQuery {
 }
 
 #[derive(Debug, Serialize)]
+struct ApiHistory {
+    workspace: String,
+    project: String,
+    path: String,
+    total: u64,
+    offset: usize,
+    limit: usize,
+    versions: Vec<ai_memory_store::PageVersion>,
+    diff: ApiHistoryDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistoryDiff {
+    /// `None` when `to` replaced nothing at this path.
+    from: Option<ApiHistorySide>,
+    to: ApiHistorySide,
+    /// `same`, `changed` or `too_large`.
+    status: &'static str,
+    /// Why a `too_large` diff was refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The output line cap cut `hunks` short.
+    truncated: bool,
+    hunks: Vec<crate::diff::Hunk>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistorySide {
+    id: String,
+    title: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ApiSessionList {
     sessions: Vec<SessionSummary>,
 }
@@ -1482,6 +1548,9 @@ struct ApiSessionObservations {
 
 #[derive(Debug, Serialize)]
 struct ApiPage {
+    /// Id of the latest version, the token a conditional MCP write or delete
+    /// passes back. It changes with every new version, so the ETag does too.
+    id: String,
     workspace: String,
     project: String,
     path: String,

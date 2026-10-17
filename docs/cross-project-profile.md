@@ -3,8 +3,8 @@
 ai-memory keeps knowledge per project, so switching harness costs nothing:
 Claude Code, Codex and OpenCode in one checkout read the same pages. The
 **profile** removes the other cost, switching *project*. It is a small set of
-pages recording how you usually work — the package manager you reach for, how
-you lay out tests, the architecture you prefer, the review workflow you follow —
+pages recording how you usually work (the package manager you reach for, how
+you lay out tests, the architecture you prefer, the review workflow you follow),
 and every project receives it at session start, through every harness.
 
 When you start a new repository and describe what you want, the agent already
@@ -99,6 +99,17 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 | `applies_to` | Stack tags the entry is scoped to, e.g. `[rust]` or `typescript`. |
 | `enforced_by` | Something already enforces it (e.g. `pre-push hook`); kept out of the digest. |
 
+`memory_write_page` and `ai-memory write-page` set the last two directly:
+`applies_to: ["rust"]` and `enforced_by: "pre-push hook"` in the tool call,
+or `--applies-to rust --enforced-by "pre-push hook"` on the command line
+(with `--workspace default --project _global --path profile/...` in the
+default deployment). A tag must be one the profile detects in a project
+(`rust`, `typescript`, `python`, ...); an unknown tag is refused rather than
+silently hiding the entry. Like the other metadata, a rewrite that omits them
+clears them. Both are refused on a page the digest does not read: one outside
+`profile/`, or a `profile/` path in a project other than `_global` or a
+profile project.
+
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one
 (git keeps its history). Most entries, though, are learned on their own; see
@@ -112,7 +123,7 @@ ai-memory profile list                   # every entry with its scope tags
 ai-memory profile show tools/pnpm.md     # one entry
 ai-memory profile forget tools/pnpm.md   # remove one entry (stays removed until you say it again)
 ai-memory profile review                 # entries with their evidence, habits still short of the bar
-ai-memory profile rebuild                # re-read every project from the start (safe to repeat)
+ai-memory profile rebuild                # re-read every project from the start (safe to repeat; removes nothing)
 ai-memory profile apply                  # write the entries that fit this repo into its rules file
 ai-memory profile list --user alice      # an operator's private profile (share = "user")
 ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
@@ -172,10 +183,18 @@ is new since the last one.
   code blocks never are. A sentence that reads like agent output (markdown
   bold, or a `file.ext:line` reference) is skipped too: on hosts where agents
   brief each other through the prompt channel, that text is a lead agent's
-  task brief or a pasted review, not you. Your verbatim words are kept as
-  evidence.
+  task brief or a pasted review, not you. Text you did not write is skipped
+  as well: a harness turn stored as a prompt (Claude Code's
+  `<task-notification>` blocks), the instruction files Codex injects as a user
+  message, and ai-memory's own routing snippet or recalled-history digest
+  pasted into a prompt (only that block; your sentences around it still
+  count). Your verbatim words are kept as evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
-  `procedures/`.
+  `procedures/`. A page contributes its `summary`, or else its first line of
+  prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the
+  top of an ADR are skipped. A page the auto-improve scheduler auto-approved
+  is skipped too: model output nobody reviewed is not curated, but a page a
+  human approved still counts.
 - **Stack signals**: the languages the project's activity shows (from file
   names such as `Cargo.toml` and source extensions).
 
@@ -245,7 +264,14 @@ the same way, with the word lists and the newest statement.
   rewrites a page it did not write, or one whose body changed since it wrote
   it, and `profile review` lists it as edited by hand.
 - **Start over:** `ai-memory profile rebuild` re-reads every project from the
-  beginning. It does not touch entries you edited or removed.
+  beginning. It does not touch entries you edited or removed, and it never
+  removes an entry: a candidate already recorded keeps the classification it
+  was recorded with, and an entry whose evidence no longer meets the bar stays
+  as written.
+- **After upgrading:** a release that tightens what the profile learns applies
+  to sentences read from then on. Entries an earlier version admitted stay,
+  even after `profile rebuild`; list them with `ai-memory profile review` and
+  remove the ones you do not want with `ai-memory profile forget <path>`.
 
 ## Server settings
 
@@ -285,8 +311,8 @@ llm = true
   - `auto` (default): `global` on a single-operator server, `user` on a
     multi-user one.
 - **`min_projects`**: how many distinct projects a choice must appear in before
-  it joins the profile on its own (a choice you state as general — "in all my
-  projects" — needs only one).
+  it joins the profile on its own (a choice you state as general, such as "in all my
+  projects", needs only one).
 - **`inject_on_session_start`**: `false` keeps the digest out of session start;
   the profile still reaches `memory_query`.
 - **`digest_max_bytes`** / **`baseline_max_bytes`**: the digest budgets, in

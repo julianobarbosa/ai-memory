@@ -30,6 +30,11 @@ use crate::{
     run_auto_improve_review,
 };
 
+/// `ActorContext.agent` the scheduler stamps on proposals it auto-approves
+/// (`decided_by_actor_json`). The profile harvester reads it to keep model
+/// output nobody reviewed out of the cross-project profile (#1211).
+pub const AUTO_IMPROVE_AUTO_APPROVE_AGENT: &str = "auto_improve_scheduler_auto_approve";
+
 /// Settings for the scheduled auto-improvement loop, already mapped from
 /// the host's configuration. Bundles the review config with the
 /// scheduler-only knobs so the tick driver takes a single value.
@@ -568,7 +573,7 @@ async fn stage_and_apply(
                 ctx.project_id,
                 *proposal_id,
                 ActorContext {
-                    agent: Some("auto_improve_scheduler_auto_approve".into()),
+                    agent: Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT.into()),
                     ..ActorContext::default()
                 },
                 None,

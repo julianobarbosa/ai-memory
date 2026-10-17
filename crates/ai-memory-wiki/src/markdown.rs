@@ -3,8 +3,8 @@
 //! We deliberately do *not* use `gray_matter` here: it parses fine but
 //! loses comments and key ordering on re-serialise, which is exactly the
 //! "duplicate frontmatter on already-frontmatter'd files" class of bug
-//! basic-memory hit (#528). Going through `serde_yaml` directly keeps the
-//! round-trip predictable.
+//! basic-memory hit (#528). Reading through [`crate::frontmatter_yaml`] and
+//! writing through `serde-saphyr` directly keeps the round-trip predictable.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -12,7 +12,23 @@ use std::ops::Range;
 use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, LinkTarget, PagePath};
 use serde::{Deserialize, Serialize};
 
-use crate::error::WikiResult;
+use crate::error::{WikiError, WikiResult};
+
+/// `yaml_12` emits plain scalars the way `serde_yaml` 0.9 did (no quotes
+/// around dates or `yes`), but prefixes this header, which a frontmatter
+/// block never carried.
+const YAML_12_HEADER: &str = "%YAML 1.2\n---\n";
+
+/// Serializer options for frontmatter, chosen to match `serde_yaml` 0.9
+/// output. The one remaining difference: a value that needs quoting gets
+/// double quotes where `serde_yaml` used single quotes.
+fn frontmatter_emit_options() -> serde_saphyr::SerializerOptions {
+    serde_saphyr::ser_options! {
+        yaml_12: true,
+        // Never fold long single-line strings into `>` blocks.
+        folded_wrap_chars: usize::MAX,
+    }
+}
 
 /// A parsed markdown document with detached frontmatter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,8 +74,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     {
         let fm_str = rest[..end].trim_end_matches('\r');
         let body = rest[end + close.len()..].to_string();
-        let fm_yaml: serde_yaml::Value = serde_yaml::from_str(fm_str)?;
-        let fm_json: serde_json::Value = serde_json::to_value(fm_yaml)?;
+        let fm_json = crate::frontmatter_yaml::parse(fm_str).map_err(WikiError::Yaml)?;
         return Ok(Markdown {
             frontmatter: fm_json,
             body,
@@ -72,7 +87,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
 }
 
 /// Emit a [`Markdown`] back to a string. Frontmatter is serialised through
-/// `serde_yaml` (so it round-trips deterministically); a `Null` or empty
+/// `serde-saphyr` (so it round-trips deterministically); a `Null` or empty
 /// object frontmatter is omitted entirely.
 ///
 /// # Errors
@@ -85,9 +100,11 @@ pub fn emit(md: &Markdown) -> WikiResult<String> {
     };
     let mut out = String::with_capacity(md.body.len() + 32);
     if has_fm {
-        let yaml = serde_yaml::to_string(&md.frontmatter)?;
+        let yaml =
+            serde_saphyr::to_string_with_options(&md.frontmatter, frontmatter_emit_options())?;
+        let yaml = yaml.strip_prefix(YAML_12_HEADER).unwrap_or(&yaml);
         out.push_str("---\n");
-        out.push_str(&yaml);
+        out.push_str(yaml);
         if !yaml.ends_with('\n') {
             out.push('\n');
         }
@@ -140,7 +157,11 @@ impl CodeFence {
     /// Returns `(updated_fence_state, line_is_code_or_fence)`.
     fn step(current: Option<Self>, line: &str) -> (Option<Self>, bool) {
         let in_fence = current.is_some();
-        let trimmed = line.trim_start();
+        let leading_spaces = line.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        if leading_spaces > 3 {
+            return (current, in_fence);
+        }
+        let trimmed = &line[leading_spaces..];
         let glyph = match trimmed.chars().next() {
             Some(c @ ('`' | '~')) => c,
             _ => return (current, in_fence),
@@ -515,6 +536,95 @@ fn rewrite_wikilinks_in_segment(
                 out.push_str(raw);
                 out.push_str("]]");
             }
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
+/// Rewrite `body`, replacing each wikilink whose normalised
+/// `(workspace, project, path)` key appears in `delink` with its plain label
+/// text: the `|label` when one is present, otherwise the raw target text.
+/// Every other wikilink — resolved cross-scope links and all same-project
+/// links included — is copied byte-identically, and fenced code blocks /
+/// inline code spans are skipped exactly as [`extract_links`] skips them, so
+/// an example `[[project:path]]` shown as code is never rewritten.
+///
+/// The consolidation apply path uses this to strip cross-scope links the
+/// store cannot resolve (#1218): the `delink` set is built from
+/// [`extract_links`] keys, so a key computed here matches byte-for-byte.
+/// Wikilink targets are project-root-relative, so `page_path` only matters
+/// for the (never-delinked) same-project form.
+#[must_use]
+pub fn delink_wikilinks(
+    body: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+) -> String {
+    if delink.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<CodeFence> = None;
+    for raw_line in body.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw_line);
+        let (next_fence, is_fence_or_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_fence_or_code {
+            out.push_str(line);
+            out.push_str(terminator);
+            continue;
+        }
+        let code_spans = inline_code_spans(line);
+        let mut pos = 0;
+        for span in &code_spans {
+            delink_wikilinks_in_segment(&line[pos..span.start], page_path, delink, &mut out);
+            out.push_str(&line[span.clone()]);
+            pos = span.end;
+        }
+        delink_wikilinks_in_segment(&line[pos..], page_path, delink, &mut out);
+        out.push_str(terminator);
+    }
+    out
+}
+
+fn delink_wikilinks_in_segment(
+    seg: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+    out: &mut String,
+) {
+    let mut rest = seg;
+    loop {
+        let Some(start) = rest.find("[[") else {
+            out.push_str(rest);
+            return;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            out.push_str(&rest[start..]);
+            return;
+        };
+        let raw = &after_start[..end];
+        // Parse exactly as `extract_wikilinks` does so a key in `delink`
+        // (built from `extract_links` output) hits the same occurrence.
+        let (target_part, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(t, l)| (t, Some(l)));
+        let unlabelled = target_part.trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        let delinked = normalize_link_target(&path_part, page_path, true)
+            .is_some_and(|path| delink.contains(&(workspace, project, path)));
+        if delinked {
+            let text = label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(unlabelled);
+            out.push_str(text);
+        } else {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
         }
         rest = &after_start[end + 2..];
     }
@@ -1212,6 +1322,245 @@ mod tests {
         assert_eq!(emit(&md).unwrap(), "Hello\n");
     }
 
+    fn frontmatter_of(yaml: &str) -> serde_json::Value {
+        parse(&format!("---\n{yaml}\n---\nbody\n"))
+            .unwrap()
+            .frontmatter
+    }
+
+    /// What `serde_yaml` 0.9 indexed for each value spelling (`None`: it
+    /// refused the page). A hand-edited page must index the same now.
+    #[test]
+    fn frontmatter_values_match_serde_yaml_0_9() {
+        use serde_json::json;
+        let cases: &[(&str, Option<serde_json::Value>)] = &[
+            // Leading zeros, digit separators, upper-case prefixes and
+            // out-of-range floats were text.
+            ("007", Some(json!("007"))),
+            ("+08", Some(json!("+08"))),
+            ("-01", Some(json!("-01"))),
+            ("1_000", Some(json!("1_000"))),
+            ("0X1F", Some(json!("0X1F"))),
+            ("0O17", Some(json!("0O17"))),
+            ("1e999", Some(json!("1e999"))),
+            // Infinity and NaN have no JSON form; serde_json wrote null.
+            (".inf", Some(json!(null))),
+            ("-.inf", Some(json!(null))),
+            (".nan", Some(json!(null))),
+            ("+.nan", Some(json!("+.nan"))),
+            // Integers wider than 64 bits were refused.
+            ("18446744073709551616", None),
+            ("-18446744073709551616", None),
+            (
+                "18446744073709551615",
+                Some(json!(18_446_744_073_709_551_615_u64)),
+            ),
+            ("-9223372036854775808", Some(json!(i64::MIN))),
+            // A local tag became a one-entry map; core tags kept the text.
+            ("!foo bar", Some(json!({ "!foo": "bar" }))),
+            ("!foo [1, 007]", Some(json!({ "!foo": [1, "007"] }))),
+            ("!!timestamp 2026-10-12", Some(json!("2026-10-12"))),
+            ("!!str 123", Some(json!("123"))),
+            ("!!binary aGVsbG8=", Some(json!("aGVsbG8="))),
+            // Controls.
+            ("yes", Some(json!("yes"))),
+            ("on", Some(json!("on"))),
+            ("True", Some(json!(true))),
+            ("2026-10-12", Some(json!("2026-10-12"))),
+            ("2026-10-12T01:08:40Z", Some(json!("2026-10-12T01:08:40Z"))),
+            ("0.92", Some(json!(0.92))),
+            ("1e3", Some(json!(1000.0))),
+            ("0x1F", Some(json!(31))),
+            ("0o17", Some(json!(15))),
+            ("0b101", Some(json!(5))),
+            ("1:20", Some(json!("1:20"))),
+            ("~", Some(json!(null))),
+            ("", Some(json!(null))),
+            ("'123'", Some(json!("123"))),
+        ];
+        for (yaml, expected) in cases {
+            let parsed = parse(&format!("---\nv: {yaml}\n---\nbody\n"));
+            match expected {
+                Some(value) => assert_eq!(
+                    parsed.map(|md| md.frontmatter).ok(),
+                    Some(json!({ "v": value })),
+                    "v: {yaml}"
+                ),
+                None => assert!(
+                    matches!(parsed, Err(crate::error::WikiError::Yaml(_))),
+                    "v: {yaml} must be refused, got {parsed:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn last_block_scalar_drops_its_final_newline_as_serde_yaml_did() {
+        // The fence drops the newline before `---`, so the YAML ends without
+        // one; libyaml did not count the missing break into the block.
+        let fm = frontmatter_of("a: |\n  kept\nb: |\n  last");
+        assert_eq!(fm, serde_json::json!({ "a": "kept\n", "b": "last" }));
+        let fm = frontmatter_of("b: |\n  last\n ");
+        assert_eq!(fm, serde_json::json!({ "b": "last\n" }));
+    }
+
+    #[test]
+    fn empty_frontmatter_block_is_null() {
+        let md = parse("---\n\n---\nbody\n").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body\n");
+    }
+
+    #[test]
+    fn duplicate_frontmatter_keys_are_rejected() {
+        let err = parse("---\ntitle: a\ntitle: b\n---\nbody\n").unwrap_err();
+        let crate::error::WikiError::Yaml(msg) = err else {
+            panic!("expected WikiError::Yaml, got {err:?}");
+        };
+        assert!(msg.contains("duplicate"), "{msg}");
+        assert!(msg.contains("line 2"), "error names the location: {msg}");
+    }
+
+    #[test]
+    fn block_scalars_and_multiline_strings_round_trip() {
+        let fm =
+            frontmatter_of("lit: |\n  one\n  two\nfold: >\n  folded\n  text\nstrip: |-\n  keep");
+        assert_eq!(
+            fm,
+            serde_json::json!({
+                "lit": "one\ntwo\n",
+                "fold": "folded text\n",
+                "strip": "keep",
+            })
+        );
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        // serde_yaml 0.9 wrote newline-bearing strings as literal blocks.
+        assert_eq!(
+            emitted,
+            "---\nlit: |\n  one\n  two\nfold: |\n  folded text\nstrip: keep\n---\n"
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    #[test]
+    fn keys_and_values_that_need_quotes_round_trip() {
+        let fm = serde_json::json!({
+            "key: colon": "a # b",
+            "#hash": "@at",
+            "123": "true",
+            "": "null",
+            "plain": "2026-10-12",
+        });
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        // Quoting uses double quotes (serde_yaml 0.9 used single quotes);
+        // dates stay plain, as serde_yaml wrote them.
+        assert_eq!(
+            emitted,
+            "---\n\"key: colon\": \"a # b\"\n\"#hash\": \"@at\"\n\"123\": \"true\"\n\"\": \"null\"\nplain: 2026-10-12\n---\n"
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    #[test]
+    fn non_ascii_and_long_strings_emit_plain_on_one_line() {
+        let long = "word ".repeat(400).trim_end().to_string();
+        let fm = serde_json::json!({ "title": "Olá — 日本語 🎉", "long": long });
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            emitted,
+            format!("---\ntitle: Olá — 日本語 🎉\nlong: {long}\n---\n")
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    /// A page in the shape serde_yaml 0.9 wrote (compact list indent, plain
+    /// timestamps, `{}`/`[]` for empty collections) re-emits byte for byte,
+    /// so the parser swap rewrites nothing on a page's next save.
+    #[test]
+    fn serde_yaml_shaped_page_re_emits_byte_for_byte() {
+        let src = "---\n\
+            kind: decision\n\
+            confidence: 0.92\n\
+            pinned: false\n\
+            created_at: 2026-10-12T01:08:40Z\n\
+            status: yes\n\
+            tags:\n\
+            - rust\n\
+            - 日本語\n\
+            summary: |\n  First line.\n  Second line.\n\
+            evidence:\n\
+            - kind: observation\n  id: 019e5633-4140-7dd0-9e2f-118825ca6355\n  at: 2026-07-18T09:35:52Z\n\
+            - kind: page\n  path: decisions/0001.md\n\
+            relations: {}\n\
+            aliases: []\n\
+            ---\n\
+            # Body\n";
+        assert_eq!(emit(&parse(src).unwrap()).unwrap(), src);
+    }
+
+    #[test]
+    fn frontmatter_alias_bomb_is_refused_quickly() {
+        // Nine levels of nine-fold aliases expand to 9^9 nodes.
+        let mut yaml = String::from("a: &a [x, x, x, x, x, x, x, x, x]\n");
+        let mut prev = 'a';
+        for name in "bcdefghi".chars() {
+            let refs = vec![format!("*{prev}"); 9].join(", ");
+            yaml.push_str(&format!("{name}: &{name} [{refs}]\n"));
+            prev = name;
+        }
+        let started = std::time::Instant::now();
+        let err = parse(&format!("---\n{yaml}---\nbody\n")).unwrap_err();
+        assert!(
+            matches!(err, crate::error::WikiError::Yaml(_)),
+            "alias bomb must surface as a YAML error: {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "alias bomb refusal must stay bounded, took {:?}",
+            started.elapsed()
+        );
+
+        // Control: ordinary anchors and aliases still parse, as before.
+        let fm = frontmatter_of("base: &b\n  tier: core\nref: *b\nlist: [*b]\nmerged:\n  <<: *b");
+        assert_eq!(
+            fm,
+            serde_json::json!({
+                "base": { "tier": "core" },
+                "ref": { "tier": "core" },
+                "list": [{ "tier": "core" }],
+                // serde_yaml 0.9 kept `<<` as an ordinary key.
+                "merged": { "<<": { "tier": "core" } },
+            })
+        );
+    }
+
+    #[test]
+    fn frontmatter_nesting_is_capped_at_serde_yaml_depth() {
+        let nested = |depth: usize, inner: &str| {
+            format!("{}{inner}{}", "[".repeat(depth), "]".repeat(depth))
+        };
+        // serde_yaml allowed 128 nested collections, the top mapping included.
+        assert!(parse(&format!("---\nv: {}\n---\n", nested(127, "1"))).is_ok());
+        let err = parse(&format!("---\nv: {}\n---\n", nested(128, "1"))).unwrap_err();
+        assert!(matches!(err, crate::error::WikiError::Yaml(_)), "{err:?}");
+        // An alias counts the depth it lands at, as serde_yaml's replay did.
+        let deep_alias = format!("a: &a {}\nb: {}", nested(100, "1"), nested(30, "*a"));
+        let err = parse(&format!("---\n{deep_alias}\n---\n")).unwrap_err();
+        assert!(matches!(err, crate::error::WikiError::Yaml(_)), "{err:?}");
+    }
+
     #[test]
     fn title_priority_frontmatter_then_heading_then_stem() {
         let path = PagePath::new("notes/foo.md").unwrap();
@@ -1251,6 +1600,63 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    /// Build a `delink` key exactly as the consolidation guard does: from
+    /// `extract_links` output for the cross-project targets named in
+    /// `targets`.
+    fn delink_set(body: &str, page: &PagePath, targets: &[&str]) -> BTreeSet<LinkKey> {
+        extract_links(body, page)
+            .into_iter()
+            .filter(|l| l.project.is_some() && targets.contains(&l.path.as_str()))
+            .map(|l| (l.workspace, l.project, l.path.as_str().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn delink_wikilinks_strips_only_listed_cross_scope_links() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "See [[infra:runbooks/02.md]] and [[infra:runbooks/missing.md|the gap]], \
+                    plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "See [[infra:runbooks/02.md]] and the gap, \
+             plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n",
+            "only the unresolved link is de-linked; the resolved one and the \
+             same-project pending link stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_without_label_keeps_the_target_text() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "Depends on [[_global:nope]].\n";
+        let delink = delink_set(body, &page, &["nope.md"]);
+        assert_eq!(delink.len(), 1, "_global target is extracted");
+        assert_eq!(
+            delink_wikilinks(body, &page, &delink),
+            "Depends on _global:nope.\n"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_skips_code_and_leaves_empty_set_untouched() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "```\n[[infra:runbooks/missing.md]]\n```\n\
+                    Inline `[[infra:runbooks/missing.md]]` stays code, \
+                    but [[infra:runbooks/missing.md]] is prose.\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "```\n[[infra:runbooks/missing.md]]\n```\n\
+             Inline `[[infra:runbooks/missing.md]]` stays code, \
+             but infra:runbooks/missing.md is prose.\n"
+        );
+        // An empty set must be a byte-identical no-op.
+        assert_eq!(delink_wikilinks(body, &page, &BTreeSet::new()), body);
     }
 
     #[test]
@@ -1437,6 +1843,58 @@ mod tests {
         let links4 = extract_links(md4, &path);
         assert_eq!(links4.len(), 1);
         assert_eq!(links4[0].path.as_str(), "outside.md");
+    }
+
+    #[test]
+    fn indented_pseudo_closers_do_not_expose_or_rewrite_fenced_links() {
+        let page = PagePath::new("concepts/a.md").unwrap();
+        let delink = BTreeSet::from([
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/hidden.md".to_string(),
+            ),
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/visible.md".to_string(),
+            ),
+        ]);
+
+        for prefix in ["    ", "\t", "\u{2003}"] {
+            let body = format!(
+                "````md\n{prefix}````\n[[decisions/hidden.md]]\n\
+                 [[infra:runbooks/hidden.md]]\n````\n[[decisions/visible.md]]\n\
+                 [[infra:runbooks/visible.md]]\n"
+            );
+            let links = extract_links(&body, &page);
+            let paths: Vec<&str> = links.iter().map(|link| link.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                ["decisions/visible.md", "runbooks/visible.md"],
+                "prefix {prefix:?}"
+            );
+
+            let rewritten = rewrite_local_wikilinks(&body, &page, "proj");
+            assert!(
+                rewritten.contains("[[decisions/hidden.md]]"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+            assert!(
+                rewritten.contains("[decisions/visible.md](../decisions/visible.md)"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+
+            let delinked = delink_wikilinks(&body, &page, &delink);
+            assert!(
+                delinked.contains("[[infra:runbooks/hidden.md]]"),
+                "prefix {prefix:?}: {delinked}"
+            );
+            assert!(
+                delinked.contains("\ninfra:runbooks/visible.md\n"),
+                "prefix {prefix:?}: {delinked}"
+            );
+        }
     }
 
     #[test]

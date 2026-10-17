@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Read-only HTTP browser for the ai-memory wiki (project list, tree navigation, markdown rendering, FTS5 search)."
 
+[features]
+default = []
+management-ui = []
+
 [dependencies]
 ai-memory-core.workspace = true
+ai-memory-llm.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 anyhow.workspace = true
@@ -34,6 +40,8 @@ anyhow.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 

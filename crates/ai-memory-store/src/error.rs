@@ -104,6 +104,11 @@ pub enum StoreError {
     #[error("writer actor is no longer running")]
     WriterClosed,
 
+    /// The read connection pool was closed at shutdown; no new read opens a
+    /// connection.
+    #[error("read connection pool is closed")]
+    ReaderClosed,
+
     /// A hook tried to reuse a session id that belongs to another immutable
     /// session tuple or operator. Deliberately carries no row details.
     #[error("session collision")]

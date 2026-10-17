@@ -27,6 +27,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -374,6 +375,7 @@ async fn rename_project_pages_still_searchable() {
     // axum's `oneshot` consumes the router.
     let state2 = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state.wiki.clone(),
@@ -450,6 +452,7 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
     // Purge the row out from under any in-flight rename.
     let purge_state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: state.writer.clone(),
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),
@@ -503,5 +506,196 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
         rename_resp.status(),
         StatusCode::NOT_FOUND,
         "rename of a vanished project must NOT silently return 200"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1208: `project_id` as an alternative to `from`
+// ---------------------------------------------------------------------------
+
+/// `rename-project` accepts `project_id` in place of `from`, so an operator
+/// can rename a legacy twin row whose name is shadowed by another project's
+/// `legacy_name`.
+#[tokio::test]
+async fn rename_project_accepts_project_id_instead_of_from() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    seed_page(&store, &state.wiki, "old-name").await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .reader
+        .find_project(ws, "old-name".to_string())
+        .await
+        .unwrap()
+        .expect("seeded project exists");
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "project_id": proj.to_string(),
+            "to": "new-name",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(
+        store
+            .reader
+            .find_project(ws, "new-name".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "the row named by project_id must be renamed"
+    );
+}
+
+/// A malformed `project_id` is a 400, before any lookup.
+#[tokio::test]
+async fn rename_project_rejects_a_malformed_project_id_with_400() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "project_id": "not-a-uuid",
+            "to": "new-name",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// An unknown (or foreign-scope) `project_id` is a 404.
+#[tokio::test]
+async fn rename_project_unknown_project_id_is_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "project_id": "00000000-0000-0000-0000-0000000000ff",
+            "to": "new-name",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// An id that really exists, but in ANOTHER workspace, is a 404 and leaves
+/// that project's name alone. Control: the same id renames when the request
+/// names its own workspace. (#1208)
+#[tokio::test]
+async fn rename_project_refuses_a_real_id_from_another_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "secret", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state.clone(),
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "project_id": foreign.to_string(),
+            "to": "hijacked",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a real id from another workspace must not resolve here"
+    );
+    assert_eq!(
+        store
+            .reader
+            .project_name_by_id(other_ws, foreign)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("secret"),
+        "the foreign project keeps its name"
+    );
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "elsewhere",
+            "project_id": foreign.to_string(),
+            "to": "renamed",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "control: its own workspace");
+}
+
+/// `from` and `project_id` together are ambiguous and refused with 400.
+#[tokio::test]
+async fn rename_project_refuses_both_from_and_project_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    seed_page(&store, &state.wiki, "old-name").await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .reader
+        .find_project(ws, "old-name".to_string())
+        .await
+        .unwrap()
+        .expect("seeded project exists");
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "from": "old-name",
+            "project_id": proj.to_string(),
+            "to": "new-name",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        store
+            .reader
+            .find_project(ws, "old-name".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "an ambiguous request must not rename anything"
     );
 }

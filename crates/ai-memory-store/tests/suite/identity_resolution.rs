@@ -37,16 +37,18 @@ async fn workspace(store: &Store) -> WorkspaceId {
         .unwrap()
 }
 
-async fn user(store: &Store, name: &str, byte: u8) -> UserId {
+async fn user(store: &Store, name: &str) -> UserId {
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: name.to_owned(),
                 name: None,
                 email: None,
             },
-            [byte; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap()
@@ -220,8 +222,8 @@ async fn an_outsider_cannot_take_an_unclaimed_projects_identity() {
         .set_access_mode(team_project, ai_memory_store::AccessMode::Restricted)
         .await
         .unwrap();
-    let member = user(&store, "member", 1).await;
-    let outsider = user(&store, "outsider", 2).await;
+    let member = user(&store, "member").await;
+    let outsider = user(&store, "outsider").await;
     store
         .writer
         .grant_memory(member, team_project, GrantLevel::Write, None)
@@ -277,8 +279,8 @@ async fn a_created_or_split_project_admits_its_creator() {
         .await
         .unwrap();
     let ws = workspace(&store).await;
-    let alice = user(&store, "alice", 1).await;
-    let bob = user(&store, "bob", 2).await;
+    let alice = user(&store, "alice").await;
+    let bob = user(&store, "bob").await;
 
     let (a, how) = resolve(
         &store,
@@ -613,7 +615,7 @@ async fn unauthorized_capture_cannot_claim_or_promote_an_identityless_legacy_nam
         .set_access_mode(project, AccessMode::Restricted)
         .await
         .unwrap();
-    let outsider = user(&store, "claim-promotion-outsider", 32).await;
+    let outsider = user(&store, "claim-promotion-outsider").await;
 
     let (resolved, how) = resolve_capture(
         &store,
@@ -643,7 +645,7 @@ async fn unauthorized_capture_resolves_but_cannot_promote_a_legacy_name() {
         .set_access_mode(project, AccessMode::Restricted)
         .await
         .unwrap();
-    let outsider = user(&store, "promotion-outsider", 33).await;
+    let outsider = user(&store, "promotion-outsider").await;
 
     let (resolved, how) = resolve_capture(
         &store,
@@ -712,7 +714,7 @@ async fn marker_aliases_require_same_remote_identity_and_preserve_uuid() {
         .set_access_mode(project, AccessMode::Restricted)
         .await
         .unwrap();
-    let writer = user(&store, "alias-writer", 7).await;
+    let writer = user(&store, "alias-writer").await;
     store
         .writer
         .grant_memory(writer, project, GrantLevel::Write, None)
@@ -737,7 +739,7 @@ async fn marker_aliases_require_same_remote_identity_and_preserve_uuid() {
         "read does not rename"
     );
 
-    let outsider = user(&store, "alias-outsider", 8).await;
+    let outsider = user(&store, "alias-outsider").await;
     let refused = store
         .writer
         .resolve_project_aliases_for_write(
@@ -1180,7 +1182,7 @@ async fn authorized_write_promotes_in_place_and_preserves_dependents_and_legacy_
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = workspace(&store).await;
-    let owner = user(&store, "promotion-owner", 7).await;
+    let owner = user(&store, "promotion-owner").await;
     let project = resolve(
         &store,
         ws,
@@ -1353,8 +1355,8 @@ async fn read_only_user_cannot_promote_a_legacy_name() {
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = workspace(&store).await;
-    let owner = user(&store, "promotion-owner", 8).await;
-    let reader = user(&store, "promotion-reader", 9).await;
+    let owner = user(&store, "promotion-owner").await;
+    let reader = user(&store, "promotion-reader").await;
     let project = resolve(
         &store,
         ws,
@@ -1459,7 +1461,7 @@ async fn audit_failure_rolls_back_promotion_and_keeps_the_writer_alive() {
         .upsert_page(preserved_page(ws, project))
         .await
         .unwrap();
-    let owner = user(&store, "rollback-owner", 31).await;
+    let owner = user(&store, "rollback-owner").await;
     store
         .writer
         .grant_memory(owner, project, GrantLevel::Write, None)

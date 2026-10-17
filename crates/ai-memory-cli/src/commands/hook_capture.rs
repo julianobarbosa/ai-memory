@@ -17,22 +17,30 @@ use crate::marker::{
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
-    CaptureConfig, CapturePolicy, CaptureSource, PolicyState, describe_invalid_capture_config,
+    CLIENT_MARKER_HEADER, CaptureConfig, CapturePolicy, CaptureSource, PolicyState,
+    describe_invalid_capture_config,
 };
 
 /// Resolve the nearest marker's capture policy without changing routing parsing.
 /// Root-level marker keys are intentionally ignored here; only `[capture]` is strict.
 pub fn capture_policy(cwd: &str) -> CapturePolicy {
-    let home = home_dir();
     let Some(marker) = find_marker(cwd) else {
+        let home = home_dir();
         return CapturePolicy::resolve(
             CaptureSource::Absent,
             cwd,
             home.as_deref().and_then(Path::to_str),
         );
     };
+    marker_capture_policy(&marker, cwd)
+}
+
+/// The capture policy one marker file declares; `cwd` stands in for its
+/// directory only when that cannot be read as text.
+pub(crate) fn marker_capture_policy(marker: &Path, cwd: &str) -> CapturePolicy {
+    let home = home_dir();
     let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
-    match read_capture_config(&marker) {
+    match read_capture_config(marker) {
         Ok(config) => CapturePolicy::resolve(
             CaptureSource::Parsed(&config),
             marker_dir,
@@ -316,7 +324,7 @@ pub fn marker_requests_briefing(cwd: &str) -> bool {
 
 /// Host-side routing hints sent with native lifecycle events.
 /// Missing names are left to the server; this inspection creates no scope.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct HookScope {
     #[serde(serialize_with = "serialize_scope_hint")]
     workspace: Option<String>,
@@ -387,6 +395,23 @@ impl HookScope {
         (self.workspace.is_some() || self.project_src == Some("marker")) && !self.is_explicit()
     }
 
+    /// Whether these hints alone decide the server's project: a project name,
+    /// or an identity the server routes by. Otherwise the server derives the
+    /// project from the event's cwd.
+    pub(crate) const fn names_the_project(&self) -> bool {
+        self.project.is_some() || self.identity.is_some()
+    }
+
+    /// Whether a project the server derives from the cwd follows the
+    /// enclosing repository (`repo-root`) rather than the cwd's own folder,
+    /// the default `basename`.
+    pub(crate) fn derives_from_repo_root(&self) -> bool {
+        matches!(
+            self.project_strategy.as_deref(),
+            Some("repo-root" | "repo_root")
+        )
+    }
+
     /// Whether both names were resolved on the host.
     #[must_use]
     pub fn is_explicit(&self) -> bool {
@@ -404,6 +429,18 @@ impl HookScope {
 #[must_use]
 pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
     hook_scope_from_selection(cwd, default_strategy, routing_selection(cwd).ok().flatten())
+}
+
+/// [`hook_scope`] resolved against `home` instead of the operator's home
+/// directory, so tests can keep a developer's `~/.ai-memory.toml` out.
+#[cfg(test)]
+pub(crate) fn hook_scope_with_home(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> HookScope {
+    let selection = crate::marker::routing_selection_with_home(cwd, cwd, home, false);
+    hook_scope_from_selection(cwd, default_strategy, selection.ok().flatten())
 }
 
 pub(crate) fn inspect_repository_coordinate(
@@ -717,6 +754,12 @@ fn repository_identity(
     .filter(|identity| identity.source.routes_by_identity())
 }
 
+/// [`CLIENT_MARKER_HEADER`] value the native hook sends on
+/// every request to the server. Set per request rather than as a client
+/// default because the same client also refreshes OIDC tokens with a third
+/// party, which has no use for it.
+const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
+
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
 /// skips Windows proxy auto-detection (registry / WinINET lookups), which
 /// is pure overhead for a loopback/LAN POST. Built once per invocation and
@@ -786,6 +829,7 @@ pub async fn post_hook(
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
         .timeout(timeout)
         .body(body.to_owned());
     if let Some(t) = token {
@@ -808,6 +852,13 @@ pub async fn post_hook(
 /// edge auth hop over the whole batch instead of paying it per event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOutcome {
+    /// Modern server returned one terminal result for each acknowledged item.
+    Detailed {
+        /// Per-item processing outcomes in request order.
+        outcomes: Vec<String>,
+        /// Item that failed after any earlier acknowledged items.
+        failed_index: Option<usize>,
+    },
     /// Server committed the leading `usize` items (contiguous prefix, oldest
     /// first). Equals the request length on full success; a smaller value means
     /// the server stopped on that item (fail-fast) — the caller deletes the
@@ -861,6 +912,7 @@ pub async fn post_batch(
     let mut req = client
         .post(batch_url)
         .header("Content-Type", "application/json")
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
         .timeout(timeout)
         .body(payload.to_owned());
     if let Some(t) = token {
@@ -872,7 +924,12 @@ pub async fn post_batch(
             if status.is_success() {
                 match resp.json::<serde_json::Value>().await {
                     Ok(v) => {
-                        if let Some(indices) = accepted_indices(&v) {
+                        if let Some(outcomes) = batch_outcomes(&v) {
+                            BatchOutcome::Detailed {
+                                outcomes,
+                                failed_index: failed_index(&v),
+                            }
+                        } else if let Some(indices) = accepted_indices(&v) {
                             BatchOutcome::AcceptedIndices {
                                 indices,
                                 failed_index: failed_index(&v),
@@ -915,6 +972,18 @@ pub async fn post_batch(
     }
 }
 
+fn batch_outcomes(v: &serde_json::Value) -> Option<Vec<String>> {
+    let results = v.get("results")?.as_array()?;
+    let mut outcomes = Vec::with_capacity(results.len());
+    for (position, result) in results.iter().enumerate() {
+        if result.get("index")?.as_u64()? as usize != position {
+            return None;
+        }
+        outcomes.push(result.get("outcome")?.as_str()?.to_owned());
+    }
+    Some(outcomes)
+}
+
 fn failed_index(v: &serde_json::Value) -> Option<usize> {
     v.get("failed_index")?.as_u64().map(|n| n as usize)
 }
@@ -938,7 +1007,10 @@ pub async fn get_handoff(
     token: Option<&str>,
     timeout: Duration,
 ) -> Option<String> {
-    let mut req = client.get(url).timeout(timeout);
+    let mut req = client
+        .get(url)
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
+        .timeout(timeout);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -979,6 +1051,32 @@ pub async fn get_handoff(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Shadows [`super::marker_query_suffix`] for every test in this module,
+    /// resolving against an empty operator home: the real one reads
+    /// `home_dir()`, and a developer's own `~/.ai-memory.toml` applies to
+    /// every cwd, so it would leak into the assertions. Tests that exercise a
+    /// home marker pass one to `routing_selection_with_home` themselves.
+    fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+        let home = tempfile::TempDir::new().unwrap();
+        match super::super::super::marker::routing_selection_with_home(
+            cwd,
+            cwd,
+            Some(home.path()),
+            false,
+        ) {
+            Ok(selection) => {
+                marker_query_suffix_impl_from_selection(cwd, default_strategy, true, selection)
+            }
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Shadows [`super::hook_scope`] the same way, for the same reason.
+    fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
+        let home = tempfile::TempDir::new().unwrap();
+        hook_scope_with_home(cwd, default_strategy, Some(home.path()))
+    }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1162,6 +1260,73 @@ mod tests {
         assert!(got.is_none(), "non-2xx body must not become context");
     }
 
+    /// Like `serve_once`, but answers 200 and hands back the raw request.
+    async fn capture_once() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read until the end of the headers; the body is irrelevant.
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn every_native_hook_request_carries_the_client_marker() {
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without it, and hook events ride the same contract.
+        let marker = format!("{CLIENT_MARKER_HEADER}: hook\r\n");
+        let (base, request) = capture_once().await;
+        get_handoff(
+            &build_client(),
+            &format!("{base}/handoff?agent=claude-code"),
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        let request = request.await.unwrap();
+        assert!(request.starts_with("get /handoff?"), "{request}");
+        assert!(request.contains(&marker), "handoff GET: {request}");
+
+        let (base, request) = capture_once().await;
+        post_hook(
+            &build_client(),
+            &format!("{base}/hook?event=stop"),
+            "{}",
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(request.await.unwrap().contains(&marker), "hook POST");
+
+        let (base, request) = capture_once().await;
+        post_batch(
+            &build_client(),
+            &format!("{base}/hook/batch"),
+            "[]",
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(request.await.unwrap().contains(&marker), "batch POST");
+    }
+
     // The marker parser's own tests (`parse_toml_key`, `find_marker`) moved to
     // `crate::marker` along with the code. What stays here is hook-specific:
     // the strict `[capture]` section and the query-string suffix.
@@ -1185,6 +1350,47 @@ mod tests {
         assert!(read_capture_config(&marker).is_err());
         std::fs::write(&marker, "x".repeat(MAX_MARKER_BYTES + 1)).unwrap();
         assert!(read_capture_config(&marker).is_err());
+    }
+
+    /// Every TOML spelling of `[capture]` the native parser honours, and the
+    /// ones it rejects, from the shared fixture the generated TypeScript
+    /// reader's Node runtime evidence runs too: a dotted top-level key or a
+    /// quoted table name must not escape either reader, and a shape toml_edit
+    /// rejects (an inline table, `[[capture]]`) fails closed in both.
+    #[test]
+    fn capture_section_spellings_match_toml_semantics() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-hooks/tests/fixtures/capture-policy.json"
+        ))
+        .unwrap();
+        let spellings = &fixture["marker_spellings"];
+        let texts = |kind: &str| {
+            spellings[kind]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| text.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let read = |text: &str| {
+            std::fs::write(&marker, text).unwrap();
+            read_capture_config(&marker).map(|config| config.ignore_paths)
+        };
+        for honoured in texts("honoured") {
+            assert_eq!(
+                read(&honoured),
+                Ok(vec!["secret/**".to_owned()]),
+                "{honoured}"
+            );
+        }
+        for rejected in texts("rejected") {
+            assert!(read(&rejected).is_err(), "{rejected}");
+        }
+        for unrelated in texts("unrelated") {
+            assert_eq!(read(&unrelated), Ok(Vec::new()), "{unrelated}");
+        }
     }
 
     #[test]

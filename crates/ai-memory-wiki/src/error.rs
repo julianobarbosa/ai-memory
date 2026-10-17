@@ -97,8 +97,8 @@ pub(crate) fn into_io_error(error: WikiError) -> std::io::Error {
     }
 }
 
-impl From<serde_yaml::Error> for WikiError {
-    fn from(value: serde_yaml::Error) -> Self {
+impl From<serde_saphyr::SerializeError> for WikiError {
+    fn from(value: serde_saphyr::SerializeError) -> Self {
         Self::Yaml(value.to_string())
     }
 }

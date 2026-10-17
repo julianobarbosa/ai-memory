@@ -15,6 +15,8 @@ final class AppModel {
     var isBusy = false
     var runtimeMissing = false
     var tokenConfigured = false
+    /// `init` wrote a bearer into the data dir; used when Settings has none.
+    var dataDirTokenPresent = false
     var lastHTTPStatus: Int?
 
     @ObservationIgnored private var tokenStore: any TokenStore
@@ -34,6 +36,7 @@ final class AppModel {
         self.tokenStore = tokenStore
         self.runner = runner
         self.tokenConfigured = tokenStore.read()?.isEmpty == false
+        self.dataDirTokenPresent = DataDirToken.read(dataDir: settings.resolvedDataDir) != nil
         startPolling()
     }
 
@@ -70,6 +73,10 @@ final class AppModel {
         report != nil
     }
 
+    private var effectiveToken: String? {
+        DataDirToken.effective(saved: tokenStore.read(), dataDir: dataDir)
+    }
+
     var dataDir: URL {
         settings.resolvedDataDir
     }
@@ -99,7 +106,7 @@ final class AppModel {
         launchd = controller.state()
         lastHTTPStatus = nil
         do {
-            report = try await health.fetch(baseURL: settings.serverURL, token: tokenStore.read())
+            report = try await health.fetch(baseURL: settings.serverURL, token: effectiveToken)
             fetchFailed = false
             lastError = nil
         } catch {
@@ -129,6 +136,7 @@ final class AppModel {
         }
         runtimeMissing = RuntimeLayout.resolve() == nil
         tokenConfigured = tokenStore.read()?.isEmpty == false
+        dataDirTokenPresent = DataDirToken.read(dataDir: dataDir) != nil
     }
 
     func installAndStart() async {
@@ -207,7 +215,7 @@ final class AppModel {
             let runtime = try self.requireRuntime()
             let result = try BundledCLI(runtime: runtime, runner: self.runner).status(
                 serverURL: self.settings.serverURL,
-                token: self.tokenStore.read(),
+                token: self.effectiveToken,
                 dataDir: self.settings.dataDirOverride
             )
             self.statusOutput = result.combinedOutput

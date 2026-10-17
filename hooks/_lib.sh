@@ -924,7 +924,7 @@ ai_memory_post_hook() {
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
@@ -932,13 +932,13 @@ ai_memory_post_hook() {
     elif [ -n "$_amhdr" ]; then
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
             --data-binary @- 2>/dev/null) || _amcode=000
     else
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null) || _amcode=000
@@ -960,18 +960,30 @@ ai_memory_post_hook() {
 # prepended to the agent's context, so cutting it to the invariant-5
 # budget would truncate the handoff that continuity depends on.
 # Invariant 5 governs fire-and-forget capture, not this read.
+# Every request in this bundle sends `X-AI-Memory-Client`: an unauthenticated
+# server reached through a non-loopback host name refuses a handoff fetch
+# without it, because a web page cannot add that header to a request it makes.
+#
+# The GET claims the newest open handoff in whatever project the server
+# resolves. `ai_memory_marker_qs` adds `&cwd=` whenever the payload named a
+# directory, so a URL without it names no project: the server would fall back
+# to its default or the caller's last active project, and the claim could
+# consume another repository's handoff. Fetch nothing then; the handoff stays
+# open for memory_handoff_accept (parity with the native hook).
 ai_memory_get_handoff() {
     case "$1" in
         *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+        *'&cwd='*) ;;
+        *) return 0 ;;
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 1.0 "$1" \
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
     elif [ -n "$_amhdr" ]; then
-        curl -s --max-time 1.0 "$1" -H @"$_amhdr"
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
     else
-        curl -s --max-time 1.0 "$1"
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
     fi
 }
 
@@ -1189,13 +1201,13 @@ ai_memory_drain_spool() {
         if [ -n "$_amdtok" ]; then
             _amdhdr="$_amddir/.drain-header.$$"
             (umask 077; printf 'Authorization: Bearer %s\n' "$_amdtok" >"$_amdhdr") 2>/dev/null || continue
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" -H @"$_amdhdr" \
                 --data-binary @- 2>/dev/null) || _amdcode=000
             rm -f "$_amdhdr" 2>/dev/null || true
         else
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" \
                 --data-binary @- 2>/dev/null) || _amdcode=000

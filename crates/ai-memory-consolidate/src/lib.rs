@@ -12,6 +12,7 @@ pub mod auto_improve;
 pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
+mod code_fence;
 pub mod cold_cluster;
 pub mod compaction;
 pub mod consolidator;
@@ -21,10 +22,12 @@ pub mod embed;
 pub mod entropy_filter;
 pub mod experience;
 pub mod keep_tokens;
+mod link_guard;
 pub mod lint;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
+mod prompt_template;
 pub mod sweep;
 pub mod types;
 
@@ -66,7 +69,7 @@ pub use consolidator::{
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
     MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, disambiguate_colliding_session_title,
-    existing_session_page_titles, redacted_error_summary,
+    effective_input_chars, existing_session_page_titles, redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
@@ -82,16 +85,16 @@ pub use embed::{
 };
 pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
-pub use keep_tokens::mine_keep_tokens;
+pub use keep_tokens::{mine_keep_tokens, mine_residue_tokens};
 pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,
 };
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
-    MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
+    LedgerRetention, MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
     run_sweep_with_breadth, run_sweep_with_compaction, run_sweep_with_hygiene,
-    run_sweep_with_options,
+    run_sweep_with_ledgers, run_sweep_with_options,
 };
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,

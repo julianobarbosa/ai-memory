@@ -507,6 +507,14 @@ pub fn parse_agent(s: &str) -> AgentKind {
     AgentKind::from_wire(s)
 }
 
+/// The prompt text of a `UserPromptSubmit`-style payload, from the same keys
+/// the router reads (`prompt`, `message`, `text`), flattened when a harness
+/// sends content blocks.
+#[must_use]
+pub fn user_prompt_text(raw: &serde_json::Value) -> Option<String> {
+    extract_content(raw, &["prompt", "message", "text"])
+}
+
 /// Identify the harness from the payload itself when it carries an
 /// unambiguous vendor marker, overriding the `?agent=` the hook command
 /// declared.
@@ -527,6 +535,62 @@ pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
     extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
 }
 
+/// Session and checkout fields extracted from the canonical hook payload shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookPayloadContext {
+    /// Harness-native session identity.
+    pub session_id: Option<String>,
+    /// Current checkout directory.
+    pub cwd: Option<String>,
+}
+
+/// Extract the session and checkout exactly as [`HookEnvelope`] does.
+#[must_use]
+pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
+    let session_id = extract_string(
+        raw,
+        &[
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "session",
+            "conversationId",
+        ],
+    )
+    .or_else(|| {
+        extract_string_path(
+            raw,
+            &[
+                &["info", "id"],
+                &["properties", "sessionID"],
+                &["properties", "info", "id"],
+                &["event", "properties", "sessionID"],
+                &["event", "properties", "info", "id"],
+                &["payload", "info", "id"],
+                &["payload", "properties", "sessionID"],
+                &["payload", "properties", "info", "id"],
+            ],
+        )
+    });
+    let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_string_path(
+                raw,
+                &[
+                    &["path", "cwd"],
+                    &["info", "directory"],
+                    &["properties", "info", "directory"],
+                    &["event", "properties", "info", "directory"],
+                    &["payload", "path", "cwd"],
+                    &["payload", "info", "directory"],
+                    &["payload", "properties", "info", "directory"],
+                ],
+            )
+        });
+    HookPayloadContext { session_id, cwd }
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -537,66 +601,14 @@ impl HookEnvelope {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
-        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code and native Codex use
-        // `session_id`, older Codex bridges `sessionId`, and Antigravity CLI
-        // uses `conversationId`.
-        // JSON keys are case-sensitive, so all spellings must be listed
-        // or tool events fail the router's "missing session_id" check.
-        let body_session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
-        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
-        // Cursor spells the workspace directory `workspace_roots` (an array,
-        // normally one entry; multi-root workspaces carry several) and never
-        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
-        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
-        // Without this spelling every Cursor session resolved to no cwd at all
-        // and landed in the server-default `default/scratch` bucket.
-        let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| {
-                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
-            })
-            .or_else(|| {
-                extract_string_path(
-                    &raw,
-                    &[
-                        &["path", "cwd"],
-                        &["info", "directory"],
-                        &["properties", "info", "directory"],
-                        &["event", "properties", "info", "directory"],
-                        &["payload", "path", "cwd"],
-                        &["payload", "info", "directory"],
-                        &["payload", "properties", "info", "directory"],
-                    ],
-                )
-            });
+        let context = hook_payload_context(&raw);
+        let session_id = context
+            .session_id
+            .or_else(|| query.session_id.filter(|s| !s.is_empty()));
         // Body cwd wins over the query-string fallback: the body is
         // what agent CLIs natively send, so any query-string `cwd` is
         // a bridge / test override that should defer to live data.
-        let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
+        let cwd = context.cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
@@ -813,16 +825,27 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
         AgentKind::ClaudeCode
             | AgentKind::CommandCode
             | AgentKind::Codex
+            // Cursor's own hooks and its copies of the Claude Code hooks carry
+            // Claude's snake_case tool aliases.
+            | AgentKind::Cursor
             | AgentKind::OpenCode
             | AgentKind::Pi
             | AgentKind::Omp
             | AgentKind::AntigravityCli
             | AgentKind::Grok
             | AgentKind::Hermes
+            | AgentKind::KiroCli
             | AgentKind::Pool
             | AgentKind::Zcode
             | AgentKind::CopilotCli
             | AgentKind::Grizzybot
+            | AgentKind::Droid
+            | AgentKind::Muse
+            // CodeBuddy Code sends Claude Code's snake_case tool fields
+            // (#1299). Unknown values stay `Other` and keep the capture-only
+            // path.
+            | AgentKind::CodeBuddy
+            | AgentKind::IbmBob
     )
 }
 
@@ -947,6 +970,16 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
         args,
         &["ReplacementContent", "CodeContent", "ReplacementChunks"],
     )
+}
+
+/// The tool a tool event names, under the keys the observation title uses.
+pub(crate) fn event_tool_name(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool", "tool_name", "name"])
+}
+
+/// The tool-use id a tool event carries (Claude-family payloads).
+pub(crate) fn event_tool_use_id(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool_use_id"])
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1158,6 +1191,12 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"]),
         HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        // Why the session ended (#1225): a string only, first line only, so
+        // consolidation and the zero-LLM page can tell a normal quit from
+        // anything else.
+        HookEvent::SessionEnd => extract_string(raw, &["reason"])
+            .and_then(first_line)
+            .map(|reason| format!("reason: {reason}")),
         _ => None,
     }
 }
@@ -2154,6 +2193,8 @@ mod tests {
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         assert_eq!(parse_agent("pool"), AgentKind::Pool);
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
+        assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -2213,6 +2254,96 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    /// CodeBuddy posts Claude Code's tool payload. The same body under
+    /// `agent=codebuddy` is a closed tool observation; under an unknown
+    /// agent it stays capture-only (`title` empty, no tool family).
+    #[test]
+    fn codebuddy_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_codebuddy",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::CodeBuddy);
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("outcome: unknown"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_codebuddy"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
+    /// IBM Bob documents the same snake_case tool fields as Claude Code. A
+    /// recognized Bob payload becomes a closed tool observation while an
+    /// unknown agent carrying identical JSON stays on the capture-only path.
+    #[test]
+    fn ibm_bob_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_bob",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::IbmBob);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_bob"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
     }
 
     /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the
@@ -2439,6 +2570,86 @@ mod tests {
         assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
     }
 
+    /// Factory Droid's PostToolUse is Claude-shaped with no tool-call id
+    /// (0.240.0 tool schemas, #1240): a `Create` is a closed `file` family and
+    /// its `tool_response` is the captured output.
+    #[test]
+    fn droid_create_post_tool_use_is_a_closed_file_family_without_call_id() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "permission_mode": "auto-low",
+            "tool_name": "Create",
+            "tool_input": {"file_path": "/repo/notes.md", "content": "hello"},
+            "tool_response": {"filePath": "/repo/notes.md", "success": true},
+            "session_id": "droid-session",
+            "transcript_path": "/home/u/.factory/sessions/x.jsonl",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("droid".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Droid);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("droid-session"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(!body.contains("tool_call_id"), "{body}");
+        assert!(body.contains("/repo/notes.md"), "{body}");
+    }
+
+    /// Meta Muse Code's PostToolUse and PostToolUseFailure, as captured
+    /// offline from Muse Code 1.4.7 (paths rewritten): a `write_file` is a
+    /// closed `file` family that keeps its `tool_use_id`, the session id is
+    /// the payload's UUIDv7, and a failure aliases to `post-tool-use`.
+    #[test]
+    fn muse_post_tool_use_is_a_closed_file_family_with_call_id() {
+        let raw = serde_json::json!({
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "model": "muse-wonder-1.0",
+            "model_provider": "meta",
+            "permission_mode": "bypassPermissions",
+            "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+            "tool_input": {"content": "alpha\n", "path": "notes.txt"},
+            "tool_name": "write_file",
+            "tool_response": {
+                "filePath": "/repo/notes.txt",
+                "structuredPatch": [{"lines": ["+alpha"], "newLines": 1, "newStart": 1, "oldLines": 0, "oldStart": 1}]
+            },
+            "tool_use_id": "call_30a33793ad9c",
+            "transcript_path": null,
+            "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("muse".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Muse);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("call_30a33793ad9c"), "{body}");
+
+        assert_eq!(
+            HookEvent::parse("PostToolUseFailure"),
+            HookEvent::PostToolUse
+        );
+    }
+
     /// Body is well-formed JSON but the expected `session_id` /
     /// `cwd` keys are missing — extraction returns None per key.
     #[test]
@@ -2493,6 +2704,31 @@ mod tests {
         };
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
         assert_eq!(env.agent, AgentKind::Other);
+    }
+
+    /// #1225: a SessionEnd's `reason` becomes the observation body (first
+    /// line, string only), so why a session ended survives capture. An
+    /// absent, empty or non-string reason leaves the body empty as before.
+    #[test]
+    fn session_end_reason_becomes_the_observation_body() {
+        let q = HookQuery {
+            event: "session-end".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = |raw| HookEnvelope::from_query_and_body(q.clone(), raw).body_excerpt;
+        assert_eq!(
+            body(serde_json::json!({ "reason": "prompt_input_exit" })).as_deref(),
+            Some("reason: prompt_input_exit")
+        );
+        assert_eq!(
+            body(serde_json::json!({ "reason": "logout\ninjected second line" })).as_deref(),
+            Some("reason: logout")
+        );
+        assert_eq!(body(serde_json::json!({})), None);
+        assert_eq!(body(serde_json::json!({ "reason": "" })), None);
+        assert_eq!(body(serde_json::json!({ "reason": 7 })), None);
+        assert_eq!(body(serde_json::json!({ "reason": { "kind": "x" } })), None);
     }
 
     /// Title-hint extraction must truncate at the first newline (the
@@ -2800,6 +3036,163 @@ mod tests {
             body.contains("MARKER_OBJ_456"),
             "object tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Cursor runs the Claude Code hooks too, sending its own payload with
+    /// Claude's `tool_name`/`tool_input` aliases and the result as a JSON
+    /// string in `tool_output`. The payload marks the event as Cursor's, and
+    /// Cursor was absent from `closed_tool_agent`, so its tool observations
+    /// were stored with no title or body (captured live from Cursor 3.24.9).
+    #[test]
+    fn cursor_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversation_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_output": "{\"output\":\"MARKER_CURSOR_OUTPUT\",\"exitCode\":0}",
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+                "cwd": "",
+                "workspace_roots": [],
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::Cursor);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("cursor post-tool body");
+        assert!(body.contains("MARKER_CURSOR_OUTPUT"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "preToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Kiro CLI's tool hooks carry `tool_name` and `tool_input`, and its
+    /// `PostToolUse` adds `tool_response`: a plain string on the v3 engine
+    /// (live capture, Kiro CLI 2.16.2) and an object with a `success` flag on
+    /// v2. The capture policy already read this shape, but Kiro was absent from
+    /// `closed_tool_agent`, so its tool observations were stored with no title
+    /// or body, the failure mode Grok had in #931.
+    #[test]
+    fn kiro_cli_tool_events_keep_their_family_title_and_output() {
+        let v3 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "kiro-v3-session",
+                "cwd": "/workspace/project",
+                "tool_name": "read_file",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_response": "MARKER_KIRO_V3_OUTPUT",
+            }),
+        );
+        assert_eq!(v3.agent, AgentKind::KiroCli);
+        assert_eq!(v3.title_hint.as_deref(), Some("tool file"));
+        let body = v3.body_excerpt.expect("kiro v3 post-tool body");
+        assert!(body.contains("MARKER_KIRO_V3_OUTPUT"), "{body:?}");
+
+        let v2 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "kiro-v2-session",
+                "cwd": "/workspace/project",
+                "tool_name": "fs_read",
+                "tool_input": {"operations": [{"mode": "Line", "path": "src/lib.rs"}]},
+                "tool_response": {"success": true, "result": ["MARKER_KIRO_V2_OUTPUT"]},
+            }),
+        );
+        assert_eq!(v2.title_hint.as_deref(), Some("tool file"));
+        let body = v2.body_excerpt.expect("kiro v2 post-tool body");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_KIRO_V2_OUTPUT"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "kiro-v3-session",
+                "cwd": "/workspace/project",
+                "tool_name": "read_file",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but
+    /// fell through to the unknown family, so its output was never stored
+    /// (#1186). The PreToolUse body still never carries the command.
+    #[test]
+    fn claude_code_powershell_tool_keeps_its_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": "Get-ChildItem SENTINEL_COMMAND", "description": "list"},
+                "tool_response": {"stdout": "MARKER_POWERSHELL_1186", "stderr": ""},
+                "tool_use_id": "toolu_1186",
+            }),
+        );
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("powershell post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("MARKER_POWERSHELL_1186"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": "Get-ChildItem SENTINEL_COMMAND"},
+                "tool_use_id": "toolu_1186",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        let body = pre.body_excerpt.expect("powershell pre-tool body");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
     /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case

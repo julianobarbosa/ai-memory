@@ -3,8 +3,9 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
+    AgentKind, ManagedNativeSessionReference, ManagedRunId, NativeSessionIdentity,
+    NewWorkstreamEvent, ProjectId, Sanitizer, WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -188,6 +189,9 @@ pub struct PreparedWorkstreamRun {
     pub native_session_id: Option<String>,
     /// Last adapter cursor for that native session.
     pub source_cursor: Option<String>,
+    /// Newest current session when this launch switches away from another
+    /// harness.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Last sequence already delivered to that native session.
     pub sync_after: i64,
     /// Workstream high-water mark assigned to the launch.
@@ -295,6 +299,9 @@ pub struct ManagedRunContext {
     pub agent: AgentKind,
     /// Linked native session when SessionStart has already reported it.
     pub native_session_id: Option<String>,
+    /// Newest current session from another harness when this run represents a
+    /// harness switch.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Lower delivery cursor.
     pub sync_after: i64,
     /// Assigned high-water mark.
@@ -392,6 +399,7 @@ struct FinishRunRow {
     sync_after: i64,
     sync_through: i64,
     context_delivered: bool,
+    exit_code: Option<i32>,
 }
 
 struct LinkRunRow {
@@ -525,6 +533,22 @@ pub(crate) fn prepare_run(
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
         });
+    let previous_native_session = tx
+        .query_row(
+            "SELECT agent_kind, native_session_id FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND is_current = 1 \
+             ORDER BY updated_at DESC, agent_kind ASC LIMIT 1",
+            params![workstream_id.as_bytes()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .and_then(|(previous_agent, previous_session)| {
+            let previous_agent = AgentKind::from_wire(&previous_agent);
+            (previous_agent != agent).then_some(ManagedNativeSessionReference {
+                agent: previous_agent,
+                native_session_id: previous_session,
+            })
+        });
     let established: i64 = tx.query_row(
         "SELECT CASE WHEN \
              EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
@@ -540,8 +564,9 @@ pub(crate) fn prepare_run(
     tx.execute(
         "INSERT INTO managed_runs( \
              id, workstream_id, agent_kind, lease_owner, native_session_id, owner_user, state, \
-             sync_after, sync_through, context_delivered, lease_expires_at, started_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10)",
+             sync_after, sync_through, context_delivered, lease_expires_at, started_at, \
+             previous_agent_kind, previous_native_session_id \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10, ?11, ?12)",
         params![
             run_id.as_bytes(),
             workstream_id.as_bytes(),
@@ -553,6 +578,12 @@ pub(crate) fn prepare_run(
             latest_sequence,
             now + LEASE_MICROS,
             now,
+            previous_native_session
+                .as_ref()
+                .map(|source| source.agent.as_str()),
+            previous_native_session
+                .as_ref()
+                .map(|source| source.native_session_id.as_str()),
         ],
     )?;
     tx.execute(
@@ -568,6 +599,7 @@ pub(crate) fn prepare_run(
         agent,
         native_session_id,
         source_cursor,
+        previous_native_session,
         sync_after,
         sync_through: latest_sequence,
         may_adopt_existing_session: established == 0,
@@ -1054,13 +1086,30 @@ pub(crate) fn finish_run(
     authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, false)
+}
+
+pub(crate) fn recover_run(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, true)
+}
+
+fn finish_run_inner(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+    recover_expired: bool,
+) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \
-                    sync_after, sync_through, context_delivered \
+                    sync_after, sync_through, context_delivered, exit_code \
              FROM managed_runs WHERE id = ?1",
             params![input.run_id.as_bytes()],
             |row| {
@@ -1072,6 +1121,7 @@ pub(crate) fn finish_run(
                     sync_after: row.get(4)?,
                     sync_through: row.get(5)?,
                     context_delivered: row.get(6)?,
+                    exit_code: row.get(7)?,
                 })
             },
         )
@@ -1090,6 +1140,7 @@ pub(crate) fn finish_run(
         sync_after,
         sync_through,
         context_delivered,
+        exit_code,
     } = run;
     let latest_before: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sequence), 0) FROM workstream_events WHERE workstream_id = ?1",
@@ -1097,12 +1148,44 @@ pub(crate) fn finish_run(
         |row| row.get(0),
     )?;
     if state == "finished" {
+        if recover_expired {
+            validate_finished_recovery(
+                &tx,
+                &workstream,
+                &agent_wire,
+                linked_session.as_deref(),
+                exit_code,
+                input,
+            )?;
+        }
+        tx.commit()?;
         return Ok(FinishedWorkstreamRun {
             imported_events: 0,
             latest_sequence: latest_before,
         });
     }
-    if state != "active" {
+    if state == "expired" && recover_expired {
+        let superseded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_runs newer \
+             JOIN managed_runs current ON current.id = ?2 \
+             WHERE newer.workstream_id = ?1 AND \
+               (newer.started_at > current.started_at OR \
+                (newer.started_at = current.started_at AND newer.rowid > current.rowid)))",
+            params![workstream, input.run_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if superseded {
+            return Err(StoreError::InvalidState(format!(
+                "managed run {} was superseded and cannot be recovered",
+                input.run_id
+            )));
+        }
+        tx.execute(
+            "UPDATE managed_runs SET state = 'active', ended_at = NULL, lease_expires_at = ?1 \
+             WHERE id = ?2 AND state = 'expired'",
+            params![now + LEASE_MICROS, input.run_id.as_bytes()],
+        )?;
+    } else if state != "active" {
         return Err(StoreError::InvalidState(format!(
             "managed run {} is {state}",
             input.run_id
@@ -1274,6 +1357,108 @@ pub(crate) fn finish_run(
         imported_events: imported,
         latest_sequence: latest,
     })
+}
+
+fn validate_finished_recovery(
+    tx: &Transaction<'_>,
+    workstream: &[u8],
+    agent_wire: &str,
+    linked_session: Option<&str>,
+    exit_code: Option<i32>,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<()> {
+    if input.native_session_id.as_deref() != linked_session
+        || (input.complete && input.exit_code != exit_code)
+        || (!input.complete && (input.source_cursor.is_some() || input.exit_code.is_some()))
+    {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery is not an exact replay".into(),
+        ));
+    }
+    for event in &input.events {
+        type StoredEvent = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        );
+        let stored: Option<StoredEvent> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind, source_record_id, role, content, \
+                        occurred_at, metadata_json FROM workstream_events \
+                 WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let expected = (
+            event.agent.as_str(),
+            event.native_session_id.as_str(),
+            event.kind.as_str(),
+            source_record_id.as_deref(),
+            event.role.as_deref(),
+            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES),
+            event.occurred_at.as_deref(),
+            serde_json::to_string(&metadata)?,
+        );
+        let exact = stored.as_ref().is_some_and(|stored| {
+            stored.0 == expected.0
+                && stored.1 == expected.1
+                && stored.2 == expected.2
+                && stored.3.as_deref() == expected.3
+                && stored.4.as_deref() == expected.4
+                && stored.5 == expected.5
+                && stored.6.as_deref() == expected.6
+                && stored.7 == expected.7
+        });
+        if !exact || event.agent.as_str() != agent_wire {
+            return Err(StoreError::InvalidState(
+                "finished managed run recovery contains uncommitted or changed events".into(),
+            ));
+        }
+    }
+    let stored_cursor = if let Some(native_session) = linked_session {
+        tx.query_row(
+            "SELECT source_cursor FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3",
+            params![workstream, agent_wire, native_session],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidState(
+                "finished managed run recovery has no durable native session".into(),
+            )
+        })?
+    } else {
+        None
+    };
+    if input.complete && stored_cursor != input.source_cursor {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery cannot advance its source cursor".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reader-side managed-run status.
@@ -1514,7 +1699,8 @@ pub(crate) fn run_context(
     let row = conn
         .query_row(
             "SELECT mr.workstream_id, w.name, mr.agent_kind, mr.native_session_id, \
-                    mr.sync_after, mr.sync_through, mr.context_delivered \
+                    mr.sync_after, mr.sync_through, mr.context_delivered, \
+                    mr.previous_agent_kind, mr.previous_native_session_id \
              FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
              WHERE mr.id = ?1 AND mr.state = 'active'",
             params![run_id.as_bytes()],
@@ -1527,13 +1713,33 @@ pub(crate) fn run_context(
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workstream, name, agent, native, after, through, delivered)) = row else {
+    let Some((
+        workstream,
+        name,
+        agent,
+        native,
+        after,
+        through,
+        delivered,
+        previous_agent,
+        previous_native,
+    )) = row
+    else {
         return Ok(None);
     };
+    let previous_native_session =
+        previous_agent
+            .zip(previous_native)
+            .map(|(agent, native_session_id)| ManagedNativeSessionReference {
+                agent: AgentKind::from_wire(&agent),
+                native_session_id,
+            });
     let workstream_id = WorkstreamId::from_slice(&workstream)?;
     let mut stmt = conn.prepare(
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
@@ -1584,6 +1790,7 @@ pub(crate) fn run_context(
         workstream_name: name,
         agent: AgentKind::from_wire(&agent),
         native_session_id: native,
+        previous_native_session,
         sync_after: after,
         sync_through: through,
         context_delivered: delivered,

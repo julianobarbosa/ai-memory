@@ -6,6 +6,22 @@ use serde_json::Value;
 mod scrub;
 pub use scrub::sanitize_external_text;
 
+/// Render a session id for terminal output, bounded so a long id cannot flood
+/// a report. CodeQL's sensitive-data heuristic reads any `session_id` name as
+/// account information; this is the function its `rust/cleartext-logging`
+/// barrier model names for the companions
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`),
+/// so companions print every session id through it. A session id is a routing
+/// identifier, not a credential.
+pub fn display_session_id(value: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut output = value.chars().take(MAX_CHARS).collect::<String>();
+    if value.chars().count() > MAX_CHARS {
+        output.push_str("...");
+    }
+    output
+}
+
 /// Reject credentials and control characters without changing retry identities.
 pub fn reject_sensitive(value: &Value) -> Result<()> {
     bounded(value, 0)?;

@@ -36,16 +36,20 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
+use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_workstream::{
     LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
-    list_native_sessions, wait_for_transcript_flush,
+    export_transcript_delta, export_transcript_range, list_native_sessions,
+    wait_for_transcript_flush,
 };
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
+use super::transcript_capture::{EventCapture, TranscriptCapture};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
 
@@ -60,6 +64,7 @@ const PER_HARNESS_SCAN_LIMIT: usize = 200;
 /// One `POST /hook/batch` request carries at most this many events — matches the
 /// server's `MAX_HOOK_BATCH_ITEMS` so a batch is never rejected for size.
 const HOOK_BATCH_ITEMS: usize = 256;
+const HOOK_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// The extension label backfilled non-user events (assistant/tool) are recorded
 /// under, mirroring the companion importer's replay-through-`/hook` mechanism.
@@ -91,6 +96,9 @@ struct BackfillReport {
     /// True when the store was already populated (or `--force` off) and nothing
     /// was imported.
     skipped_non_empty: bool,
+    /// True when this install's capture mode admits nothing from this
+    /// checkout (allowlist mode without a marker), so nothing was imported.
+    skipped_not_admitted: bool,
     /// True for a `--dry-run` (planning only, no import).
     dry_run: bool,
 }
@@ -133,6 +141,166 @@ pub(crate) fn sentinel_path(data_dir: &Path, cwd: &Path) -> PathBuf {
     hasher.update(cwd.as_os_str().as_encoded_bytes());
     let digest = hasher.finalize();
     data_dir.join("backfill-state").join(format!("{digest:x}"))
+}
+
+/// How long an in-progress marker blocks a new automatic backfill for the same
+/// checkout. A worker that died without releasing it (killed, crashed host)
+/// stops blocking after this, so the marker can never wedge the trigger.
+const INFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Cap on the emptiness probe. Without it a saturated server leaves every
+/// spawned backfill parked on an open connection, which piles more load on it.
+const EMPTINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn inflight_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = sentinel_path(data_dir, cwd).into_os_string();
+    path.push(".inflight");
+    PathBuf::from(path)
+}
+
+fn inflight_lock_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = inflight_path(data_dir, cwd).into_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// Unpredictable ownership nonce for one in-flight marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InflightClaim(String);
+
+impl InflightClaim {
+    fn new() -> Self {
+        // UUID v4 draws from the operating system CSPRNG. The simple form is
+        // path- and argv-safe while retaining 122 random bits.
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(raw)
+            .ok()
+            .map(|token| Self(token.simple().to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Run one marker mutation while holding the checkout's advisory lock.
+///
+/// Hook calls must remain non-blocking, so contention or an unusable state
+/// directory fails closed instead of waiting. The lock file intentionally
+/// remains in place: unlinking an advisory-lock file can split contenders
+/// across two inodes and destroy serialization.
+fn with_inflight_lock<T>(data_dir: &Path, cwd: &Path, operation: impl FnOnce() -> T) -> Option<T> {
+    let lock_path = inflight_lock_path(data_dir, cwd);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    lock.try_lock_exclusive().ok()?;
+    let result = operation();
+    let _ = fs2::FileExt::unlock(&lock);
+    Some(result)
+}
+
+/// Claim the right to spawn the automatic backfill for `cwd`.
+///
+/// Returns an ownership token when this caller created the marker and must
+/// spawn (or call [`release_inflight`] if the spawn fails). The token travels
+/// to the detached worker and prevents a delayed old worker from refreshing or
+/// releasing a newer stale takeover. `O_CREAT|O_EXCL` plus the per-checkout
+/// lock makes a burst of SessionStart hooks launch exactly one backfill.
+pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> Option<InflightClaim> {
+    let path = inflight_path(data_dir, cwd);
+    let claim = InflightClaim::new();
+    with_inflight_lock(data_dir, cwd, || {
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    if file.write_all(claim.as_str().as_bytes()).is_err() {
+                        let _ = std::fs::remove_file(&path);
+                        return None;
+                    }
+                    return Some(claim.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
+                    if !stale {
+                        return None;
+                    }
+                    let mut aside = path.clone().into_os_string();
+                    aside.push(format!(".stale.{}", claim.as_str()));
+                    if std::fs::rename(&path, &aside).is_err() {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                // An unwritable state dir must not turn into a spawn storm.
+                Err(_) => return None,
+            }
+        }
+        None
+    })
+    .flatten()
+}
+
+/// Refresh the marker only while `claim` still owns it.
+fn refresh_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        if contents != claim.as_str() {
+            return false;
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .is_ok()
+    })
+    .unwrap_or(false)
+}
+
+/// Drop the in-progress marker taken by [`claim_inflight`].
+pub(crate) fn release_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(claim.as_str()) {
+            return false;
+        }
+        std::fs::remove_file(path).is_ok()
+    })
+    .unwrap_or(false)
+}
+
+struct InflightGuard<'a> {
+    data_dir: &'a Path,
+    cwd: &'a Path,
+    claim: InflightClaim,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        release_inflight(self.data_dir, self.cwd, &self.claim);
+    }
 }
 
 fn write_sentinel(data_dir: &Path, cwd: &Path) {
@@ -189,7 +357,25 @@ async fn backfill_endpoint(
 /// are returned, including in JSON mode.
 pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the current working directory")?;
+    run_in(config, args, cwd).await
+}
 
+/// [`run`] for the checkout at `cwd`.
+async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
+    // The SessionStart hook took the in-progress marker before spawning this
+    // worker; free it however the run ends so a failed run can be retried.
+    let inflight_claim = args
+        .inflight_claim
+        .as_deref()
+        .and_then(InflightClaim::parse);
+    let _inflight = inflight_claim.clone().map(|claim| InflightGuard {
+        data_dir: &config.data_dir,
+        cwd: &cwd,
+        claim,
+    });
+    if let Some(claim) = &inflight_claim {
+        refresh_inflight(&config.data_dir, &cwd, claim);
+    }
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
@@ -203,14 +389,23 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let home = run::native_home(config).context("locating the local harness session stores")?;
-    let endpoint = backfill_endpoint(config, &args).await?;
-
     let mut report = BackfillReport {
         workspace: workspace.clone(),
         project: project.clone(),
         dry_run: args.dry_run,
         ..BackfillReport::default()
     };
+
+    // The live hook's admission gate and `[capture] ignore_paths`, applied to
+    // the import as the hook applies them to live events. A checkout the hook
+    // would emit nothing for (allowlist capture mode without a marker) imports
+    // nothing, before the server is contacted at all.
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, &cwd);
+    if !capture.admits_capture() {
+        report.skipped_not_admitted = true;
+        return finish(&args, &report);
+    }
+    let endpoint = backfill_endpoint(config, &args).await?;
 
     // Emptiness gate. Only bootstrap a brand-new store; an established project
     // is never retro-imported (that would duplicate hook-captured history).
@@ -243,10 +438,17 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
             report.skipped_for_cap += 1;
             continue;
         }
-        match import_one(&endpoint, &workspace, &project, &home, &cwd, &session).await {
+        match import_one(
+            &endpoint, &workspace, &project, &home, &cwd, &capture, &session,
+        )
+        .await
+        {
             Ok(events) => {
                 report.imported_sessions += 1;
                 report.imported_events += events;
+                if let Some(claim) = &inflight_claim {
+                    refresh_inflight(&config.data_dir, &cwd, claim);
+                }
             }
             Err(error) => {
                 report.failed_sessions += 1;
@@ -279,13 +481,22 @@ async fn project_is_empty(
     workspace: &str,
     project: &str,
 ) -> Result<bool> {
-    match get_json::<ByAgentResponse>(
-        endpoint,
-        "/admin/sessions/by-agent",
-        &[("workspace", workspace), ("project", project)],
+    let probe = tokio::time::timeout(
+        EMPTINESS_PROBE_TIMEOUT,
+        get_json::<ByAgentResponse>(
+            endpoint,
+            "/admin/sessions/by-agent",
+            &[("workspace", workspace), ("project", project)],
+        ),
     )
     .await
-    {
+    .unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "the server did not answer within {}s",
+            EMPTINESS_PROBE_TIMEOUT.as_secs()
+        ))
+    });
+    match probe {
         Ok(response) => Ok(response.by_agent.iter().map(|c| c.sessions).sum::<u64>() == 0),
         // A project that has never been written to does not exist server-side
         // yet, so the no-create lookup answers 404 — which is the strongest
@@ -430,7 +641,7 @@ pub(crate) async fn collect_local_sessions_with(
 
 /// One item in a `POST /hook/batch` request: the full hook URL (whose query the
 /// server parses for event/agent/scope/session) plus the JSON body.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct HookItem {
     url: String,
     body: serde_json::Value,
@@ -439,8 +650,61 @@ struct HookItem {
 /// The server's `/hook/batch` acknowledgement (subset we act on).
 #[derive(Debug, Deserialize)]
 struct HookBatchAck {
-    /// Contiguous leading prefix committed, oldest-first.
     accepted: usize,
+    results: Vec<HookBatchResult>,
+    #[serde(default)]
+    accepted_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    failed_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookBatchResult {
+    index: usize,
+    outcome: String,
+}
+
+fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usize>> {
+    let indices = ack
+        .accepted_indices
+        .clone()
+        .unwrap_or_else(|| (0..ack.accepted).collect());
+    if ack.accepted > items.len()
+        || indices.iter().any(|index| *index >= items.len())
+        || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || ack.accepted
+            != indices
+                .iter()
+                .enumerate()
+                .take_while(|(pos, index)| *pos == **index)
+                .count()
+        || ack.results.len() != indices.len()
+        || ack
+            .failed_index
+            .is_some_and(|index| index >= items.len() || indices.contains(&index))
+    {
+        bail!("invalid hook acknowledgement; keeping transcript for retry");
+    }
+    for (result, index) in ack.results.iter().zip(&indices) {
+        if result.index != *index {
+            bail!("hook acknowledgement result indices disagree");
+        }
+        let is_end = reqwest::Url::parse(&items[*index].url)?
+            .query_pairs()
+            .any(|(key, value)| key == "event" && value == "session-end");
+        match result.outcome.as_str() {
+            "stored" | "replayed" => {}
+            "ignored_end" if is_end => {}
+            "resumed" => bail!("hook processing resumed; rerun to confirm durable replay"),
+            outcome => {
+                bail!("hook item {index} was not durably stored ({outcome}); keeping transcript")
+            }
+        }
+    }
+    if let Some(index) = ack.failed_index {
+        bail!("hook processing failed at item {index}; keeping transcript for retry");
+    }
+    Ok(indices)
 }
 
 /// Import one native session by replaying its transcript through `/hook`, the
@@ -449,13 +713,15 @@ struct HookBatchAck {
 /// the original harness and its native session id. Returns the number of
 /// content events (messages/tools) imported. The server sanitizes and bounds
 /// every event, so retroactive text crosses the same trust boundary as live
-/// capture.
+/// capture, and `capture` drops or strips tool events the checkout's
+/// `[capture] ignore_paths` excludes before anything is posted.
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
     project: &str,
     home: &Path,
     cwd: &Path,
+    capture: &TranscriptCapture,
     session: &SessionRef,
 ) -> Result<usize> {
     let roots = LaunchRoots { home, cwd };
@@ -463,29 +729,112 @@ async fn import_one(
         build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
             .ok()
             .and_then(|plan| plan.session_dir);
-    // These are historical sessions, so the flush wait is a quick no-op; ignore
-    // its result and read whatever is on disk.
-    let _ = wait_for_transcript_flush(
-        session.harness,
+    import_exact_session(
+        endpoint,
+        workspace,
+        project,
         home,
         cwd,
-        session_dir.as_deref(),
-        &session.native_session_id,
-    )
-    .await;
-    let transcript = export_transcript(
         session.harness,
-        home,
-        cwd,
-        session_dir.as_deref(),
         &session.native_session_id,
+        session_dir.as_deref(),
         None,
+        capture,
     )
     .await
-    .with_context(|| format!("reading the {} transcript", session.harness.as_str()))?;
+}
 
-    let sid = &session.native_session_id;
-    let agent = session.harness.agent_kind().as_str();
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn import_exact_session_range(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    recovery_interval_id: &str,
+    session_dir: Option<&Path>,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+    expected_digests: &[String],
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let _ = wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await;
+    let transcript = export_transcript_range(
+        harness,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+        source_cursor,
+        final_cursor,
+    )
+    .await
+    .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    let actual = ai_memory_workstream::transcript_interval_digests(&transcript.events);
+    if actual != expected_digests {
+        bail!("native transcript range no longer matches its exact ordered semantic identity");
+    }
+    import_exported_transcript(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        Some(recovery_interval_id),
+        transcript,
+        capture,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn import_exact_session(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    session_dir: Option<&Path>,
+    source_cursor: Option<&str>,
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let _ = wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await;
+    let transcript = if let Some(cursor) = source_cursor {
+        export_transcript_delta(harness, home, cwd, session_dir, native_session_id, cursor).await
+    } else {
+        export_transcript(harness, home, cwd, session_dir, native_session_id, None).await
+    }
+    .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    import_exported_transcript(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        None,
+        transcript,
+        capture,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_exported_transcript(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    recovery_interval_id: Option<&str>,
+    transcript: ai_memory_workstream::ExportedTranscript,
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let sid = native_session_id;
+    let agent = harness.agent_kind().as_str();
     let resolved = resolve_occurred_at(&transcript.events);
     let mut items = Vec::with_capacity(transcript.events.len() + 2);
     items.push(hook_item(
@@ -495,13 +844,25 @@ async fn import_one(
         agent,
         "session-start",
         sid,
-        &format!("{sid}:session-start"),
+        &replay_ingest_key(recovery_interval_id, sid, "session-start", "boundary"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.earliest }),
     )?);
     let mut content = 0usize;
-    for (event, occurred_at) in transcript.events.iter().zip(&resolved.per_event) {
-        if let Some(mapped) = map_event(sid, event, occurred_at.as_deref()) {
+    let captures = capture.decide(&transcript.events);
+    for ((event, occurred_at), capture) in transcript
+        .events
+        .iter()
+        .zip(&resolved.per_event)
+        .zip(&captures)
+    {
+        if let Some(mapped) = map_event(
+            recovery_interval_id,
+            sid,
+            event,
+            occurred_at.as_deref(),
+            capture,
+        ) {
             items.push(hook_item(
                 endpoint,
                 workspace,
@@ -523,13 +884,95 @@ async fn import_one(
         agent,
         "session-end",
         sid,
-        &format!("{sid}:session-end"),
+        &replay_ingest_key(recovery_interval_id, sid, "session-end", "boundary"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.latest }),
     )?);
 
     post_hook_items(endpoint, &items).await?;
     Ok(content)
+}
+
+/// Replay only the user prompts of one session the server already knows,
+/// for harnesses whose live hooks carry no prompt event (Antigravity CLI).
+/// `finalize-session` sends these before its synthetic `session-end`, so the
+/// summary page and the automatic handoff are built with the prompts.
+///
+/// No session boundaries are sent: the caller owns the `session-end`, and a
+/// keyed one would be deduplicated on a later `--reopen`. Each prompt carries
+/// the same [`replay_ingest_key`] that `backfill` mints for that event, so
+/// repeated finalizes (and a backfill of the same session) store it once.
+/// Returns the number of prompts sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_session_prompts(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+) -> Result<usize> {
+    let transcript = export_transcript(harness, home, cwd, None, native_session_id, None)
+        .await
+        .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    let items = prompt_hook_items(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        &transcript.events,
+    )?;
+    if !items.is_empty() {
+        post_hook_items(endpoint, &items).await?;
+    }
+    Ok(items.len())
+}
+
+/// The `user-prompt` hook items of a transcript, in transcript order, each
+/// dated at its own event time and keyed with [`replay_ingest_key`]. Every
+/// other event kind is dropped.
+fn prompt_hook_items(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    events: &[NewWorkstreamEvent],
+) -> Result<Vec<HookItem>> {
+    let agent = harness.agent_kind().as_str();
+    let resolved = resolve_occurred_at(events);
+    let mut items = Vec::new();
+    for (event, occurred_at) in events.iter().zip(&resolved.per_event) {
+        // Only user prompts are forwarded below, and `[capture] ignore_paths`
+        // governs file-tool events (the live hook does not filter prompts
+        // either), so no capture decision applies here.
+        let Some(mapped) = map_event(
+            None,
+            native_session_id,
+            event,
+            occurred_at.as_deref(),
+            &EventCapture::Keep,
+        ) else {
+            continue;
+        };
+        if mapped.event != "user-prompt" {
+            continue;
+        }
+        items.push(hook_item(
+            endpoint,
+            workspace,
+            project,
+            agent,
+            &mapped.event,
+            native_session_id,
+            &mapped.ingest_key,
+            None,
+            mapped.body,
+        )?);
+    }
+    Ok(items)
 }
 
 /// Per-event `occurred_at` resolution for one transcript, plus the session's
@@ -620,17 +1063,40 @@ struct MappedEvent {
 /// `occurred_at` (RFC 3339), already resolved by the caller, rides in the hook
 /// body so the imported observation is dated at the transcript's own event
 /// time rather than at import time.
+///
+/// `capture` is the checkout's capture decision for this event: a dropped
+/// event maps to nothing, and a metadata-only one carries the hook's
+/// metadata-only body with its `_ai_memory_capture` protocol, which the server
+/// validates and rebuilds from its allowlist exactly as for a live hook. A kept
+/// event carries no protocol: its body is a normalized transcript record, not
+/// the native tool payload the server's re-inspection reads, so a claim would
+/// be judged against the wrong schema and stripped; the server never receives
+/// the ignore patterns, so the client's decision is the only one possible.
+/// An unrecognized tool's event carries only its family, as the live server
+/// stores for an unknown-family tool, never its arguments or output.
 fn map_event(
+    recovery_interval_id: Option<&str>,
     session_id: &str,
     event: &NewWorkstreamEvent,
     occurred_at: Option<&str>,
+    capture: &EventCapture,
 ) -> Option<MappedEvent> {
     let content = event.content.trim();
     if content.is_empty() {
         return None;
     }
+    let decision = match capture {
+        EventCapture::Drop => return None,
+        EventCapture::MetadataOnly(decision) => Some(decision),
+        EventCapture::Keep | EventCapture::Unrecognized => None,
+    };
     let role = event.role.as_deref().unwrap_or("");
-    let ingest_key = format!("{session_id}:{}", event.event_id);
+    let ingest_key = replay_ingest_key(
+        recovery_interval_id,
+        session_id,
+        event.kind.as_str(),
+        &event.event_id,
+    );
     match event.kind {
         WorkstreamEventKind::Message if role == "user" || role == "human" => Some(MappedEvent {
             event: "user-prompt".to_string(),
@@ -651,16 +1117,39 @@ fn map_event(
                 _ if role.is_empty() => "message".to_string(),
                 _ => format!("{role}-message"),
             };
-            Some(MappedEvent {
-                event: format!("backfill.{source_event}"),
-                source_event: Some(source_event),
-                ingest_key,
-                body: serde_json::json!({
+            let body = match decision {
+                Some(decision) => {
+                    let mut body = metadata_only_body(Some(session_id), None, decision);
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert("occurred_at".into(), occurred_at.into());
+                    }
+                    body
+                }
+                None if matches!(capture, EventCapture::Unrecognized) => {
+                    let outcome = if event.kind == WorkstreamEventKind::ToolResult {
+                        "\noutcome: unknown"
+                    } else {
+                        ""
+                    };
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "title": "tool unknown",
+                        "message": format!("tool_family: unknown{outcome}"),
+                        "occurred_at": occurred_at,
+                    })
+                }
+                None => serde_json::json!({
                     "session_id": session_id,
                     "title": first_line(content),
                     "message": event.content,
                     "occurred_at": occurred_at,
                 }),
+            };
+            Some(MappedEvent {
+                event: format!("backfill.{source_event}"),
+                source_event: Some(source_event),
+                ingest_key,
+                body,
             })
         }
         WorkstreamEventKind::Compaction
@@ -678,6 +1167,27 @@ fn first_line(content: &str) -> String {
     } else {
         capped
     }
+}
+
+fn replay_ingest_key(
+    recovery_interval_id: Option<&str>,
+    session_id: &str,
+    kind: &str,
+    event_id: &str,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [
+        recovery_interval_id.unwrap_or_default(),
+        session_id,
+        kind,
+        event_id,
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("recovery_{}", &digest[..55])
 }
 
 /// Build a `/hook` URL whose query the server parses for event/agent/scope. The
@@ -720,32 +1230,58 @@ fn hook_item(
     })
 }
 
-/// POST the events in server-sized batches, retrying the unaccepted suffix of a
-/// partially accepted batch (per-source rate limiting can skip a tail) before
-/// failing. Events are oldest-first, so a leading-prefix ack is safe to resume.
+/// POST events in server-sized batches. Recovery requires a modern per-item
+/// acknowledgement and fails closed on partial or terminal-drop outcomes.
+fn hook_batch_end(items: &[HookItem], offset: usize) -> Result<usize> {
+    let mut end = offset;
+    let mut bytes = 2_usize;
+    while end < items.len() && end - offset < HOOK_BATCH_ITEMS {
+        let item_bytes = serde_json::to_vec(&items[end])?.len().saturating_add(1);
+        if item_bytes > HOOK_BATCH_BYTES {
+            bail!("one sanitized hook item exceeds the recovery request byte limit");
+        }
+        if end > offset && bytes.saturating_add(item_bytes) > HOOK_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(item_bytes);
+        end += 1;
+    }
+    Ok(end)
+}
+
 async fn post_hook_items(endpoint: &ServerEndpoint, items: &[HookItem]) -> Result<()> {
-    for chunk in items.chunks(HOOK_BATCH_ITEMS) {
-        let mut offset = 0usize;
+    let mut offset = 0_usize;
+    while offset < items.len() {
+        let end = hook_batch_end(items, offset)?;
+        let chunk = &items[offset..end];
         let mut stalled = 0u32;
-        while offset < chunk.len() {
-            let batch: Vec<&HookItem> = chunk[offset..].iter().collect();
+        loop {
+            let batch: Vec<&HookItem> = chunk.iter().collect();
             let ack: HookBatchAck = post_json(endpoint, "/hook/batch", &batch)
                 .await
                 .context("replaying transcript events through /hook/batch")?;
-            if ack.accepted == 0 {
+            let accepted = acknowledged_items(&ack, &batch)?;
+            if accepted.len() == batch.len() {
+                break;
+            }
+            if accepted.is_empty() {
                 stalled += 1;
                 if stalled >= 5 {
                     bail!(
-                        "server accepted none of a hook batch after {stalled} attempts \
+                        "server acknowledged none of a hook batch after {stalled} attempts \
                          (rate limited or saturated); rerun to resume"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(200 * u64::from(stalled))).await;
                 continue;
             }
-            stalled = 0;
-            offset += ack.accepted.min(chunk.len() - offset);
+            bail!(
+                "server acknowledged only {} of {} transcript items; keeping transcript for a safe retry",
+                accepted.len(),
+                batch.len()
+            );
         }
+        offset = end;
     }
     Ok(())
 }
@@ -756,6 +1292,13 @@ fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()
         return Ok(());
     }
     if args.quiet {
+        return Ok(());
+    }
+    if report.skipped_not_admitted {
+        println!(
+            "ai-memory: capture mode is allowlist and this checkout has no .ai-memory.toml marker opting in (or its marker is unreadable) — nothing to backfill for {}/{}.",
+            report.workspace, report.project
+        );
         return Ok(());
     }
     if report.skipped_non_empty {
@@ -848,6 +1391,150 @@ mod tests {
         assert_eq!(select_sessions(vec![session("a", 1)], 1).len(), 1);
     }
 
+    /// #1287: a burst of SessionStart hooks in one directory must spawn one
+    /// backfill. Only the first claim wins; another directory is unaffected.
+    #[test]
+    fn only_one_session_start_claims_the_backfill_per_checkout() {
+        let data = tempfile::tempdir().unwrap();
+        let app = Path::new("/home/me/projects/app");
+        let other = Path::new("/home/me/projects/other");
+
+        let claim = claim_inflight(data.path(), app).unwrap();
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "second burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "third burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), other).is_some(),
+            "separate checkout"
+        );
+
+        assert!(release_inflight(data.path(), app, &claim));
+        assert!(
+            claim_inflight(data.path(), app).is_some(),
+            "free again after release"
+        );
+    }
+
+    /// A worker that died without releasing its marker must not block the
+    /// checkout forever.
+    #[test]
+    fn a_stale_inflight_marker_is_replaced() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        claim_inflight(data.path(), cwd).unwrap();
+
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        assert!(
+            claim_inflight(data.path(), cwd).is_some(),
+            "stale marker is taken over"
+        );
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "the new claim holds"
+        );
+    }
+
+    /// A worker's refresh makes an old marker fresh again, so a long backfill
+    /// keeps its claim; the refreshed marker retains its ownership token.
+    #[test]
+    fn a_refreshed_marker_is_not_taken_over() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        let claim = claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(refresh_inflight(data.path(), cwd, &claim));
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "a live worker keeps it"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), claim.as_str());
+    }
+
+    /// Once a stale marker has been taken over, the previous worker cannot
+    /// refresh or release the replacement marker even if it resumes later.
+    #[test]
+    fn stale_takeover_refuses_the_previous_owners_refresh_and_release() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        let previous = claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let replacement = claim_inflight(data.path(), cwd).unwrap();
+        assert_ne!(previous, replacement);
+        assert!(!refresh_inflight(data.path(), cwd, &previous));
+        assert!(!release_inflight(data.path(), cwd, &previous));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            replacement.as_str(),
+            "the replacement owner remains intact"
+        );
+        assert!(refresh_inflight(data.path(), cwd, &replacement));
+        assert!(release_inflight(data.path(), cwd, &replacement));
+        assert!(!marker.exists());
+    }
+
+    /// The stale takeover leaves no `.stale.*` file behind and exactly one
+    /// marker in place.
+    #[test]
+    fn a_stale_takeover_leaves_one_marker_and_no_debris() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        claim_inflight(data.path(), cwd).unwrap();
+        let names: Vec<String> = std::fs::read_dir(marker.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "marker plus its stable lock: {names:?}");
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight.lock")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".stale.")),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn sentinel_path_is_cwd_specific_and_path_safe() {
         let dir = Path::new("/data");
@@ -888,9 +1575,11 @@ mod tests {
     #[test]
     fn user_message_maps_to_the_canonical_user_prompt() {
         let m = map_event(
+            None,
             "sid",
             &event(WorkstreamEventKind::Message, Some("user"), "do the thing"),
             Some("2026-09-10T12:00:00Z"),
+            &EventCapture::Keep,
         )
         .expect("user message maps");
         assert_eq!(m.event, "user-prompt");
@@ -901,14 +1590,608 @@ mod tests {
         assert_eq!(m.body["prompt"], "do the thing");
         assert_eq!(m.body["occurred_at"], "2026-09-10T12:00:00Z");
         assert_eq!(
-            m.ingest_key, "sid:evt-1",
+            m.ingest_key,
+            replay_ingest_key(None, "sid", "message", "evt-1"),
             "ingest key is stable per source event"
         );
+        assert_eq!(m.ingest_key.len(), 64);
+        assert!(
+            m.ingest_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+    }
+
+    #[test]
+    fn replay_keys_are_deterministic_valid_and_bounded_for_long_native_ids() {
+        let session = "native:".repeat(200);
+        let event = "event/with spaces:".repeat(200);
+        let first = replay_ingest_key(None, &session, "message", &event);
+        let second = replay_ingest_key(None, &session, "message", &event);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.starts_with("recovery_"));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_ne!(
+            first,
+            replay_ingest_key(None, &session, "tool_call", &event)
+        );
+        let other_interval = replay_ingest_key(Some("journal-2"), &session, "message", &event);
+        assert_ne!(first, other_interval);
+        assert_eq!(
+            other_interval,
+            replay_ingest_key(Some("journal-2"), &session, "message", &event),
+            "one journal interval must replay stably"
+        );
+    }
+
+    #[test]
+    fn prompt_replay_keeps_only_user_prompts_with_backfill_keys() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let with_id = |id: &str, mut e: NewWorkstreamEvent| {
+            e.event_id = id.to_string();
+            e
+        };
+        let events = [
+            with_id(
+                "p1",
+                event(WorkstreamEventKind::Message, Some("user"), "first ask"),
+            ),
+            with_id(
+                "a1",
+                event(WorkstreamEventKind::Message, Some("assistant"), "an answer"),
+            ),
+            with_id(
+                "t1",
+                event(WorkstreamEventKind::ToolCall, None, "run tests"),
+            ),
+            with_id(
+                "p2",
+                event(WorkstreamEventKind::Message, Some("user"), "second ask"),
+            ),
+        ];
+        let items = prompt_hook_items(
+            &endpoint,
+            "ws",
+            "proj",
+            ManagedHarness::Antigravity,
+            "sid",
+            &events,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2, "only the two user prompts are replayed");
+        for (item, (id, prompt)) in items
+            .iter()
+            .zip([("p1", "first ask"), ("p2", "second ask")])
+        {
+            let url = reqwest::Url::parse(&item.url).unwrap();
+            let query = |name: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.into_owned())
+            };
+            assert_eq!(query("event").as_deref(), Some("user-prompt"));
+            assert_eq!(query("agent").as_deref(), Some("antigravity-cli"));
+            assert_eq!(
+                query("extension"),
+                None,
+                "a prompt is not a backfill extension"
+            );
+            assert_eq!(
+                query("ingest_key"),
+                Some(replay_ingest_key(None, "sid", "message", id)),
+                "the key matches what backfill mints for the same event"
+            );
+            assert_eq!(item.body["prompt"], prompt);
+        }
+    }
+
+    #[test]
+    fn recovery_hook_batches_respect_count_and_serialized_byte_limits() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let make = |size| HookItem {
+            url: endpoint.build_url("/hook?event=user-prompt"),
+            body: serde_json::json!({"prompt": "x".repeat(size)}),
+        };
+        let items = (0..HOOK_BATCH_ITEMS + 1)
+            .map(|_| make(1))
+            .collect::<Vec<_>>();
+        assert_eq!(hook_batch_end(&items, 0).unwrap(), HOOK_BATCH_ITEMS);
+
+        let large = vec![make(HOOK_BATCH_BYTES / 2), make(HOOK_BATCH_BYTES / 2)];
+        assert_eq!(hook_batch_end(&large, 0).unwrap(), 1);
+        assert!(
+            hook_batch_end(&[make(HOOK_BATCH_BYTES)], 0)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn acknowledgement_requires_results_and_rejects_terminal_drops() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let item = hook_item(
+            &endpoint,
+            "ws",
+            "project",
+            "claude-code",
+            "user-prompt",
+            "sid",
+            "key",
+            None,
+            serde_json::json!({"session_id": "sid", "prompt": "hello"}),
+        )
+        .unwrap();
+        let items = [&item];
+        for outcome in [
+            "dropped_policy",
+            "dropped_subagent",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+            "resumed",
+        ] {
+            let ack = HookBatchAck {
+                accepted: 1,
+                results: vec![HookBatchResult {
+                    index: 0,
+                    outcome: outcome.into(),
+                }],
+                accepted_indices: None,
+                failed_index: None,
+            };
+            assert!(acknowledged_items(&ack, &items).is_err(), "{outcome}");
+        }
+        let legacy = HookBatchAck {
+            accepted: 1,
+            results: Vec::new(),
+            accepted_indices: None,
+            failed_index: None,
+        };
+        assert!(acknowledged_items(&legacy, &items).is_err());
+    }
+
+    #[test]
+    fn acknowledgement_allows_stored_replayed_and_only_terminal_ignored_end() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let make = |event| {
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                event,
+                "sid",
+                "key",
+                None,
+                serde_json::json!({"session_id": "sid"}),
+            )
+            .unwrap()
+        };
+        let prompt = make("user-prompt");
+        let end = make("session-end");
+        for outcome in ["stored", "replayed"] {
+            let ack = HookBatchAck {
+                accepted: 1,
+                results: vec![HookBatchResult {
+                    index: 0,
+                    outcome: outcome.into(),
+                }],
+                accepted_indices: Some(vec![0]),
+                failed_index: None,
+            };
+            assert_eq!(acknowledged_items(&ack, &[&prompt]).unwrap(), vec![0]);
+        }
+        let ignored = HookBatchAck {
+            accepted: 1,
+            results: vec![HookBatchResult {
+                index: 0,
+                outcome: "ignored_end".into(),
+            }],
+            accepted_indices: Some(vec![0]),
+            failed_index: None,
+        };
+        assert!(acknowledged_items(&ignored, &[&prompt]).is_err());
+        assert_eq!(acknowledged_items(&ignored, &[&end]).unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn real_hook_router_replay_is_idempotent_and_reports_outcomes() {
+        use ai_memory_core::{ActiveProject, IngestMetrics, Sanitizer, SessionId};
+        use ai_memory_hooks::{
+            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
+            hook_router,
+        };
+        use ai_memory_store::Store;
+        use ai_memory_wiki::Wiki;
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let workspace_id = store.writer.get_or_create_workspace("ws").await.unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let state = HookState {
+            workspace_id,
+            project_id,
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki: Wiki::new(temp.path(), store.writer.clone()).unwrap(),
+            consolidator: None,
+            sanitizer: Sanitizer::default(),
+            project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
+            active_project: ActiveProject::new(),
+            ingest_metrics: Arc::new(IngestMetrics::default()),
+            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+            ingest_gates: IngestGates::default(),
+            ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
+            consolidate_on_session_end: false,
+            session_consolidation_notify: None,
+            profile_notify: None,
+            capture_assistant_enabled: false,
+            claim_handoff_on_session_start: true,
+            create_handoff_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+            home_dir: None,
+            trusted_proxy_identity: false,
+            per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
+            ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+        };
+        let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
+        let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
+        let recovery_interval_id = Some("journal");
+        let items = vec![
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "session-start",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "session-start", "boundary"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+            )
+            .unwrap(),
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "user-prompt",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "message", "event-1"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": "same prompt"}),
+            )
+            .unwrap(),
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "session-end",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "session-end", "boundary"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+            )
+            .unwrap(),
+        ];
+        let spool = crate::commands::hook_spool::spool_dir(temp.path());
+        let overlapping = hook_item(
+            &endpoint,
+            "ws",
+            "project",
+            "claude-code",
+            "user-prompt",
+            sid,
+            "random_live_key",
+            None,
+            serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": "same prompt"}),
+        )
+        .unwrap();
+        crate::commands::hook_spool::enqueue(
+            &spool,
+            &crate::commands::hook_spool::entry_for(
+                overlapping.url,
+                overlapping.body.to_string(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        let quarantine = crate::commands::hook_spool::quarantine_session_entries(
+            &Config::default(),
+            &spool,
+            "journal",
+            0,
+            u64::MAX,
+            &endpoint.identity(),
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            sid,
+        )
+        .unwrap();
+        assert_eq!(crate::commands::hook_spool::spool_len(&spool), 0);
+
+        let body = serde_json::to_vec(&items).unwrap();
+        let first = hook_router(state.clone())
+            .oneshot(
+                axum::http::Request::post("/hook/batch")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let first: HookBatchAck = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            acknowledged_items(&first, &items.iter().collect::<Vec<_>>())
+                .unwrap()
+                .len(),
+            3
+        );
+        let second = hook_router(state.clone())
+            .oneshot(
+                axum::http::Request::post("/hook/batch")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second: HookBatchAck = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            second
+                .results
+                .iter()
+                .any(|result| result.outcome == "replayed")
+        );
+        assert!(
+            second
+                .results
+                .iter()
+                .any(|result| result.outcome == "ignored_end")
+        );
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "same prompt")
+                .count(),
+            1
+        );
+        quarantine.complete().unwrap();
+    }
+
+    /// Two sequential offline intervals on one resumed native session: the
+    /// second interval's journal id gives its boundary and content keys their
+    /// own identity, so its session-end is STORED (re-closing the session with
+    /// its end-of-session effects) instead of being short-circuited as a
+    /// replay of the first interval's end, while re-running either interval
+    /// stays a pure replay.
+    #[tokio::test]
+    async fn two_sequential_recovery_intervals_on_one_resumed_session_replay_exactly_once() {
+        use ai_memory_core::{ActiveProject, IngestMetrics, ObservationKind, Sanitizer, SessionId};
+        use ai_memory_hooks::{
+            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
+            hook_router,
+        };
+        use ai_memory_store::Store;
+        use ai_memory_wiki::Wiki;
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let workspace_id = store.writer.get_or_create_workspace("ws").await.unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let state = HookState {
+            workspace_id,
+            project_id,
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki: Wiki::new(temp.path(), store.writer.clone()).unwrap(),
+            consolidator: None,
+            sanitizer: Sanitizer::default(),
+            project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
+            active_project: ActiveProject::new(),
+            ingest_metrics: Arc::new(IngestMetrics::default()),
+            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+            ingest_gates: IngestGates::default(),
+            ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
+            consolidate_on_session_end: false,
+            session_consolidation_notify: None,
+            profile_notify: None,
+            capture_assistant_enabled: false,
+            claim_handoff_on_session_start: true,
+            create_handoff_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+            home_dir: None,
+            trusted_proxy_identity: false,
+            per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
+            ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+        };
+        let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
+        let sid = "native-session-resumed-across-two-offline-intervals";
+        let interval_items = |journal: &str, prompt: &str, event_id: &str| {
+            vec![
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "session-start",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "session-start", "boundary"),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+                )
+                .unwrap(),
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "user-prompt",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "message", event_id),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": prompt}),
+                )
+                .unwrap(),
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "session-end",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "session-end", "boundary"),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+                )
+                .unwrap(),
+            ]
+        };
+        let router_state = state.clone();
+        let post = move |items: Vec<HookItem>| {
+            let state = router_state.clone();
+            async move {
+                let response = hook_router(state)
+                    .oneshot(
+                        axum::http::Request::post("/hook/batch")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(serde_json::to_vec(&items).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let ack: HookBatchAck = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    acknowledged_items(&ack, &items.iter().collect::<Vec<_>>())
+                        .unwrap()
+                        .len(),
+                    items.len()
+                );
+                ack.results
+                    .into_iter()
+                    .map(|result| result.outcome)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let first = interval_items("journal-a", "first interval prompt", "event-1");
+        assert_eq!(
+            post(first.clone()).await,
+            vec!["stored", "stored", "stored"],
+            "the first offline interval recovers exactly once"
+        );
+        let second = interval_items("journal-b", "second interval prompt", "event-2");
+        assert_eq!(
+            post(second.clone()).await,
+            vec!["stored", "stored", "stored"],
+            "the resumed interval's content and session-end must be stored, not replayed"
+        );
+
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 6, "two start/end pairs and two prompts");
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "first interval prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "second interval prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.kind == ObservationKind::SessionEnd)
+                .count(),
+            2,
+            "each interval's session-end is its own stored observation"
+        );
+
+        for rerun in [first, second] {
+            assert!(
+                rerun
+                    .iter()
+                    .zip(post(rerun.clone()).await)
+                    .all(|(item, outcome)| {
+                        let is_end = reqwest::Url::parse(&item.url)
+                            .unwrap()
+                            .query_pairs()
+                            .any(|(key, value)| key == "event" && value == "session-end");
+                        outcome == "replayed" || (is_end && outcome == "ignored_end")
+                    }),
+                "re-running a recovered interval is a pure replay"
+            );
+        }
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 6, "replays add no observations");
     }
 
     #[test]
     fn assistant_and_tool_events_map_to_backfill_extension_observations() {
         let a = map_event(
+            None,
             "sid",
             &event(
                 WorkstreamEventKind::Message,
@@ -916,6 +2199,7 @@ mod tests {
                 "here is the plan\nline2",
             ),
             None,
+            &EventCapture::Keep,
         )
         .expect("assistant maps");
         assert_eq!(a.event, "backfill.assistant-message");
@@ -931,9 +2215,11 @@ mod tests {
         );
 
         let t = map_event(
+            None,
             "sid",
             &event(WorkstreamEventKind::ToolCall, None, "grep foo"),
             None,
+            &EventCapture::Keep,
         )
         .expect("tool call maps");
         assert_eq!(t.event, "backfill.tool_call");
@@ -1050,9 +2336,11 @@ mod tests {
     fn empty_and_boundary_events_are_dropped() {
         assert!(
             map_event(
+                None,
                 "sid",
                 &event(WorkstreamEventKind::Message, Some("user"), "   "),
                 None,
+                &EventCapture::Keep,
             )
             .is_none(),
             "whitespace-only content is not an observation"
@@ -1063,7 +2351,14 @@ mod tests {
             WorkstreamEventKind::Annotation,
         ] {
             assert!(
-                map_event("sid", &event(kind, None, "boundary"), None).is_none(),
+                map_event(
+                    None,
+                    "sid",
+                    &event(kind, None, "boundary"),
+                    None,
+                    &EventCapture::Keep
+                )
+                .is_none(),
                 "{kind:?} is not session content"
             );
         }
@@ -1119,6 +2414,744 @@ mod tests {
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
     }
 
+    /// GHSA-gcpc-88hm-3xqr: a planted Claude transcript reads one file under
+    /// the checkout's `[capture] ignore_paths` and one outside it. The
+    /// excluded read's call and output never reach `/hook/batch`; the public
+    /// read's do. A malformed read is posted as the hook's metadata-only body.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_never_posts_tool_content_the_capture_policy_excludes() {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        let app = Router::new().route(
+            "/hook/batch",
+            post(
+                move |axum::Json(items): axum::Json<Vec<serde_json::Value>>| {
+                    let captured = captured.clone();
+                    async move {
+                        let accepted = items.len();
+                        captured.lock().unwrap().extend(items);
+                        let results: Vec<_> = (0..accepted)
+                            .map(|index| serde_json::json!({ "index": index, "outcome": "stored" }))
+                            .collect();
+                        axum::Json(serde_json::json!({ "accepted": accepted, "results": results }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let session_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(repo.path().to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let cwd = repo.path().to_string_lossy();
+        let record = |uuid: &str, kind: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid, "sessionId": sid, "cwd": cwd,
+                "timestamp": "2026-09-01T10:00:00Z",
+                "message": {"role": kind, "content": content},
+            })
+            .to_string()
+        };
+        let read = |id: &str, input: serde_json::Value| serde_json::json!({"type": "tool_use", "id": id, "name": "Read", "input": input});
+        let output = |id: &str, text: &str| serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text});
+        let lines = [
+            record("u1", "user", serde_json::json!("read the adr and lib")),
+            record(
+                "a1",
+                "assistant",
+                serde_json::json!([
+                    read(
+                        "toolu_adr",
+                        serde_json::json!({"file_path": repo.path().join("docs/adr/1.md")})
+                    ),
+                    read(
+                        "toolu_pub",
+                        serde_json::json!({"file_path": repo.path().join("src/lib.rs")})
+                    ),
+                    read(
+                        "toolu_bad",
+                        serde_json::json!({"file_path": 7, "note": "ARGSENTINEL"})
+                    ),
+                ]),
+            ),
+            record(
+                "u2",
+                "user",
+                serde_json::json!([
+                    output("toolu_adr", "ADRSENTINEL private decision"),
+                    output("toolu_pub", "PUBLICCONTROL public code"),
+                    output("toolu_bad", "BADSENTINEL unprovable output"),
+                ]),
+            ),
+        ];
+        std::fs::write(
+            session_dir.join(format!("{sid}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let endpoint = ServerEndpoint::for_hook_target(format!("http://{address}"), None);
+        let session = SessionRef {
+            harness: ManagedHarness::Claude,
+            native_session_id: sid.into(),
+            updated_at: SystemTime::now(),
+        };
+        let capture = TranscriptCapture::for_checkout(home.path(), repo.path());
+        import_one(
+            &endpoint,
+            "ws",
+            "proj",
+            home.path(),
+            repo.path(),
+            &capture,
+            &session,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let posted = posted.lock().unwrap();
+        let text = serde_json::to_string(&*posted).unwrap();
+        for sentinel in ["ADRSENTINEL", "docs/adr", "ARGSENTINEL", "BADSENTINEL"] {
+            assert!(!text.contains(sentinel), "{sentinel} was posted: {text}");
+        }
+        assert!(text.contains("PUBLICCONTROL"), "public output: {text}");
+        assert!(text.contains("src/lib.rs"), "public call: {text}");
+        let stripped: Vec<_> = posted
+            .iter()
+            .filter(|item| item["body"].get("_ai_memory_capture").is_some())
+            .collect();
+        assert_eq!(
+            stripped.len(),
+            2,
+            "the malformed call and its output: {text}"
+        );
+        for item in stripped {
+            assert_eq!(
+                item["body"]["_ai_memory_capture"]["disposition"],
+                "metadata-only"
+            );
+            assert_eq!(item["body"]["tool_family"], "file");
+            assert_eq!(item["body"]["tool_call_id"], "toolu_bad");
+        }
+    }
+
+    /// Allowlist capture mode (#446) makes an unmarked checkout emit nothing
+    /// from the live hook, so a manual backfill of it must not contact the
+    /// server at all. Controls: the same checkout with a marker, and the same
+    /// unmarked checkout under the default denylist mode, both proceed to the
+    /// server.
+    #[tokio::test]
+    async fn allowlist_mode_backfills_nothing_from_an_unmarked_checkout() {
+        use axum::{Router, extract::Request};
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(request.uri().path().to_owned());
+                axum::Json(serde_json::json!({ "by_agent": [], "accepted": 0 }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let attempt = |mode: Option<&'static str>, marked: bool| {
+            let requests = requests.clone();
+            async move {
+                let home = tempfile::tempdir().unwrap();
+                let data_dir = tempfile::tempdir().unwrap();
+                let repo = tempfile::tempdir().unwrap();
+                if let Some(mode) = mode {
+                    std::fs::write(
+                        data_dir.path().join(super::super::hook::CAPTURE_MODE_FILE),
+                        mode,
+                    )
+                    .unwrap();
+                }
+                if marked {
+                    std::fs::write(repo.path().join(".ai-memory.toml"), "[capture]\n").unwrap();
+                }
+                let mut config =
+                    crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+                config.data_dir = data_dir.path().to_path_buf();
+                config.home_dir = Some(home.path().to_string_lossy().into_owned());
+                config.server_url = format!("http://{address}");
+                config.auth.bearer_token = None;
+                let mut args = spawned_args(None, None);
+                args.auto = false;
+                args.workspace = Some("ws".into());
+                args.project = Some("proj".into());
+                requests.lock().unwrap().clear();
+                run_in(&config, args, repo.path().to_path_buf())
+                    .await
+                    .unwrap();
+                requests.lock().unwrap().clone()
+            }
+        };
+
+        assert!(
+            attempt(Some("allowlist\n"), false).await.is_empty(),
+            "allowlist + unmarked checkout must not reach the server"
+        );
+        assert!(
+            !attempt(Some("allowlist\n"), true).await.is_empty(),
+            "control: a marked checkout proceeds under allowlist"
+        );
+        assert!(
+            !attempt(None, false).await.is_empty(),
+            "control: denylist (default) is unchanged"
+        );
+        server.abort();
+    }
+
+    /// Plant `lines` as one native session and backfill it from `repo`,
+    /// returning everything posted to `/hook/batch` as one JSON string.
+    #[cfg(unix)]
+    async fn backfill_posted(
+        harness: ManagedHarness,
+        home: &Path,
+        data_dir: &Path,
+        repo: &Path,
+        sid: &str,
+        lines: &[serde_json::Value],
+    ) -> String {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let session_file = match harness {
+            ManagedHarness::Claude => home
+                .join(".claude/projects")
+                .join(repo.to_string_lossy().replace('/', "-"))
+                .join(format!("{sid}.jsonl")),
+            ManagedHarness::Codex => home
+                .join(".codex/sessions/2026/09/01")
+                .join(format!("rollout-2026-09-01T10-00-00-{sid}.jsonl")),
+            other => panic!("no fixture layout for {}", other.as_str()),
+        };
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&session_file, body).unwrap();
+
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        let app = Router::new().route(
+            "/hook/batch",
+            post(
+                move |axum::Json(items): axum::Json<Vec<serde_json::Value>>| {
+                    let captured = captured.clone();
+                    async move {
+                        let accepted = items.len();
+                        captured.lock().unwrap().extend(items);
+                        let results: Vec<_> = (0..accepted)
+                            .map(|index| serde_json::json!({ "index": index, "outcome": "stored" }))
+                            .collect();
+                        axum::Json(serde_json::json!({ "accepted": accepted, "results": results }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::for_hook_target(format!("http://{address}"), None);
+        let session = SessionRef {
+            harness,
+            native_session_id: sid.into(),
+            updated_at: SystemTime::now(),
+        };
+        let capture = TranscriptCapture::for_checkout(data_dir, repo);
+        import_one(&endpoint, "ws", "proj", home, repo, &capture, &session)
+            .await
+            .unwrap();
+        server.abort();
+        serde_json::to_string(&*posted.lock().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn marked_checkout(marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ai-memory.toml"), marker).unwrap();
+        dir
+    }
+
+    /// Codex records its shell tool as `exec_command` with `{cmd, workdir}`;
+    /// the live hook receives it as `Bash`. A command whose `workdir`-relative
+    /// argument names an ignored path never reaches `/hook/batch`, call or
+    /// output; the same command run from a public directory does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_inspects_codex_exec_command_as_the_hook_shell_call() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = marked_checkout("[capture]\nignore_paths = [\"docs/adr/**\"]\n");
+        for dir in ["docs/adr", "src/adr"] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+        }
+        let sid = "019a0000-0000-7000-8000-000000000001";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let exec = |id: &str, workdir: &str| {
+            item(serde_json::json!({
+                "type": "function_call", "name": "exec_command", "call_id": id,
+                "arguments": serde_json::json!({
+                    "cmd": "cat adr/x.md", "workdir": repo.path().join(workdir),
+                }).to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            item(serde_json::json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "show both adr notes"}],
+            })),
+            exec("call_adr", "docs"),
+            output("call_adr", "ADRSENTINEL private decision"),
+            exec("call_pub", "src"),
+            output("call_pub", "PUBLICCONTROL public note"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(!posted.contains("/docs\\\""), "excluded call: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public output: {posted}");
+        assert!(posted.contains("/src"), "public call: {posted}");
+    }
+
+    /// A Claude Code transcript record: `content` is the message content.
+    #[cfg(unix)]
+    fn claude_record(
+        sid: &str,
+        uuid: &str,
+        cwd: &Path,
+        role: &str,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": role, "uuid": uuid, "sessionId": sid, "cwd": cwd,
+            "timestamp": "2026-09-01T10:00:00Z",
+            "message": {"role": role, "content": content},
+        })
+    }
+
+    #[cfg(unix)]
+    fn claude_tool(name: &str, id: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+    }
+
+    #[cfg(unix)]
+    fn claude_output(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text})
+    }
+
+    /// Claude Code records each line's `cwd`, which follows the session as it
+    /// moves. The live hook resolves a relative argument from that cwd, so an
+    /// import must too: `cat adr/x.md` run from `docs/` reads an ignored file
+    /// and is never posted, while the same command run from the checkout root
+    /// names a public path and is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_resolves_each_call_from_its_record_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = marked_checkout("[capture]\nignore_paths = [\"docs/adr/**\"]\n");
+        let docs = repo.path().join("docs");
+        std::fs::create_dir_all(docs.join("adr")).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555556";
+        let cat = |id| claude_tool("Bash", id, serde_json::json!({"command": "cat adr/x.md"}));
+        let lines = [
+            claude_record(sid, "u1", repo.path(), "user", "read the adr".into()),
+            claude_record(
+                sid,
+                "a1",
+                &docs,
+                "assistant",
+                serde_json::json!([cat("toolu_docs")]),
+            ),
+            claude_record(
+                sid,
+                "u2",
+                &docs,
+                "user",
+                serde_json::json!([claude_output("toolu_docs", "ADRSENTINEL private decision")]),
+            ),
+            claude_record(
+                sid,
+                "a2",
+                repo.path(),
+                "assistant",
+                serde_json::json!([cat("toolu_root")]),
+            ),
+            claude_record(
+                sid,
+                "u3",
+                repo.path(),
+                "user",
+                serde_json::json!([claude_output("toolu_root", "PUBLICCONTROL root note")]),
+            ),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "control output: {posted}");
+        assert_eq!(
+            posted.matches("cat adr/x.md").count(),
+            2,
+            "only the root call, as title and message: {posted}"
+        );
+    }
+
+    /// A call the live hook would reroute to another checkout must pass that
+    /// checkout's admission gate and reach the same server, or it is never
+    /// posted: under allowlist mode an unmarked repository admits nothing, a
+    /// marker selecting an unregistered profile emits nothing, and a marker
+    /// selecting a registered profile sends to another server. Control: a read
+    /// in a marked checkout of the same project with no server selection is
+    /// posted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_drops_reroutes_the_live_hook_would_not_deliver_here() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let name = crate::server_profiles::ProfileName::parse("team-e").unwrap();
+        crate::server_profiles::add(data_dir.path(), &name, "https://e.example", &[], Some("E"))
+            .unwrap();
+        let source = marked_checkout("workspace = \"w\"\nproject = \"p\"\n");
+        let unmarked = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(unmarked.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let unknown_profile = marked_checkout("server = \"team-b\"\n");
+        let other_server = marked_checkout("server = \"team-e\"\n");
+        let same_server = marked_checkout("workspace = \"w\"\nproject = \"p\"\n");
+        let sid = "11111111-2222-3333-4444-555555555557";
+        let reads = [
+            (&unmarked, "UNMARKEDSENTINEL"),
+            (&unknown_profile, "UNKNOWNPROFILESENTINEL"),
+            (&other_server, "OTHERSERVERSENTINEL"),
+            (&same_server, "SAMESERVERCONTROL"),
+        ];
+        let mut lines = vec![claude_record(
+            sid,
+            "u0",
+            source.path(),
+            "user",
+            "read the notes".into(),
+        )];
+        for (index, (repo, text)) in reads.iter().enumerate() {
+            let file = repo.path().join(format!("{text}.txt"));
+            std::fs::write(&file, text).unwrap();
+            let id = format!("toolu_{index}");
+            lines.push(claude_record(
+                sid,
+                &format!("a{index}"),
+                source.path(),
+                "assistant",
+                serde_json::json!([claude_tool(
+                    "Read",
+                    &id,
+                    serde_json::json!({"file_path": file})
+                )]),
+            ));
+            lines.push(claude_record(
+                sid,
+                &format!("u{}", index + 1),
+                source.path(),
+                "user",
+                serde_json::json!([claude_output(&id, &format!("{text} content"))]),
+            ));
+        }
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            data_dir.path(),
+            source.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in [
+            "UNMARKEDSENTINEL",
+            "UNKNOWNPROFILESENTINEL",
+            "OTHERSERVERSENTINEL",
+        ] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert!(
+            posted.contains("SAMESERVERCONTROL content"),
+            "control: {posted}"
+        );
+        assert!(posted.contains("read the notes"), "prompt kept: {posted}");
+    }
+
+    /// The live server stores only the family of an unknown-family tool, with
+    /// no policy at all. A backfilled Codex MCP call and its output therefore
+    /// post only `tool_family: unknown`, never their arguments or output, while
+    /// a recognized shell call's output is posted as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_posts_no_content_for_unrecognized_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sid = "019a0000-0000-7000-8000-000000000002";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let call = |id: &str, name: &str, arguments: serde_json::Value| {
+            item(serde_json::json!({
+                "type": "function_call", "name": name, "call_id": id,
+                "arguments": arguments.to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            call(
+                "call_mcp",
+                "mcp__vault__fetch",
+                serde_json::json!({"query": "ARGSENTINEL"}),
+            ),
+            output("call_mcp", "MCPSENTINEL private record"),
+            call(
+                "call_pub",
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test"}),
+            ),
+            output("call_pub", "PUBLICCONTROL test result"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in ["ARGSENTINEL", "MCPSENTINEL", "mcp__vault"] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert_eq!(
+            posted.matches("\"title\":\"tool unknown\"").count(),
+            2,
+            "the call and its output are still recorded: {posted}"
+        );
+        assert!(posted.contains("PUBLICCONTROL"), "control: {posted}");
+    }
+
+    /// A reroute is delivered only when the destination's marker selects the
+    /// same registered server profile as the source and the same project: a
+    /// different registered profile is dropped, and so is a checkout of
+    /// another project on the same profile, whose events the live hook files
+    /// under that project. The same holds for records written in such a
+    /// checkout, whatever their tool calls name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_keeps_reroutes_to_the_same_server_profile_only() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let checkout = |name: &str, profile: &str, project: &str| {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".ai-memory.toml"),
+                format!("server = \"{profile}\"\nworkspace = \"w\"\nproject = \"{project}\"\n"),
+            )
+            .unwrap();
+            dir
+        };
+        let source = checkout("source", "team-a", "p");
+        let same = checkout("same", "team-a", "p");
+        let other = checkout("other", "team-e", "p");
+        let sibling = checkout("sibling", "team-a", "q");
+        let root = |dir: &Path| dir.to_string_lossy().into_owned();
+        for (name, roots) in [
+            ("team-a", vec![root(&source), root(&same), root(&sibling)]),
+            ("team-e", vec![root(&other)]),
+        ] {
+            let name = crate::server_profiles::ProfileName::parse(name).unwrap();
+            crate::server_profiles::add(
+                data_dir.path(),
+                &name,
+                "https://a.example",
+                &roots,
+                Some("T"),
+            )
+            .unwrap();
+        }
+        let sid = "11111111-2222-3333-4444-555555555558";
+        let mut lines = vec![claude_record(sid, "u0", &source, "user", "read".into())];
+        for (index, (repo, text)) in [
+            (&same, "SAMEPROFILECONTROL"),
+            (&other, "OTHERPROFILESENTINEL"),
+            (&sibling, "OTHERPROJECTSENTINEL"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = repo.join(format!("{text}.txt"));
+            let id = format!("toolu_{index}");
+            lines.push(claude_record(
+                sid,
+                &format!("a{index}"),
+                &source,
+                "assistant",
+                serde_json::json!([claude_tool(
+                    "Read",
+                    &id,
+                    serde_json::json!({"file_path": file})
+                )]),
+            ));
+            lines.push(claude_record(
+                sid,
+                &format!("u{}", index + 1),
+                &source,
+                "user",
+                serde_json::json!([claude_output(&id, &format!("{text} content"))]),
+            ));
+        }
+        lines.push(claude_record(
+            sid,
+            "moved",
+            &sibling,
+            "user",
+            "SIBLINGPROMPTSENTINEL".into(),
+        ));
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            data_dir.path(),
+            &source,
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(
+            posted.contains("SAMEPROFILECONTROL content"),
+            "same profile: {posted}"
+        );
+        for sentinel in [
+            "OTHERPROFILESENTINEL",
+            "OTHERPROJECTSENTINEL",
+            "SIBLINGPROMPTSENTINEL",
+        ] {
+            assert!(!posted.contains(sentinel), "{sentinel}: {posted}");
+        }
+    }
+
+    /// Claude Code writes a monitored command's streamed output and a
+    /// background agent's report as user turns, and its compact summary too;
+    /// no prompt hook fires for any of them, so none is posted as a prompt.
+    /// Control: the operator's own prompt is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_posts_no_task_notification_or_compact_summary_as_a_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555559";
+        let mut monitor = claude_record(
+            sid,
+            "n1",
+            repo.path(),
+            "user",
+            "<task-notification>\n<event>MONITORSENTINEL stdout line</event>\n</task-notification>"
+                .into(),
+        );
+        monitor["origin"] = serde_json::json!({"kind": "task-notification"});
+        let report = claude_record(
+            sid,
+            "n2",
+            repo.path(),
+            "user",
+            "<task-notification>\n<result>AGENTSENTINEL report</result>\n</task-notification>"
+                .into(),
+        );
+        let mut summary = claude_record(
+            sid,
+            "c1",
+            repo.path(),
+            "user",
+            "This session is being continued. SUMMARYSENTINEL".into(),
+        );
+        summary["isCompactSummary"] = true.into();
+        let lines = [
+            claude_record(sid, "u1", repo.path(), "user", "PROMPTCONTROL".into()),
+            monitor,
+            report,
+            summary,
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in ["MONITORSENTINEL", "AGENTSENTINEL", "SUMMARYSENTINEL"] {
+            assert!(!posted.contains(sentinel), "{sentinel}: {posted}");
+        }
+        assert!(posted.contains("PROMPTCONTROL"), "control: {posted}");
+    }
+
     fn spawned_args(
         server_url: Option<&str>,
         server_profile: Option<&str>,
@@ -1133,6 +3166,7 @@ mod tests {
             json: false,
             quiet: true,
             auto: true,
+            inflight_claim: None,
             server_url: server_url.map(str::to_owned),
             server_profile: server_profile.map(str::to_owned),
         }
@@ -1206,6 +3240,34 @@ mod tests {
         assert!(
             sentinel_path(&config.data_dir, &cwd).exists(),
             "the opt-out must still record the attempt so it does not re-spawn"
+        );
+    }
+
+    /// The worker frees the marker the hook claimed, however it ends, so the
+    /// next SessionStart can spawn again when one is needed.
+    #[tokio::test]
+    async fn an_auto_run_releases_the_marker_its_hook_claimed() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.backfill_on_start = false;
+        config.server_url = "http://127.0.0.1:9".to_string();
+        let cwd = data_dir.path().join("checkout");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let claim = claim_inflight(&config.data_dir, &cwd).unwrap();
+        let mut args = spawned_args(None, None);
+        args.inflight_claim = Some(claim.as_str().to_owned());
+
+        run_in(&config, args, cwd.clone()).await.unwrap();
+        assert!(
+            !inflight_path(&config.data_dir, &cwd).exists(),
+            "the worker must release its marker"
+        );
+        assert!(
+            claim_inflight(&config.data_dir, &cwd).is_some(),
+            "free for the next run"
         );
     }
 }

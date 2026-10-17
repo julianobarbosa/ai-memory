@@ -22,6 +22,7 @@ async fn make_state(tmp: &TempDir) -> AdminState {
     let db_path = store.db_path().to_path_buf();
     AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -717,4 +718,73 @@ async fn write_page_metadata_store_failure_rolls_back_and_recovers() {
             .unwrap(),
         original_id
     );
+}
+
+/// The route `ai-memory write-page` posts to sets a profile entry's
+/// `applies_to` and `enforced_by`, refuses an unknown tag with 422, and
+/// refuses both keys on a page outside `profile/`, or on a `profile/` path in
+/// an ordinary project, before creating its scope.
+#[tokio::test]
+async fn write_page_sets_profile_fields_and_refuses_them_elsewhere() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let request = json!({
+        "workspace": "default", "project": "_global", "path": "profile/style/types.md",
+        "body": "# Types\n\nNever cast.", "applies_to": ["TypeScript"],
+        "enforced_by": "pre-push hook"
+    });
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let global = state
+        .writer
+        .get_or_create_project(ws, "_global", None)
+        .await
+        .unwrap();
+    let path = ai_memory_core::PagePath::new("profile/style/types.md").unwrap();
+    let md = state.wiki.read_page(ws, global, &path).unwrap();
+    assert_eq!(md.frontmatter["applies_to"], json!(["typescript"]));
+    assert_eq!(md.frontmatter["enforced_by"], "pre-push hook");
+
+    let mut unknown = request.clone();
+    unknown["applies_to"] = json!(["typscript"]);
+    let resp = post_json(state.clone(), "/admin/write-page", unknown).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("typscript")
+    );
+
+    let ws = state
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    for path in ["notes/types.md", "profile/style/types.md"] {
+        let mut stray = request.clone();
+        stray["project"] = json!("fresh");
+        stray["path"] = json!(path);
+        let resp = post_json(state.clone(), "/admin/write-page", stray).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert!(
+            state
+                .reader
+                .find_project(ws, "fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "{path}: refused before the project is created"
+        );
+    }
 }

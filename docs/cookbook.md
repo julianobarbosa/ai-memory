@@ -49,12 +49,14 @@ automatically, and (with an LLM) consolidation compiles them into pages.
 Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
-prepended to the agent's context automatically. To make it apply to **all** your
-projects, ask for it as a standing preference — it goes to your cross-project
+prepended to the agent's context automatically: an excerpt of every rule first,
+whole bodies while the budget lasts, and `memory_read_page` for the rest. Pin
+the rule to have it shown in full before the others. To make it apply to **all** your
+projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
 server, writing a global rule needs root or a `write` grant on `_global`. From
-another project's page, link to that standing page with `[[_global:path]]` — it
+another project's page, link to that standing page with `[[_global:path]]`, which
 always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
@@ -64,8 +66,8 @@ projects use `[[project:path]]`; another workspace uses
 > "In all my projects: use pnpm, keep integration tests in tests/suite."
 
 Your agent writes each one into the cross-project profile
-(`memory_write_page` with `scope: "profile"`). From then on every project — and
-every harness — gets a short "your usual choices" section at session start, and
+(`memory_write_page` with `scope: "profile"`). From then on every project, in
+every harness, gets a short "your usual choices" section at session start, and
 the agent applies those choices whenever the repository's rules file and you
 say nothing. A brand-new repository gets the whole baseline, plus a pointer to
 `ai-memory profile apply` for writing it into that repository's rules file.
@@ -78,7 +80,9 @@ say nothing. A brand-new repository gets the whole baseline, plus a pointer to
   forget tools/pnpm.md` (it stays dropped until you say it again).
 - Keep a client project out of it: `[profile] contribute = false` in that
   repository's `.ai-memory.toml`; keep the digest out of one: `consume = false`.
-- Scope an entry to a stack with frontmatter `applies_to: [rust]`.
+- Scope an entry to a stack with `applies_to: ["rust"]` on `memory_write_page`
+  (`--applies-to rust` on `write-page`), or mark it `enforced_by` to keep it
+  out of the digest.
 - On by default for a single user (one profile across every workspace). On a
   shared server it is off until the operator sets `[profile] enabled = true`,
   and then each person gets a private profile.
@@ -89,8 +93,8 @@ Details: [`cross-project-profile.md`](cross-project-profile.md).
 
 Two ways, depending on where the document lives:
 
-1. **It's already a wiki page** (you saved it, or imported it — below): tell the
-   agent "read the `norms/gdpr-retention` page before implementing" — it calls
+1. **It's already a wiki page** (you saved it, or imported it as described below): tell the
+   agent "read the `norms/gdpr-retention` page before implementing" and it calls
    `memory_read_page` with that path and works from the full body.
 2. **It's an external file** (a norm/spec on disk): save it as a page first
    ("remember this spec as `norms/gdpr-retention`", paste or point at it), then
@@ -107,7 +111,7 @@ bring an existing body of documents in as project memory:
   document, under a stable prefix like `norms/…`. Then any project can read a
   specific one before implementing (recipe above).
 - **A whole OKF/Obsidian vault or an export from another tool**: use the
-  companion importer (see [`companion-crates.md`](companion-crates.md)) — it
+  companion importer (see [`companion-crates.md`](companion-crates.md)). It
   ingests OMC and external-conversation exports into the store. `ai-memory
   export-okf` is the inverse (export your wiki as an OKF bundle), useful to see
   the exact on-disk shape your documents should take.
@@ -119,13 +123,76 @@ Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
 
+## Coming from agentmemory
+
+The data moves with the companion importer
+([`ai-memory-importer`](../companions/ai-memory-importer), boundary in
+[`companion-crates.md`](companion-crates.md)). Most of the work is re-wiring
+each harness. Do it in this order:
+
+1. **Export from agentmemory while it still runs.** Its export command writes
+   one `ExportData` JSON file; its Obsidian export writes a vault directory.
+   The JSON is the complete route (memory versions, TTLs, sessions,
+   summaries, lessons, insights). The importer reads only that file and never
+   contacts agentmemory.
+2. **Stop agentmemory and unwire it.** Remove its MCP server entry, the
+   plugins and skills it installed for each harness, and the memory guideline
+   block its `connect` command writes into rules files (`AGENTS.md`,
+   `GEMINI.md`, `.cursor/rules/`, `.kiro/steering/` and the like). Left in
+   place, that block keeps agents calling tools that no longer exist, and one
+   of them, `memory_consolidate`, is also an ai-memory tool with different
+   arguments. `ai-memory doctor` lists every leftover it can see, with the file
+   and lines and the fix, and changes nothing:
+
+   ```text
+   ⚠ agentmemory configuration is still present (2 place(s)). ...
+     - MCP server entry in /home/me/.cursor/mcp.json (mcpServers.agentmemory)
+         fix: remove the `mcpServers.agentmemory` entry from /home/me/.cursor/mcp.json; ...
+     - guideline block in /home/me/work/api/AGENTS.md (lines 5-10)
+         fix: delete the agentmemory guideline block (lines 5-10) from ...
+   ```
+
+   Rules kept outside files (Warp's, for example) need a look by hand.
+3. **Wire ai-memory into each harness:** `ai-memory install-hooks --agent <name>
+   --apply`, `ai-memory install-mcp --client <name> --apply` and `ai-memory
+   install-skills --agent <name>`.
+4. **Map projects, dry-run, then import.** agentmemory names a project by its
+   directory basename, so the importer needs a mapping file to the ai-memory
+   `workspace`/`project` (by basename, or by exact session `cwd` when two
+   repositories share a name). The dry run lists every unmapped project and
+   every record type it leaves out, with counts; `--apply` refuses to run
+   while anything is unmapped:
+
+   ```bash
+   cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+     agentmemory-export --file agentmemory-export.json --mapping mapping.json
+   cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+     agentmemory-export --file agentmemory-export.json --mapping mapping.json \
+     --apply --manifest-out agentmemory-manifest.json
+   ```
+
+   Pages land under `imported/agentmemory/` in the mapped project. A memory's
+   versions become one page with its supersession history, `forgetAfter`
+   becomes `expires_at`, and observations are dropped unless you pass
+   `--replay-observations`. Rerunning is safe: pages already imported are
+   skipped. For a vault, use `agentmemory-vault --dir <vault> --workspace W
+   --project P` instead.
+5. **Check.** Ask your agent something an old memory answered, or call
+   `memory_query` for a known title in each project, and run `ai-memory
+   doctor` again until it reports no leftovers.
+
+What has no ai-memory counterpart (graph nodes and edges, actions, signals,
+routines, sentinels, sketches, checkpoints) is counted in the manifest's
+`dropped` section and not imported. ai-memory derives its own entity graph from
+the imported pages.
+
 ## Recipe: mirror a team wiki into the repository (team wiki sync)
 
 To keep a team's shared memory reviewable next to the code it documents, use
 the [`ai-memory-wikisync`](../companions/ai-memory-wikisync) companion
 (boundary in [`companion-crates.md`](companion-crates.md)). It exports
 explicitly allowlisted page families from the server's read-only `/api/v1`
-surface into a directory in your repo — dry-run by default:
+surface into a directory in your repo. It is dry-run by default:
 
 ```bash
 ai-memory-wikisync plan   --server http://127.0.0.1:49374 \
@@ -136,22 +203,65 @@ ai-memory-wikisync export ...same args... --apply   # writes; prints the git com
 
 Everything is opt-in and fail-safe: the family allowlist must be explicit
 (`*` is refused), files edited locally since the last export are reported
-with a diff summary and refused without `--force`, nothing is ever deleted
-(that is a later slice), no frontmatter is forged, and the tool never runs
-git itself. Slice 1 is read-only export; bidirectional sync, deletes and
-conflict handling are tracked in #986.
+with a diff summary and refused without `--force`, no frontmatter is forged,
+and the tool never runs git itself. `sync` sends reviewed repository edits
+back through MCP (each write conditional on the version it planned against;
+needs ai-memory 3.0+), and deletes travel only with `--propagate-deletes`.
+
+### Keep it in step after merges and in CI
+
+`install-hook` writes a git `post-merge` hook that runs `sync` after every
+merge or pull: a dry-run report by default, or a write with `--on-merge apply`. It
+never stores a token (the hook reads `AI_MEMORY_AUTH_TOKEN` when it runs) and
+never passes `--prefer`, so conflicts still wait for a person:
+
+```bash
+ai-memory-wikisync install-hook --workspace demo --project app \
+    --dest docs/wiki --include _rules --include decisions
+ai-memory-wikisync uninstall-hook --dest docs/wiki   # removes only its block
+```
+
+In CI, `sync --check` writes nothing and exits `0` in sync, `3` when the
+repository and the server differ, and `4` on conflicts or refusals. A CI
+checkout has no sync state, so it compares the repository with the server
+directly. A GitHub Actions job that flags drift on wiki pull requests:
+
+```yaml
+name: team-wiki
+on:
+  pull_request:
+    paths: ["docs/wiki/**"]
+jobs:
+  wiki-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install --locked --git https://github.com/akitaonrails/ai-memory ai-memory-wikisync
+      - name: Compare docs/wiki with the team's ai-memory server
+        env:
+          AI_MEMORY_SERVER_URL: ${{ secrets.AI_MEMORY_SERVER_URL }}
+          AI_MEMORY_AUTH_TOKEN: ${{ secrets.AI_MEMORY_AUTH_TOKEN }}
+        run: |
+          ai-memory-wikisync sync --check \
+            --workspace demo --project app --dest docs/wiki \
+            --include _rules --include decisions
+```
+
+The server must be reachable from the runner (`serve --enable-api` behind a
+token). To tolerate drift and fail only on refusals, end the command with
+`|| [ $? -eq 3 ]`.
 
 ## Recipe: control what gets kept, aged, or consolidated
 
-By default nothing you have to think about: memory decays on a single gentle
+By default there is nothing to think about: memory decays on a single gentle
 curve, and an upgrade to 2.4 changes no scores and evicts nothing. When you *do*
-want to tune aging, it is all opt-in and reversible — the original of anything
+want to tune aging, it is all opt-in and reversible. The original of anything
 compacted or merged stays in git and the supersession chain, recoverable with
 `ai-memory restore-page`.
 
 - **Keep something forever:** pin it. A pinned page is exempt from the
   forget-sweep regardless of tier or age. Semantic and procedural pages never
-  decay either — only working/episodic memory ages.
+  decay either; only working/episodic memory ages.
 - **Make a note expire on a deadline:** ask your agent to remember it "until
   <date>" (an `expires_at`); the forget-sweep deletes it when the time passes,
   no matter how often it was read. A TTL outranks pinning.
@@ -163,7 +273,7 @@ compacted or merged stays in git and the supersession chain, recoverable with
   prose; `[decay] dedup_cold_clusters` collapses near-duplicate cold pages into
   one survivor. Both are zero-LLM, off by default, and supersede rather than
   delete.
-- **Keep used memory longer:** nothing to configure — a page you open, search,
+- **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
 - **Surface likely contradictions:** run `memory_lint` (through your agent or the
@@ -172,7 +282,7 @@ compacted or merged stays in git and the supersession chain, recoverable with
   as disagreement, so a single-domain or single-language store yields mostly
   candidate pairs: read each finding as a pair to check, not as a defect. If
   that noise is too high, raise `contradiction_band_min` (`config.toml` or
-  `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`) — on such a store the
+  `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`). On such a store the
   band measures domain proximity more than conflict, so a higher floor trims
   same-domain-but-unrelated pairs.
 - **Let an LLM consolidate on idle ("dream"):** with a provider *and* an embedder
@@ -187,9 +297,41 @@ compacted or merged stays in git and the supersession chain, recoverable with
   in the same repo): automatic. A handoff is captured at session end and the
   next session's on-start hook prepends it. Ask "where did we leave off?".
 - **Ask an agent in another project to do something** without loading that
-  project's context here: cross-project messaging — "send project-b a request to
+  project's context here: use cross-project messaging. Say "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
+
+## Recipe: ask an operator to decide
+
+When an orchestrator has to stop for a person, send a normal cross-project
+message and poll for a normal reply. The subject lines are the shared
+convention; `memory_message_send` and `memory_message_list` are the tools.
+
+1. Send to the project the operator reads. `subject` is
+   `decision: <short question>`. The body names the question, each option's
+   `id` and label, and `reply_project: <your workspace>/<your project>`.
+   Save the returned `message_id`. You need write on that mailbox project,
+   and it must already exist.
+2. The operator, or a companion, answers with `memory_message_send` back to
+   `reply_project`. `subject` is `decision-reply: <message_id>`. The body
+   carries `option: <id>`. Sending the reply needs write on your project.
+3. Poll `memory_message_list` on your inbox until a pending row's subject is
+   that exact `decision-reply:` line. The oldest match is the answer. Pop it
+   when you take it, then `memory_message_cancel` the question.
+
+Before you act on a `requires_root: true` decision, compare `from_owner_user`
+on the reply with the root identity you were configured with. It is
+attribution, not a role, and it is empty on anonymous and single-operator
+servers, so treat an empty value as not root. The server itself does not check
+who answers. `/web` shows the mailbox and leaves every message pending.
+
+The list is oldest-first, 50 rows by default and 200 at most, so keep the
+inbox you poll from drained. A companion can wake on the `message_send`
+observer webhook, then list; the webhook carries scope and actor, and the
+orchestrator still polls.
+
+Full layout and limits:
+[`agent-messaging.md`](agent-messaging.md#operator-decisions-by-subject-and-body).
 
 ## Recipe: several accounts or an external launcher
 
@@ -244,15 +386,15 @@ ai-memory run --yolo claude
   `Enter`/`y`/`yes` proceeds (the default); `n`/`no` aborts before anything
   launches.
 - **The ai-jail offer.** If [ai-jail](https://github.com/akitaonrails/ai-jail)
-  is usable — on Linux/macOS, installed on `PATH` (or `~/.local/bin/ai-jail`),
-  with its sandbox backend present (`bwrap` on Linux, `sandbox-exec` on
-  macOS) — and you are not already inside it, a second question offers to
+  is usable (on Linux/macOS, installed on `PATH` or `~/.local/bin/ai-jail`,
+  with its sandbox backend present: `bwrap` on Linux, `sandbox-exec` on
+  macOS) and you are not already inside it, a second question offers to
   re-run the session inside it. When it is not usable (or on Windows) there is
   no second question; the run just proceeds. Accepting re-execs the original
   command under `ai-jail --network --agent-state --env <NAME>... --`,
   forwarding only the credential/config
   environment variables that are already set (server/hook URL,
-  `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
+  `CLAUDE_CONFIG_DIR`, provider API keys, etc.). `--network` keeps the
   loopback ai-memory server reachable while still sandboxing the filesystem.
   Declining keeps the run unsandboxed (your choice, already warned).
 - **Choosing what the jail gets.** After you accept the offer, a checklist
@@ -267,8 +409,8 @@ ai-memory run --yolo claude
   as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
   ai-jail straight away, turning on those pre-marked defaults and leaving
-  everything else to your own ai-jail config — with or without `--yolo`, and
-  in scripts too; it fails rather than running unjailed if ai-jail is not
+  everything else to your own ai-jail config. This works with or without
+  `--yolo`, and in scripts too; it fails rather than running unjailed if ai-jail is not
   usable. `--jail=github,ssh,no-mise` is exact: the listed toggles (`no-X`
   forces one off), with every other checklist row forced off; `all` turns
   every row on and `none` turns every row off. `--no-jail` never jails and skips the
@@ -276,6 +418,14 @@ ai-memory run --yolo claude
   flags on purpose: they would collide with the harness's own flags (Claude
   Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
   your installed ai-jail lacks are hidden, and naming one is an error.
+- **Connecting back to ai-memory.** The jailed process automatically receives
+  the resolved server URL and URL base path, including a remote server from
+  `config.toml`. A root bearer read from `config.toml` or
+  `bearer_token_file` is not exposed to the managed harness; the launch stops
+  instead. For an authenticated server, give the launch a least-privilege API
+  token with `AI_MEMORY_AUTH_TOKEN=... ai-memory run --jail ...`, or run
+  without the jail. An explicitly supplied environment token already belongs
+  to the child-process boundary and is forwarded.
 - **A project `.ai-jail` wins.** If the directory you launch from has its own
   `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
   no toggles; `--jail=…` still applies its list on top. A project file cannot
@@ -284,7 +434,7 @@ ai-memory run --yolo claude
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
-  directly — `ai-jail ai-memory run … --yolo` sees no extra friction.
+  directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
@@ -298,7 +448,7 @@ ai-memory run --yolo claude
   **It cannot remove your own `ask` rules**: Claude Code honors explicit
   `permissions.ask` rules (and its built-in command-safety checks) in every
   mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
-  pauses the run. For a pause-free sandbox, drop those `ask` entries — `deny`
+  pauses the run. For a pause-free sandbox, drop those `ask` entries; `deny`
   rules block without pausing, so they can stay. Best paired with ai-jail.
 - **Passing extra env, e.g. a GitHub token.** `ai-memory run claude --yolo
   --env GH_TOKEN="$(gh auth token)"` forwards it into the jailed agent (needs
@@ -387,7 +537,9 @@ ai-memory resume --search auth       # pick a matching workstream in this checko
 ai-memory resume --all               # pick from every linked checkout on this machine
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory recover                    # replay outage spool/transcripts safely
 ai-memory list-projects              # every workspace/project the server knows about
+ai-memory project init               # pin this checkout's scope in a .ai-memory.toml
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
@@ -398,17 +550,36 @@ ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```
 
+On an interactive terminal, `status` and `doctor` group and wrap their output
+for readability. Redirected output, JSON, `NO_COLOR`, and `TERM=dumb` remain
+plain; see [Diagnostic report presentation](diagnostics.md) for the exact
+contract.
+
 ## When it isn't doing what you expect
 
 - **Server/homelab down**: `ai-memory run` does not need the server to start a
   harness. When the server is unreachable it prints one loud warning and
-  launches anyway — hooks keep capturing to the local spool (drained
+  launches anyway. Hooks keep capturing to the local spool (drained
   automatically when the server returns), an existing MCP registration
   degrades to no-recall for the session, and the child's exit code is
   returned. What you lose for that run is the workstream lease/context,
-  transcript import, and handoff delivery; sessions resume only through an
-  explicit native selector because no lease means no mutual exclusion. See
-  [Degraded offline
+  immediate transcript import, and handoff delivery; sessions resume only
+  through an explicit native selector because no lease means no mutual
+  exclusion. An explicit resume is journaled with its exact pre-launch native
+  cursor and recovery imports only the appended delta; a cursor that cannot be
+  proven requires manual repair. A fresh run is journaled only when one new
+  native session can be correlated; ambiguity prints a manual backfill action.
+  Once the server returns, run `ai-memory recover`: for transcript-capable
+  harnesses it quarantines correlated spool entries, drains unrelated events,
+  and replays the bounded exact transcript through sanitized `/hook/batch`;
+  Antigravity has no supported transcript exporter, so its degraded run is
+  journaled as spool-only and clears only after correlated hook evidence has a
+  durable-delivery confirmation; recovery never calls its exporter. Empty or
+  previously correlated-loss spool state stays journaled for manual repair. Owner-authorized recovery
+  finishes an expired original managed run only when it was not superseded. A full journal refuses
+  new entries instead of evicting old work, and dropped spool events make the
+  command fail while retaining every journal entry for a later clean pass.
+  Re-running is safe. See [Degraded offline
   launches](managed-workstreams.md#degraded-offline-launches). To fail instead
   of degrading, pass `--require-server` (or set `run.require_server = true` /
   `AI_MEMORY_RUN_REQUIRE_SERVER=true`). For a planned outage, consider
@@ -434,7 +605,7 @@ ai-memory serve                      # run the server
   counts are shown as unavailable rather than zero.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
   every harness that has local sessions in this project and whether the server
-  captured them — so a harness you rotated in without installing its hook (a
+  captured them. A harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
   as a warning with the exact `install-hooks` command to fix it. For Claude
   Code it also reports the detected default auto-memory directory and whether
@@ -443,6 +614,17 @@ ai-memory serve                      # run the server
   and is not reported. An `excluded` verdict applies only to native/generated
   hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
   exclusions.
+- **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
+  with the server down and says so; it reports the local hook spool (events
+  waiting for the server, and a warning once it is full and newly captured
+  events are dropped until space is available); and when ai-memory's Codex
+  hooks are installed, it asks Codex whether it will run them. Codex skips a
+  hook you have not trusted, and skips it again after its command changes,
+  without telling you: open Codex, run `/hooks`, and trust them.
+- **Agents keep calling `memory_recall`, `memory_save` or other tools ai-memory
+  does not have**: agentmemory's MCP entry or its rules-file guideline block is
+  still there. `ai-memory doctor` names each one with the fix (see
+  [Coming from agentmemory](#coming-from-agentmemory)).
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an
@@ -450,7 +632,7 @@ ai-memory serve                      # run the server
   background; you can trigger or preview it yourself with `ai-memory backfill`
   (`--dry-run` to see what it would import), or turn it off with
   `AI_MEMORY_BACKFILL_ON_START=false`.
-- **A search misses something you saved**: confirm the scope — memory is
+- **A search misses something you saved**: confirm the scope. Memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.
 - **You want an LLM feature (consolidation, digests)**: set a provider

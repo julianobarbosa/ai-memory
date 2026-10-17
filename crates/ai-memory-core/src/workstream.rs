@@ -259,6 +259,13 @@ pub struct PrepareManagedRunRequest {
     pub force_unlock: bool,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
+    /// The checkout's git-remote identity (`github.com/acme/api`), sent only
+    /// when `project` is the name that identity derives. The server then
+    /// routes by identity, as hook capture does, so a project created from the
+    /// folder name before identities were recorded is claimed instead of
+    /// twinned under the derived name. Old servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_identity: Option<String>,
 }
 
 /// Result of preparing a managed invocation.
@@ -280,6 +287,11 @@ pub struct PrepareManagedRunResponse {
     /// Adapter cursor from the last successful source import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_cursor: Option<String>,
+    /// Newest linked session from the harness this workstream is switching
+    /// away from. The launcher resolves and reads it locally; the server never
+    /// receives a native transcript path or its contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// First portable sequence not yet delivered to this native session.
     pub sync_after: i64,
     /// Portable high-water mark assigned to this launch.
@@ -291,6 +303,17 @@ pub struct PrepareManagedRunResponse {
     /// Warning when project-name promotion committed but its wiki manifest did not refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_warning: Option<crate::repository_identity::ManifestWarning>,
+}
+
+/// Server-known identity of a native session used immediately before a
+/// cross-harness managed launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedNativeSessionReference {
+    /// Harness that owns the native session.
+    pub agent: AgentKind,
+    /// Harness-native session identifier. Its local store path is deliberately
+    /// absent from this wire type.
+    pub native_session_id: String,
 }
 
 /// One-time startup context for harnesses without a SessionStart hook.
@@ -533,7 +556,35 @@ mod tests {
 
         assert!(!response.may_adopt_existing_session);
         assert!(response.resolved_agent.is_none());
+        assert!(response.previous_native_session.is_none());
         assert!(response.manifest_warning.is_none());
+    }
+
+    #[test]
+    fn prepare_response_carries_only_previous_native_identity() {
+        let response: PrepareManagedRunResponse = serde_json::from_value(serde_json::json!({
+            "workstream_id": "018f0000-0000-7000-8000-000000000001",
+            "workstream_name": "default",
+            "run_id": "018f0000-0000-7000-8000-000000000002",
+            "previous_native_session": {
+                "agent": "claude-code",
+                "native_session_id": "session-1"
+            },
+            "sync_after": 0,
+            "sync_through": 0
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response.previous_native_session,
+            Some(ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "session-1".into(),
+            })
+        );
+        let encoded = serde_json::to_value(response).unwrap();
+        assert!(encoded.get("path").is_none());
+        assert!(encoded.get("content").is_none());
     }
 
     #[test]

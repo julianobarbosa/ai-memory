@@ -1034,6 +1034,80 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     );
 }
 
+/// Factory Droid (#1240): `install-mcp` and `install-hooks` merge into
+/// `~/.factory/mcp.json` and the bare `~/.factory/hooks.json` event map
+/// around the user's own entries, and `uninstall` removes only ai-memory's.
+#[test]
+fn droid_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".factory/mcp.json");
+    let hooks = home.path().join(".factory/hooks.json");
+    write_file(
+        &mcp,
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    );
+    write_file(
+        &hooks,
+        r#"{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh"}]}]}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "droid", "--apply"][..],
+        &["install-hooks", "--agent", "droid", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    let pre = wired["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{wired}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent droid"),
+        "{wired}"
+    );
+    assert!(wired["SessionEnd"].is_array(), "{wired}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let unwired = std::fs::read_to_string(&hooks).unwrap();
+    assert!(!unwired.contains("--agent droid"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
+}
+
 #[test]
 fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
     let _guard = cli_test_lock();
@@ -2236,4 +2310,74 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+/// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
+/// `$XDG_CONFIG_HOME/muse/settings.json` around the user's own server and
+/// hook, keeping `schema_version` and unknown keys, the MCP entry goes under
+/// the legacy `mcp_servers` map the file already uses (never a second map),
+/// and `uninstall` removes only ai-memory's entries.
+#[test]
+fn muse_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".config/muse/settings.json");
+    write_file(
+        &settings,
+        r#"{"schema_version":1,"theme":"dark","mcp_servers":{"other":{"transport":"stdio","command":"other-mcp","mode":"optional"}},"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh","timeout":5}]}]}}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "muse", "--apply"][..],
+        &["install-hooks", "--agent", "muse", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(installed["schema_version"], 1);
+    assert_eq!(installed["theme"], "dark");
+    assert!(installed.get("mcpServers").is_none(), "{installed}");
+    let ours = &installed["mcp_servers"]["ai-memory"];
+    assert_eq!(ours["transport"], "stdio", "{installed}");
+    assert_eq!(ours["mode"], "optional");
+    assert_eq!(ours["args"][1], "--agent");
+    assert_eq!(ours["args"][2], "muse");
+    assert_eq!(installed["mcp_servers"]["other"]["command"], "other-mcp");
+    let pre = installed["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{installed}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent muse"),
+        "{installed}"
+    );
+    assert!(installed["hooks"]["SessionEnd"].is_array(), "{installed}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let text = std::fs::read_to_string(&settings).unwrap();
+    assert!(!text.contains("--agent muse"), "{text}");
+    assert!(!text.contains("mcp-bridge"), "{text}");
+    let removed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(removed["schema_version"], 1);
+    assert_eq!(removed["theme"], "dark");
+    assert_eq!(removed["mcp_servers"]["other"]["command"], "other-mcp");
+    assert_eq!(
+        removed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
 }

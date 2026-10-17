@@ -285,6 +285,22 @@ pub enum AgentKind {
     CopilotCli,
     /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
     Grizzybot,
+    /// Factory Droid CLI (`droid`), whose hooks send Claude Code-shaped
+    /// payloads (#1240).
+    Droid,
+    /// Meta Muse Code (`muse`), whose hooks send Claude Code-shaped payloads
+    /// with Muse's own tool names.
+    Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`). Hooks are Claude Code-shaped
+    /// (PascalCase events; `session_id`, `cwd`, `tool_name` and `tool_input`
+    /// on stdin). `SessionStart` stdout's `hookSpecificOutput.additionalContext`
+    /// is appended to the session (#1299).
+    #[serde(rename = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
+    /// IBM Bob IDE, whose lifecycle hooks send Claude Code-shaped payloads
+    /// but consume `SessionStart` stdout as plain context text.
+    #[serde(rename = "ibm-bob", alias = "bob")]
+    IbmBob,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -295,7 +311,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 27] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -318,6 +334,10 @@ impl AgentKind {
         Self::Zcode,
         Self::CopilotCli,
         Self::Grizzybot,
+        Self::Droid,
+        Self::Muse,
+        Self::CodeBuddy,
+        Self::IbmBob,
         Self::Other,
     ];
 
@@ -347,6 +367,10 @@ impl AgentKind {
             Self::Zcode => "zcode",
             Self::CopilotCli => "copilot-cli",
             Self::Grizzybot => "grizzybot",
+            Self::Droid => "droid",
+            Self::Muse => "muse",
+            Self::CodeBuddy => "codebuddy",
+            Self::IbmBob => "ibm-bob",
             Self::Other => "other",
         }
     }
@@ -379,6 +403,10 @@ impl AgentKind {
             "zcode" | "zai" => Self::Zcode,
             "copilot-cli" | "copilot_cli" => Self::CopilotCli,
             "grizzybot" | "grizzy-bot" => Self::Grizzybot,
+            "droid" | "factory-droid" | "factory_droid" => Self::Droid,
+            "muse" | "muse-code" | "musecode" => Self::Muse,
+            "codebuddy" | "code-buddy" => Self::CodeBuddy,
+            "ibm-bob" | "bob" => Self::IbmBob,
             _ => Self::Other,
         }
     }
@@ -423,6 +451,19 @@ impl AgentKind {
     /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
     /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
     /// native hook prints that top-level envelope for it.
+    ///
+    /// Factory Droid documents `SessionStart` stdout as session context and
+    /// parses a JSON stdout's `hookSpecificOutput.additionalContext`, the
+    /// envelope the native hook prints for Claude Code (#1240).
+    ///
+    /// Meta Muse Code injects a `SessionStart` stdout's
+    /// `hookSpecificOutput.additionalContext` as developer context (verified
+    /// offline against Muse Code 1.4.7), so it takes the same envelope.
+    ///
+    /// CodeBuddy Code appends that same envelope to the session (reported
+    /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
+    /// handoff for it. The fetch stays the built-in SessionStart path; a
+    /// separate `GET /handoff` client is not part of the installer.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -458,6 +499,19 @@ impl AgentKind {
         matches!(self, Self::KimiCode)
     }
 
+    /// Whether this agent adds a `UserPromptSubmit` hook's
+    /// `hookSpecificOutput.additionalContext` to the turn it belongs to.
+    ///
+    /// Claude Code places it alongside the submitted prompt and Codex adds it
+    /// as developer context (both hook references). The compaction recap uses
+    /// this channel. Grok discards an allowing `UserPromptSubmit`'s output,
+    /// and Kimi Code injects raw stdout rather than this envelope, so neither
+    /// is listed.
+    #[must_use]
+    pub fn user_prompt_injects_context(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Codex)
+    }
+
     /// Whether `PostToolUse` stdout is model-visible context.
     ///
     /// Grok Build reads that stdout and delivers `hookSpecificOutput.additionalContext`
@@ -477,14 +531,17 @@ impl AgentKind {
     ///
     /// Grok does: the same session id comes back after an end, so an already-
     /// ended receiver row is a live restart, not a corpse, and
-    /// `accept_handoff` reopens it. For every other agent an ended session is
+    /// `accept_handoff` reopens it. Kimi Code does too: a resumed session
+    /// reuses the native session id after `SessionEnd` (same shape as Grok;
+    /// observed in production 2026-10). For every other agent an ended
+    /// session is
     /// final — a late/out-of-order startup fetch must not rebind it to a new
     /// handoff, so accepting into an ended session stays an error (this is what
     /// keeps a lifecycle-only receiver from reclaiming after it released and
     /// ended).
     #[must_use]
     pub fn reuses_session_id_after_end(self) -> bool {
-        matches!(self, Self::Grok)
+        matches!(self, Self::Grok | Self::KimiCode)
     }
 }
 
@@ -599,6 +656,12 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+        // A resumed session reuses the native id after SessionEnd (observed
+        // in production 2026-10), the same shape as Grok's restart.
+        assert!(AgentKind::KimiCode.reuses_session_id_after_end());
+        assert!(AgentKind::Grok.reuses_session_id_after_end());
+        assert!(!AgentKind::ClaudeCode.reuses_session_id_after_end());
+        assert!(!AgentKind::Codex.reuses_session_id_after_end());
     }
 
     #[test]
@@ -658,6 +721,102 @@ mod tests {
         // which the native hook prints for it.
         assert!(AgentKind::CopilotCli.session_start_injects_handoff());
         assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_droid_round_trips() {
+        assert_eq!(AgentKind::Droid.as_str(), "droid");
+        for alias in ["droid", "factory-droid", "factory_droid"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Droid, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Droid).unwrap(),
+            "\"droid\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"droid\"").unwrap(),
+            AgentKind::Droid
+        );
+        // The bare vendor name is not an alias, and unknown tags still
+        // degrade to Other.
+        assert_eq!(AgentKind::from_wire("factory"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("droid-2"), AgentKind::Other);
+        // Droid reads `hookSpecificOutput.additionalContext` from SessionStart
+        // stdout, so the native hook fetches the handoff there.
+        assert!(AgentKind::Droid.session_start_injects_handoff());
+        assert!(!AgentKind::Droid.user_prompt_injects_handoff());
+        assert!(!AgentKind::Droid.post_tool_injects_handoff());
+        assert!(!AgentKind::Droid.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_muse_round_trips() {
+        assert_eq!(AgentKind::Muse.as_str(), "muse");
+        for alias in ["muse", "muse-code", "musecode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Muse, "{alias}");
+        }
+        assert_eq!(serde_json::to_string(&AgentKind::Muse).unwrap(), "\"muse\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"muse\"").unwrap(),
+            AgentKind::Muse
+        );
+        assert_eq!(AgentKind::from_wire("meta"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("muse-2"), AgentKind::Other);
+        // Muse injects SessionStart's `hookSpecificOutput.additionalContext`,
+        // so the native hook fetches the handoff there.
+        assert!(AgentKind::Muse.session_start_injects_handoff());
+        assert!(!AgentKind::Muse.user_prompt_injects_handoff());
+        assert!(!AgentKind::Muse.post_tool_injects_handoff());
+        assert!(!AgentKind::Muse.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_codebuddy_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CodeBuddy.as_str(), "codebuddy");
+        for alias in ["codebuddy", "code-buddy"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CodeBuddy, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CodeBuddy).unwrap(),
+            "\"codebuddy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"codebuddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"code-buddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(AgentKind::from_wire("codebuddy-2"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("tencent"), AgentKind::Other);
+        // CodeBuddy appends SessionStart's hookSpecificOutput.additionalContext
+        // (#1299), so the built-in fetch is the delivery path.
+        assert!(AgentKind::CodeBuddy.session_start_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.user_prompt_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.post_tool_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_ibm_bob_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::IbmBob.as_str(), "ibm-bob");
+        for alias in ["ibm-bob", "bob"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::IbmBob, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::IbmBob).unwrap(),
+            "\"ibm-bob\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"bob\"").unwrap(),
+            AgentKind::IbmBob
+        );
+        assert_eq!(AgentKind::from_wire("bob-shell-2"), AgentKind::Other);
+        assert!(AgentKind::IbmBob.session_start_injects_handoff());
+        assert!(!AgentKind::IbmBob.user_prompt_injects_handoff());
+        assert!(!AgentKind::IbmBob.post_tool_injects_handoff());
+        assert!(!AgentKind::IbmBob.reuses_session_id_after_end());
     }
 
     #[test]
@@ -756,6 +915,18 @@ mod tests {
             assert_eq!(
                 agent.user_prompt_injects_handoff(),
                 agent == AgentKind::KimiCode,
+                "{}",
+                agent.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn user_prompt_context_injection_is_claude_code_and_codex() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_context(),
+                matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex),
                 "{}",
                 agent.as_str()
             );

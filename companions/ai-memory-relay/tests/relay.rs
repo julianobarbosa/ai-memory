@@ -28,13 +28,29 @@ mod queue_under_test;
 
 // ---------------------------------------------------------------- fixtures
 
-/// A kept sandbox. The path is printed so a failure points at the evidence.
-fn fixture(name: &str) -> PathBuf {
-    let root = tempfile::TempDir::new().unwrap().keep();
-    let root = root.join(name);
-    std::fs::create_dir_all(&root).unwrap();
-    println!("fixture {name}: {}", root.display());
-    root
+/// A sandbox path that owns its temp dir, so the tree is removed when the test
+/// ends instead of accumulating in the system temp directory.
+struct Sandbox {
+    _guard: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for Sandbox {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+fn fixture(name: &str) -> Sandbox {
+    let guard = tempfile::TempDir::new().unwrap();
+    let path = guard.path().join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    Sandbox {
+        _guard: guard,
+        path,
+    }
 }
 
 fn queue_dir(root: &Path) -> PathBuf {
@@ -1393,7 +1409,7 @@ CREATE TABLE IF NOT EXISTS session_agent(
 );
 "#;
 
-fn v1_fixture(name: &str) -> PathBuf {
+fn v1_fixture(name: &str) -> Sandbox {
     let root = fixture(name);
     let dir = queue_dir(&root);
     std::fs::create_dir(&dir).unwrap();
@@ -1419,7 +1435,10 @@ fn v1_fixture(name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    dir
+    Sandbox {
+        _guard: root._guard,
+        path: dir,
+    }
 }
 
 fn snapshot(conn: &rusqlite::Connection) -> Vec<String> {
@@ -1658,7 +1677,8 @@ fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_
 fn classification_read_failures_display_the_sqlite_cause_once_and_preserve_foreign_bytes() {
     for malformed_file in [false, true] {
         let dir = if malformed_file {
-            let dir = fsguard::prepare_queue_dir(&queue_dir(&fixture("invalid-sqlite"))).unwrap();
+            let sandbox = fixture("invalid-sqlite");
+            let dir = fsguard::prepare_queue_dir(&queue_dir(&sandbox)).unwrap();
             let path = dir.join("relay.sqlite");
             fsguard::create_private_file(&path).unwrap();
             std::fs::OpenOptions::new()
@@ -1667,7 +1687,10 @@ fn classification_read_failures_display_the_sqlite_cause_once_and_preserve_forei
                 .unwrap()
                 .write_all(b"not a SQLite database")
                 .unwrap();
-            dir
+            Sandbox {
+                _guard: sandbox._guard,
+                path: dir,
+            }
         } else {
             let dir = v1_fixture("missing-meta");
             let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
@@ -1826,7 +1849,12 @@ fn fresh_queue_init_and_v1_reopens_work_across_processes() {
         let dir = if legacy {
             v1_fixture("process-reopen")
         } else {
-            fsguard::prepare_queue_dir(&queue_dir(&fixture("process-init"))).unwrap()
+            let sandbox = fixture("process-init");
+            let path = fsguard::prepare_queue_dir(&queue_dir(&sandbox)).unwrap();
+            Sandbox {
+                _guard: sandbox._guard,
+                path,
+            }
         };
         let before = legacy
             .then(|| snapshot(&rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap()));

@@ -2,13 +2,14 @@
 //! (`docs/design-cross-project-profile.md`): the per-project `[profile]`
 //! flags (V74) and the bounded reads the SessionStart digest needs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use ai_memory_core::profile::{
     PROFILE_PATH_PREFIX, ProfileCandidateSource, ProfileEntry, ProfileGenerality, stack_tags_in,
 };
-use ai_memory_core::{ProjectId, WorkspaceId};
-use rusqlite::{Connection, OptionalExtension, params};
+use ai_memory_core::{AutoImproveProposalId, ProjectId, WorkspaceId};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::error::StoreResult;
 use crate::reader::{not_expired, now_us};
@@ -499,6 +500,55 @@ pub(crate) fn profile_pages_since(
         });
     }
     Ok(pages)
+}
+
+/// The `agent` of each given proposal's decider
+/// (`auto_improve_proposals.decided_by_actor_json`), keyed by proposal id, in
+/// one batch lookup. The harvester reads it to tell a page the scheduler
+/// auto-approved (model output nobody reviewed, #1211) from a page a human
+/// approved. A proposal with no row — a legacy or imported page whose
+/// frontmatter id resolves nowhere — is absent, and stays curated.
+pub(crate) fn auto_improve_decided_by(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    proposal_ids: &[AutoImproveProposalId],
+) -> StoreResult<HashMap<AutoImproveProposalId, Option<String>>> {
+    if proposal_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let blobs: Vec<Value> = proposal_ids
+        .iter()
+        .map(|id| Value::Blob(id.as_bytes().to_vec()))
+        .collect();
+    let placeholders = std::iter::repeat_n("?", blobs.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, json_extract(decided_by_actor_json, '$.agent') \
+         FROM auto_improve_proposals \
+         WHERE workspace_id = ? AND project_id = ? AND id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            std::iter::once(&Value::Blob(workspace_id.as_bytes().to_vec()))
+                .chain(std::iter::once(&Value::Blob(
+                    project_id.as_bytes().to_vec(),
+                )))
+                .chain(blobs.iter()),
+        ),
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, agent) = row?;
+        let Ok(id) = AutoImproveProposalId::from_slice(&id) else {
+            continue;
+        };
+        out.insert(id, agent);
+    }
+    Ok(out)
 }
 
 /// Record a project's candidates and advance its marks, in one transaction.

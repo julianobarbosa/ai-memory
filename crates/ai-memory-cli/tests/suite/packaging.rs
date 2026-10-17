@@ -360,6 +360,10 @@ fn docker_source_build_uses_vendored_tailwind() {
     let dockerfile = read_repo("docker/Dockerfile");
     assert!(dockerfile.contains("cargo build --locked --release -p ai-memory-cli"));
     assert!(
+        dockerfile.contains("COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE ./"),
+        "the source builder must copy files embedded by ai-memory-cli"
+    );
+    assert!(
         !dockerfile.contains("TAILWIND"),
         "the vendored stylesheet is the default; the image build must not opt into a regeneration"
     );
@@ -487,6 +491,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         posix.contains("CLAUDE_CODE_SESSION_ID"),
         "POSIX wrapper must forward Claude's session id into the bridge container"
     );
+    assert!(
+        posix.contains("  MUSE_SESSION_ID \\"),
+        "POSIX wrapper must forward Muse's session id into the bridge container"
+    );
     assert!(posix.contains("git -C \"${PWD}\" rev-parse --show-toplevel"));
     assert!(posix.contains("AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"));
     assert!(posix.contains("${SCOPE_ROOT}:/scope:ro"));
@@ -507,6 +515,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     assert!(
         powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
         "PowerShell wrapper must forward Claude's session id into the bridge container"
+    );
+    assert!(
+        powershell.contains("\"MUSE_SESSION_ID\""),
+        "PowerShell wrapper must forward Muse's session id into the bridge container"
     );
     assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
     assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
@@ -671,6 +683,8 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-wrapper.cmd",
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
+        "install.sh",
+        "install.ps1",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(
@@ -701,6 +715,32 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
     assert!(hook_installer.contains("tar -xOf"));
     assert!(!hook_installer.contains("tar -xzf"));
     assert!(!hook_installer.contains("raw.githubusercontent.com"));
+}
+
+/// `install.ps1` runs only on Windows CI; these source checks keep its safety
+/// properties visible to every platform's gate: the checksum is compared
+/// before anything is unpacked, archive entries escaping the install dir are
+/// refused, it never `exit`s (which would close the shell under `iex`), and
+/// it runs from one function called on the last line.
+#[test]
+fn install_ps1_keeps_its_safety_checks() {
+    let script = read_repo("install.ps1");
+    let hash = script.find("Get-FileHash").expect("checksum computed");
+    let mismatch = script.find("checksum mismatch").expect("mismatch refused");
+    let unsafe_entry = script.find("unsafe path").expect("unsafe entries refused");
+    let expand = script.find("Expand-Archive").expect("archive unpacked");
+    assert!(hash < expand && mismatch < expand && unsafe_entry < expand);
+    assert!(script.contains("$parts -contains '..'"));
+    assert!(script.contains("ai-memory-windows-x86_64.zip"));
+    assert!(script.contains("AI_MEMORY_NO_MODIFY_PATH"));
+    assert!(
+        !script
+            .lines()
+            .any(|line| line.trim_start().starts_with("exit")),
+        "install.ps1 must throw, not exit"
+    );
+    assert_eq!(script.trim_end().lines().last(), Some("Install-AiMemory"));
+    assert!(!script.contains("raw.githubusercontent.com"));
 }
 
 #[test]
@@ -759,7 +799,23 @@ fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
 fn dev_loop_is_wired_consistently() {
     // One gate, written down in four places; keep them from drifting apart.
     let ci = read_repo(".github/workflows/ci.yml");
-    assert!(ci.contains("cargo test --workspace --all-targets"));
+    assert!(ci.contains("cargo nextest run --workspace --all-targets --profile ci"));
+    // nextest does not run doctests.
+    assert!(ci.contains("cargo test --workspace --doc"));
+    // Windows stays on plain `cargo test`: nextest's per-test processes cost
+    // more there than its parallelism saves.
+    let windows = read_repo(".github/workflows/windows.yml");
+    assert!(windows.contains("cargo test --workspace --all-targets"));
+    // The `ci` profile is what makes CI a full gate: every tier, nothing
+    // turned green by a retry.
+    let nextest = read_repo(".config/nextest.toml");
+    let ci_profile = nextest
+        .split("[profile.ci]")
+        .nth(1)
+        .expect("nextest.toml defines [profile.ci]");
+    let ci_profile = ci_profile.split("\n[").next().unwrap_or(ci_profile);
+    assert!(ci_profile.contains("default-filter = \"all()\""));
+    assert!(ci_profile.contains("retries = 0"));
     assert!(
         ci.contains("TAILWIND_BUILD=1"),
         "CI must regenerate the stylesheet somewhere"
@@ -852,6 +908,11 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
         )
         .unwrap();
     }
+    std::fs::write(
+        tmp.path().join("bundle/hooks/_lib.sh"),
+        "# shared helper sourced by every event script\n",
+    )
+    .unwrap();
     let archive = tmp.path().join("ai-memory-hooks.tar.gz");
     let status = Command::new("tar")
         .arg("-czf")
@@ -909,6 +970,10 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
         "installer failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        destination.join("_lib.sh").is_file(),
+        "the shared helper must land beside the agent directories"
     );
     let installed = destination.join(canonical_agent);
     let mut names = std::fs::read_dir(&installed)
@@ -1541,14 +1606,14 @@ struct PrePushFixture {
     cygpath: Option<PathBuf>,
     hook_toplevel: String,
     fixture_toplevel: String,
+    _guard: tempfile::TempDir,
 }
 
 #[cfg(any(unix, windows))]
 impl PrePushFixture {
     fn new() -> Option<Self> {
-        // `keep()`: the sandbox is the evidence behind a failure, so it outlives
-        // the test rather than being deleted on drop.
-        let root = sandbox_root(tempfile::tempdir().unwrap().keep());
+        let guard = tempfile::tempdir().unwrap();
+        let root = sandbox_root(guard.path().to_path_buf());
         assert!(
             !root.starts_with(repo_root()),
             "the sandbox must live outside this checkout, got {}",
@@ -1610,6 +1675,7 @@ impl PrePushFixture {
             system_config,
             hook_toplevel: String::new(),
             fixture_toplevel: String::new(),
+            _guard: guard,
         };
         fixture.git(&fixture.hook_repo, &["init", "-q"]);
         fixture.git(&fixture.fixture_repo, &["init", "-q"]);
@@ -2619,6 +2685,8 @@ mod slow {
             "session-end",
             "session-start",
             "stop",
+            "subagent-start",
+            "subagent-stop",
             "user-prompt-submit",
         ];
 
@@ -2641,6 +2709,43 @@ mod slow {
             .map(|hook| format!("{hook}.sh"))
             .collect::<Vec<_>>();
         assert_eq!(names, expected);
+    }
+
+    // The installer lists each agent's scripts by hand, so a bundle that gains
+    // or loses a script leaves the list stale: a script the list still asks for
+    // aborts the install, and one it never asks for is silently not installed.
+    // Feeding it the file names the repository bundles really ship catches both.
+    #[cfg(unix)]
+    #[test]
+    fn hook_installer_installs_every_script_each_shipped_bundle_has() {
+        for agent in [
+            "claude-code",
+            "codex",
+            "cursor",
+            "gemini-cli",
+            "antigravity-cli",
+            "grok",
+            "kimi-code",
+            "kiro-cli",
+            "command-code",
+        ] {
+            let mut shipped = std::fs::read_dir(repo_root().join("hooks").join(agent))
+                .unwrap()
+                .filter_map(|entry| {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    name.strip_suffix(".sh").map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            shipped.sort();
+            let hooks = shipped.iter().map(String::as_str).collect::<Vec<_>>();
+            let expected = shipped
+                .iter()
+                .map(|hook| format!("{hook}.sh"))
+                .collect::<Vec<_>>();
+
+            let installed = installed_hook_names(agent, agent, &hooks);
+            assert_eq!(installed, expected, "{agent}");
+        }
     }
 
     #[cfg(unix)]

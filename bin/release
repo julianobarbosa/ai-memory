@@ -11,12 +11,15 @@
 #   3. Runs cargo-deny and cargo-audit (warn-only — a known advisory should
 #      not block a release; the operator reviews the output).
 #   4. Updates [workspace.package] version in Cargo.toml.
-#   5. Moves CHANGELOG.md [Unreleased] entries to a new [X.Y.Z] section
+#   5. Re-renders the marketplace plugins (plugins/, .claude-plugin/,
+#      .agents/plugins/) so every plugin version is X.Y.Z and every catalog
+#      entry points at the vX.Y.Z tag this release creates.
+#   6. Moves CHANGELOG.md [Unreleased] entries to a new [X.Y.Z] section
 #      dated today.
-#   6. Commits both files as "release: vX.Y.Z".
-#   7. Creates an annotated git tag vX.Y.Z whose message is the changelog
+#   7. Commits those files as "release: vX.Y.Z".
+#   8. Creates an annotated git tag vX.Y.Z whose message is the changelog
 #      entry for this version.
-#   8. Prints next-step instructions: push the commit + tag, then deploy.
+#   9. Prints next-step instructions: push the commit + tag, then deploy.
 #
 # The script intentionally does NOT push to git remote or to Docker Hub.
 # Releases are operator-driven: review the tag locally before pushing.
@@ -104,7 +107,7 @@ if new_text == text:
 #    path deps (ai-memory-core, ai-memory-store, etc.).  These always use the
 #    same version as the workspace package itself.
 new_text = re.sub(
-    r'(ai-memory-\w+\s*=\s*\{[^}]*version\s*=\s*")[^"]+(")',
+    r'(ai-memory-[\w-]+\s*=\s*\{[^}]*version\s*=\s*")[^"]+(")',
     r'\g<1>$VERSION\g<2>',
     new_text,
     flags=re.MULTILINE,
@@ -121,6 +124,14 @@ PYEOF
 # on network, falling back to a networked update if the cache is incomplete.
 echo "==> Syncing Cargo.lock"
 cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+
+# ── re-render the marketplace plugins ──────────────────────────────────────
+
+# The renderer stamps the binary's own version, so it runs from a build of
+# the bumped tree. The tag then carries catalogs that point at itself and
+# nothing has to be pushed after the release (#1166).
+echo "==> Re-rendering the marketplace plugins for ${VERSION}"
+cargo run --quiet --locked --bin ai-memory -- render-plugins --out "$REPO_ROOT"
 
 # ── update CHANGELOG.md ────────────────────────────────────────────────────
 
@@ -169,10 +180,20 @@ path.write_text(new_text)
 print("  moved [Unreleased] entries to [$VERSION] - $TODAY")
 PYEOF
 
+# A new major line keeps CHANGELOG.md to itself: the previous major's
+# sections and compare links move to docs/changelog/<major>.x.md, where they
+# stay frozen (scripts/check-changelog-frozen.sh reads both places).
+if [[ "$VERSION" =~ ^([0-9]+)\.0\.0$ ]] && (( BASH_REMATCH[1] > 0 )); then
+  echo "==> Archiving the $(( BASH_REMATCH[1] - 1 )).x CHANGELOG sections"
+  python3 "$REPO_ROOT/scripts/changelog_sections.py" archive "$(( BASH_REMATCH[1] - 1 ))" --root "$REPO_ROOT"
+  git add "$REPO_ROOT/docs/changelog"
+fi
+
 # ── commit + tag ───────────────────────────────────────────────────────────
 
 echo "==> Committing release files"
-git add "$CARGO_TOML" "$CHANGELOG" Cargo.lock
+git add "$CARGO_TOML" "$CHANGELOG" Cargo.lock \
+  "$REPO_ROOT/plugins" "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/.agents/plugins"
 git commit -m "release: ${TAG}"
 
 echo "==> Extracting changelog entry for tag message"

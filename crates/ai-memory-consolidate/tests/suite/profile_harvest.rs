@@ -379,6 +379,261 @@ async fn tool_output_is_never_a_candidate() {
     assert!(statements.iter().any(|s| s.contains("pnpm")));
 }
 
+/// Text a harness or ai-memory put into a user-prompt observation is never
+/// harvested as the user's words: the instruction files Codex injects as a
+/// user turn (stored before the import filter knew its bare heading, and read
+/// again by `profile rebuild`), a harness block delivered as a user turn, and
+/// ai-memory's own routing block pasted into a prompt, even when the 16 KiB
+/// cap cut it before its end marker. The user's own sentence next to the
+/// pasted block is harvested (control).
+#[tokio::test]
+async fn injected_instructions_and_ai_memory_blocks_are_never_candidates() {
+    use ai_memory_core::routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY};
+
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let codex_turn = format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<!-- global-rules:start -->\n\
+         Always use yarn classic for installs.\n<!-- global-rules:end -->\n\n\
+         {MARKER_START}{SNIPPET_BODY}"
+    );
+    prompt(&fx, alpha, &codex_turn, 1).await;
+    prompt(
+        &fx,
+        alpha,
+        "<task-notification>\nAlways use yarn berry for installs.\n</task-notification>",
+        2,
+    )
+    .await;
+    let pasted = format!(
+        "Always use pnpm for installs.\n\n{MARKER_START}\n\
+         Never write routine notes to memory by hand.\n{MARKER_END}\n"
+    );
+    prompt(&fx, alpha, &pasted, 3).await;
+    let truncated = format!("Here is my file:\n{MARKER_START}{SNIPPET_BODY}");
+    prompt(&fx, alpha, &truncated, 4).await;
+
+    pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().any(|s| s.contains("pnpm")),
+        "the user's own sentence was lost: {statements:?}"
+    );
+    assert_eq!(
+        statements.len(),
+        1,
+        "injected text became a candidate: {statements:?}"
+    );
+}
+
+/// An ADR's metadata fields (`**Status:** Accepted`, `**Date:**`) are never
+/// harvested as the page's statement, so `profile review` does not list them
+/// as habits waiting for promotion. The decision itself is the candidate, and
+/// a habit said in two projects is still admitted (controls).
+#[tokio::test]
+async fn page_metadata_fields_are_never_candidates() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    for (proj, slug, context) in [
+        (alpha, "wal-mode", "Readers blocked the writer under load."),
+        (
+            beta,
+            "queue-backend",
+            "Jobs were lost when the broker restarted.",
+        ),
+    ] {
+        fx.wiki
+            .write_page(WritePageRequest {
+                workspace_id: fx.ws,
+                project_id: proj,
+                path: PagePath::new(format!("decisions/{slug}.md")).unwrap(),
+                frontmatter: serde_json::json!({}),
+                body: format!(
+                    "# {slug}\n\n\
+                     **Status:** Accepted\n\
+                     **Date:** 2026-10-01\n\
+                     **Deciders:** Alice, Bob\n\n\
+                     ## Context\n\n\
+                     {context}\n\n\
+                     ## Decision\n\n\
+                     We adopt it for every store.\n"
+                ),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    prompt(
+        &fx,
+        alpha,
+        "I prefer small focused commits over big ones.",
+        1,
+    )
+    .await;
+    prompt(
+        &fx,
+        beta,
+        "I prefer small focused commits over big ones!",
+        3,
+    )
+    .await;
+
+    let report = pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    for field in ["Status", "Date", "Deciders", "Accepted"] {
+        assert!(
+            statements.iter().all(|s| !s.contains(field)),
+            "a metadata field became a candidate: {statements:?}"
+        );
+    }
+    assert!(
+        statements
+            .iter()
+            .any(|s| s == "Readers blocked the writer under load."),
+        "{statements:?}"
+    );
+
+    let review = ai_memory_consolidate::profile::profile_review(
+        &fx.store.reader,
+        &single_user(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        review
+            .waiting
+            .iter()
+            .all(|w| !w.statement.contains("Accepted")),
+        "{:?}",
+        review.waiting
+    );
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(pages.len(), 1, "{report:?} {pages:?}");
+    assert!(pages[0].1.contains("small focused commits"), "{pages:?}");
+}
+
+/// A curated page the auto-improve scheduler auto-approved is model output
+/// nobody reviewed (#1211): it never becomes a profile candidate. A page a
+/// human approved still counts, and a hand-written page counts (controls).
+#[tokio::test]
+async fn auto_approved_auto_improve_pages_are_never_candidates() {
+    use ai_memory_consolidate::auto_improve_schedule::AUTO_IMPROVE_AUTO_APPROVE_AGENT;
+    use ai_memory_store::{
+        AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun,
+    };
+
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+
+    // Hand-written control.
+    fx.wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id: alpha,
+            path: PagePath::new("decisions/hand-written.md").unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "# Hand-written rule\n\nAlways run the smoke suite before tagging.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Two proposals: one auto-approved by the scheduler, one approved by a
+    // human.
+    let proposal = |path: &str, title: &str, body: &str| NewAutoImproveProposal {
+        operation: AutoImproveProposalOperation::Create,
+        target_path: PagePath::new(path).unwrap(),
+        kind: "rule".into(),
+        title: title.into(),
+        confidence: 0.9,
+        rationale: "because".into(),
+        evidence_json: serde_json::json!([]),
+        body_markdown: body.into(),
+        artifact_sha256: None,
+        edit_mode: None,
+        patch_json: None,
+        expected_base_body_sha256: None,
+    };
+    let staged = fx
+        .store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: fx.ws,
+                project_id: alpha,
+                session_id: None,
+                proposals: vec![
+                    proposal(
+                        "decisions/auto-approved.md",
+                        "Auto-approved rule",
+                        "# Auto-approved rule\n\nAlways mock the clock in scheduler tests.",
+                    ),
+                    proposal(
+                        "decisions/human-approved.md",
+                        "Human-approved rule",
+                        "# Human-approved rule\n\nAlways squash migrations before a release.",
+                    ),
+                ],
+                proposal_actor: ActorContext::anonymous(),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                summary: None,
+                provider: None,
+                model: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    for (id, actor) in staged.proposal_ids.iter().zip([
+        ActorContext {
+            agent: Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT.into()),
+            ..ActorContext::default()
+        },
+        ActorContext {
+            agent: Some("cli".into()),
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        },
+    ]) {
+        fx.wiki
+            .approve_auto_improve_proposal(fx.ws, alpha, *id, actor, None, None)
+            .await
+            .unwrap();
+    }
+
+    pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().all(|s| !s.contains("mock the clock")),
+        "an auto-approved page became a candidate: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|s| s.contains("squash migrations")),
+        "the human-approved page was lost: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|s| s.contains("smoke suite")),
+        "the hand-written page was lost: {statements:?}"
+    );
+}
+
 /// `[profile] contribute = false` keeps a project out entirely; the same
 /// words in a contributing project are harvested (control).
 #[tokio::test]

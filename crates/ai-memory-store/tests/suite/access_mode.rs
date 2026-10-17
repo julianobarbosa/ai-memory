@@ -53,16 +53,18 @@ fn page(
     }
 }
 
-async fn user(store: &Store, name: &str, byte: u8) -> UserId {
+async fn user(store: &Store, name: &str) -> UserId {
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: name.to_owned(),
                 name: None,
                 email: None,
             },
-            [byte; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap()
@@ -91,9 +93,9 @@ async fn fixture() -> Fixture {
         .get_or_create_project(ws, "client-work", None)
         .await
         .unwrap();
-    let reader = user(&store, "ray", 1).await;
-    let writer = user(&store, "wren", 2).await;
-    let outsider = user(&store, "otto", 3).await;
+    let reader = user(&store, "ray").await;
+    let writer = user(&store, "wren").await;
+    let outsider = user(&store, "otto").await;
     store
         .writer
         .grant_memory(reader, project, GrantLevel::Read, None)

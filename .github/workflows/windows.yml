@@ -103,8 +103,12 @@ jobs:
               - 'crates/ai-memory-store/**'
               - 'crates/ai-memory-hooks/**'
               - 'crates/ai-memory-cli/src/commands/install_hooks.rs'
+              - 'crates/ai-memory-cli/src/commands/service_host.rs'
+              - 'crates/ai-memory-cli/src/commands/user_service.rs'
               - 'hooks/**'
               - 'tests/hooks/**'
+              - 'install.ps1'
+              - 'tests/install_ps1.ps1'
               - '.github/workflows/windows.yml'
 
   test:
@@ -123,6 +127,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
+      - name: install.ps1 against local releases
+        run: pwsh -NoProfile -File tests/install_ps1.ps1 -Binary target/debug/ai-memory.exe
       - name: Check the external lifecycle relay
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target

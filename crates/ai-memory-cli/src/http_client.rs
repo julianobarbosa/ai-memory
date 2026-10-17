@@ -24,6 +24,9 @@ use serde::de::DeserializeOwned;
 use crate::config::{Config, DEFAULT_SERVER_URL};
 use ai_memory_web::normalize_prefix;
 
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
+const CLI_CLIENT_KIND: &str = "cli";
+
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
@@ -238,8 +241,11 @@ impl ServerEndpoint {
         parsed.as_str().trim_end_matches('/').to_owned()
     }
 
-    /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
+    /// Mark a request to this server as first-party
+    /// ([`ai_memory_hooks::CLIENT_MARKER_HEADER`]) and attach the bearer when a
+    /// token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header(ai_memory_hooks::CLIENT_MARKER_HEADER, CLI_CLIENT_KIND);
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -396,11 +402,9 @@ fn build_url_with_query(
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
 /// message that surfaces the resolved server URL. The common cases are
-/// "Connection refused" and a connect that never completes: on Windows a
-/// closed loopback port is routinely dropped (timed out) by the firewall
-/// instead of being refused, and both mean the same operator problem —
-/// the CLI defaulted to (or was pointed at) an endpoint where nothing
-/// answered.
+/// "Connection refused", a connect that never completes, and a peer that
+/// closes before sending an HTTP response. They all mean the same operator
+/// problem: the CLI was pointed at an endpoint where no server answered.
 pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
@@ -432,13 +436,19 @@ pub(crate) fn augment_connect_error(
     }
 }
 
-/// Whether an error chain means "nothing answered at the transport
-/// layer": reqwest classified it as a connect-phase or timeout failure,
-/// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
-/// wording — is buried in the source chain. reqwest wraps its errors
-/// deeply, and matching only an explicit RST would hide the diagnosis
-/// from exactly the hosts (windows-latest among them) whose firewalls
-/// turn a refused loopback connect into a silent timeout.
+/// Whether a request failed because nothing answered — a refused connection
+/// or a timeout — rather than because the server answered with an error.
+pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
+    let answered = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some());
+    !answered && err.chain().any(error_chain_indicates_no_answer)
+}
+
+/// Whether an error chain means "nothing answered at the transport layer".
+/// reqwest may classify this as a connect/timeout failure or wrap the socket
+/// error deeply. A peer can also accept and close before the HTTP response,
+/// which is equally unreachable from the caller's perspective.
 fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(req) = err.downcast_ref::<reqwest::Error>()
         && (req.is_connect() || req.is_timeout())
@@ -450,13 +460,25 @@ fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> b
         if let Some(io) = e.downcast_ref::<std::io::Error>()
             && matches!(
                 io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
             )
         {
             return true;
         }
         let wording = e.to_string().to_ascii_lowercase();
-        if wording.contains("connection refused") || wording.contains("timed out") {
+        if wording.contains("connection refused")
+            || wording.contains("connection reset")
+            || wording.contains("connection aborted")
+            || wording.contains("connection closed before message completed")
+            || wording.contains("unexpected eof")
+            || wording.contains("broken pipe")
+            || wording.contains("timed out")
+        {
             return true;
         }
         src = e.source();
@@ -558,6 +580,24 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn only_an_unanswered_request_is_unreachable() {
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("HTTP request to http://127.0.0.1:1/admin/status failed");
+        assert!(server_unreachable(&refused));
+        let answered = server_response_error_for_test(
+            reqwest::Method::GET,
+            "/admin/status",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "down for maintenance".to_owned(),
+        );
+        assert!(!server_unreachable(&answered));
+        assert!(!server_unreachable(&anyhow::anyhow!(
+            "malformed response body"
+        )));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -822,7 +862,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn authenticate_no_token_leaves_request_unchanged() {
+    fn authenticate_no_token_sets_only_the_client_marker() {
         let ep = ServerEndpoint::from_pair(None, None);
         let client = reqwest::Client::new();
         // Build a request, authenticate it, then build to inspect.
@@ -834,6 +874,14 @@ mod tests {
         assert!(
             req.headers().get("authorization").is_none(),
             "no Authorization header expected"
+        );
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without the marker, so every CLI request carries it.
+        assert_eq!(
+            req.headers()
+                .get(ai_memory_hooks::CLIENT_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cli")
         );
     }
 
@@ -858,21 +906,17 @@ mod tests {
     // Server reachability probe
     // ----------------------------------------------------------------
 
-    /// Bind a loopback listener, capture its address, and release it: the
-    /// next connection to that address is refused. Rebinding races exist on
-    /// loopback but are vanishingly rare under a test load.
-    async fn closed_port_endpoint() -> ServerEndpoint {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        ServerEndpoint::from_pair(Some(format!("http://{address}")), None)
+    /// Keep a listener bound and close every accepted connection so parallel
+    /// tests cannot reuse an allegedly closed ephemeral port.
+    fn no_answer_endpoint() -> ServerEndpoint {
+        ServerEndpoint::from_pair(Some(ai_memory_test_support::dead_http_endpoint()), None)
     }
 
     #[tokio::test]
-    async fn probe_reports_a_closed_port_as_unreachable_with_the_diagnosis() {
-        let endpoint = closed_port_endpoint().await;
+    async fn probe_reports_an_accept_then_close_peer_as_unreachable_with_the_diagnosis() {
+        let endpoint = no_answer_endpoint();
         let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
-            panic!("a closed port must be Unreachable");
+            panic!("a peer that closes before responding must be Unreachable");
         };
         let url = endpoint.build_url("/workstream/runs");
         let augmented = augment_connect_error(error, &endpoint, &url);

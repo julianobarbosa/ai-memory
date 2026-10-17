@@ -20,7 +20,7 @@
 //!   returned nor walked through. The seed lookup is an exact-path read
 //!   and still starts from an expired page.
 
-use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, WorkspaceId};
+use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Relation, Tier, UserId, WorkspaceId};
 use ai_memory_store::{
     AccessMode, GrantLevel, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, Store,
 };
@@ -54,6 +54,15 @@ fn same_project_link(path: &str) -> ai_memory_core::LinkTarget {
         project: None,
         path: PagePath::new(path).unwrap(),
         relation: None,
+    }
+}
+
+fn contradiction_link(path: &str) -> ai_memory_core::LinkTarget {
+    ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: Some(Relation::Contradicts),
     }
 }
 
@@ -393,13 +402,15 @@ async fn the_walk_hides_and_does_not_cross_projects_the_viewer_cannot_read() {
     }
     let viewer = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "vera".into(),
                 name: None,
                 email: None,
             },
-            [7; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -737,4 +748,409 @@ async fn cross_project_edges_hide_edges_touching_an_expired_page() {
             "scope {scope:?}: edges touching an expired page must be hidden"
         );
     }
+}
+
+/// `page_links_preview` cuts each direction in SQL and counts the rest under
+/// the same filters: a back-link from a project the viewer cannot read is
+/// neither listed nor counted, so "and N more" leaks nothing either.
+///
+/// ```text
+///   app:b1..b5 ──▶ app:a ◀── secret:s1..s3   (secret restricted, no grant)
+/// ```
+#[tokio::test]
+async fn page_links_preview_caps_in_sql_and_counts_only_readable_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "secret".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page_with_links(ws, app, "notes/a.md", vec![]))
+        .await
+        .unwrap();
+    for i in 1..=5 {
+        let path = format!("notes/b{i}.md");
+        let page = page_with_links(ws, app, &path, vec![same_project_link("notes/a.md")]);
+        store.writer.upsert_page(page).await.unwrap();
+    }
+    for i in 1..=3 {
+        let path = format!("notes/s{i}.md");
+        let page = page_with_links(
+            ws,
+            secret,
+            &path,
+            vec![cross_project_link("app", "notes/a.md")],
+        );
+        store.writer.upsert_page(page).await.unwrap();
+    }
+    store
+        .writer
+        .set_access_mode(secret, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let viewer = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "vera".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let preview = |who: Option<UserId>, limit: usize| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .page_links_preview(ws, app, "notes/a.md".into(), who, limit)
+                .await
+                .unwrap()
+        }
+    };
+
+    let cut = preview(Some(viewer), 2).await;
+    let paths: Vec<&str> = cut.backlinks.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(paths, ["notes/b1.md", "notes/b2.md"]);
+    assert_eq!(
+        cut.backlinks_total, 5,
+        "the secret back-links are not counted"
+    );
+    assert!(cut.links.is_empty() && cut.links_total == 0);
+
+    let all = preview(Some(viewer), 10).await;
+    assert_eq!(all.backlinks.len(), 5);
+    assert_eq!(all.backlinks_total, 5);
+    assert!(all.backlinks.iter().all(|p| p.project == "app"));
+
+    // Control: no viewer (root, or authorization off) counts all eight, and
+    // the cut keeps `page_links` order.
+    let root = preview(None, 2).await;
+    assert_eq!(root.backlinks_total, 8);
+    let full = store
+        .reader
+        .page_links(ws, app, "notes/a.md".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(full.backlinks.len(), 8);
+    let head: Vec<&str> = full.backlinks[..2]
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    let cut_root: Vec<&str> = root.backlinks.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(cut_root, head);
+}
+
+/// `contradiction_edges` returns declared contradicts edges from latest
+/// unexpired pages. A target edge resolves only when pointing at an existing,
+/// latest, and unexpired page. If the target was tombstoned, expired, or never
+/// existed, `resolved` evaluates to false. An expired source page is omitted
+/// entirely from contradiction edges.
+#[tokio::test]
+async fn contradiction_edges_require_latest_unexpired_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(ws, app, "notes/live_target.md", vec![]))
+        .await
+        .unwrap();
+
+    let tombstoned_target_id = store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/tombstoned_target.md",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, app, "notes/expired_target.md", vec![]),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, app, "notes/future_target.md", vec![]),
+            future_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/source.md",
+            vec![
+                contradiction_link("notes/live_target.md"),
+                contradiction_link("notes/tombstoned_target.md"),
+                contradiction_link("notes/expired_target.md"),
+                contradiction_link("notes/future_target.md"),
+                contradiction_link("notes/missing_target.md"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_source.md",
+                vec![contradiction_link("notes/live_target.md")],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    let soft_deleted = store
+        .writer
+        .soft_delete_for_decay_if_latest(
+            ws,
+            app,
+            PagePath::new("notes/tombstoned_target.md").unwrap(),
+            tombstoned_target_id,
+        )
+        .await
+        .unwrap();
+    assert!(soft_deleted, "tombstone soft delete succeeded");
+
+    let edges = store.reader.contradiction_edges(ws, app).await.unwrap();
+
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.from_path == "notes/expired_source.md"),
+        "expired source page must not emit contradiction edges"
+    );
+
+    let pairs: Vec<(String, String, bool)> = edges
+        .into_iter()
+        .map(|e| (e.from_path, e.to_path, e.resolved))
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            (
+                "notes/source.md".to_string(),
+                "notes/expired_target.md".to_string(),
+                false,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/future_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/live_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/missing_target.md".to_string(),
+                false,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/tombstoned_target.md".to_string(),
+                false,
+            ),
+        ]
+    );
+}
+
+/// `dangling_cross_project_links` returns declared dependencies on pages in
+/// another project that do not resolve to an existing, latest, unexpired page.
+/// If the target was tombstoned (soft-deleted), expired, or never existed, it
+/// is reported as dangling. Targets that are live or have future TTL do not
+/// dangle. An expired source page is omitted entirely.
+#[tokio::test]
+async fn dangling_cross_project_links_require_latest_unexpired_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+    let lib = store
+        .writer
+        .get_or_create_project(ws, "lib".to_string(), None)
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(ws, lib, "notes/live_target.md", vec![]))
+        .await
+        .unwrap();
+
+    let tombstoned_target_id = store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            lib,
+            "notes/tombstoned_target.md",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, lib, "notes/expired_target.md", vec![]),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, lib, "notes/future_target.md", vec![]),
+            future_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/source.md",
+            vec![
+                cross_project_link("ghost", "notes/missing.md"),
+                cross_project_link("lib", "notes/live_target.md"),
+                cross_project_link("lib", "notes/tombstoned_target.md"),
+                cross_project_link("lib", "notes/expired_target.md"),
+                cross_project_link("lib", "notes/future_target.md"),
+                cross_project_link("lib", "notes/missing_target.md"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_source.md",
+                vec![cross_project_link("lib", "notes/live_target.md")],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    let soft_deleted = store
+        .writer
+        .soft_delete_for_decay_if_latest(
+            ws,
+            lib,
+            PagePath::new("notes/tombstoned_target.md").unwrap(),
+            tombstoned_target_id,
+        )
+        .await
+        .unwrap();
+    assert!(soft_deleted, "tombstone soft delete succeeded");
+
+    let dangling = store
+        .reader
+        .dangling_cross_project_links(ws, app)
+        .await
+        .unwrap();
+
+    assert!(
+        !dangling
+            .iter()
+            .any(|d| d.from_path == "notes/expired_source.md"),
+        "expired source page must not emit dangling links"
+    );
+
+    let summary: Vec<(String, String, String, bool)> = dangling
+        .into_iter()
+        .map(|d| (d.from_path, d.project, d.path, d.project_exists))
+        .collect();
+
+    assert_eq!(
+        summary,
+        vec![
+            (
+                "notes/source.md".to_string(),
+                "ghost".to_string(),
+                "notes/missing.md".to_string(),
+                false,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "lib".to_string(),
+                "notes/expired_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "lib".to_string(),
+                "notes/missing_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "lib".to_string(),
+                "notes/tombstoned_target.md".to_string(),
+                true,
+            ),
+        ]
+    );
 }

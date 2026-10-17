@@ -57,6 +57,30 @@ jobs:
             echo "tag version v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
             exit 1
           fi
+          # bin/release re-renders the marketplace plugins with the bump, so
+          # the tag's catalogs point at the tag itself (#1166).
+          for manifest in plugins/claude-code/.claude-plugin/plugin.json plugins/codex/.codex-plugin/plugin.json; do
+            plugin_version="$(jq -r .version "$manifest")"
+            if [ "$plugin_version" != "$tag_version" ]; then
+              echo "$manifest has version ${plugin_version}, expected ${tag_version}; re-run render-plugins" >&2
+              exit 1
+            fi
+          done
+          for catalog in .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
+            # A missing catalog or an empty plugin list would leave the loop
+            # below nothing to check, so refuse both before reading refs.
+            if ! jq -e '.plugins | length > 0' "$catalog" >/dev/null; then
+              echo "$catalog is missing or lists no plugins; re-run render-plugins" >&2
+              exit 1
+            fi
+            refs="$(jq -r '.plugins[].source.ref' "$catalog")"
+            for ref in $refs; do
+              if [ "$ref" != "v${tag_version}" ]; then
+                echo "$catalog points at ${ref}, expected v${tag_version}; re-run render-plugins" >&2
+                exit 1
+              fi
+            done
+          done
           echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
 
   binary:
@@ -525,6 +549,28 @@ jobs:
             sha256sum ai-memory-hooks.tar.gz > ai-memory-hooks.tar.gz.sha256
           )
 
+      # For Customize > Plugins > Upload plugin in the Claude desktop app and
+      # Cowork: the plugin directory itself, launcher mode included.
+      - name: Stage the Claude Code plugin zip
+        run: |
+          set -euo pipefail
+          (cd plugins/claude-code && zip -qrX "$GITHUB_WORKSPACE/artifacts/ai-memory-claude-plugin.zip" .)
+          (
+            cd artifacts
+            sha256sum ai-memory-claude-plugin.zip > ai-memory-claude-plugin.zip.sha256
+          )
+
+      - name: Stage checksum-verified install scripts
+        run: |
+          set -euo pipefail
+          install -m 0755 install.sh artifacts/install.sh
+          install -m 0644 install.ps1 artifacts/install.ps1
+          (
+            cd artifacts
+            sha256sum install.sh > install.sh.sha256
+            sha256sum install.ps1 > install.ps1.sha256
+          )
+
       - name: Generate release body
         run: |
           echo "## Checksums (SHA256)" > body.md
@@ -534,6 +580,10 @@ jobs:
           echo "" >> body.md
           echo "## Install" >> body.md
           echo '```bash' >> body.md
+          echo "# Linux/macOS, no root: checksum-verified release binary under ~/.local, then one-step setup" >> body.md
+          echo "curl -fsSL https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.sh | AI_MEMORY_VERSION=${{ needs.validate-version.outputs.version }} sh" >> body.md
+          echo "ai-memory setup" >> body.md
+          echo "" >> body.md
           echo "# Arch Linux (AUR)" >> body.md
           echo "yay -S ai-memory-bin      # prebuilt Linux x86_64/aarch64 binary" >> body.md
           echo "yay -S ai-memory          # builds from source" >> body.md
@@ -546,8 +596,9 @@ jobs:
           echo "# macOS aarch64/x86_64 (no toolchain): download the matching ai-memory-macos-<arch>.tar.gz below," >> body.md
           echo "# extract it, and follow the bundled docs/macos.md." >> body.md
           echo "" >> body.md
-          echo "# Windows x86_64 (no toolchain): download ai-memory-windows-x86_64.zip below," >> body.md
-          echo "# extract it, and follow the bundled docs/windows.md." >> body.md
+          echo "# Windows x86_64, no admin (PowerShell): checksum-verified release under %LOCALAPPDATA%\\Programs, then one-step setup" >> body.md
+          echo "\$env:AI_MEMORY_VERSION='${{ needs.validate-version.outputs.version }}'; irm https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.ps1 | iex" >> body.md
+          echo "ai-memory setup" >> body.md
           echo "" >> body.md
           echo "# From source" >> body.md
           echo "cargo install --locked --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md

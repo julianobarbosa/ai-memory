@@ -2,6 +2,8 @@
 target/
 **/target/
 
+**/node_modules/
+
 # Local state.
 .local-data/
 *.log
@@ -18,6 +20,9 @@ perf.data*
 
 # Sandbox marker.
 .ai-jail
+
+# Node dependencies of the optional TypeScript SDK; never part of the image.
+**/node_modules/
 
 # Operator-specific deployment files. Keep this block last so a later negation
 # cannot re-include credentials or host configuration in the build context.

@@ -12,6 +12,11 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use walkdir::WalkDir;
 
+mod agentmemory;
+mod mcp;
+#[cfg(test)]
+mod test_http;
+
 const IMPORT_VERSION: &str = "omc-wiki-v1";
 const CONVERSATION_IMPORT_VERSION: &str = "external-conversation-v1";
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
@@ -36,6 +41,10 @@ enum Commands {
     OmcWiki(OmcArgs),
     /// Replay a generic external conversation through ai-memory's hook API.
     ExternalConversation(ConversationArgs),
+    /// Import the Obsidian vault agentmemory's `obsidian-export` writes.
+    AgentmemoryVault(agentmemory::vault::VaultArgs),
+    /// Import an agentmemory `ExportData` JSON file.
+    AgentmemoryExport(agentmemory::export::ExportArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -297,6 +306,8 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::OmcWiki(args) => run_omc(args).await,
         Commands::ExternalConversation(args) => run_conversation(args).await,
+        Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
+        Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
     }
 }
 
@@ -1058,39 +1069,17 @@ struct ParsedMarkdown {
     pinned: bool,
 }
 
-/// Split an OMC page into frontmatter fields and body. The fence is found
-/// the way `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8
-/// BOM, and with either LF or CRLF fence lines, since a wiki checked out on
-/// Windows with `core.autocrlf=true` has CRLF throughout. Missing it dropped
-/// kind, tier, tags and pin, and imported the YAML block as body text.
+/// Split an OMC page into frontmatter fields and body.
 fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     let mut out = ParsedMarkdown::default();
-    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
-        (Some(rest), "\r\n")
-    } else {
-        (input.strip_prefix("---\n"), "\n")
-    };
-    let close = format!("\n---{newline}");
-    let body = if let Some(rest) = rest {
-        if let Some(end) = rest.find(&close) {
-            let yaml = rest[..end].trim_end_matches('\r');
-            let value: serde_yaml::Value =
-                serde_yaml::from_str(yaml).context("parse YAML frontmatter")?;
-            if let Some(map) = value.as_mapping() {
-                out.title = yaml_string(map, "title");
-                out.kind = yaml_string(map, "kind");
-                out.tier = yaml_string(map, "tier");
-                out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
-                out.tags = yaml_tags(map);
-            }
-            rest[end + close.len()..].to_owned()
-        } else {
-            input.to_owned()
-        }
-    } else {
-        input.to_owned()
-    };
+    let (frontmatter, body) = split_frontmatter(input)?;
+    if let Some(map) = frontmatter.as_ref() {
+        out.title = yaml_string(map, "title");
+        out.kind = yaml_string(map, "kind");
+        out.tier = yaml_string(map, "tier");
+        out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
+        out.tags = yaml_tags(map);
+    }
     if out.title.is_none() {
         out.title = first_h1(&body);
     }
@@ -1098,21 +1087,66 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     Ok(out)
 }
 
-fn yaml_key(key: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(key.into())
+/// Split a Markdown page into its YAML frontmatter mapping (when the block
+/// is a mapping) and its body. The fence is found the way
+/// `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8 BOM, and
+/// with either LF or CRLF fence lines, since a wiki checked out on Windows
+/// with `core.autocrlf=true` has CRLF throughout. Missing it dropped kind,
+/// tier, tags and pin, and imported the YAML block as body text.
+fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
+        (Some(rest), "\r\n")
+    } else {
+        (input.strip_prefix("---\n"), "\n")
+    };
+    let close = format!("\n---{newline}");
+    let Some(rest) = rest else {
+        return Ok((None, input.to_owned()));
+    };
+    let Some(end) = rest.find(&close) else {
+        return Ok((None, input.to_owned()));
+    };
+    let yaml = rest[..end].trim_end_matches('\r');
+    let value: serde_json::Value =
+        serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
+            .context("parse YAML frontmatter")?;
+    let map = match value {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    };
+    Ok((map, rest[end + close.len()..].to_owned()))
 }
-fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(yaml_key(key))
+
+/// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
+/// parser: YAML 1.2 booleans (`pinned: yes` stays a string, so not pinned),
+/// `<<` as an ordinary key, and `.inf`/`.nan` kept as text instead of
+/// failing the page.
+fn frontmatter_parse_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+        ignore_binary_tag_for_string: true,
+        reject_non_finite_typeless_float: false,
+        with_snippet: false,
+        budget: serde_saphyr::budget! { max_depth: 128 },
+    }
+}
+
+type YamlMap = serde_json::Map<String, serde_json::Value>;
+
+fn yaml_string(map: &YamlMap, key: &str) -> Option<String> {
+    map.get(key)
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .filter(|s| !s.trim().is_empty())
 }
-fn yaml_bool(map: &serde_yaml::Mapping, key: &str) -> Option<bool> {
-    map.get(yaml_key(key)).and_then(|v| v.as_bool())
+fn yaml_bool(map: &YamlMap, key: &str) -> Option<bool> {
+    map.get(key).and_then(|v| v.as_bool())
 }
-fn yaml_tags(map: &serde_yaml::Mapping) -> Vec<String> {
-    match map.get(yaml_key("tags")) {
-        Some(serde_yaml::Value::Sequence(seq)) => seq
+fn yaml_tags(map: &YamlMap) -> Vec<String> {
+    match map.get("tags") {
+        Some(serde_json::Value::Array(seq)) => seq
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
@@ -1359,8 +1393,8 @@ fn enc_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use crate::test_http::{read_http_request, respond_json};
+    use std::net::TcpListener;
     use std::thread;
     use tempfile::tempdir;
 
@@ -1387,47 +1421,6 @@ mod tests {
         })
     }
 
-    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete headers");
-            bytes.extend_from_slice(&buf[..read]);
-            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        while bytes.len() - header_end < content_length {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete body");
-            bytes.extend_from_slice(&buf[..read]);
-        }
-        (
-            headers,
-            bytes[header_end..header_end + content_length].to_vec(),
-        )
-    }
-
-    fn respond_json(stream: &mut TcpStream, status: &str, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        stream.flush().unwrap();
-    }
-
     #[test]
     fn parses_omc_frontmatter() {
         let parsed = parse_markdown("---\ntitle: T\nkind: rule\ntier: procedural\ntags: [a, b]\npinned: true\nextra: ignored\n---\n# Body\ntext").unwrap();
@@ -1437,6 +1430,18 @@ mod tests {
         assert_eq!(parsed.tags, vec!["a", "b"]);
         assert!(parsed.pinned);
         assert_eq!(parsed.body, "# Body\ntext");
+    }
+
+    /// `serde_yaml` 0.9 read YAML 1.1 words as text, so `pinned: yes` never
+    /// pinned a page and a bare `tags:` word stayed a one-item list.
+    #[test]
+    fn omc_frontmatter_keeps_yaml_1_1_words_as_text() {
+        let parsed = parse_markdown("---\ntitle: yes\npinned: yes\ntags: on\n---\nbody").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("yes"));
+        assert!(!parsed.pinned);
+        assert_eq!(parsed.tags, vec!["on"]);
+
+        assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
     }
 
     /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
@@ -1965,7 +1970,8 @@ mod tests {
 
     #[test]
     fn sanitized_redaction_markers_survive_utf8_byte_caps_in_bodies_and_titles() {
-        let root = tempdir().unwrap().keep();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
         for (role, cap) in [
             ("user", MAX_USER_MESSAGE_BYTES),
             ("assistant", MAX_EXTENSION_MESSAGE_BYTES),
@@ -1976,7 +1982,7 @@ mod tests {
                 {"role":role, "content":format!("{prefix}abcdefghijklmnop\u{1b}[0m\u{202e}")},
                 {"role":"assistant", "content":format!("{} token=abcdefghijklmnop", "x".repeat(145))}
             ]});
-            let file = write_conversation(&root, source);
+            let file = write_conversation(root, source);
             let plan = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
             for event in &plan.events {
                 ai_memory_client::check_body(&event.body).unwrap();

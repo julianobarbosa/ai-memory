@@ -30,13 +30,6 @@ use crate::types::{
 /// Primary OpenCode Go OpenAI-compatible base URL.
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
-/// Public OpenCode Zen/Go OpenAI-compatible base URL.
-#[deprecated(
-    since = "2.1.0",
-    note = "names Zen but holds Go's endpoint; use OPENCODE_GO_BASE_URL"
-)]
-pub const OPENCODE_ZEN_BASE_URL: &str = OPENCODE_GO_BASE_URL;
-
 /// Default model when `AI_MEMORY_LLM_MODEL` is not set.
 pub const OPENCODE_DEFAULT_MODEL: &str = "mimo-v2.6-flash";
 
@@ -621,12 +614,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn the_deprecated_alias_still_resolves_to_go() {
-        assert_eq!(OPENCODE_ZEN_BASE_URL, OPENCODE_GO_BASE_URL);
-    }
-
-    #[test]
     fn with_base_url_repoints_the_provider_at_zen() {
         let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
         assert_eq!(provider.base_url(), OPENCODE_GO_BASE_URL);
@@ -805,6 +792,7 @@ mod tests {
                     ),
                     base_url: Some(base),
                     compat_strict: false,
+                    compat_disable_thinking: false,
                     request_timeout_secs: 5,
                     reasoning_effort: Some(ReasoningEffort::High),
                     extra_headers: ExtraHeaders::parse(["x-test: routed"]).unwrap(),

@@ -130,7 +130,10 @@ to unkeyed ingestion, so validate them before sending.
 
 The server claims the key and observation in one transaction. A completed replay
 is skipped; a pending replay resumes downstream work without inserting another
-observation. Keys expire after **30 days**. This is bounded retry protection, not
+observation. Ordinary client keys expire after **30 days**. The reserved,
+server-validated `recovery_<55 hex>` namespace is used only by native transcript
+recovery/backfill and remains bound to its actual stored session until that
+session or project is deleted. This is bounded retry protection, not
 permanent deduplication or an exactly-once guarantee for every wiki side effect.
 
 ### Ordered batches and recovery
@@ -164,7 +167,8 @@ Use the tuple recipe when event IDs have narrower scope.
   index order, including an empty array when nothing was acknowledged. Outcomes
   are `stored`, `replayed`, `resumed`, `ignored_end`, `dropped_policy`,
   `dropped_subagent`, `dropped_unauthorized`, `dropped_collision` and
-  `dropped_invalid` (no session id outside a SessionStart). A drop is a
+  `dropped_invalid` (no session id outside a SessionStart, or a purged
+  session). A drop is a
   terminal acknowledgement. Older servers omit `results`; the relay records
   those receipts as `unknown`.
 - A rate-limited source can be skipped while other sources advance. Inspect

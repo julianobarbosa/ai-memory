@@ -19,6 +19,12 @@ The command is split on whitespace and executed directly, not through a shell.
 Use a wrapper script if you need quoting, environment setup, or multiple
 commands.
 
+The eval policy is owned by the server process. `ai-memory auto-improve` and
+direct HTTP requests cannot replace the configured command, targets, timeout,
+or score threshold. When a CLI talks to a remote server, configure
+`[auto_improve.eval]` in that server's config; older clients that send an
+`eval` request field receive `422 Unprocessable Entity` and must be upgraded.
+
 ## Request contract
 
 The scorer receives one JSON object on stdin:
@@ -108,10 +114,10 @@ to pending evidence; reading a report cannot restore independent observations.
 
 This repository includes two dependency-free templates:
 
-- [`docs/examples/auto-improve-eval/score_proposal.py`](examples/auto-improve-eval/score_proposal.py)
-  — Python scorer that checks basic structure and placeholders.
-- [`docs/examples/auto-improve-eval/score_proposal.sh`](examples/auto-improve-eval/score_proposal.sh)
-  — POSIX shell wrapper around an embedded Python scorer for hosts that prefer a
+- [`docs/examples/auto-improve-eval/score_proposal.py`](examples/auto-improve-eval/score_proposal.py):
+  Python scorer that checks basic structure and placeholders.
+- [`docs/examples/auto-improve-eval/score_proposal.sh`](examples/auto-improve-eval/score_proposal.sh):
+  POSIX shell wrapper around an embedded Python scorer for hosts that prefer a
   script entrypoint.
 
 Try them with the sample payload:

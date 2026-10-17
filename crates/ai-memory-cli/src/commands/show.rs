@@ -21,7 +21,7 @@ use crate::cli::{
 };
 use crate::commands::{install_instructions, project_registry};
 use crate::config::{Config, DEFAULT_WORKSPACE};
-use crate::http_client::{ServerEndpoint, get_json};
+use crate::http_client::ServerEndpoint;
 
 const PROJECT_MARKERS: [&str; 12] = [
     ".git",
@@ -52,7 +52,16 @@ const NEW_PROJECT_LABEL: &str = "+ New project";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProjectRow {
+    /// Workspace id, when the server sent one. `Option` so an older server
+    /// that predates these fields still deserializes (they are additive on
+    /// the wire). (#1208)
+    #[serde(default)]
+    pub(crate) workspace_id: Option<String>,
     pub(crate) workspace_name: String,
+    /// Project id, the ambiguous-name escape hatch an operator can pass to
+    /// `--project-id` on the destructive admin commands. (#1208)
+    #[serde(default)]
+    pub(crate) project_id: Option<String>,
     pub(crate) project_name: String,
     pub(crate) page_count: u64,
     pub(crate) last_updated: Option<String>,
@@ -205,7 +214,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
 
     let (target, workspace, project) = if let Some(name) = new_project {
         let workspace = args.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE);
-        let target = create_project(&root, &name, workspace, harness)?;
+        let target = create_project(&root, &name, workspace, harness, &config.runtime_env)?;
         (target, workspace.to_owned(), name)
     } else {
         let candidate = &candidates[project_index - 1];
@@ -251,10 +260,12 @@ async fn collect_candidates(
     workspace_filter: Option<&str>,
     scan: bool,
 ) -> Vec<Candidate> {
-    let query = workspace_filter
-        .filter(|value| !value.is_empty())
-        .map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
-    let rows: Option<Vec<ProjectRow>> = match get_json(endpoint, "/api/v1/projects", &query).await {
+    let rows: Option<Vec<ProjectRow>> = match crate::commands::list_projects::fetch_project_rows(
+        endpoint,
+        workspace_filter,
+    )
+    .await
+    {
         Ok(rows) => Some(rows),
         Err(error) => {
             eprintln!(
@@ -554,9 +565,10 @@ fn create_project(
     name: &str,
     workspace: &str,
     harness: RunHarnessChoice,
+    env: &crate::config::RuntimeEnv,
 ) -> Result<PathBuf> {
     create_project_with_initializer(parent, name, workspace, |staging| {
-        install_context_files(harness, staging)
+        install_context_files(harness, staging, env)
     })
 }
 
@@ -600,7 +612,11 @@ fn create_project_with_initializer(
     Ok(target)
 }
 
-fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
+fn install_context_files(
+    harness: RunHarnessChoice,
+    path: &Path,
+    env: &crate::config::RuntimeEnv,
+) -> Result<()> {
     let (instruction, agent, skill_root) = match harness {
         RunHarnessChoice::Claude => (
             "CLAUDE.md",
@@ -613,16 +629,19 @@ fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
             path.join(".agents/skills"),
         ),
     };
-    install_instructions::run_quiet(InstallInstructionsArgs {
-        target: Some(path.join(instruction)),
-        print: false,
-        no_skills: false,
-        compact: false,
-        skills_scope: None,
-        skills_agent: Some(agent),
-        skills_target_dir: Some(skill_root),
-        skills_force: false,
-    })
+    install_instructions::run_quiet(
+        InstallInstructionsArgs {
+            target: Some(path.join(instruction)),
+            print: false,
+            no_skills: false,
+            compact: false,
+            skills_scope: None,
+            skills_agent: Some(agent),
+            skills_target_dir: Some(skill_root),
+            skills_force: false,
+        },
+        env,
+    )
 }
 
 fn humanize_age(timestamp: Option<&str>) -> String {

@@ -1024,6 +1024,187 @@ fn find_marker_matching<T>(
     }
 }
 
+/// [`find_marker`] for the many directories one event names: every directory
+/// a lookup passes through keeps its answer (and its [`checkout_root`]), so a
+/// deep tree costs one probe per directory rather than one walk per lookup.
+/// Each filesystem probe first calls the caller's `spend`; when that refuses,
+/// the lookup stops with `None`.
+pub(crate) struct MarkerMemo {
+    home: Option<PathBuf>,
+    governing: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    checkouts: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    /// Directories known to exist: one a probe found, and every ancestor of
+    /// it.
+    directories: std::collections::HashSet<PathBuf>,
+}
+
+impl MarkerMemo {
+    pub(crate) fn with_home(home: Option<&Path>) -> Self {
+        Self {
+            home: home.map(absolute_normalized),
+            governing: std::collections::HashMap::new(),
+            checkouts: std::collections::HashMap::new(),
+            directories: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Records that `dir` exists, and with it every ancestor.
+    pub(crate) fn note_directory(&mut self, dir: &Path) {
+        for ancestor in absolute_normalized(dir).ancestors() {
+            if !self.directories.insert(ancestor.to_path_buf()) {
+                break;
+            }
+        }
+    }
+
+    /// The nearest existing directory at or above `path` (an existing path's
+    /// parent when it is not a directory), probing only what is not known
+    /// already; `path` is taken as given, never joined to the process's own
+    /// directory; `Some(None)` when there is none, `None` when `spend` refuses
+    /// a probe first.
+    pub(crate) fn existing_dir(
+        &mut self,
+        path: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut candidate = path;
+        loop {
+            if self.directories.contains(candidate) {
+                return Some(Some(candidate.to_path_buf()));
+            }
+            spend()?;
+            if candidate.is_dir() {
+                self.note_directory(candidate);
+                return Some(Some(candidate.to_path_buf()));
+            }
+            match candidate.parent() {
+                Some(parent) => candidate = parent,
+                None => return Some(None),
+            }
+        }
+    }
+
+    /// The marker [`find_marker`] finds from `dir`; `None` when `spend`
+    /// refuses a probe first.
+    pub(crate) fn find_marker(
+        &mut self,
+        dir: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut current = absolute_normalized(dir);
+        let mut chain = Vec::new();
+        let found = loop {
+            if let Some(known) = self.governing.get(&current) {
+                break known.clone();
+            }
+            spend()?;
+            let candidate = current.join(MARKER_FILENAME);
+            if candidate.is_file() {
+                chain.push(current);
+                break Some(candidate);
+            }
+            // The same boundary as `find_marker_matching`: `$HOME` for a
+            // directory inside it, else the nearest `.git` root (the
+            // directory itself outside any checkout), else the filesystem
+            // root when home is unknown.
+            let boundary = match self.home.as_deref() {
+                Some(home) if current.starts_with(home) => current == home,
+                // Below a directory known to lie in no checkout, this one is
+                // a checkout root or in none: a boundary either way.
+                Some(_) => {
+                    current
+                        .parent()
+                        .is_some_and(|parent| matches!(self.checkouts.get(parent), Some(None)))
+                        || self
+                            .checkout_root(&current, spend)?
+                            .is_none_or(|root| root == current)
+                }
+                None => false,
+            };
+            let parent = current.parent().map(Path::to_path_buf);
+            chain.push(current);
+            match parent {
+                Some(parent)
+                    if !boundary
+                        && Some(parent.as_path()) != chain.last().map(PathBuf::as_path) =>
+                {
+                    current = parent;
+                }
+                _ => break None,
+            }
+        };
+        for dir in chain {
+            self.governing.insert(dir, found.clone());
+        }
+        Some(found)
+    }
+
+    /// Records the marker an earlier [`find_marker`] found from `dir`, for
+    /// `dir` and every directory that walk passed: up to the marker's own
+    /// directory, or to the walk's boundary when it found none. Call it after
+    /// [`Self::checkout_root`] of `dir`, which that boundary may need.
+    pub(crate) fn remember(&mut self, dir: &Path, marker: Option<&Path>) {
+        let start = absolute_normalized(dir);
+        let stop = match marker {
+            Some(marker) => marker.parent().map(absolute_normalized),
+            None => match self.home.as_deref() {
+                Some(home) if start.starts_with(home) => Some(home.to_path_buf()),
+                Some(_) => self.checkouts.get(&start).cloned().flatten(),
+                None => None,
+            },
+        };
+        // Outside a checkout (or for a marker not above `dir`) the walk
+        // checked `dir` alone.
+        let stop = match (marker, &stop) {
+            (_, Some(stop)) if start.starts_with(stop) => Some(stop.clone()),
+            (None, None) if self.home.is_none() => None,
+            _ => Some(start.clone()),
+        };
+        let mut current = Some(start.as_path());
+        while let Some(dir) = current {
+            self.governing
+                .insert(dir.to_path_buf(), marker.map(Path::to_path_buf));
+            if Some(dir) == stop.as_deref() {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+
+    /// [`checkout_root`] of `dir`, remembered for every directory passed.
+    pub(crate) fn checkout_root(
+        &mut self,
+        dir: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut current = absolute_normalized(dir);
+        let mut chain = Vec::new();
+        let found = loop {
+            if let Some(known) = self.checkouts.get(&current) {
+                break known.clone();
+            }
+            spend()?;
+            if current.join(".git").exists() {
+                let root = current.clone();
+                chain.push(current);
+                break Some(root);
+            }
+            let parent = current.parent().map(Path::to_path_buf);
+            chain.push(current);
+            match parent {
+                Some(parent) if Some(parent.as_path()) != chain.last().map(PathBuf::as_path) => {
+                    current = parent;
+                }
+                _ => break None,
+            }
+        };
+        for dir in chain {
+            self.checkouts.insert(dir, found.clone());
+        }
+        Some(found)
+    }
+}
+
 /// Whether a marker's raw text declares anything beyond a `[capture]`
 /// section: any root-level scope key (`workspace`/`project`/
 /// `project_strategy`), or any of the other settings
@@ -1194,7 +1375,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     stack.into_iter().collect()
 }
 
-fn checkout_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn checkout_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
         if dir.join(".git").exists() {
@@ -1320,6 +1501,93 @@ mod tests {
             Some(marker),
             "a marker in any ancestor wins"
         );
+    }
+
+    /// The memoized lookup answers exactly as `find_marker` does from every
+    /// directory, inside home and outside it, in and out of a checkout, with
+    /// and without a home; each directory costs one probe of each kind at
+    /// most, however many lookups pass it, and directories an earlier walk
+    /// already covered (`remember`) cost none.
+    #[test]
+    fn marker_memo_answers_like_find_marker_once_per_directory() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let dirs = [
+            home.join("p").join("q").join("r"),
+            home.join("s").join("t"),
+            root.join("out").join("repo").join("u").join("v"),
+            root.join("out").join("repo").join("w").join("z"),
+            root.join("out").join("norepo").join("x").join("y"),
+        ];
+        for dir in &dirs {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(root.join("out").join("repo").join(".git")).unwrap();
+        for marked in [
+            home.join("p"),
+            root.join("out").join("repo"),
+            root.join("out").join("repo").join("w"),
+            root.join("out").join("norepo").join("x"),
+        ] {
+            write_marker(&marked, "workspace = \"w\"\n");
+        }
+        let every: Vec<PathBuf> = dirs
+            .iter()
+            .flat_map(|dir| dir.ancestors().take_while(|a| a.starts_with(&root)))
+            .map(Path::to_path_buf)
+            .collect();
+        for home in [Some(home.as_path()), None] {
+            let mut memo = MarkerMemo::with_home(home);
+            let mut probes = 0;
+            for dir in &every {
+                let found = memo.find_marker(dir, &mut || {
+                    probes += 1;
+                    Some(())
+                });
+                assert_eq!(
+                    found,
+                    Some(find_marker_with_home(dir.to_str().unwrap(), home)),
+                    "{dir:?} with home {home:?}"
+                );
+            }
+            let levels = every
+                .iter()
+                .map(|dir| dir.components().count())
+                .sum::<usize>();
+            assert!(
+                probes <= 2 * every.len() + 2 * root.components().count(),
+                "{probes}"
+            );
+            assert!(probes < levels, "{probes} probes, {levels} levels");
+            // A refused probe stops the lookup.
+            let mut fresh = MarkerMemo::with_home(home);
+            assert_eq!(fresh.find_marker(&dirs[0], &mut || None), None);
+            // What an earlier walk found costs nothing to look up again.
+            for dir in &dirs {
+                let mut seeded = MarkerMemo::with_home(home);
+                if home.is_none() || !dir.starts_with(home.unwrap()) {
+                    seeded.checkout_root(dir, &mut || Some(()));
+                }
+                let found = find_marker_with_home(dir.to_str().unwrap(), home);
+                seeded.remember(dir, found.as_deref());
+                for ancestor in dir.ancestors().take_while(|a| a.starts_with(&root)) {
+                    let mut spent = false;
+                    let answer = seeded.find_marker(ancestor, &mut || {
+                        spent = true;
+                        Some(())
+                    });
+                    assert_eq!(
+                        answer,
+                        Some(find_marker_with_home(ancestor.to_str().unwrap(), home)),
+                        "{ancestor:?} below {dir:?} with home {home:?}"
+                    );
+                    if ancestor == dir.as_path() {
+                        assert!(!spent, "{dir:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

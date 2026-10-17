@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "`ai-memory` binary entry point."
@@ -21,6 +22,10 @@ path = "src/main.rs"
 # main.rs is a shim with no tests of its own. Without this, `cargo test` builds
 # a second ~120 MB harness binary for it that contains no tests.
 test = false
+
+[features]
+default = []
+management-ui = ["ai-memory-mcp/management-ui", "ai-memory-web/management-ui"]
 
 [dependencies]
 ai-memory-consolidate.workspace = true
@@ -48,6 +53,7 @@ dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
+libc.workspace = true
 # `transport-streamable-http-client-reqwest` pulls reqwest in with no TLS backend
 # (`__reqwest = ["dep:reqwest"]` and nothing more), so the bridge could not reach an
 # `https://` MCP server at all.
@@ -73,6 +79,8 @@ rmcp = { workspace = true, features = [
 rustls = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
+parking_lot.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
@@ -100,3 +108,6 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-registry = "0.100.0"

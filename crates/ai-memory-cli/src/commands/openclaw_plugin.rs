@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
-    ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
-    ts_timeout_signal,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime,
+    ts_string_literal, ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -239,7 +239,7 @@ fn build_plugin(
 
 import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync }} from "node:fs";
+import {{ closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -249,11 +249,7 @@ const AGENT = "openclaw";
 {capture_policy}
 
 {timeout_signal}
-function authHeaders(): Record<string, string> {{
-  const token = resolveToken();
-  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
-}}
-
+{auth_headers}
 function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
@@ -381,9 +377,10 @@ function postPreCompact(event: any, ctx: any): void {{
   const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
-    // Fire-and-forget, but never silent loss: an unreachable server or
-    // 5xx spools the event in the CLI hook-spool format for a later
-    // drain (#580); a delivered post opportunistically drains backlog.
+    // Fire-and-forget, but never silent loss: an unreachable server, a
+    // 5xx or a transient 4xx spools the event in the CLI hook-spool format
+    // for a later drain (#580); a delivered post opportunistically drains
+    // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
     const request = fetch(url, {{
@@ -394,7 +391,7 @@ function postPreCompact(event: any, ctx: any): void {{
     }})
       .catch(() => undefined)
       .then((resp) => {{
-        if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);
+        if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
@@ -490,6 +487,7 @@ export default definePluginEntry({{
         token_line = token_line,
         repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
         timeout_signal = ts_timeout_signal(),
+        auth_headers = ts_auth_headers_fn(),
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -506,10 +504,9 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(plugin.contains("function spoolFailedHook("));
         assert!(plugin.contains("async function drainHookSpool()"));
-        assert!(
-            plugin
-                .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
-        );
+        assert!(plugin.contains(
+            "if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);"
+        ));
         assert!(plugin.contains("else requestSpoolDrain();"));
         crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
@@ -587,7 +584,7 @@ mod tests {
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
+        assert_eq!(plugin.matches("windowsHide: true").count(), 3);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -687,7 +684,7 @@ mod tests {
             .unwrap()
             .0;
         let source = format!(
-            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst routeCwd={1};const direct=homeRoute(readHomeRouteText(join(homedir(),\".ai-memory.toml\")),routeCwd,\"github.com/acme/api\");const url=new URL(\"http://h/hook\");const ok=applyMarkerParams(url,routeCwd);process.stdout.write((direct?.project??\"none\")+\":\"+String(ok)+url.search);",
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst routeCwd={1};const direct=homeRoute(readHomeRouteText(join(homedir(),\".ai-memory.toml\")),routeCwd,\"github.com/acme/api\");const url=new URL(\"http://h/hook\");const ok=applyMarkerParams(url,routeCwd);process.stdout.write((direct?.project??\"none\")+\":\"+String(ok)+url.search);",
             helpers,
             serde_json::to_string(&repo.to_string_lossy()).unwrap()
         );
@@ -821,14 +818,18 @@ mod tests {
             .0;
         let module = tmp.path().join("openclaw-all-routes.ts");
         let source = format!(
-            "import {{ execFileSync as realExecFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction execFileSync(command:string,args:string[],options?:any):string{{return realExecFileSync(command,args,options) as string;}}\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst cases={} as any[];for(const c of cases){{const file=join(homedir(),\".ai-memory.toml\");writeFileSync(file,c.text);const url=new URL(\"http://h/hook\");let applied=false;let helper=\"none\";try{{const route=homeRoute(readHomeRouteText(file),c.cwd,c.identity);helper=route?route.workspace+\"/\"+route.project:\"none\";}}catch{{helper=\"invalid\";}}try{{applied=applyMarkerParams(url,c.cwd);}}catch{{applied=false;}}process.stdout.write(JSON.stringify({{name:c.name,applied,helper,params:Object.fromEntries(url.searchParams)}})+\"\\n\");}}",
+            "import {{ execFileSync as realExecFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction execFileSync(command:string,args:string[],options?:any):string{{return realExecFileSync(command,args,options) as string;}}\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst cases={} as any[];for(const c of cases){{const file=join(homedir(),\".ai-memory.toml\");writeFileSync(file,c.text);const url=new URL(\"http://h/hook\");let applied=false;let helper=\"none\";try{{const route=homeRoute(readHomeRouteText(file),c.cwd,c.identity);helper=route?route.workspace+\"/\"+route.project:\"none\";}}catch{{helper=\"invalid\";}}try{{applied=applyMarkerParams(url,c.cwd);}}catch{{applied=false;}}process.stdout.write(JSON.stringify({{name:c.name,applied,helper,params:Object.fromEntries(url.searchParams)}})+\"\\n\");}}",
             helpers,
             serde_json::to_string(&cases).unwrap()
         );
         std::fs::write(&module, source).unwrap();
+        // A Windows cwd such as `c:/work/api/lib` is relative on Unix, so the
+        // marker walk starts in node's working directory; run it from the temp
+        // dir so a contributor's `.ai-memory.toml` in the checkout is not found.
         let output = std::process::Command::new("node")
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
+            .current_dir(tmp.path())
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .output()
@@ -959,7 +960,7 @@ mod tests {
             .unwrap()
             .0;
         let source = format!(
-            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync, unlinkSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst repoCwd={};const marker={};const homeMarker={};const run=(body:string)=>{{writeFileSync(marker,body);const url=new URL(\"http://h/hook\");applyMarkerParams(url,repoCwd);return Object.fromEntries(url.searchParams);}};const noMarkerUrl=new URL(\"http://h/hook\");applyMarkerParams(noMarkerUrl,repoCwd);const noMarker=Object.fromEntries(noMarkerUrl.searchParams);const plain=run('project=\"api\"\\n');const aliases=run('project=\"api\"\\naliases=[\"old-api\"]\\n');unlinkSync(marker);writeFileSync(homeMarker,'[routes.identity.\"github.com/acme/api\"]\\nroute_workspace=\"oss\"\\nroute_project=\"api\"\\n');const routedUrl=new URL(\"http://h/hook\");applyMarkerParams(routedUrl,repoCwd);process.stdout.write(JSON.stringify({{noMarker,plain,aliases,routed:Object.fromEntries(routedUrl.searchParams)}}));",
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, unlinkSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst repoCwd={};const marker={};const homeMarker={};const run=(body:string)=>{{writeFileSync(marker,body);const url=new URL(\"http://h/hook\");applyMarkerParams(url,repoCwd);return Object.fromEntries(url.searchParams);}};const noMarkerUrl=new URL(\"http://h/hook\");applyMarkerParams(noMarkerUrl,repoCwd);const noMarker=Object.fromEntries(noMarkerUrl.searchParams);const plain=run('project=\"api\"\\n');const aliases=run('project=\"api\"\\naliases=[\"old-api\"]\\n');unlinkSync(marker);writeFileSync(homeMarker,'[routes.identity.\"github.com/acme/api\"]\\nroute_workspace=\"oss\"\\nroute_project=\"api\"\\n');const routedUrl=new URL(\"http://h/hook\");applyMarkerParams(routedUrl,repoCwd);process.stdout.write(JSON.stringify({{noMarker,plain,aliases,routed:Object.fromEntries(routedUrl.searchParams)}}));",
             helpers,
             serde_json::to_string(&repo.to_string_lossy()).unwrap(),
             serde_json::to_string(&marker.to_string_lossy()).unwrap(),

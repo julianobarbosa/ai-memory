@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${AI_MEMORY_ACCEPTANCE_BIN:-"$ROOT/target/debug/ai-memory"}
 KEEP=${AI_MEMORY_ACCEPTANCE_KEEP:-0}
 DETERMINISTIC_ONLY=${AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY:-0}
-HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi command-code kiro grok antigravity"}
+HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi command-code kiro grok antigravity copilot"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-workstream-acceptance.XXXXXX")
 DATA="$TMP/data"
 REPO="$TMP/repo"
@@ -16,8 +16,39 @@ CONFIG="$TMP/config"
 LOGS="$TMP/logs"
 SERVER_PID=""
 
+# `ai-memory run` wires the harness it launches into that harness's user
+# config. Every leg below must do that inside a fixture home; a leak points
+# the operator's real Codex or Claude config at this throwaway server. These
+# are the files ai-memory writes, so any change to one fails the run.
+OPERATOR_HOME=$HOME
+OPERATOR_CONFIGS=(
+  "$OPERATOR_HOME/.codex/hooks.json"
+  "$OPERATOR_HOME/.codex/config.toml"
+  "$OPERATOR_HOME/.claude/settings.json"
+  "$OPERATOR_HOME/.gemini/config/hooks.json"
+  "$OPERATOR_HOME/.gemini/config/mcp_config.json"
+  "$OPERATOR_HOME/.kimi-code/config.toml"
+)
+operator_config_digest() {
+  local file
+  for file in "${OPERATOR_CONFIGS[@]}"; do
+    if [ -f "$file" ]; then
+      sha256sum "$file"
+    else
+      printf 'absent  %s\n' "$file"
+    fi
+  done
+}
+OPERATOR_CONFIG_DIGEST=$(operator_config_digest)
+
 cleanup() {
   local code=$?
+  if [ "$(operator_config_digest)" != "$OPERATOR_CONFIG_DIGEST" ]; then
+    printf 'the acceptance run changed the operator'"'"'s agent config:\n' >&2
+    diff <(printf '%s\n' "$OPERATOR_CONFIG_DIGEST") \
+      <(operator_config_digest) >&2 || true
+    code=1
+  fi
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -27,6 +58,7 @@ cleanup() {
   else
     rm -rf "$TMP"
   fi
+  exit "$code"
 }
 trap cleanup EXIT INT TERM
 
@@ -134,6 +166,7 @@ assert_managed_leg() {
   local expect_context=$5
   local log=$6
   local before_observations=${7:-0}
+  local expect_new_observation=${8:-1}
   local native_id delivery sync_after sync_through context_delivered after_observations
 
   if [ "$expected_agent" = antigravity-cli ]; then
@@ -147,13 +180,15 @@ assert_managed_leg() {
       tail -120 "$log" >&2
       return 1
     }
-    after_observations=$(agent_observation_count "$expected_agent")
-    [ "$after_observations" -gt "$before_observations" ] || {
-      printf '%s did not persist a startup-hook observation (before: %s, after: %s)\n' \
-        "$expected_agent" "$before_observations" "$after_observations" >&2
-      tail -120 "$log" >&2
-      return 1
-    }
+    if [ "$expect_new_observation" = 1 ]; then
+      after_observations=$(agent_observation_count "$expected_agent")
+      [ "$after_observations" -gt "$before_observations" ] || {
+        printf '%s did not persist a startup-hook observation (before: %s, after: %s)\n' \
+          "$expected_agent" "$before_observations" "$after_observations" >&2
+        tail -120 "$log" >&2
+        return 1
+      }
+    fi
   else
     native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
       "SELECT native_session_id FROM workstream_events
@@ -358,6 +393,15 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     ;;
   grok)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    if [ -n "${AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG:-}" ]; then
+      printf '%s\n' "${AI_MEMORY_PREVIOUS_SESSION_HISTORY:-}" \
+        >"$AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG"
+    fi
+    if [ -n "${AI_MEMORY_PREVIOUS_SESSION_HISTORY:-}" ] && \
+       [ -n "${AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY:-}" ]; then
+      cp "$AI_MEMORY_PREVIOUS_SESSION_HISTORY" \
+        "$AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY"
+    fi
     # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume <id>`
     # (returning) selectors the way the real CLI does.
     session_id=""
@@ -418,11 +462,61 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
       "$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK" \
       >"$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK_LOG"
     ;;
+  copilot)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume=<id>`
+    # (returning) selectors the way the real CLI does.
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      case "$arg" in
+        --resume=*) session_id=${arg#--resume=} ;;
+      esac
+      if [ "$previous_arg" = --session-id ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    [ -n "$session_id" ] || {
+      printf 'copilot fake mode requires a wrapper session selector\n' >&2
+      exit 1
+    }
+    session_dir="${COPILOT_HOME:?copilot fake mode requires COPILOT_HOME}/session-state/$session_id"
+    mkdir -p "$session_dir"
+    events="$session_dir/events.jsonl"
+    if [ ! -f "$events" ]; then
+      jq -nc --arg id "$session_id" --arg cwd "$PWD" \
+        '{type:"session.start",data:{sessionId:$id,version:1,producer:"copilot-agent",context:{cwd:$cwd}},id:"start"}' \
+        >"$events"
+      printf '{"type":"system.message","data":{"role":"system","content":"PRIVATE fake copilot system prompt"},"id":"system"}\n' >>"$events"
+    fi
+    # The real SessionStart hook links the native session and returns any
+    # pending workstream context as top-level additionalContext.
+    jq -nc --arg id "$session_id" --arg cwd "$PWD" \
+      '{session_id:$id, cwd:$cwd, hook_event_name:"SessionStart", source:"startup"}' | \
+      AI_MEMORY_HOOK_URL="${AI_MEMORY_SERVER_URL:?}" \
+      "$AI_MEMORY_ACCEPTANCE_COPILOT_HOOK" \
+      >"$AI_MEMORY_ACCEPTANCE_COPILOT_HOOK_LOG"
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-COPILOT}
+    round=$(wc -l <"$events" | tr -d ' ')
+    jq -nc --arg text "$sentinel" --arg id "user-$round" \
+      '{type:"user.message",data:{content:$text},id:$id}' >>"$events"
+    jq -nc --arg text "$sentinel reply" --arg id "assistant-$round" \
+      '{type:"assistant.message",data:{content:$text,reasoningText:"PRIVATE reasoning",toolRequests:[]},id:$id}' >>"$events"
+    ;;
 esac
 EOF
 chmod +x "$FAKE"
 
 printf 'running deterministic wrapper edge checks\n'
+
+# The fake harnesses below need nothing from the operator's home, and each
+# `run` would otherwise autowire the operator's real agent config.
+OPERATOR_XDG_CONFIG_HOME=${XDG_CONFIG_HOME-}
+OPERATOR_XDG_DATA_HOME=${XDG_DATA_HOME-}
+export HOME="$CONFIG/edge-home"
+mkdir -p "$HOME"
+unset CODEX_HOME CLAUDE_CONFIG_DIR XDG_CONFIG_HOME XDG_DATA_HOME
 
 # Utility invocations must not discover and import another process's recent
 # session merely because it is active in the same checkout.
@@ -963,7 +1057,7 @@ diff -u <(printf '%s\n' --conversation "$ANTIGRAVITY_FAKE_ID") \
   "$TMP/antigravity-second-argv.log"
 returned_antigravity=$(assert_managed_leg "$antigravity_ws_hex" antigravity-cli \
   "$antigravity_second_before" "$antigravity_second_delivery" 0 \
-  "$LOGS/edge-antigravity-second.log" "$antigravity_second_observations")
+  "$LOGS/edge-antigravity-second.log" "$antigravity_second_observations" 0)
 [ "$returned_antigravity" = "$ANTIGRAVITY_FAKE_ID" ] || {
   printf 'returning Antigravity launch did not resume %s\n' "$ANTIGRAVITY_FAKE_ID" >&2
   exit 1
@@ -1057,6 +1151,8 @@ jq -e --arg id "$grok_session_id" \
   GROK_HOME="$GROK_FAKE_HOME" \
   AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
   AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-second-argv.log" \
+  AI_MEMORY_PREVIOUS_SESSION_HISTORY="$TMP/stale-history-must-not-reach-child" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG="$TMP/grok-second-history-env.log" \
   AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-TWO" \
     "$BIN" --data-dir "$DATA" run --workstream edge-grok --executable "$FAKE" \
       grok-build >"$LOGS/edge-grok-second.log" 2>&1
@@ -1064,6 +1160,11 @@ jq -e --arg id "$grok_session_id" \
 grep -A1 -x -- '--resume' "$TMP/grok-second-argv.log" | grep -qx "$grok_session_id" || {
   printf 'returning grok launch did not resume the linked session\n' >&2
   cat "$TMP/grok-second-argv.log" >&2
+  exit 1
+}
+[ -z "$(cat "$TMP/grok-second-history-env.log")" ] || {
+  printf 'same-harness grok inherited a stale previous-session dossier path\n' >&2
+  cat "$TMP/grok-second-history-env.log" >&2
   exit 1
 }
 if grep -qx -- '--rules' "$TMP/grok-second-argv.log"; then
@@ -1081,18 +1182,21 @@ jq -e \
   exit 1
 }
 
-# A fresh grok session joining the established edge-kimi workstream must
-# receive that workstream's history through `--rules`, with historical tool
-# activity labelled as completed evidence.
-grok_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
-grok_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" grok)
+# A fresh grok session joining the untouched Command Code workstream must
+# receive both its portable history through `--rules` and its readable native
+# history through the local dossier. Other cross-harness checks mutate the
+# Kimi workstream before this point, so it is not an exact two-harness switch.
+grok_cross_before=$(latest_workstream_sequence "$command_code_ws_hex")
+grok_cross_delivery=$(current_delivery_cursor "$command_code_ws_hex" grok)
 (
   cd "$REPO"
   GROK_HOME="$GROK_FAKE_HOME" \
   AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
   AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG="$TMP/grok-cross-history-env.log" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY="$TMP/grok-cross-history.md" \
   AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-CROSS" \
-    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-command-code --executable "$FAKE" \
       grok >"$LOGS/edge-grok-cross.log" 2>&1
 )
 grep -qx -- '--session-id' "$TMP/grok-cross-argv.log" || {
@@ -1105,13 +1209,138 @@ grep -qx -- '--rules' "$TMP/grok-cross-argv.log" || {
   cat "$TMP/grok-cross-argv.log" >&2
   exit 1
 }
-grep -q 'AMWS-FAKE-KIMI' "$TMP/grok-cross-argv.log" || {
+grep -q 'AMWS-FAKE-COMMAND-CODE' "$TMP/grok-cross-argv.log" || {
   printf 'the grok --rules packet did not carry the prior harness history\n' >&2
   exit 1
 }
-assert_managed_leg "$kimi_ws_hex" grok "$grok_cross_before" \
+grep -q 'AMWS-FAKE-COMMAND-CODE' "$TMP/grok-cross-history.md" || {
+  printf 'the local previous-session dossier did not carry Command Code history\n' >&2
+  exit 1
+}
+grep -q 'untrusted local history' "$TMP/grok-cross-history.md" || {
+  printf 'the local previous-session dossier lacked its security boundary\n' >&2
+  exit 1
+}
+grok_cross_history_path=$(cat "$TMP/grok-cross-history-env.log")
+[ -n "$grok_cross_history_path" ] && [ ! -e "$grok_cross_history_path" ] || {
+  printf 'the local previous-session dossier survived the managed child\n' >&2
+  printf '%s\n' "$grok_cross_history_path" >&2
+  exit 1
+}
+assert_managed_leg "$command_code_ws_hex" grok "$grok_cross_before" \
   "$grok_cross_delivery" 1 \
   "$LOGS/edge-grok-cross.log" >/dev/null
+
+# Copilot fake-mode fixture: the fake copilot honors the wrapper's
+# `--session-id`/`--resume=` selectors, writes the real
+# $COPILOT_HOME/session-state/<id>/events.jsonl layout, and pipes its startup
+# payload through the real SessionStart hook, which links the native session
+# and returns pending context as top-level additionalContext.
+COPILOT_FAKE_HOME="$CONFIG/copilot-fake"
+COPILOT_HOOK="$ROOT/hooks/copilot-cli/session-start.sh"
+mkdir -p "$COPILOT_FAKE_HOME"
+(
+  cd "$REPO"
+  COPILOT_HOME="$COPILOT_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=copilot \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/copilot-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-COPILOT-ONE" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK="$COPILOT_HOOK" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK_LOG="$TMP/copilot-first-hook.json" \
+    "$BIN" --data-dir "$DATA" run --new edge-copilot --executable "$FAKE" \
+      --yolo copilot >"$LOGS/edge-copilot-first.log" 2>&1
+)
+grep -qx -- '--yolo' "$TMP/copilot-first-argv.log" &&
+  grep -qx -- '--session-id' "$TMP/copilot-first-argv.log" || {
+  printf 'fresh copilot launch did not receive --yolo and a wrapper session id\n' >&2
+  cat "$TMP/copilot-first-argv.log" >&2
+  exit 1
+}
+copilot_session_id=$(grep -A1 -x -- '--session-id' "$TMP/copilot-first-argv.log" | tail -1)
+copilot_ws_hex=$(workstream_hex edge-copilot)
+[ "${#copilot_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-copilot workstream id\n' >&2
+  exit 1
+}
+copilot_native=$(assert_managed_leg "$copilot_ws_hex" copilot-cli 0 0 0 \
+  "$LOGS/edge-copilot-first.log")
+[ "$copilot_native" = "$copilot_session_id" ] || {
+  printf 'Copilot linked native session %s, expected %s\n' \
+    "$copilot_native" "$copilot_session_id" >&2
+  exit 1
+}
+copilot_ws_id="${copilot_ws_hex:0:8}-${copilot_ws_hex:8:4}-${copilot_ws_hex:12:4}-${copilot_ws_hex:16:4}-${copilot_ws_hex:20:12}"
+private_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$copilot_ws_id" --limit 100 --json "PRIVATE")
+jq -e 'length == 0' <<<"$private_hits" >/dev/null || {
+  printf 'Copilot system prompt or reasoning leaked into the workstream ledger\n' >&2
+  exit 1
+}
+
+# Returning to the same copilot session must resume it with `--resume=<id>`
+# and import only the new round.
+copilot_second_before=$(latest_workstream_sequence "$copilot_ws_hex")
+copilot_second_delivery=$(current_delivery_cursor "$copilot_ws_hex" copilot-cli)
+(
+  cd "$REPO"
+  COPILOT_HOME="$COPILOT_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=copilot \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/copilot-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-COPILOT-TWO" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK="$COPILOT_HOOK" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK_LOG="$TMP/copilot-second-hook.json" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-copilot --executable "$FAKE" \
+      copilot-cli >"$LOGS/edge-copilot-second.log" 2>&1
+)
+diff -u <(printf '%s\n' "--resume=$copilot_session_id") \
+  "$TMP/copilot-second-argv.log"
+returned_copilot=$(assert_managed_leg "$copilot_ws_hex" copilot-cli \
+  "$copilot_second_before" "$copilot_second_delivery" 0 \
+  "$LOGS/edge-copilot-second.log")
+[ "$returned_copilot" = "$copilot_session_id" ] || {
+  printf 'returning Copilot launch did not resume %s\n' "$copilot_session_id" >&2
+  exit 1
+}
+copilot_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$copilot_ws_id" --limit 100 --json "AMWS-FAKE-COPILOT")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-COPILOT-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-COPILOT-TWO")))] | length == 1)' \
+  <<<"$copilot_second_hits" >/dev/null || {
+  printf 'copilot incremental import duplicated or missed a round sentinel\n' >&2
+  tail -80 "$LOGS/edge-copilot-second.log" >&2
+  exit 1
+}
+
+# A fresh copilot session joining the established edge-kimi workstream must
+# start a new native session and receive the prior visible ledger through the
+# real hook's additionalContext output.
+copilot_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
+copilot_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" copilot-cli)
+(
+  cd "$REPO"
+  COPILOT_HOME="$COPILOT_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=copilot \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/copilot-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-COPILOT-CROSS" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK="$COPILOT_HOOK" \
+  AI_MEMORY_ACCEPTANCE_COPILOT_HOOK_LOG="$TMP/copilot-cross-hook.json" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      copilot >"$LOGS/edge-copilot-cross.log" 2>&1
+)
+grep -qx -- '--session-id' "$TMP/copilot-cross-argv.log" || {
+  printf 'copilot joining an established workstream did not start a fresh session\n' >&2
+  cat "$TMP/copilot-cross-argv.log" >&2
+  exit 1
+}
+jq -e '.additionalContext | contains("AMWS-FAKE-KIMI")' \
+  "$TMP/copilot-cross-hook.json" >/dev/null || {
+  printf 'Copilot hook did not receive the prior Kimi workstream history\n' >&2
+  cat "$TMP/copilot-cross-hook.json" >&2
+  exit 1
+}
+assert_managed_leg "$kimi_ws_hex" copilot-cli "$copilot_cross_before" \
+  "$copilot_cross_delivery" 1 "$LOGS/edge-copilot-cross.log" >/dev/null
 
 # A blank first launch remains eligible for one-time native-session adoption.
 # Use a pseudo-terminal because redirected/scripted launches deliberately skip
@@ -1332,6 +1561,12 @@ if [ "$DETERMINISTIC_ONLY" = 1 ]; then
   exit 0
 fi
 
+# The real-harness phase reads credentials from the operator's home and
+# isolates each leg itself.
+export HOME="$OPERATOR_HOME"
+[ -z "$OPERATOR_XDG_CONFIG_HOME" ] || export XDG_CONFIG_HOME="$OPERATOR_XDG_CONFIG_HOME"
+[ -z "$OPERATOR_XDG_DATA_HOME" ] || export XDG_DATA_HOME="$OPERATOR_XDG_DATA_HOME"
+
 read -r -a requested_harnesses <<<"$HARNESS_WORDS"
 harnesses=()
 for requested_harness in "${requested_harnesses[@]}"; do
@@ -1344,6 +1579,7 @@ for requested_harness in "${requested_harnesses[@]}"; do
       ;;
     grok-build) harness=grok ;;
     antigravity-cli | agy) harness=antigravity ;;
+    copilot-cli) harness=copilot ;;
     *) harness=$requested_harness ;;
   esac
   harness_command=$harness
@@ -1377,6 +1613,9 @@ COMMAND_CODE_SETTINGS="$COMMAND_CODE_ACCEPTANCE_HOME/.commandcode/settings.json"
 GROK_ACCEPTANCE_HOME="$CONFIG/grok-home"
 ANTIGRAVITY_ACCEPTANCE_HOME="$CONFIG/antigravity-home"
 ANTIGRAVITY_HOOKS="$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/config/hooks.json"
+COPILOT_ACCEPTANCE_HOME="$CONFIG/copilot-home"
+COPILOT_HOOKS="$COPILOT_ACCEPTANCE_HOME/hooks/ai-memory.json"
+mkdir -p "$(dirname "$COPILOT_HOOKS")"
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")" "$(dirname "$CODEX_HOOKS")" \
   "$(dirname "$OPENCODE_PLUGIN")" "$(dirname "$PI_EXTENSION")" \
   "$(dirname "$OMP_EXTENSION")" "$OMP_AGENT_DIR" "$OPENCODE_DATA_HOME/opencode" \
@@ -1493,6 +1732,15 @@ if [ -f "$HOME/.gemini/config/config.json" ]; then
     "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/config/config.json"
 fi
 
+# Copilot CLI resolves config, login state, hooks, and session-state below
+# $COPILOT_HOME. Copy only config.json (login and model preferences, verified
+# sufficient on Copilot CLI 1.0.92); the operator's hooks, MCP servers, and
+# sessions stay out of the fixture.
+COPILOT_SOURCE_HOME=${COPILOT_HOME:-$HOME/.copilot}
+if [ -f "$COPILOT_SOURCE_HOME/config.json" ]; then
+  cp "$COPILOT_SOURCE_HOME/config.json" "$COPILOT_ACCEPTANCE_HOME/config.json"
+fi
+
 install_hook() {
   local agent=$1
   local target=$2
@@ -1502,7 +1750,7 @@ install_hook() {
     --config-file "$target"
   )
   case "$agent" in
-    claude-code | codex | kimi-code | antigravity-cli)
+    claude-code | codex | kimi-code | antigravity-cli | copilot-cli)
       command+=(--hooks-dir "$ROOT/hooks")
       ;;
   esac
@@ -1519,6 +1767,7 @@ install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
 install_hook command-code "$COMMAND_CODE_SETTINGS"
 install_hook antigravity-cli "$ANTIGRAVITY_HOOKS"
+install_hook copilot-cli "$COPILOT_HOOKS"
 
 agent_wire_name() {
   case "$1" in
@@ -1528,6 +1777,7 @@ agent_wire_name() {
     kimi) printf 'kimi-code\n' ;;
     command-code) printf 'command-code\n' ;;
     antigravity) printf 'antigravity-cli\n' ;;
+    copilot) printf 'copilot-cli\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -1608,6 +1858,10 @@ run_harness() {
       native_args=(-p --print-timeout "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_TIMEOUT:-5m}" "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_MODEL:-}" ] || native_args=(-p --print-timeout "${AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_TIMEOUT:-5m}" --model "$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_MODEL" "$prompt")
       ;;
+    copilot)
+      native_args=(-p "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_COPILOT_MODEL:-}" ] || native_args=(-p --model "$AI_MEMORY_ACCEPTANCE_COPILOT_MODEL" "$prompt")
+      ;;
     *)
       printf 'unsupported acceptance harness: %s\n' "$harness" >&2
       return 1
@@ -1647,6 +1901,10 @@ run_harness() {
       >"$log" 2>&1
   elif [ "$harness" = antigravity ]; then
     (cd "$REPO" && HOME="$ANTIGRAVITY_ACCEPTANCE_HOME" \
+      "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
+      >"$log" 2>&1
+  elif [ "$harness" = copilot ]; then
+    (cd "$REPO" && COPILOT_HOME="$COPILOT_ACCEPTANCE_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
   else

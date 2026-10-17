@@ -47,6 +47,7 @@ pub(crate) fn agent_choice_for_harness(harness: ManagedHarness) -> Option<AgentC
         ManagedHarness::KiroV3 => AgentChoice::KiroCliV3,
         ManagedHarness::Grok => AgentChoice::Grok,
         ManagedHarness::Antigravity => AgentChoice::AntigravityCli,
+        ManagedHarness::Copilot => AgentChoice::CopilotCli,
         // No AgentChoice / installer support.
         ManagedHarness::Crush => return None,
     })
@@ -311,7 +312,11 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
     } = targets;
     let infer_opencode_transition = opencode_dialect.is_some() && !config.server_url_configured();
     let server_url = (!infer_opencode_transition).then(|| config.server_url.clone());
-    let auth_token = config.auth.bearer_token.clone();
+    // Only an inline token is handed to the installers as an explicit value.
+    // One read from `[auth].bearer_token_file` stays out of rendered configs:
+    // hook install persists it to the hook credential files, and MCP install
+    // routes it through the bridge or an env-var reference (#552).
+    let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
@@ -404,6 +409,9 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             config_file: mcp_file,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
+            stdio_bridge: false,
+            bridge_data_dir: None,
         });
     WireInstalls {
         opencode_dialect,
@@ -475,6 +483,22 @@ pub(crate) fn ensure_wired_with_env(
         return;
     };
     if targets.sentinel.exists() {
+        return;
+    }
+    if let Some(harness) = plugin_harness(targets.agent)
+        && let Some(home) = super::run::native_home(config)
+        && super::agent_plugins::enabled(harness, &home, &|name| {
+            effective_env.get(name).map(OsStr::to_os_string)
+        })
+        .is_some()
+    {
+        // No sentinel: the check is two small file reads, and a later
+        // `claude plugin uninstall` must let the next launch wire again.
+        eprintln!(
+            "ai-memory: the ai-memory plugin is enabled in {}; it carries the hooks and MCP \
+             entry, so this launch wires nothing for it.",
+            harness.agent()
+        );
         return;
     }
     let agent = targets.agent;
@@ -604,6 +628,15 @@ pub(crate) fn ensure_wired_with_env(
     }
 }
 
+/// The marketplace plugin that covers `agent`'s wiring, when one exists.
+fn plugin_harness(agent: AgentChoice) -> Option<super::agent_plugins::PluginHarness> {
+    match agent {
+        AgentChoice::ClaudeCode => Some(super::agent_plugins::PluginHarness::ClaudeCode),
+        AgentChoice::Codex => Some(super::agent_plugins::PluginHarness::Codex),
+        _ => None,
+    }
+}
+
 /// The `--scope project` Claude Code install covering `launch_cwd`, if any.
 /// The operator chose per-checkout capture there, so auto-wire must not add
 /// the same hooks to the user-level file on top of it. The path also keys the
@@ -637,6 +670,7 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             assert!(
                 agent_choice_for_harness(harness).is_some(),
@@ -992,6 +1026,12 @@ mod tests {
                 "hooks/ai-memory.json",
                 Some("config.toml"),
             ),
+            (
+                ManagedHarness::Copilot,
+                "COPILOT_HOME",
+                "hooks/ai-memory.json",
+                Some("mcp-config.json"),
+            ),
         ] {
             let installs = planned_installs(&config, harness, &env_pair(var, &root));
             assert_eq!(installs.hooks.len(), 1, "{harness:?}");
@@ -1134,6 +1174,7 @@ mod tests {
             (ManagedHarness::Kimi, &["KIMI_CODE_HOME"][..]),
             (ManagedHarness::KiroV3, &["KIRO_HOME"][..]),
             (ManagedHarness::Grok, &["GROK_HOME"][..]),
+            (ManagedHarness::Copilot, &["COPILOT_HOME"][..]),
         ] {
             let run_env: Vec<_> = vars
                 .iter()
@@ -1497,7 +1538,10 @@ mod tests {
                 AgentChoice::ClaudeCode,
                 install_hooks::claude_settings_path(),
             ),
-            (AgentChoice::Codex, install_hooks::codex_hooks_path()),
+            (
+                AgentChoice::Codex,
+                install_hooks::codex_hooks_path(&crate::config::RuntimeEnv::from_process()),
+            ),
             (AgentChoice::OpenCode, install_hooks::opencode_plugin_path()),
             (
                 AgentChoice::OpenCode2,
@@ -1523,6 +1567,10 @@ mod tests {
                 AgentChoice::AntigravityCli,
                 install_hooks::antigravity_hooks_path(),
             ),
+            (
+                AgentChoice::CopilotCli,
+                install_hooks::copilot_cli_hooks_path(),
+            ),
         ] {
             assert_eq!(
                 install_hooks::hook_config_target_with(agent, &process_env).ok(),
@@ -1543,6 +1591,7 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             let agent = agent_choice_for_harness(harness).unwrap();
             assert!(
@@ -1649,6 +1698,66 @@ mod tests {
             "the online completion installs the MCP entry"
         );
         assert!(sentinel.exists(), "the completed wiring is recorded");
+    }
+
+    /// An enabled ai-memory Claude Code plugin already carries the hooks and
+    /// MCP entry, so a managed launch writes neither (adversarial: the files
+    /// stay absent). Control: with the plugin disabled the same launch wires
+    /// both, so the plugin state is what decided it.
+    #[test]
+    fn an_enabled_plugin_leaves_the_harness_unwired() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        crate::commands::agent_plugins::test_support::install_claude_plugin(
+            home.path(),
+            "3.0.0",
+            true,
+        );
+        let claude = home.path().join(".claude");
+        let settings = claude.join("settings.json");
+        let mcp = claude.join(".claude.json");
+
+        let mut config = test_config(home.path(), data.path());
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        let run_env = env_pair("CLAUDE_CONFIG_DIR", &claude);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &run_env,
+            &config.data_dir,
+        );
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("\"hooks\""),
+            "no settings hooks beside the plugin"
+        );
+        assert!(!mcp.exists(), "no MCP entry beside the plugin");
+
+        crate::commands::agent_plugins::test_support::install_claude_plugin(
+            home.path(),
+            "3.0.0",
+            false,
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &run_env,
+            &config.data_dir,
+        );
+        assert!(
+            install_hooks::settings_file_carries_ai_memory_hooks(&settings),
+            "a disabled plugin is wired around as before"
+        );
+        assert!(mcp.exists());
     }
 
     /// The load-bearing "won't mess up any harness" guarantee: auto-wire installs
