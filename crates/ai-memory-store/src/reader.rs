@@ -1643,8 +1643,11 @@ pub struct DerivedIndexStatus {
     pub observations_rows: u64,
     /// Rows currently present in the observation FTS5 index.
     pub observations_fts_rows: u64,
-    /// Latest pages without any embedding row whose body is non-empty —
-    /// i.e. the pages a backfill can actually act on.
+    /// Latest pages without an embedding row for the configured
+    /// `(provider, model, dim)` triple, whose body is non-empty — i.e. the
+    /// pages a backfill can actually act on. A vector stored under another
+    /// triple is stale and does not cover the page. Without a configured
+    /// embedder (the `None` query) this is "without any embedding row".
     pub latest_pages_missing_embeddings: u64,
     /// Latest pages without an embedding whose body is empty; no
     /// embedder can ever cover these (the backfill skips them by rule).
@@ -1874,7 +1877,7 @@ pub struct ProjectSummary {
     pub project_id: String,
     /// Name of the project within the workspace.
     pub project_name: String,
-    /// Number of `is_latest = 1` pages.
+    /// Number of unexpired `is_latest = 1` pages.
     pub page_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
@@ -2038,7 +2041,7 @@ pub struct WorkspaceSummary {
     pub workspace_name: String,
     /// Number of projects in this workspace.
     pub project_count: u64,
-    /// Number of `is_latest = 1` pages across the workspace.
+    /// Number of unexpired `is_latest = 1` pages across the workspace.
     pub page_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the workspace has no pages yet.
@@ -7943,7 +7946,7 @@ impl ReaderPool {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let (cross_project_dependents, cross_project_dependencies) =
-                cross_project_degree(conn, workspace_id, project_id)?;
+                cross_project_degree(conn, workspace_id, project_id, now_us)?;
 
             let settled: Vec<SettledPage> = if settled_first {
                 let settled_kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
@@ -8535,17 +8538,21 @@ impl ReaderPool {
                 readable_repository_predicate("p.project_id", viewer),
             );
 
+            let ttl = not_expired("pages", "?");
+            let ttl_p = not_expired("p", "?");
+
             let stale: i64 = conn
                 .query_row(
                     &format!(
                         "SELECT COUNT(*) FROM pages \
                          WHERE workspace_id = ? AND is_latest = 1 \
-                           AND tier = 'episodic' AND updated_at < ?{clause}"
+                           AND tier = 'episodic' AND updated_at < ?{clause}{ttl}"
                     ),
                     params_from_iter(
                         [ws(), Value::Integer(cutoff_30d)]
                             .into_iter()
-                            .chain(proj.clone()),
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
                     ),
                     |row| row.get(0),
                 )
@@ -8557,11 +8564,15 @@ impl ReaderPool {
                     &format!(
                         "SELECT COALESCE(SUM(c - 1), 0) FROM ( \
                             SELECT COUNT(*) c FROM pages \
-                            WHERE workspace_id = ? AND is_latest = 1{clause} \
+                            WHERE workspace_id = ? AND is_latest = 1{clause}{ttl} \
                             GROUP BY title HAVING c > 1 \
                          )"
                     ),
-                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -8571,11 +8582,15 @@ impl ReaderPool {
                 .query_row(
                     &format!(
                         "SELECT COUNT(*) FROM pages p \
-                         WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p} \
+                         WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p}{ttl_p} \
                            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
                            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)"
                     ),
-                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -8667,10 +8682,13 @@ impl ReaderPool {
                    JOIN workspaces w ON w.id = pg.workspace_id "
             );
 
-            // Params follow placeholder order: ws, cutoff, [proj], limit.
+            let ttl_pg = not_expired("pg", "?");
+            let ttl_inner = not_expired("pages", "?");
+
+            // Params follow placeholder order: ws, cutoff, [proj], now_us, limit.
             let stale_sql = format!(
                 "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1 \
-                   AND pg.tier = 'episodic' AND pg.updated_at < ?{clause} \
+                   AND pg.tier = 'episodic' AND pg.updated_at < ?{clause}{ttl_pg} \
                  ORDER BY pg.updated_at ASC LIMIT ?"
             );
             let mut stale_stmt = conn.prepare(&stale_sql)?;
@@ -8680,18 +8698,19 @@ impl ReaderPool {
                         [ws(), Value::Integer(cutoff_30d)]
                             .into_iter()
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Params: ws, [proj], ws(inner), [proj(inner)], limit.
+            // Params: ws, [proj], now_us, ws(inner), [proj(inner)], now_us(inner), limit.
             let dup_sql = format!(
-                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause}{ttl_pg} \
                    AND pg.title IN ( \
                        SELECT title FROM pages \
-                       WHERE workspace_id = ? AND is_latest = 1{inner_clause} \
+                       WHERE workspace_id = ? AND is_latest = 1{inner_clause}{ttl_inner} \
                        GROUP BY title HAVING COUNT(*) > 1 \
                    ) \
                  ORDER BY pg.title, p.name LIMIT ?"
@@ -8702,17 +8721,19 @@ impl ReaderPool {
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(ws()))
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Params: ws, [proj], limit.
+            // Params: ws, [proj], now_us, limit.
             let orphan_sql = format!(
-                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause}{ttl_pg} \
                    AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = pg.id) \
                    AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = pg.id) \
                  ORDER BY pg.updated_at DESC LIMIT ?"
@@ -8723,6 +8744,7 @@ impl ReaderPool {
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
@@ -9278,7 +9300,7 @@ impl ReaderPool {
     /// Return one row per (workspace, project) with page-count and
     /// last-updated aggregates. Used by the web UI project-list view.
     ///
-    /// Only `is_latest = 1` pages are counted. `viewer` lists only the
+    /// Only unexpired `is_latest = 1` pages are counted. `viewer` lists only the
     /// repositories that user may read — see [`readable_repository_filter`];
     /// `None` lists every one.
     ///
@@ -9293,7 +9315,7 @@ impl ReaderPool {
 
     /// Return one row per project within one workspace.
     ///
-    /// Only `is_latest = 1` pages are counted. `viewer` as for
+    /// Only unexpired `is_latest = 1` pages are counted. `viewer` as for
     /// [`Self::list_projects_with_stats`].
     ///
     /// # Errors
@@ -9317,6 +9339,7 @@ impl ReaderPool {
             // three organisations listed by name — so the filter is on the
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
+            let ttl = not_expired("pg", "?2");
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.id AS workspace_id, \
                         w.name AS workspace_name, \
@@ -9326,12 +9349,13 @@ impl ReaderPool {
                         MAX(pg.updated_at) AS last_updated_us \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  WHERE (?1 IS NULL OR w.name = ?1){visible} \
                  GROUP BY w.id, p.id \
                  ORDER BY last_updated_us DESC NULLS LAST"
             ))?;
-            let rows = stmt.query_map(params![workspace], |row| {
+            let now = now_us();
+            let rows = stmt.query_map(params![workspace, now], |row| {
                 let workspace_id: Vec<u8> = row.get(0)?;
                 let workspace_name: String = row.get(1)?;
                 let project_id: Vec<u8> = row.get(2)?;
@@ -9583,7 +9607,7 @@ impl ReaderPool {
     /// last-updated aggregates. Used by custom frontends that need a
     /// workspace chooser before narrowing into projects.
     ///
-    /// Only `is_latest = 1` pages are counted.
+    /// Only unexpired `is_latest = 1` pages are counted.
     ///
     /// With a `viewer`, a workspace is listed only when it holds at least one
     /// repository that user may read, and its counts cover only those. A
@@ -9608,6 +9632,7 @@ impl ReaderPool {
             } else {
                 ""
             };
+            let ttl = not_expired("pg", "?1");
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.name AS workspace_name, \
                         COUNT(DISTINCT p.id) AS project_count, \
@@ -9615,11 +9640,12 @@ impl ReaderPool {
                         MAX(pg.updated_at) AS last_updated_us \
                  FROM workspaces w \
                  LEFT JOIN projects p ON p.workspace_id = w.id{visible} \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  GROUP BY w.id{only_readable} \
                  ORDER BY w.name ASC"
             ))?;
-            let rows = stmt.query_map([], |row| {
+            let now = now_us();
+            let rows = stmt.query_map(params![now], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_count: i64 = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
@@ -11392,6 +11418,11 @@ impl ReaderPool {
 
     /// Return health counters for derived indexes and link/embedding state.
     ///
+    /// "Missing" keeps its historical meaning here: a latest page has no
+    /// vector at all. Server health surfaces with a configured embedder use
+    /// [`Self::derived_index_status_for_embedding`] so vectors from an old
+    /// model do not hide the current backfill gap.
+    ///
     /// These checks are intentionally read-only and derived-index-safe: they
     /// report drift but do not repair it. Rebuild/backfill paths stay behind
     /// explicit admin operations.
@@ -11399,7 +11430,27 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn derived_index_status(&self) -> StoreResult<DerivedIndexStatus> {
-        self.with_conn(|conn| {
+        self.derived_index_status_inner(None).await
+    }
+
+    /// Return derived-index health while judging embedding coverage against
+    /// the configured `(provider, model, dim)` identity.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn derived_index_status_for_embedding(
+        &self,
+        configured_embedding: (String, String, u32),
+    ) -> StoreResult<DerivedIndexStatus> {
+        self.derived_index_status_inner(Some(configured_embedding))
+            .await
+    }
+
+    async fn derived_index_status_inner(
+        &self,
+        configured_embedding: Option<(String, String, u32)>,
+    ) -> StoreResult<DerivedIndexStatus> {
+        self.with_conn(move |conn| {
             let mut triples_stmt = conn.prepare(
                 "SELECT provider, model, dim, COUNT(*) \
                  FROM page_embeddings \
@@ -11458,14 +11509,38 @@ impl ReaderPool {
                 // as \"missing\" overstated the actionable number forever
                 // (observed live: a stable 427 that no backfill could
                 // ever clear). Unembeddable pages are reported apart.
-                latest_pages_missing_embeddings: count(
-                    conn,
-                    "SELECT COUNT(*) \
-                     FROM pages pg \
-                     LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
-                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
-                       AND TRIM(pg.body) != ''",
-                )?,
+                // With a configured triple, "has a vector" means "has a
+                // vector the current model would produce": a row stored
+                // under an old triple is stale, and without the triple the
+                // count would read zero after every model switch.
+                latest_pages_missing_embeddings: match configured_embedding {
+                    Some((provider, model, dim)) => {
+                        let provider = provider.as_str();
+                        let model = model.as_str();
+                        let dim = i64::from(dim);
+                        count_bound(
+                            conn,
+                            "SELECT COUNT(*) \
+                             FROM pages pg \
+                             WHERE pg.is_latest = 1 AND TRIM(pg.body) != '' \
+                               AND NOT EXISTS ( \
+                                   SELECT 1 FROM page_embeddings pe \
+                                   WHERE pe.page_id = pg.id \
+                                     AND pe.provider = ?1 \
+                                     AND pe.model = ?2 \
+                                     AND pe.dim = ?3)",
+                            &[&provider, &model, &dim],
+                        )
+                    }
+                    None => count(
+                        conn,
+                        "SELECT COUNT(*) \
+                         FROM pages pg \
+                         LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
+                         WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                           AND TRIM(pg.body) != ''",
+                    ),
+                }?,
                 latest_pages_unembeddable: count(
                     conn,
                     "SELECT COUNT(*) \
@@ -13475,34 +13550,42 @@ fn count_project(
 /// Cross-project link degree for a project: `(dependents, dependencies)`.
 /// `dependents` = distinct other projects whose pages link into this one;
 /// `dependencies` = distinct other projects this one links out to. Counts
-/// resolved links only (`to_page_id` is set); project ids are globally
-/// unique, so a bare `!= project_id` excludes self across all workspaces.
+/// resolved links between latest unexpired pages only (`to_page_id` is set);
+/// project ids are globally unique, so a bare `!= project_id` excludes self
+/// across all workspaces.
 fn cross_project_degree(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    now_us: i64,
 ) -> StoreResult<(u64, u64)> {
+    let tp_ttl = not_expired("tp", "?3");
+    let fp_ttl = not_expired("fp", "?3");
     let dependents: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(DISTINCT fp.project_id) \
-             FROM links l \
-             JOIN pages tp ON tp.id = l.to_page_id \
-                 AND tp.workspace_id = ?1 AND tp.project_id = ?2 AND tp.is_latest = 1 \
-             JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
-             WHERE fp.project_id != ?2",
-            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            &format!(
+                "SELECT COUNT(DISTINCT fp.project_id) \
+                 FROM links l \
+                 JOIN pages tp ON tp.id = l.to_page_id \
+                     AND tp.workspace_id = ?1 AND tp.project_id = ?2 AND tp.is_latest = 1{tp_ttl} \
+                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{fp_ttl} \
+                 WHERE fp.project_id != ?2"
+            ),
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
             |row| row.get(0),
         )
         .optional()?;
     let dependencies: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(DISTINCT tp.project_id) \
-             FROM links l \
-             JOIN pages fp ON fp.id = l.from_page_id \
-                 AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
-             JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
-             WHERE tp.project_id != ?2",
-            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            &format!(
+                "SELECT COUNT(DISTINCT tp.project_id) \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{fp_ttl} \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{tp_ttl} \
+                 WHERE tp.project_id != ?2"
+            ),
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
             |row| row.get(0),
         )
         .optional()?;

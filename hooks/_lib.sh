@@ -61,11 +61,18 @@ ai_memory_find_marker() {
 # tables). Returns the first match or nothing. Ignores comments and
 # blank lines by construction (the regex only matches the `key = "..."`
 # shape).
+ai_memory_strip_utf8_bom() {
+    # Byte spelling keeps this portable across GNU/BSD sed and the awk images
+    # used in CI; LC_ALL=C makes the three bytes ordinary pattern characters.
+    LC_ALL=C sed "1s/^$(printf '\357\273\277')//"
+}
+
 ai_memory_parse_toml_key() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
-        "$file" | head -n 1
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
+        | head -n 1
 }
 
 # Like ai_memory_parse_toml_key but also accepts a BARE value
@@ -76,8 +83,9 @@ ai_memory_parse_toml_key() {
 ai_memory_parse_toml_flag() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
-        "$file" | head -n 1 | sed 's/[[:space:]]*$//'
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
+        | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
@@ -104,7 +112,8 @@ ai_memory_marker_declares_settings() {
     for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
-    LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' "$file" && return 0
+    ai_memory_strip_utf8_bom <"$file" \
+        | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
     for key in default_global inject_on_session_start max_chars contribute consume; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
@@ -549,7 +558,7 @@ ai_memory_aliases_json_value() {
 
 ai_memory_aliases_json() {
     [ -f "$1" ] || return 0
-    _ai_alias_body=$(LC_ALL=C awk '
+    _ai_alias_body=$(ai_memory_strip_utf8_bom <"$1" | LC_ALL=C awk '
         BEGIN { table = 0; count = 0; bad = 0 }
         {
             line = $0
@@ -572,7 +581,7 @@ ai_memory_aliases_json() {
             if (bad) print "invalid"
             else if (count == 1) print body
         }
-    ' "$1")
+    ')
     [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
     [ -n "$_ai_alias_body" ] || return 0
     _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')

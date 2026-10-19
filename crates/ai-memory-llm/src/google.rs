@@ -38,6 +38,7 @@ impl GoogleEmbedder {
     /// Propagates HTTP client construction errors.
     pub fn new(api_key: SecretString, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         let model = normalize_model_id(model.into());

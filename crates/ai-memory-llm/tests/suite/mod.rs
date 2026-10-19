@@ -10,4 +10,6 @@ mod extra_headers_on_the_wire;
 mod fallback_provider;
 mod openai_compat_embedder;
 mod openai_compat_guardrails;
+mod openai_compat_retry_after;
 mod openai_compat_strict;
+mod redirect_credentials;

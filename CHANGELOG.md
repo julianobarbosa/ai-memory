@@ -12,6 +12,132 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Repaired the exact migration checksum recorded by v2.2.1 for the original
+  V62 page-window migration before running strict migration validation. This
+  removes the false divergence error on every upgraded-server start while
+  keeping unknown migration edits fatal. CI now rejects changes to migration
+  files already present on a PR's base branch.
+  ([#1443](https://github.com/akitaonrails/ai-memory/issues/1443))
+- Sent `response_format=json_schema` for structured OpenCode Chat Completions
+  calls, with the existing tolerant fallback for models that reject it, so
+  `memory_query answer=true` no longer receives unstructured prose by default.
+  ([#1441](https://github.com/akitaonrails/ai-memory/issues/1441))
+- Preserved third-party commands that share an event matcher group with an
+  ai-memory hook when `install-hooks` reapplies or removes its own entry.
+  ([#1453](https://github.com/akitaonrails/ai-memory/pull/1453))
+- Accepted a UTF-8 byte-order mark before imported page frontmatter in the
+  wiki sync companion.
+  ([#1452](https://github.com/akitaonrails/ai-memory/pull/1452))
+- Skipped H1-like comment lines inside fenced code when the importer derives
+  page titles, including AgentMemory vault imports.
+  ([#1451](https://github.com/akitaonrails/ai-memory/pull/1451))
+- Recognized importer frontmatter whose closing fence is the final line of a
+  file without a trailing newline.
+  ([#1450](https://github.com/akitaonrails/ai-memory/pull/1450))
+- Encoded spaces as `%20` instead of `+` in importer URL path segments,
+  preserving workspace, project, and page names that contain spaces.
+  ([#1449](https://github.com/akitaonrails/ai-memory/pull/1449))
+- Recognized exclamation-mark punctuation in short automatic-handoff
+  acknowledgments such as `thanks!` and `perfect!`.
+  ([#1448](https://github.com/akitaonrails/ai-memory/pull/1448))
+- Treated a blank `session_id` as omitted when starting an automatic
+  improvement review, matching the other session-scoped MCP tools.
+  ([#1447](https://github.com/akitaonrails/ai-memory/pull/1447))
+- Returned MCP `invalid_params` for caller-supplied invalid page paths, tiers,
+  and scopes instead of misreporting them as internal server errors.
+  ([#1445](https://github.com/akitaonrails/ai-memory/pull/1445))
+- Parsed an empty Markdown frontmatter block (`---` followed immediately by
+  its closing fence) as frontmatter instead of folding it and later thematic
+  breaks into the page body. ([#1444](https://github.com/akitaonrails/ai-memory/pull/1444))
+- Kept hook events whose JSON payload contains half of a UTF-16 surrogate pair
+  as a `\u` escape, such as tool output cut in the middle of an emoji. Native,
+  shell, PowerShell and direct hook clients now share the bounded server-side
+  repair, replacing the unpaired escape with U+FFFD instead of dropping the
+  whole event.
+  ([#1432](https://github.com/akitaonrails/ai-memory/pull/1432))
+- Model-produced page paths are now cleaned of the remaining shapes `ensure_portable`
+  refuses, a component ending in a dot or space and a DOS device name like `aux.md`,
+  so one such path no longer aborts every page in a consolidation or bootstrap batch.
+  ([#1430](https://github.com/akitaonrails/ai-memory/pull/1430))
+- Preserved FTS5 column filters inside parenthesized groups, so queries such
+  as `(title:handoff)` no longer broaden into a search for the literal word
+  `title` across every indexed field. ([#1442](https://github.com/akitaonrails/ai-memory/pull/1442))
+- Revalidated session-purge tombstones inside the reindex write transaction,
+  preventing a queued watcher update from recreating a deleted summary after
+  file cleanup failed. Kept surviving manual replacements at the same path
+  editable through the watcher (#1439).
+- Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
+  dialog keyboard accessible, and added a labelled main-navigation landmark
+  with current-page state and narrow-screen wrapping.
+  ([#1391](https://github.com/akitaonrails/ai-memory/pull/1391),
+  [#1392](https://github.com/akitaonrails/ai-memory/pull/1392),
+  [#1393](https://github.com/akitaonrails/ai-memory/pull/1393))
+- Made guarded admin routes treat an omitted `confirm` as `false`, returning
+  the documented 400 response without performing the operation.
+  ([#1394](https://github.com/akitaonrails/ai-memory/pull/1394))
+- Retried OpenAI-style embedding requests on HTTP 503 as well as 429, honored
+  bounded whole-second `Retry-After` values, and made `ai-memory embed` fail
+  after printing a report that contains failed pages.
+  ([#1397](https://github.com/akitaonrails/ai-memory/pull/1397))
+- Made pending-write diffs return an internal error when the existing page
+  cannot be read instead of presenting an update as a new page.
+  ([#1399](https://github.com/akitaonrails/ai-memory/pull/1399))
+- Refused page-path components over 255 UTF-8 bytes and additional Windows DOS
+  device spellings, while keeping existing non-portable pages readable.
+  ([#1400](https://github.com/akitaonrails/ai-memory/pull/1400),
+  [#1407](https://github.com/akitaonrails/ai-memory/pull/1407))
+- Recognized frontmatter whose closing fence is at end of file, ignored H1-like
+  comments inside fenced code when deriving titles, and gave empty exported
+  wikilink labels their target as visible text.
+  ([#1402](https://github.com/akitaonrails/ai-memory/pull/1402),
+  [#1403](https://github.com/akitaonrails/ai-memory/pull/1403),
+  [#1419](https://github.com/akitaonrails/ai-memory/pull/1419))
+- Preserved FTS5 prefix operators and `title:` / `body:` filters on punctuated
+  terms, and stripped managed-workstream column prefixes only at word starts.
+  ([#1404](https://github.com/akitaonrails/ai-memory/pull/1404),
+  [#1405](https://github.com/akitaonrails/ai-memory/pull/1405),
+  [#1406](https://github.com/akitaonrails/ai-memory/pull/1406))
+- Stripped reasoning that ends in a bare closing tag from OpenAI-compatible
+  structured responses and found Cursor Agent JSON inside bracketed prose.
+  ([#1408](https://github.com/akitaonrails/ai-memory/pull/1408),
+  [#1409](https://github.com/akitaonrails/ai-memory/pull/1409))
+- Matched automatic-handoff acknowledgments as whole phrases, treated Windows
+  drive roots as broad session anchors, preserved Antigravity output around
+  invalid UTF-8 bytes, and stopped repeating the last prompt in automatic
+  handoffs.
+  ([#1410](https://github.com/akitaonrails/ai-memory/pull/1410),
+  [#1411](https://github.com/akitaonrails/ai-memory/pull/1411),
+  [#1412](https://github.com/akitaonrails/ai-memory/pull/1412),
+  [#1418](https://github.com/akitaonrails/ai-memory/pull/1418))
+- Returned `invalid params` for malformed handoff and message ids and accepted
+  surrounding whitespace consistently on handoff cancellation.
+  ([#1413](https://github.com/akitaonrails/ai-memory/pull/1413))
+- Fixed A2 compaction summaries when a heading directly precedes the first
+  paragraph or the page uses CRLF line endings.
+  ([#1414](https://github.com/akitaonrails/ai-memory/pull/1414))
+- Excluded TTL-expired pages from cross-project degree metrics, memory-health
+  counts and details, and project/workspace page-count and timestamp summaries.
+  ([#1422](https://github.com/akitaonrails/ai-memory/pull/1422),
+  [#1423](https://github.com/akitaonrails/ai-memory/pull/1423),
+  [#1426](https://github.com/akitaonrails/ai-memory/pull/1426))
+- Stopped LLM provider and embedder requests from following a redirect to
+  another origin. reqwest drops `Authorization` on a cross-host hop but keeps
+  every other header, so `x-api-key`, `x-goog-api-key` and operator headers
+  from `llm_headers` reached whatever host a configured endpoint redirected
+  to. Redirects inside the same origin still work; one that changes scheme,
+  host or port now fails the request and names the origin it pointed at.
+  ([#1396](https://github.com/akitaonrails/ai-memory/pull/1396))
+- Required Write access before a session start records a project's `[profile]`
+  `profile_contribute` / `profile_consume` flags. A Read-only viewer's explicit
+  values now only narrow its own session instead of changing the flags for every
+  operator in the project.
+  ([#1421](https://github.com/akitaonrails/ai-memory/pull/1421))
+- Stopped the server from opening files named in a hook payload. Antigravity
+  step-log enrichment now runs only in the client-side `ai-memory hook`; the
+  `/hook` and `/hook/batch` ingest paths store the `tool_response` the client
+  sent and never read `artifactDirectoryPath` or `transcriptPath` locations
+  on the server's own disk.
+  ([#1420](https://github.com/akitaonrails/ai-memory/pull/1420))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
@@ -23,6 +149,9 @@ version in [`docs/changelog/`](docs/changelog/):
   when evaluating slot staleness and title uniqueness.
   ([#1389](https://github.com/akitaonrails/ai-memory/pull/1389))
 - Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
+- Encoded a literal `%` in an exported wikilink target as `%25`, so an OKF
+  bundle's Markdown link still resolves to the same literal page path.
+  ([#1456](https://github.com/akitaonrails/ai-memory/pull/1456))
 - Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
 - Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
   pages. The store query now filters out expired page targets against the
@@ -41,7 +170,33 @@ version in [`docs/changelog/`](docs/changelog/):
   ranking. `contradiction_sql` now applies the `not_expired` guard on the target
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
+- Stopped the LLM contradiction pass from auditing its previous
+  `_lint/report.md` as a knowledge page, which could recycle stale findings or
+  displace a real page from the bounded prompt. ([#1455](https://github.com/akitaonrails/ai-memory/pull/1455))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Read a first-line `.ai-memory.toml` scope key, flag, or `aliases`
+  declaration when the marker starts with a UTF-8 BOM, in both native and
+  legacy POSIX hook routing. ([#1457](https://github.com/akitaonrails/ai-memory/pull/1457))
+- Counted a latest page whose only stored vector belongs to another provider,
+  model, or dimension as missing an embedding in `ai-memory status` and the
+  web `/health` page, so the count no longer reads zero after an
+  embedding-model switch.
+  ([#1431](https://github.com/akitaonrails/ai-memory/pull/1431))
+- Bounded free-text search before the FTS5 parser sees it. A query of 100k
+  distinct terms spent ~17.5 s in query preparation alone (and a ~500 KB
+  document ~59 s end to end), and a NUL byte reached the phrase parser as
+  end-of-input, surfacing `sqlite: unterminated string` as an internal error
+  instead of a result. Query text is now folded (NUL becomes a space) and cut
+  to the first 4 KiB on a UTF-8 boundary; ordinary queries are unchanged.
+  ([#1434](https://github.com/akitaonrails/ai-memory/issues/1434))
+- Fixed generated OKF directory indexes so names containing spaces, Markdown
+  punctuation, literal URL delimiters, or Unicode remain readable, clickable
+  links in exports and newly generated migration indexes.
+  ([#1438](https://github.com/akitaonrails/ai-memory/pull/1438))
+- Made the SQLite writer wait out the 5-second busy timeout when another
+  process holds the database, such as an external `wal_checkpoint`, instead
+  of failing hook ingestion at once with "database is locked".
+  ([#1460](https://github.com/akitaonrails/ai-memory/pull/1460))
 
 ## [3.1.1] - 2026-10-17
 

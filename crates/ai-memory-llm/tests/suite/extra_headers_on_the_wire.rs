@@ -231,6 +231,61 @@ async fn an_operator_base_url_redirects_the_opencode_provider() {
     assert_eq!(values(request, "user-agent"), vec![DEFAULT_USER_AGENT]);
 }
 
+#[tokio::test]
+async fn factory_opencode_chat_completions_sends_structured_response_format() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "id",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "mimo-v2.6-flash",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "{\"ok\":true}" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(ProviderConfig {
+        provider: ProviderChoice::OpenCode,
+        model: "mimo-v2.6-flash".into(),
+        auth: ProviderAuth::required_api_key_from_env(
+            "OPENCODE_API_KEY",
+            Some(SecretString::from("sk-test")),
+        ),
+        base_url: Some(server.uri()),
+        compat_strict: false,
+        compat_disable_thinking: false,
+        request_timeout_secs: 30,
+        reasoning_effort: None,
+        extra_headers: ExtraHeaders::default(),
+    })
+    .expect("provider builds");
+
+    let value = provider
+        .complete_structured_raw(
+            ChatRequest::user_prompt("emit JSON"),
+            json!({
+                "type": "object",
+                "properties": { "ok": { "type": "boolean" } },
+                "required": ["ok"]
+            }),
+        )
+        .await
+        .expect("structured response parses");
+    assert_eq!(value, json!({"ok": true}));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+}
+
 /// An explicit `llm_base_url` configures the vendor-fixed providers too: it is
 /// how an operator routes `anthropic` or `openai` through a gateway on
 /// purpose. Dropping it sends the request, and the key, straight to the vendor

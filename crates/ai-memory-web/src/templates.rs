@@ -368,6 +368,10 @@ pub(crate) struct PageView {
     pub updated_relative: String,
     /// Humanised created timestamp.
     pub created_relative: String,
+    /// Exact updated timestamp (ISO 8601), shown on hover.
+    pub updated_at: String,
+    /// Exact created timestamp (ISO 8601), shown on hover.
+    pub created_at: String,
     /// Path of the page this supersedes, or empty string.
     pub supersedes_path: String,
     /// Link target for the superseded page, or empty string.

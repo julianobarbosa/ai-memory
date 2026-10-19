@@ -1482,8 +1482,17 @@ fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_
     if payload.starts_with('\u{feff}') {
         payload.drain(..'\u{feff}'.len_utf8());
     }
-    let json = serde_json::from_str(&payload)?;
-    Ok((payload, json))
+    match serde_json::from_str(&payload) {
+        Ok(json) => Ok((payload, json)),
+        // The repaired text becomes the spooled body: the server parses it
+        // with `serde_json` too and would reject the original.
+        Err(error) => {
+            let repaired =
+                ai_memory_hooks::replace_lone_surrogate_escapes(&payload).ok_or(error)?;
+            let json = serde_json::from_str(&repaired)?;
+            Ok((repaired, json))
+        }
+    }
 }
 
 fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {

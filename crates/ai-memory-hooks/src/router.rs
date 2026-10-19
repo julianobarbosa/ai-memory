@@ -24,12 +24,14 @@ use ai_memory_store::{
     lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
-use axum::Json;
-use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{Next, from_fn};
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -64,6 +66,9 @@ pub const DEFAULT_INGEST_GATE_MAX_ENTRIES: usize = 4096;
 /// client drain cap so a single request cannot monopolize ingest capacity or
 /// allocate/process an unbounded vector of hook events.
 pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
+
+/// Keep repair buffering at the server's global machine-route request limit.
+const MAX_HOOK_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Upper bound for reject-policy admission on the synchronous `/handoff`
 /// path. The shortest shipped client deadline is the shell hook's one-second
@@ -631,11 +636,40 @@ fn admission_skips(
 /// (the read-only compaction recap for a "reload context" prompt).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
-        .route("/hook", post(handle_hook))
+        .route(
+            "/hook",
+            post(handle_hook).route_layer(from_fn(repair_hook_json)),
+        )
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
         .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
+}
+
+/// Repair the one invalid-JSON shape first-party harnesses can produce when
+/// they truncate an escaped emoji between its UTF-16 surrogate halves. The
+/// normal `Json` extractor still owns media-type validation and all parsing;
+/// valid bodies pass through byte-for-byte.
+async fn repair_hook_json(request: Request<Body>, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, MAX_HOOK_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let bytes = repair_hook_json_bytes(bytes);
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+fn repair_hook_json_bytes(bytes: axum::body::Bytes) -> axum::body::Bytes {
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(crate::replace_lone_surrogate_escapes)
+            .map_or(bytes, axum::body::Bytes::from)
+    } else {
+        bytes
+    }
 }
 
 /// Unix milliseconds for an ingest metric stamp, saturating rather than
@@ -1659,7 +1693,25 @@ async fn fetch_and_accept_handoff_at(
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj, actor.as_ref()).await?;
-    let profile_flags = persist_profile_flags(state, &query, ws, proj).await;
+    // The `[profile]` flags are project-wide settings every operator of the
+    // project inherits, so recording them is a write: a viewer granted only
+    // Read may narrow their own session but must not change the project.
+    let may_write_profile = match crate::grants::authorize_resolved(
+        &state.reader,
+        Some((ws, proj)),
+        viewer,
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(err) if err.is_forbidden() => false,
+        Err(err) => {
+            warn!(error = %err, "could not authorize recording the [profile] flags");
+            false
+        }
+    };
+    let profile_flags = persist_profile_flags(state, &query, ws, proj, may_write_profile).await;
     let profile_md =
         render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
             .await;
@@ -2107,11 +2159,16 @@ fn explicit_profile_flag(value: Option<&str>) -> Option<bool> {
 /// session start costs one bounded read and no writer command. Never fails the
 /// session start: an unreadable stored value withholds the digest rather than
 /// guessing it was on.
+///
+/// Without `may_write` (a viewer holding only Read on the project) nothing is
+/// recorded and an explicit value can only switch a flag off for this session,
+/// never back on.
 async fn persist_profile_flags(
     state: &HookState,
     query: &HandoffQuery,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    may_write: bool,
 ) -> ai_memory_store::ProjectProfileFlags {
     let contribute = explicit_profile_flag(query.profile_contribute.as_deref());
     let consume = explicit_profile_flag(query.profile_consume.as_deref());
@@ -2129,6 +2186,12 @@ async fn persist_profile_flags(
             };
         }
     };
+    if !may_write {
+        return ai_memory_store::ProjectProfileFlags {
+            contribute: stored.contribute && contribute.unwrap_or(true),
+            consume: stored.consume && consume.unwrap_or(true),
+        };
+    }
     let wanted = ai_memory_store::ProjectProfileFlags {
         contribute: contribute.unwrap_or(stored.contribute),
         consume: consume.unwrap_or(stored.consume),
@@ -3339,7 +3402,12 @@ fn sticky_within_session_tree(
 fn meaningful_session_anchor(session_cwd: Option<&str>, home_dir: Option<&str>) -> Option<String> {
     let session_cwd = session_cwd.filter(|s| !s.trim().is_empty())?;
     let session_norm = normalize_project_path_key(session_cwd);
-    if session_norm == "/" {
+    // The filesystem root, in each spelling it normalizes to: `/`, a bare
+    // Windows drive (`C:\` becomes `c:`), or nothing at all (`//`). Every
+    // path on that root would start with it.
+    let bytes = session_norm.as_bytes();
+    let drive_root = bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if session_norm == "/" || session_norm.is_empty() || drive_root {
         return None;
     }
     if let Some(home) = home_dir
@@ -4547,8 +4615,31 @@ fn build_auto_handoff(
     // bounded queries when the digest loaded.
     let first_prompt = facts.first_prompt.clone();
     let last_prompt = facts.last_prompt.clone();
+    let open_questions = if turn_checkpoint {
+        // A completed turn is neither a native-session exit nor evidence that
+        // the user's last question remains unanswered.
+        last_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
+            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
+            .into_iter()
+            .collect()
+    } else {
+        derive_open_questions(facts, &last_prompt)
+    };
+    // A heuristic that quotes the last prompt already carries it; the summary
+    // must not repeat it.
+    let last_quoted = last_prompt.as_deref().is_some_and(|last| {
+        let quoted = cap_handoff_text(last.trim());
+        !quoted.is_empty() && open_questions.iter().any(|q| q.ends_with(quoted.as_str()))
+    });
     let mut summary = match (&first_prompt, &last_prompt) {
+        (Some(first), Some(last)) if first == last && last_quoted => {
+            "Single-prompt session; the prompt is quoted under open questions.".to_string()
+        }
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
+        (Some(first), Some(_)) if last_quoted => format!("Started: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
         (Some(first), None) => format!("Started: {}", cap(first)),
         _ => format!(
@@ -4568,19 +4659,6 @@ fn build_auto_handoff(
         summary.push_str("\n\nLatest assistant response: ");
         summary.push_str(assistant);
     }
-    let open_questions = if turn_checkpoint {
-        // A completed turn is neither a native-session exit nor evidence that
-        // the user's last question remains unanswered.
-        last_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
-            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
-            .into_iter()
-            .collect()
-    } else {
-        derive_open_questions(facts, &last_prompt)
-    };
     let next_steps = if facts.tools.is_empty() {
         Vec::new()
     } else {
@@ -4735,17 +4813,37 @@ fn is_acknowledgment(text: &str) -> bool {
     if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
         return true;
     }
-    // Also catch "ok, thanks" / "好的，谢谢" style compounds up to 20 chars.
-    if trimmed.chars().count() <= 20 && ACK_PHRASES.iter().any(|phrase| trimmed.starts_with(phrase))
-    {
-        let remainder = trimmed
-            .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || !c.is_ascii())
-            .trim_start_matches([',', '.', ' ', '，', '。']);
-        if remainder.is_empty() {
+    // Also catch "ok, thanks" / "好的，谢谢" style compounds up to 20 chars:
+    // the prompt must be made of acknowledgment phrases and separators
+    // only. Each step consumes a whole phrase (the longest that fits), and
+    // an ASCII phrase must end at a word boundary, so "kubectl" is not
+    // "k" + more and "好的，接下来写单元测试" keeps its instruction.
+    if trimmed.chars().count() > 20 {
+        return false;
+    }
+    let mut rest = trimmed;
+    loop {
+        rest = rest.trim_start_matches([',', '.', '!', ' ', '，', '。', '！']);
+        if rest.is_empty() {
             return true;
         }
+        let phrase = ACK_PHRASES
+            .iter()
+            .filter(|phrase| {
+                rest.strip_prefix(**phrase).is_some_and(|after| {
+                    !phrase.is_ascii()
+                        || !after
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphanumeric())
+                })
+            })
+            .max_by_key(|phrase| phrase.len());
+        let Some(phrase) = phrase else {
+            return false;
+        };
+        rest = &rest[phrase.len()..];
     }
-    false
 }
 
 /// Cap so a single long prompt does not blow up the handoff body.
@@ -5499,6 +5597,92 @@ pub(crate) mod tests {
         assert_eq!(stored.len(), 1);
     }
 
+    /// PoC: a hook payload cannot make the server read its own disk.
+    ///
+    /// Any capture credential (a DB user's `aim_` key, or anyone on an
+    /// unauthenticated server) posts an Antigravity `PostToolUse` whose
+    /// `artifactDirectoryPath` (or `transcriptPath`) names a directory on the
+    /// SERVER. Envelope parsing used to open
+    /// `<dir>/.system_generated/steps/<stepIdx>/output.txt` there and store up
+    /// to 2 KiB of it as the observation body, which the caller then reads back
+    /// through `memory_search` / `memory_get_observations` / the web UI. The
+    /// file here stands in for anything the server process can read.
+    #[tokio::test]
+    async fn a_hook_payload_cannot_make_the_server_read_its_own_disk() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let server_only = TempDir::new().unwrap();
+        let step = server_only
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("7");
+        std::fs::create_dir_all(&step).unwrap();
+        std::fs::create_dir_all(server_only.path().join(".system_generated").join("logs")).unwrap();
+        std::fs::write(step.join("output.txt"), "SERVER_SECRET_SENTINEL=hunter2\n").unwrap();
+        let transcript = server_only
+            .path()
+            .join(".system_generated")
+            .join("logs")
+            .join("t.jsonl");
+
+        let mut sessions = Vec::new();
+        let mut items = Vec::new();
+        for (i, locator) in [
+            ("artifactDirectoryPath", server_only.path().to_path_buf()),
+            ("transcriptPath", transcript),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = SessionId::new().to_string();
+            let mut body = serde_json::json!({
+                "session_id": session,
+                "cwd": tmp.path().to_string_lossy(),
+                "toolCall": { "name": "view_file", "args": { "AbsolutePath": "x" } },
+                "stepIdx": 7,
+            });
+            body[locator.0] = serde_json::json!(locator.1.to_string_lossy());
+            items.push(HookBatchItem {
+                url: format!("http://h/hook?event=post-tool-use&agent=antigravity-cli&i={i}"),
+                body,
+            });
+            sessions.push(session);
+        }
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stored_any = false;
+        for session in sessions {
+            for obs in state
+                .reader
+                .observations_for_session(session.parse().unwrap())
+                .await
+                .unwrap()
+            {
+                stored_any = true;
+                assert!(
+                    !obs.body.contains("SERVER_SECRET_SENTINEL"),
+                    "a hook payload made the server read a file from its own disk: {:?}",
+                    obs.body
+                );
+            }
+        }
+        assert!(stored_any, "the events themselves are still captured");
+        assert!(
+            !any_file_contains(tmp.path(), b"SERVER_SECRET_SENTINEL"),
+            "server file content reached the store"
+        );
+    }
     /// A capture that opens a new project records the user capturing as its
     /// creator.
     ///
@@ -6301,6 +6485,16 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn hook_ingress_repairs_lone_surrogate_before_json_extraction() {
+        let raw = axum::body::Bytes::from_static(
+            br#"{"session_id":"lone","tool_response":{"stdout":"ok \ud83d tail"}}"#,
+        );
+        let repaired = repair_hook_json_bytes(raw);
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["tool_response"]["stdout"], "ok \u{FFFD} tail");
+    }
+
     /// A consolidator whose provider panics if the hook path ever calls it.
     fn with_hook_consolidator(state: &mut HookState) {
         state.consolidator = Some(Arc::new(Consolidator::new(
@@ -6932,6 +7126,33 @@ pub(crate) mod tests {
         assert!(!sticky_within_session_tree(
             Some(r"C:\Users\alice"),
             Some(r"c:\users\alice\repo"),
+            Some(r"C:\Users\alice"),
+        ));
+        // A session rooted at a Windows drive root (or a cwd that
+        // normalizes to nothing) is the filesystem root too: every path on
+        // the drive would fold into it.
+        for root in [r"C:\", "C:/", "c:", "//", r"\\"] {
+            assert!(
+                !sticky_within_session_tree(
+                    Some(root),
+                    Some(r"C:\work\other-project"),
+                    Some(r"C:\Users\alice"),
+                ),
+                "{root:?} must not anchor a session"
+            );
+            assert!(
+                !sticky_out_of_tree_under_repo_root(
+                    Some(root),
+                    Some(r"C:\Users\alice"),
+                    ProjectStrategy::RepoRoot,
+                ),
+                "{root:?} must not anchor a session"
+            );
+        }
+        // A real directory on the drive still anchors.
+        assert!(sticky_within_session_tree(
+            Some(r"C:\work"),
+            Some(r"c:\work\repo"),
             Some(r"C:\Users\alice"),
         ));
     }
@@ -19954,10 +20175,7 @@ pub(crate) mod tests {
             ),
         ];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(
-            handoff.summary,
-            "Started: map the sweep code\n\nLast: fix the pinned-page sweep"
-        );
+        assert_eq!(handoff.summary, "Started: map the sweep code");
         assert_eq!(
             handoff.open_questions,
             vec!["Continue from: fix the pinned-page sweep".to_string()]
@@ -19968,6 +20186,48 @@ pub(crate) mod tests {
                 .open_questions
                 .iter()
                 .all(|q| !q.contains("task-notification"))
+        );
+    }
+
+    #[test]
+    fn auto_handoff_quotes_a_single_prompt_once() {
+        let handoff = handoff_from(
+            &[mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the login bug",
+            )],
+            false,
+        );
+        assert_eq!(handoff.open_questions, ["Continue from: fix the login bug"]);
+        assert!(
+            !handoff.summary.contains("fix the login bug"),
+            "{}",
+            handoff.summary
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_the_last_prompt_in_the_summary_when_open_questions_do_not_quote_it() {
+        // File work with no Stop takes the abnormal-exit heuristic, which does
+        // not quote the prompt, so the summary is the only place it survives.
+        let handoff = handoff_from(
+            &[
+                mk_obs(ObservationKind::UserPrompt, "fix", "fix the login bug"),
+                mk_obs(
+                    ObservationKind::PostToolUse,
+                    "tool file",
+                    "tool_family: file",
+                ),
+            ],
+            false,
+        );
+        assert!(
+            handoff
+                .summary
+                .starts_with("Session focused on: fix the login bug"),
+            "{}",
+            handoff.summary
         );
     }
 
@@ -20050,7 +20310,12 @@ pub(crate) mod tests {
             "fix <div> alignment",
         )];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(handoff.summary, "Session focused on: fix <div> alignment");
+        // The prompt is quoted under open questions, not repeated in the summary.
+        assert!(
+            !handoff.summary.contains("alignment"),
+            "{}",
+            handoff.summary
+        );
         assert_eq!(
             handoff.open_questions,
             vec!["Continue from: fix <div> alignment".to_string()]
@@ -20065,11 +20330,7 @@ pub(crate) mod tests {
             mk_obs(ObservationKind::UserPrompt, "paste", pasted),
         ];
         let handoff = handoff_from(&observations, false);
-        assert!(
-            handoff.summary.ends_with(&format!("Last: {pasted}")),
-            "got: {}",
-            handoff.summary
-        );
+        assert_eq!(handoff.summary, "Started: map the sweep code");
         assert_eq!(
             handoff.open_questions,
             vec![format!("Continue from: {pasted}")]
@@ -20081,7 +20342,7 @@ pub(crate) mod tests {
         let prompt = "\u{276f} rode o workflow de arquitetura";
         let observations = vec![mk_obs(ObservationKind::UserPrompt, "run", prompt)];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(handoff.summary, format!("Session focused on: {prompt}"));
+        assert!(!handoff.summary.contains(prompt), "{}", handoff.summary);
         assert_eq!(
             handoff.open_questions,
             vec![format!("Continue from: {prompt}")]
@@ -20192,6 +20453,62 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// An exclamation mark is punctuation like a period: "thanks!" is the
+    /// same acknowledgment as "thanks.", not a prompt to continue from.
+    #[test]
+    fn is_acknowledgment_accepts_exclamation_marks() {
+        for ack in [
+            "thanks!",
+            "great!",
+            "ok, thanks!",
+            "perfect!!",
+            "好的！",
+            "谢谢!",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        for request in ["ok? now run it", "thanks! now run the tests"] {
+            assert!(!is_acknowledgment(request), "{request:?} is a request");
+        }
+    }
+
+    /// A compound acknowledgment is acknowledgment phrases and separators
+    /// only. The old check stripped every leading letter after a matching
+    /// prefix, so a short instruction that merely starts like an
+    /// acknowledgment ("好的，接下来写单元测试", "kubectl") was discarded and
+    /// the handoff lost the user's real last request.
+    #[test]
+    fn is_acknowledgment_requires_whole_phrases() {
+        for ack in [
+            "ok, thanks",
+            "ok thanks",
+            "好的，谢谢",
+            "好的谢谢",
+            "thanks.",
+            "sure, will do",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        for request in [
+            "好的，接下来写单元测试",
+            "好像有个bug",
+            "了解一下这个函数",
+            "kubectl",
+            "typecheck",
+            "okay, now run it",
+        ] {
+            assert!(!is_acknowledgment(request), "{request:?} is a request");
+        }
+
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "p",
+            "好的，接下来写单元测试",
+        )];
+        let q = derive_open_questions(&obs, &Some("好的，接下来写单元测试".to_string()));
+        assert_eq!(q, ["Continue from: 好的，接下来写单元测试"]);
     }
 
     /// End-to-end proof that a client-supplied `occurred_at` reaches every
@@ -20630,6 +20947,107 @@ pub(crate) mod tests {
         assert!(session_start_text(&state, query).await.is_some());
         let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
         assert_eq!(flags, ai_memory_store::ProjectProfileFlags::default());
+    }
+    /// The `[profile]` flags are a project-wide setting, so recording them is a
+    /// write. A viewer holding only Read on a restricted project sends opt-out
+    /// and opt-in values at session start; neither may change what every other
+    /// operator of the project inherits. Control: a Write grant records them.
+    #[tokio::test]
+    async fn a_reader_cannot_change_a_projects_profile_flags_at_session_start() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let human = |name: &'static str, level: ai_memory_store::GrantLevel| {
+            let writer = state.writer.clone();
+            let project = state.project_id;
+            async move {
+                let user = writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                writer
+                    .grant_memory(user, project, level, None)
+                    .await
+                    .unwrap();
+                user
+            }
+        };
+        let reader = human("reader", ai_memory_store::GrantLevel::Read).await;
+        let writer = human("writer", ai_memory_store::GrantLevel::Write).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let state = Arc::new(state);
+        let session_start = |viewer: ai_memory_core::UserId, value: &'static str| {
+            let state = state.clone();
+            let mut query = profile_query(&cwd, "claude-code");
+            query.workspace = Some("default".into());
+            query.project = Some("scratch".into());
+            query.profile_contribute = Some(value.into());
+            query.profile_consume = Some(value.into());
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        Some(axum::Extension(AuthorizedViewer(viewer))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+        let stored = || {
+            let state = state.clone();
+            async move {
+                state
+                    .reader
+                    .project_profile_flags(state.workspace_id, state.project_id)
+                    .await
+                    .unwrap()
+            }
+        };
+        let on = ai_memory_store::ProjectProfileFlags::default();
+        let off = ai_memory_store::ProjectProfileFlags {
+            contribute: false,
+            consume: false,
+        };
+
+        // The reader's session start succeeds (Read is enough to open it) but
+        // its opt-out stays with this session and is not recorded.
+        let (status, body) = session_start(reader, "false").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, on, "a Read grant changed the project");
+
+        // Control: a Write grant records the project's opt-out.
+        let (status, body) = session_start(writer, "false").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, off);
+
+        // The reader cannot undo the writer's opt-out either.
+        let (status, body) = session_start(reader, "1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, off, "a Read grant re-enabled the profile");
+
+        // Control: the writer can turn it back on.
+        let (status, body) = session_start(writer, "1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, on);
     }
 
     /// A multi-user server leaves the profile off unless the operator enables

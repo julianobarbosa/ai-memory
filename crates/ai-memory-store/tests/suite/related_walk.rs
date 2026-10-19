@@ -1154,3 +1154,139 @@ async fn dangling_cross_project_links_require_latest_unexpired_target() {
         ]
     );
 }
+
+#[tokio::test]
+async fn cross_project_degree_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+    let lib = store
+        .writer
+        .get_or_create_project(ws, "lib".to_string(), None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other".to_string(), None)
+        .await
+        .unwrap();
+
+    // In lib: one live page and one expired page.
+    store
+        .writer
+        .upsert_page(page_with_links(ws, lib, "notes/live_target.md", vec![]))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, lib, "notes/expired_target.md", vec![]),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    // In app: one live page linking to lib (both live and expired targets) and
+    // one expired page linking to other.
+    store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/source.md",
+            vec![
+                cross_project_link("lib", "notes/live_target.md"),
+                cross_project_link("lib", "notes/expired_target.md"),
+            ],
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_source.md",
+                vec![cross_project_link("other", "notes/other_target.md")],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    // In other: one live target, one live page linking to app, and one expired page linking to app.
+    store
+        .writer
+        .upsert_page(page_with_links(ws, other, "notes/other_target.md", vec![]))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            other,
+            "notes/other_live_source.md",
+            vec![cross_project_link("app", "notes/source.md")],
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(
+                ws,
+                other,
+                "notes/other_expired_source.md",
+                vec![cross_project_link("app", "notes/source.md")],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    let app_brief = store
+        .reader
+        .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        app_brief.cross_project_dependencies, 1,
+        "app depends only on lib (live target); expired target and expired source to other are omitted"
+    );
+    assert_eq!(
+        app_brief.cross_project_dependents, 1,
+        "only other (live source) depends on app; expired source in other is omitted"
+    );
+
+    let lib_brief = store
+        .reader
+        .briefing_for_project(ws, lib, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(lib_brief.cross_project_dependents, 1, "app depends on lib");
+    assert_eq!(lib_brief.cross_project_dependencies, 0);
+
+    let other_brief = store
+        .reader
+        .briefing_for_project(ws, other, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        other_brief.cross_project_dependencies, 1,
+        "other depends on app"
+    );
+    assert_eq!(
+        other_brief.cross_project_dependents, 0,
+        "app's expired link to other does not make other a dependency of app"
+    );
+}

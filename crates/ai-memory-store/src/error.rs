@@ -145,7 +145,7 @@ pub enum StoreError {
     /// caller-invariant violation).
     #[error("not found: {0}")]
     NotFound(String),
-    /// A late-arriving event named a session that `purge_session` removed.
+    /// An event or disk reindex named a session that `purge_session` removed.
     /// Recreating it would silently undo a deletion the operator already
     /// performed and an application may already have reported to a user, so
     /// ingest refuses instead (#387).

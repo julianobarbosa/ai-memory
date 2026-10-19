@@ -89,27 +89,14 @@ pub struct ReindexSummary {
 
 /// The session a page belongs to, for paths that name one.
 ///
-/// Pure path shape, no I/O: only `sessions/<id>.md` can be resurrected by a
-/// purge whose file cleanup failed, so this is what decides whether the
-/// tombstone set is worth consulting — or, on the single-event path, whether
-/// it is worth loading at all.
+/// Pure path shape, no I/O. Used to keep session-summary paths out of the
+/// missing-file retirement safety net. Reindex ownership and tombstone
+/// checks belong to the store transaction, not this path-only classifier.
 pub(crate) fn session_id_for_page(path: &PagePath) -> Option<SessionId> {
     path.as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok())
-}
-
-/// Whether `path` is the page of a session this scope has tombstoned.
-///
-/// For callers that already hold the scope's set. The empty-set and
-/// path-shape checks come first so a sweep over a project with no purges
-/// never parses an id.
-pub(crate) fn is_purged_session_page(path: &PagePath, purged: &HashSet<SessionId>) -> bool {
-    if purged.is_empty() {
-        return false;
-    }
-    session_id_for_page(path).is_some_and(|id| purged.contains(&id))
 }
 
 enum PageStoreRemoval {
@@ -1810,11 +1797,9 @@ impl Wiki {
         }
     }
 
-    /// Session ids this scope has tombstoned, as a set for the reindex gate.
-    ///
-    /// The session-level twin of [`WriterHandle::scope_is_purged`], and read
-    /// the same way: once per directory per reindex pass, by the callers that
-    /// walk a tree, rather than once per page (#701).
+    /// Session ids this scope has tombstoned, for lifecycle inspection.
+    /// Reindex enforces these tombstones in its store write transaction,
+    /// rather than authorizing a write from an earlier snapshot of this set.
     ///
     /// # Errors
     /// Propagates the store error.
@@ -2282,7 +2267,7 @@ impl Wiki {
 
         let id = self
             .writer
-            .upsert_page(NewPage {
+            .upsert_page_from_disk(NewPage {
                 workspace_id,
                 project_id,
                 path,
@@ -2508,18 +2493,12 @@ impl Wiki {
             let pages = tokio::task::spawn_blocking(move || crate::watcher::walk_markdown(&pr))
                 .await
                 .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
-            let purged = self.purged_sessions(ws, proj).await?;
             for path in pages {
-                if is_purged_session_page(&path, &purged) {
-                    tracing::debug!(
-                        path = %path,
-                        "skipping reindex of a purged (tombstoned) session page",
-                    );
-                    summary.skipped_purged_sessions += 1;
-                    continue;
-                }
                 match self.reindex_page(ws, proj, path).await {
                     Ok(_) => summary.pages += 1,
+                    Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                        summary.skipped_purged_sessions += 1;
+                    }
                     Err(WikiError::Store(ai_memory_store::StoreError::PagePathCollides {
                         requested,
                         existing,
@@ -8464,6 +8443,79 @@ mod tests {
         .await
         .unwrap();
         (store, wiki, ws, src, dst, sid, path)
+    }
+
+    #[tokio::test]
+    async fn reindex_queued_after_purge_rechecks_session_tombstone() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, _, sid, path) = session_with_page(&tmp).await;
+        let page_id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(page_id)).await.unwrap();
+        // The watcher's per-directory snapshot predates the purge.
+        let snapshot = wiki.purged_sessions(ws, proj).await.unwrap();
+        assert!(!snapshot.contains(&sid));
+        let abs = wiki.abs_path(ws, proj, &path);
+        let raw = std::fs::read(&abs).unwrap();
+        let guard = wiki.mutation_lock.read().await;
+        let purge = wiki.purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip);
+        tokio::pin!(purge);
+        tokio::select! { biased;
+            _ = &mut purge => panic!("purge should wait for the shared guard"),
+            _ = std::future::ready(()) => {}
+        }
+        // A page already admitted by the stale snapshot queues behind the purge.
+        let reindex = wiki.reindex_page(ws, proj, path.clone());
+        tokio::pin!(reindex);
+        tokio::select! { biased;
+            _ = &mut reindex => panic!("reindex should wait behind queued purge"),
+            _ = std::future::ready(()) => {}
+        }
+        // Force cleanup failure portably, as the owned-session purge test
+        // does. Restore the readable leftover before the queued reindex runs.
+        std::fs::remove_file(&abs).unwrap();
+        std::fs::create_dir(&abs).unwrap();
+        drop(guard);
+        let outcome = purge.await.unwrap();
+        assert_eq!(outcome.files_failed, vec![path.clone()]);
+        std::fs::remove_dir(&abs).unwrap();
+        std::fs::write(&abs, raw).unwrap();
+        assert!(abs.is_file());
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .reader
+                .search_pages("consolidated".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().contains(&sid));
+        let reindexed = reindex.await;
+        let hits = store
+            .reader
+            .search_pages("consolidated".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                reindexed,
+                Err(WikiError::Store(
+                    ai_memory_store::StoreError::SessionPurged(_)
+                ))
+            ),
+            "{reindexed:?}"
+        );
+        assert!(
+            hits.is_empty(),
+            "a reindex queued after purge resurrected the tombstoned session page"
+        );
     }
 
     #[tokio::test]

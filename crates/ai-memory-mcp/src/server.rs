@@ -2641,8 +2641,11 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach the wiki handle. Without this, `memory_forget_sweep`
-    /// and `memory_lint` cannot write their report pages.
+    /// Attach the wiki handle. Without this, `memory_lint` returns an
+    /// error, and `memory_forget_sweep` refuses every pass that
+    /// deletes or rewrites a page (TTL, decay eviction, compaction,
+    /// cold-cluster dedup) and skips tombstone cleanup and the event-ledger
+    /// pass; only the observation prune still runs.
     #[must_use]
     pub fn with_wiki(mut self, wiki: Wiki) -> Self {
         self.wiki = Some(wiki);
@@ -2690,6 +2693,9 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \
@@ -4078,7 +4084,13 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = match args.session_id.as_deref() {
+        // Blank means omitted, as in `memory_consolidate`.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
             Some(raw) => SessionId::from_str(raw)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
@@ -4406,9 +4418,9 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let scope = args.scope.as_deref().map(str::trim);
         let profile_scope = scope == Some("profile");
@@ -4439,7 +4451,7 @@ impl AiMemoryServer {
                 .unwrap_or(if session_page { "episodic" } else { "semantic" });
         let tier: Tier = tier_name
             .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+            .map_err(|_| McpError::invalid_params(format!("unknown tier '{tier_name}'"), None))?;
         if let Some(expires_at) = args
             .expires_at
             .as_deref()
@@ -4480,7 +4492,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"global\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4505,7 +4517,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"profile\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4521,7 +4533,7 @@ impl AiMemoryServer {
                     }
                 }
                 Some(other) => {
-                    return Err(McpError::internal_error(
+                    return Err(McpError::invalid_params(
                         format!(
                             "unknown scope '{other}': the supported values are \"global\" and \"profile\""
                         ),
@@ -4753,7 +4765,7 @@ impl AiMemoryServer {
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
-                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+                .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
@@ -5286,7 +5298,7 @@ impl AiMemoryServer {
             _ => None,
         };
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => (
                 self.place_slot_delete(path, &parts).await?,
@@ -5659,7 +5671,7 @@ impl AiMemoryServer {
             .filter(|id| !id.is_empty())
             .map(|id| {
                 HandoffId::from_str(id)
-                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+                    .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
             .transpose()?;
         let handoff = if let Some(handoff_id) = requested_id {
@@ -5793,8 +5805,8 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let handoff_id = HandoffId::from_str(&args.handoff_id)
-            .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+        let handoff_id = HandoffId::from_str(args.handoff_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
             .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
@@ -6080,7 +6092,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -6161,7 +6173,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let admission = self
@@ -15175,6 +15187,91 @@ mod tests {
         }
     }
 
+    /// A malformed path, tier or scope is the caller's mistake, so the page
+    /// tools answer `invalid params` like their siblings, not an internal
+    /// error a client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn page_tools_answer_bad_path_tier_and_scope_with_invalid_params() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = |path: &str, tier: Option<&str>, scope: Option<&str>, project: Option<&str>| {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: "# Page\n".into(),
+                title: None,
+                tier: tier.map(Into::into),
+                tags: vec![],
+                pinned: false,
+                project: project.map(Into::into),
+                workspace: None,
+                scope: scope.map(Into::into),
+                expires_at: None,
+                session_id: None,
+                create_only: false,
+                expected_page_id: None,
+            }
+        };
+        for args in [
+            write("notes/a|b.md", None, None, None),
+            write("../x.md", None, None, None),
+            write("notes/ok.md", Some("bogus"), None, None),
+            write("notes/ok.md", None, Some("global"), Some("x")),
+            write("notes/ok.md", None, Some("profile"), Some("x")),
+            write("notes/ok.md", None, Some("elsewhere"), None),
+        ] {
+            let what = format!("{:?} {:?} {:?}", args.path, args.tier, args.scope);
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("../x.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "read: {err:?}"
+        );
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "../x.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "delete: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_rejects_workspace_without_project() {
         let tmp = TempDir::new().unwrap();
@@ -18818,6 +18915,128 @@ mod tests {
         );
     }
 
+    /// A malformed handoff or message id is caller input: it answers
+    /// `invalid params` (-32602) like a malformed session id, not an opaque
+    /// internal error, and keeps its message. Cancel trims the id the way
+    /// accept, pop and the admin routes already do.
+    #[tokio::test]
+    async fn malformed_handoff_and_message_ids_are_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let assert_invalid_params = |result: Result<CallToolResult, McpError>, what: &str| {
+            let err = result.expect_err("a malformed id must be refused");
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err}"
+            );
+            assert!(
+                err.to_string().contains(&format!("invalid {what}")),
+                "{err}"
+            );
+        };
+
+        assert_invalid_params(
+            server
+                .memory_handoff_accept(
+                    Parameters(HandoffAcceptArgs {
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                        handoff_id: Some("nope".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_handoff_cancel(
+                    Parameters(HandoffCancelArgs {
+                        handoff_id: "nope".into(),
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_cancel(
+                    Parameters(MessageCancelArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+
+        // A valid id with surrounding whitespace still cancels.
+        let begin = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "padded id".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let begin_text = begin
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let begin_json: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
+        let cancel = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: format!(" {handoff_id}\n"),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a whitespace-padded id names the same handoff");
+        let cancel_text = cancel
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(cancel_text.contains("\"cancelled\": true"), "{cancel_text}");
+    }
+
     #[tokio::test]
     async fn handoff_cancel_expires_open_handoff_and_clears_briefing_count() {
         let (_tmp, store, server, _ws, _pj) = setup_server().await;
@@ -19557,6 +19776,59 @@ mod tests {
             "an unknown session read as a refusal: {}",
             err.message
         );
+    }
+
+    /// A blank `session_id` means omitted and a padded one names the same
+    /// session, as in `memory_consolidate` and
+    /// `memory_read_session_observations`.
+    #[tokio::test]
+    async fn auto_improve_reads_blank_session_id_as_omitted_and_trims_padding() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let older = seed_short_completed_session(&store, ws, proj).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let latest = seed_short_completed_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for (raw, expected) in [("  ".to_string(), latest), (format!("  {older}\n"), older)] {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(raw.clone()),
+                            ..auto_improve_args(None)
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("session_id {raw:?}: {e:?}")),
+            );
+            assert_eq!(response["session_id"], expected.to_string(), "{raw:?}");
+        }
     }
 
     #[tokio::test]

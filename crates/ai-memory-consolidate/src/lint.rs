@@ -673,6 +673,8 @@ async fn contradiction_pass(
     let mut subset: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
+        // The previous report is the lint's own output, not knowledge.
+        .filter(|c| !c.path.as_str().starts_with("_lint/"))
         .filter(|c| !candidate_is_expired(c, now_us))
         .collect();
     if subset.len() < 2 {

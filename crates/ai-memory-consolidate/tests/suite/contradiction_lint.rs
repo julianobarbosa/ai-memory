@@ -16,8 +16,13 @@
 //! boundaries are testable — the synthetic bag-of-words embedder cannot pin a
 //! similarity to a chosen value.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
 use ai_memory_consolidate::{EmbeddingCoord, LintOptions, run_lint};
 use ai_memory_core::{ActorContext, PageId, PagePath, ProjectId, Tier, WorkspaceId};
+use ai_memory_llm::{ChatRequest, ChatResponse, LlmProvider, LlmResult};
 use ai_memory_store::{Store, f32_vec_to_bytes};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use rusqlite::params;
@@ -363,5 +368,85 @@ async fn contradiction_pass_skips_expired_pages() {
         !report.findings.iter().any(|f| f.kind == "contradiction"),
         "expired pages must not produce contradiction findings: {:?}",
         report.findings
+    );
+}
+
+/// Records the prompt of every structured call and reports no findings.
+struct PromptRecorder(Arc<Mutex<Vec<String>>>);
+
+impl LlmProvider for PromptRecorder {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+    fn model(&self) -> &str {
+        "recorder"
+    }
+    fn complete<'life0, 'async_trait>(
+        &'life0 self,
+        _request: ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { unreachable!("the lint pass asks for structured output") })
+    }
+    fn complete_structured_raw<'life0, 'async_trait>(
+        &'life0 self,
+        request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let prompts = self.0.clone();
+        Box::pin(async move {
+            for message in &request.messages {
+                prompts.lock().unwrap().push(message.content.clone());
+            }
+            Ok(serde_json::json!({ "findings": [] }))
+        })
+    }
+}
+
+/// The LLM pass audits knowledge pages. The previous run's `_lint/report.md`
+/// is a semantic page too, but it is the lint's own output: fed back in, the
+/// model can report the report, or re-emit stale findings that cite it.
+#[tokio::test]
+async fn llm_lint_pass_does_not_audit_the_previous_lint_report() {
+    let fx = seed_fixture().await;
+    write_semantic(&fx, "concepts/a.md", "Deploys run on Fridays.").await;
+    write_semantic(&fx, "concepts/b.md", "Deploys never run on Fridays.").await;
+    write_semantic(
+        &fx,
+        "_lint/report.md",
+        "# Lint report\n\n- **warning**: stale finding from the last run",
+    )
+    .await;
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LlmProvider> = Arc::new(PromptRecorder(prompts.clone()));
+    run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        LintOptions {
+            use_llm: true,
+            ..options(None)
+        },
+    )
+    .await
+    .unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    let prompt = prompts.join("\n");
+    assert!(prompt.contains("concepts/a.md"), "the pass ran: {prompt}");
+    assert!(!prompt.contains("_lint/report.md"), "{prompt}");
+    assert!(
+        !prompt.contains("stale finding from the last run"),
+        "{prompt}"
     );
 }

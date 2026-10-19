@@ -145,6 +145,8 @@ pub(crate) async fn handler(
         expired: meta.expired,
         updated_relative: humanize(&meta.updated_at),
         created_relative: humanize(&meta.created_at),
+        updated_at: meta.updated_at,
+        created_at: meta.created_at,
         supersedes_path,
         supersedes_href,
         body_html: rendered.html,

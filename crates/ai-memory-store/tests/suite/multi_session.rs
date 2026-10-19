@@ -4312,3 +4312,111 @@ async fn open_feedback_findings_ignores_expired_pages() {
     assert_eq!(findings[0].kind, "stale");
     assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
 }
+
+/// Memory health counts and detail lists ignore TTL-expired pages.
+#[tokio::test]
+async fn memory_health_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let past_time = jiff::Timestamp::from_second(1).unwrap();
+
+    // 1. Live episodic page and expired episodic page.
+    let mut live_stale = page(ws, proj, "notes/live_stale.md", "LiveStale", "content");
+    live_stale.tier = Tier::Episodic;
+    store.writer.upsert_page(live_stale).await.unwrap();
+
+    let mut expired_stale = page(
+        ws,
+        proj,
+        "notes/expired_stale.md",
+        "ExpiredStale",
+        "content",
+    );
+    expired_stale.tier = Tier::Episodic;
+    expired_stale.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_stale).await.unwrap();
+
+    // 2. Duplicate titles: one live page and one expired page sharing title "SameTitle".
+    let live_dup = page(ws, proj, "notes/live_dup.md", "SameTitle", "content");
+    store.writer.upsert_page(live_dup).await.unwrap();
+
+    let mut expired_dup = page(ws, proj, "notes/expired_dup.md", "SameTitle", "content");
+    expired_dup.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_dup).await.unwrap();
+
+    // 3. Orphans: live_stale and live_dup have no links.
+    // An expired orphan page should not be counted or listed as an orphan.
+    let mut expired_orphan = page(
+        ws,
+        proj,
+        "notes/expired_orphan.md",
+        "ExpiredOrphan",
+        "content",
+    );
+    expired_orphan.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_orphan).await.unwrap();
+
+    // Set updated_at on the episodic pages to 60 days ago so they qualify as stale (< 30 days).
+    let sixty_days_ago_us = jiff::Timestamp::now().as_microsecond() - 60 * 86_400 * 1_000_000;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = ?1 WHERE path IN ('notes/live_stale.md', 'notes/expired_stale.md')",
+        rusqlite::params![sixty_days_ago_us],
+    )
+    .unwrap();
+
+    // Workspace-level health counts and detail:
+    let (stale, dups, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "only live_stale is counted, expired_stale is ignored"
+    );
+    assert_eq!(
+        dups, 0,
+        "SameTitle has only one live page, expired_dup is ignored"
+    );
+    assert_eq!(
+        orphans, 2,
+        "only live_stale and live_dup are orphans; expired_orphan is ignored"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(detail.stale.len(), 1);
+    assert_eq!(detail.stale[0].path, "notes/live_stale.md");
+    assert!(detail.duplicates.is_empty());
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(
+        orphan_paths,
+        vec!["notes/live_dup.md", "notes/live_stale.md"]
+    );
+
+    // Project-level health counts and detail:
+    let (p_stale, p_dups, p_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(p_stale, 1);
+    assert_eq!(p_dups, 0);
+    assert_eq!(p_orphans, 2);
+
+    let p_detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    assert_eq!(p_detail.stale.len(), 1);
+    assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
+    assert!(p_detail.duplicates.is_empty());
+    assert_eq!(p_detail.orphans.len(), 2);
+}

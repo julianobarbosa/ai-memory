@@ -27,6 +27,7 @@ fn download(home: &Path, dest: &Path, export: bool, complete: bool) -> Output {
                 Err(error) => panic!("accepting archive request: {error}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();

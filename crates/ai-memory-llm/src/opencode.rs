@@ -83,8 +83,7 @@ impl OpenCodeProvider {
         })
     }
 
-    #[cfg(test)]
-    fn with_strict(mut self, strict: bool) -> Self {
+    pub(crate) fn with_strict(mut self, strict: bool) -> Self {
         self.chat_completions = self.chat_completions.with_strict(strict);
         self
     }
@@ -340,7 +339,9 @@ struct OpenCodeResponsesProvider {
 impl OpenCodeResponsesProvider {
     fn new(api_key: SecretString, model: String, base_url: String) -> LlmResult<Self> {
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: reqwest::Client::builder()
+                .redirect(crate::redirect::same_origin_redirects())
+                .build()?,
             api_key,
             base_url,
             model,

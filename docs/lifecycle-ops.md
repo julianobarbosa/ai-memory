@@ -192,6 +192,15 @@ busy server therefore holds up wiki mutations for longer than the delete itself.
 The git checkpoints taken before and after the purge sit outside the guard: they
 bracket it, they do not snapshot it.
 
+Reindex checks session-purge tombstones in the same SQL transaction as its
+page write. A watcher event or directory walk that started before a purge
+cannot use a stale check to restore a summary left by failed file cleanup.
+A manual replacement already preserved by the purge remains reindexable:
+the disk page must not name the purged session as its owner, and a live
+non-owned version must still exist at that path. A leftover legacy summary
+without `session_id` has no such surviving version and stays excluded.
+The watcher, its reconciliation pass and `reindex` use the same check.
+
 ### Scope containment
 
 The session id is never authority on its own. Every statement is filtered on

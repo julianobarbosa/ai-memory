@@ -301,6 +301,52 @@ async fn web_page_view_omits_author_chrome_for_anonymous_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_exposes_exact_timestamps() {
+    // The relative "Updated 3 days ago" text hides the exact time; history and
+    // session views already expose it, so the page view must too.
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/times.md", "time body"))
+        .await
+        .unwrap();
+    let meta = store
+        .reader
+        .page_meta("default", "scratch", "notes/times.md")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/notes/times.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    for (label, at) in [("Updated", &meta.updated_at), ("Created", &meta.created_at)] {
+        let tag = format!("<time datetime=\"{at}\" title=\"{at}\">");
+        assert!(text.contains(&tag), "{label} must carry {tag}: {text}");
+    }
+}
+
+#[tokio::test]
 async fn web_page_view_renders_author_chip_for_attributed_pages() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -455,19 +501,33 @@ async fn web_page_view_created_is_the_first_versions_date() {
         }
     };
 
+    // The relative value sits inside a `<time>` that carries the exact timestamp.
+    let shown = |text: &str, label: &str| -> String {
+        let start = text
+            .find(&format!("{label} <time"))
+            .unwrap_or_else(|| panic!("no {label} time: {text}"));
+        let rest = &text[start..];
+        let open = rest.find('>').unwrap() + 1;
+        let close = rest.find("</time>").unwrap();
+        rest[open..close].to_owned()
+    };
+
     let text = get("/w/default/scratch/p/notes/versions.md").await;
-    assert!(
-        text.contains("Created 1 month ago"),
-        "Created should be the oldest version's date: {text}"
+    assert_eq!(
+        shown(&text, "Created"),
+        "1 month ago",
+        "Created should be the oldest version's date"
     );
-    assert!(
-        text.contains("Updated just now"),
-        "Updated stays the latest version's date: {text}"
+    assert_eq!(
+        shown(&text, "Updated"),
+        "just now",
+        "Updated stays the latest version's date"
     );
     let text = get("/w/default/scratch/p/notes/single.md").await;
-    assert!(
-        text.contains("Created just now"),
-        "a single-version page keeps its own date: {text}"
+    assert_eq!(
+        shown(&text, "Created"),
+        "just now",
+        "a single-version page keeps its own date"
     );
 
     // The JSON API reads the same page-level date, so SPA clients agree.
@@ -4925,6 +4985,38 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
     }
 }
 
+#[tokio::test]
+async fn header_links_sit_in_a_main_nav_and_mark_the_current_section() {
+    let (_tmp, store, wiki) = setup().await;
+    // /pending and /health are root-only.
+    let app = router(store.reader.clone(), wiki).layer(axum::middleware::from_fn(
+        |mut req: Request<Body>, next: axum::middleware::Next| async move {
+            req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
+            next.run(req).await
+        },
+    ));
+    // The opening tag of the header link to `href`.
+    let tag = |body: &str, href: &str| {
+        let start = body.find(&format!(r#"<a href="{href}""#)).unwrap();
+        body[start..].split('>').next().unwrap().to_owned()
+    };
+
+    // (uri, section whose link is the current one)
+    let cases = [("/", ""), ("/pending", "pending"), ("/health", "health")];
+    for (uri, current) in cases {
+        let (status, body) = get_body(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains(r#"<nav aria-label="Main""#), "{uri}: nav");
+        for href in ["pending", "health"] {
+            assert_eq!(
+                tag(&body, href).contains(r#"aria-current="page""#),
+                href == current,
+                "{uri}: {href} link"
+            );
+        }
+    }
+}
+
 // ── Folder counts, recency and namespace pagination ──
 
 async fn get_body(app: &axum::Router, uri: &str) -> (StatusCode, String) {
@@ -5266,6 +5358,12 @@ async fn project_tree_and_namespace_listing_hide_expired_pages() {
     assert!(!project.contains("Expired Note"), "{project}");
     assert!(!project.contains("Only Gone"), "{project}");
 
+    // The home page cards count only unexpired pages.
+    let (status, home) = get_body(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(home.contains("2 pages"), "{home}");
+    assert!(!home.contains("4 pages"), "{home}");
+
     let (status, namespace) = get_body(&app, "/w/default/scratch/p/notes/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -5334,6 +5432,17 @@ async fn api_page_lists_hide_expired_pages_like_the_incremental_recent_form() {
     // The single-page read keeps answering for the expired page.
     let (status, _) = get_body(&app, &format!("{base}/pages/notes/expired.md")).await;
     assert_eq!(status, StatusCode::OK);
+
+    // Project and workspace summaries count only unexpired pages.
+    let (status, projects) = get_body(&app, "/projects").await;
+    assert_eq!(status, StatusCode::OK);
+    let projects: Value = serde_json::from_str(&projects).unwrap();
+    assert_eq!(projects[0]["page_count"], 2);
+
+    let (status, workspaces) = get_body(&app, "/workspaces").await;
+    assert_eq!(status, StatusCode::OK);
+    let workspaces: Value = serde_json::from_str(&workspaces).unwrap();
+    assert_eq!(workspaces[0]["page_count"], 2);
 }
 
 #[tokio::test]

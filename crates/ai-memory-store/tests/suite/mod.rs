@@ -35,3 +35,4 @@ mod slot_visibility;
 mod stress_writer_throughput;
 mod wal_bounds;
 mod workstream_provenance;
+mod writer_immediate;

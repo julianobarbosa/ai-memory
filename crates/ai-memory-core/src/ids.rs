@@ -1033,23 +1033,33 @@ mod tests {
 }
 
 /// Names Windows reserves regardless of extension: `CON.md` is still the
-/// console device.
+/// console device. Windows also treats the superscript digits `¹ ² ³` as
+/// port numbers, so `COM¹` is a serial port too.
 const DOS_DEVICE_NAMES: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
+    "lpt9", "lpt¹", "lpt²", "lpt³",
 ];
 
 /// Whether `stem` (a file name without its extension) is a DOS device name
 /// Windows resolves to a device instead of a file, compared case-insensitively.
+/// Spaces between the name and its extension are ignored, as Windows ignores
+/// them: `CON .md` is still the console.
 #[must_use]
 pub fn is_dos_device_name(stem: &str) -> bool {
-    DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+    DOS_DEVICE_NAMES.contains(&stem.trim_end_matches(' ').to_ascii_lowercase().as_str())
 }
 
 /// Characters Windows refuses in a filename. `/` is the separator and is
 /// handled by the caller; `\\` and a drive prefix are already rejected by
 /// [`PagePath::new`].
 const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// Longest file name, in UTF-8 bytes, that every supported filesystem stores.
+/// ext4 and most Linux filesystems cap a name at 255 bytes, NTFS at 255 UTF-16
+/// units; the byte count is never smaller than the UTF-16 count, so it is the
+/// bound both agree on.
+const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
 
 /// Returns true if a path component is reserved by Git (`.git` case-insensitively,
 /// or an 8.3 short-name alias like `git~1`..`git~4`).
@@ -1069,6 +1079,16 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
             "page path {full:?}: component {component:?} {reason}"
         )))
     };
+
+    // NTFS accepts a 100-character CJK name (103 UTF-16 units, 303 bytes)
+    // that ext4 refuses, so a page written on Windows would vanish from a
+    // Linux checkout of the same wiki.
+    if component.len() > MAX_PORTABLE_COMPONENT_BYTES {
+        return invalid(&format!(
+            "is {} bytes long; Linux filesystems refuse a name over {MAX_PORTABLE_COMPONENT_BYTES} bytes",
+            component.len()
+        ));
+    }
 
     if let Some(bad) = component
         .chars()
@@ -1122,6 +1142,10 @@ mod portable_page_path_tests {
             "notes/NUL.md",
             "notes/com1.md",
             "notes/LPT9.txt",
+            "notes/con .md",
+            "notes/NUL  .txt",
+            "notes/COM¹.md",
+            "notes/lpt³.md",
             "notes/trailing./x.md",
             "notes/trailing /x.md",
             "notes/end.md.",
@@ -1177,6 +1201,8 @@ mod portable_page_path_tests {
             "sessions/2026-08-22.md",
             "notes/icon.md",
             "notes/console.md",
+            "notes/con x.md",
+            "notes/com10.md",
             "prn-notes/aux-iliary.md",
             "a/b/c/deep.md",
             "notes/dot.in.middle.md",
@@ -1215,6 +1241,34 @@ mod portable_page_path_tests {
             assert!(
                 path.ensure_portable().is_ok(),
                 "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// The name limit is counted in UTF-8 bytes, not characters: 85 CJK
+    /// characters plus `.md` is 258 bytes, which Windows stores and Linux
+    /// refuses.
+    #[test]
+    fn components_over_255_bytes_are_rejected() {
+        let ascii_max = format!("notes/{}.md", "a".repeat(252));
+        let cjk_max = format!("notes/{}.md", "日".repeat(84));
+        for raw in [&ascii_max, &cjk_max] {
+            let path = PagePath::new(raw.as_str()).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "a 255-byte component is portable and must stay writable"
+            );
+        }
+
+        let ascii_over = format!("notes/{}.md", "a".repeat(253));
+        let cjk_over = format!("notes/{}.md", "日".repeat(85));
+        let dir_over = format!("{}/x.md", "é".repeat(128));
+        for raw in [&ascii_over, &cjk_over, &dir_over] {
+            let path =
+                PagePath::new(raw.as_str()).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} has a component over 255 bytes and must be refused at write time"
             );
         }
     }

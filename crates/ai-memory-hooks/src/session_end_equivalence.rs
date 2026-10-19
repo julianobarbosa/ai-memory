@@ -570,8 +570,31 @@ pub(super) fn build_auto_handoff(
     }
     let first_prompt = prompts.first().cloned();
     let last_prompt = prompts.last().cloned();
+    let open_questions = if turn_checkpoint {
+        // A completed turn is neither a native-session exit nor evidence that
+        // the user's last question remains unanswered.
+        last_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
+            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
+            .into_iter()
+            .collect()
+    } else {
+        derive_open_questions(observations, &last_prompt)
+    };
+    // A heuristic that quotes the last prompt already carries it; the summary
+    // must not repeat it.
+    let last_quoted = last_prompt.as_deref().is_some_and(|last| {
+        let quoted = cap_handoff_text(last.trim());
+        !quoted.is_empty() && open_questions.iter().any(|q| q.ends_with(quoted.as_str()))
+    });
     let mut summary = match (&first_prompt, &last_prompt) {
+        (Some(first), Some(last)) if first == last && last_quoted => {
+            "Single-prompt session; the prompt is quoted under open questions.".to_string()
+        }
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
+        (Some(first), Some(_)) if last_quoted => format!("Started: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
         (Some(first), None) => format!("Started: {}", cap(first)),
         _ => format!(
@@ -593,19 +616,6 @@ pub(super) fn build_auto_handoff(
         summary.push_str("\n\nLatest assistant response: ");
         summary.push_str(&assistant.body);
     }
-    let open_questions = if turn_checkpoint {
-        // A completed turn is neither a native-session exit nor evidence that
-        // the user's last question remains unanswered.
-        last_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
-            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
-            .into_iter()
-            .collect()
-    } else {
-        derive_open_questions(observations, &last_prompt)
-    };
     let next_steps = if tools.is_empty() {
         Vec::new()
     } else {

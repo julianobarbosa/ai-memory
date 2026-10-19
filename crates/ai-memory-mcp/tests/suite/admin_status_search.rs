@@ -6,9 +6,10 @@
 
 use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{ActorContext, AuthLevel, NewPage, NewUser, PagePath, Tier};
+use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{AccessMode, DecayParams, GrantLevel, Store};
-use ai_memory_wiki::Wiki;
+use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
@@ -153,6 +154,103 @@ async fn status_returns_counts_and_paths() {
             .as_u64()
             .unwrap(),
         1
+    );
+}
+
+/// After an embedding-model switch, `/admin/status` counts a page whose
+/// only vector was stored under the old triple as pending — status must
+/// match the embedder's stored identity the way `handle_embed` writes it —
+/// and reports it covered again once a vector for the configured triple
+/// exists.
+#[tokio::test]
+async fn status_counts_missing_embeddings_against_configured_triple() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_admin_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    // One page, written while the OLD model (8-dim synthetic) was
+    // configured: its only vector is stale once the model switches.
+    let old_model_wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_embedder(std::sync::Arc::new(SyntheticEmbedder::new(8)));
+    old_model_wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/old-model.md").unwrap(),
+            frontmatter: serde_json::json!({ "title": "Old model page" }),
+            body: "embedded under the old model".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Old model page".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    // The server now runs the NEW model (16-dim synthetic): the same
+    // provider/model identity, a different dimension.
+    state.embedder = Some(std::sync::Arc::new(SyntheticEmbedder::new(16)));
+
+    let missing_count = |state: AdminState| async move {
+        let app = admin_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        body["derived"]["latest_pages_missing_embeddings"]
+            .as_u64()
+            .unwrap()
+    };
+
+    assert_eq!(
+        missing_count(state.clone()).await,
+        1,
+        "a page whose only vector is from the old triple counts as pending"
+    );
+
+    // Legitimate control: re-embedded under the configured model, the
+    // page is covered again.
+    old_model_wiki
+        .with_embedder(std::sync::Arc::new(SyntheticEmbedder::new(16)))
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/old-model.md").unwrap(),
+            frontmatter: serde_json::json!({ "title": "Old model page" }),
+            body: "re-embedded under the new model".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Old model page".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_count(state).await,
+        0,
+        "a vector under the configured triple covers the page"
     );
 }
 

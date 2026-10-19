@@ -203,6 +203,55 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
+/// Reindex a disk page without reviving a purged session's summary.
+/// The tombstone and any surviving manual version are checked in the upsert
+/// transaction, so a directory walk's earlier snapshot cannot authorize a
+/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let session = page
+        .path
+        .as_str()
+        .strip_prefix("sessions/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .and_then(|id| id.parse::<SessionId>().ok());
+    if let Some(session) = session {
+        let session_text = session.to_string();
+        let owns_file = page
+            .frontmatter_json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            == Some(session_text.as_str());
+        // #866 keeps manual versions at this path. They may keep changing,
+        // but absence of `session_id` alone is not permission to recreate a
+        // deleted page: legacy summaries can lack that field too (#701).
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM purged_sessions \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
+               AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?4 \
+                   AND is_latest = 1 \
+                   AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                session.as_bytes(),
+                page.path.as_str(),
+                session_text,
+                owns_file
+            ],
+            |row| row.get(0),
+        )?;
+        if blocked {
+            return Err(StoreError::SessionPurged(session_text));
+        }
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
 /// What a conditional page write requires of the current latest version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagePrecondition {
@@ -9234,6 +9283,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn disk_reindex_checks_purge_and_surviving_version_ownership() {
+        for (label, manual_before, manual_after, incoming_owned, blocked) in [
+            ("owned leftover", false, false, true, true),
+            ("legacy leftover", false, false, false, true),
+            ("older manual is not live", true, false, false, true),
+            ("live manual replacement", false, true, false, false),
+            ("summary over live manual", false, true, true, true),
+        ] {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let sid = SessionId::new();
+            let path = format!("sessions/{sid}.md");
+            begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+            if manual_before {
+                upsert_page(&mut conn, &page(ws, proj, &path, "older manual")).unwrap();
+            }
+            let id = upsert_page(&mut conn, &session_page(ws, proj, sid, "summary")).unwrap();
+            end_session(&mut conn, &sid, Some(&id)).unwrap();
+            if manual_after {
+                upsert_page(&mut conn, &page(ws, proj, &path, "manual survivor")).unwrap();
+            }
+            purge_session(
+                &mut conn,
+                ws,
+                proj,
+                sid,
+                None,
+                Compaction::Skip,
+                PurgeMode::Commit,
+            )
+            .unwrap();
+            let disk = if incoming_owned {
+                session_page(ws, proj, sid, "rewritten summary")
+            } else {
+                page(ws, proj, &path, "rewritten manual")
+            };
+            let rows_before = count(&conn, "SELECT COUNT(*) FROM pages");
+            let result = upsert_page_from_disk(&mut conn, &disk);
+            if blocked {
+                assert!(
+                    matches!(result, Err(StoreError::SessionPurged(_))),
+                    "{label}: {result:?}"
+                );
+                assert_eq!(
+                    count(&conn, "SELECT COUNT(*) FROM pages"),
+                    rows_before,
+                    "{label}"
+                );
+            } else {
+                assert!(result.is_ok(), "{label}: {result:?}");
+            }
+            // Tombstones are scoped; the same session id in a sibling project
+            // and another session's path in this project remain writable.
+            let sibling = get_or_create_project(&mut conn, &ws, "sibling", None).unwrap();
+            assert!(
+                upsert_page_from_disk(&mut conn, &session_page(ws, sibling, sid, "sibling"))
+                    .is_ok()
+            );
+            assert!(
+                upsert_page_from_disk(
+                    &mut conn,
+                    &session_page(ws, proj, SessionId::new(), "other session")
+                )
+                .is_ok()
+            );
+            let other_ws = get_or_create_workspace(&mut conn, "other-workspace").unwrap();
+            let other_proj = get_or_create_project(&mut conn, &other_ws, "other", None).unwrap();
+            assert!(
+                upsert_page_from_disk(
+                    &mut conn,
+                    &session_page(other_ws, other_proj, sid, "other workspace")
+                )
+                .is_ok()
+            );
+            // A session_id on an ordinary content page has never made that
+            // page the reserved session summary targeted by this gate.
+            let mut note = page(ws, proj, "notes/ordinary.md", "ordinary");
+            note.frontmatter_json = serde_json::json!({"session_id": sid.to_string()});
+            assert!(upsert_page_from_disk(&mut conn, &note).is_ok());
+        }
+    }
+
+    #[test]
     fn purge_session_keeps_later_manual_page_and_its_wiki_path() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let sid = SessionId::new();
@@ -16533,6 +16664,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// `title:` must still filter on the title column when its term has
+    /// punctuation and has to be quoted.
+    #[test]
+    fn title_filter_on_punctuated_term_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "ai-memory handoff".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                "notes/mention.md",
+                "a body that mentions ai-memory",
+            ),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "title:ai-memory")
+            .expect("column-filtered search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/titled.md".to_string()]);
+    }
+
+    #[test]
+    fn grouped_title_filter_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "handoff protocol".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/mention.md", "a body about the handoff"),
+        )
+        .unwrap();
+
+        for raw in ["(title:handoff)", "(title:handoff OR title:deploy)"] {
+            let hits = fts_match_paths(&conn, raw).unwrap();
+            assert_eq!(hits, vec!["notes/titled.md".to_string()], "{raw}");
+        }
+    }
+
     /// Regression for the live-found hyphen bug: searching `ui-refresh`
     /// returned nothing in prod even though
     /// `follow-ups/ui-refresh-scroll-restoration.md` exists. The first fix
@@ -16580,6 +16763,32 @@ pub(crate) mod tests {
             "kept-hyphen phrase must not match"
         );
         assert_eq!(count("\"ui refresh\""), 1, "sub-token phrase must match");
+    }
+
+    /// A prefix search on a hyphenated term (`ai-mem*`) must still be a
+    /// prefix search once the token is quoted for its punctuation, and match
+    /// both the content token `ai-memory` and the split path index.
+    #[test]
+    fn prefix_search_on_punctuated_term_matches_content_and_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/content.md", "we ship ai-memory today"),
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "follow-ups/ui-refresh-scroll.md", "body text"),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "ai-mem*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/content.md".to_string()]);
+
+        let hits = fts_match_paths(&conn, "ui-ref*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["follow-ups/ui-refresh-scroll.md".to_string()]);
     }
 
     /// Issue #103 legacy heal: the two broad sentinels ($HOME and `/`) are

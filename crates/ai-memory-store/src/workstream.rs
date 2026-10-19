@@ -1808,10 +1808,7 @@ pub(crate) fn search_events(
     sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
-    let free_text = query
-        .replace("title:", "")
-        .replace("body:", "")
-        .replace("content:", "");
+    let free_text = strip_column_prefixes(query);
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
@@ -1842,6 +1839,29 @@ pub(crate) fn search_events(
         }
     }
     Ok(events)
+}
+
+/// Drop the `title:` / `body:` / `content:` column prefixes the search
+/// surface accepts: the ledger's FTS table has only a `content` column, so a
+/// kept `title:` would fail with "no such column". Only a prefix that starts
+/// a word is a column filter; `subtitle:` or `somebody:` keeps its text.
+fn strip_column_prefixes(query: &str) -> String {
+    const PREFIXES: [&str; 3] = ["title:", "body:", "content:"];
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let starts_word = prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == '/'));
+        if starts_word && let Some(prefix) = PREFIXES.iter().find(|p| rest.starts_with(**p)) {
+            rest = &rest[prefix.len()..];
+            prev = Some(':');
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 type EventRow = (
@@ -1905,4 +1925,26 @@ fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamE
         content,
         occurred_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_column_prefixes;
+
+    #[test]
+    fn column_prefixes_are_stripped_only_at_word_starts() {
+        assert_eq!(strip_column_prefixes("title:zebra"), "zebra");
+        assert_eq!(strip_column_prefixes("body:a content:b"), "a b");
+        assert_eq!(strip_column_prefixes("(title:a OR -body:b)"), "(a OR -b)");
+        assert_eq!(
+            strip_column_prefixes("subtitle:rendering"),
+            "subtitle:rendering"
+        );
+        assert_eq!(strip_column_prefixes("somebody: help"), "somebody: help");
+        assert_eq!(
+            strip_column_prefixes("café_title:x a/body:y"),
+            "café_title:x a/body:y"
+        );
+        assert_eq!(strip_column_prefixes("título:x"), "título:x");
+    }
 }

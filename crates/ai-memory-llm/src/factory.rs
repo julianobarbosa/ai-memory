@@ -504,6 +504,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             }
             Ok(Arc::new(
                 provider
+                    // Go's Chat Completions catalogue supports JSON Schema;
+                    // the wrapper falls back only when a model explicitly
+                    // rejects the parameter or returns an unparsable shape.
+                    .with_strict(true)
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),

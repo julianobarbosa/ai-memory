@@ -2097,8 +2097,18 @@ fn overlay_event_hooks(
         .map(|existing| {
             existing
                 .iter()
-                .filter(|e| !is_ai_memory_hook_entry(e))
-                .cloned()
+                .filter_map(|entry| {
+                    let mut entry = entry.clone();
+                    // A nested group can hold a user's hook next to ours
+                    // (a shared matcher): drop only our inner commands, and
+                    // the group only when nothing else is left in it.
+                    if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                        let before = inner.len();
+                        inner.retain(|hook| !is_ai_memory_hook_entry(hook));
+                        return (inner.len() == before || !inner.is_empty()).then_some(entry);
+                    }
+                    (!is_ai_memory_hook_entry(&entry)).then_some(entry)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -8219,6 +8229,37 @@ mod tests {
         ]);
         overlay_event_hooks(&mut hooks, "Stop", &ours);
         assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    /// A user hook added to the same matcher group as ours (what Claude
+    /// Code's /hooks UI does for a matching matcher) survives a re-apply:
+    /// only our inner command is replaced, as `uninstall` already does.
+    #[test]
+    fn overlay_event_hooks_keeps_third_party_hook_sharing_our_matcher_group() {
+        let mut hooks = serde_json::Map::new();
+        hooks.insert(
+            "SessionStart".into(),
+            serde_json::json!([
+                { "matcher": "", "hooks": [
+                    { "type": "command", "command": "/old/ai-memory hook --event session-start --agent claude-code --server-url http://old" },
+                    { "type": "command", "command": "node my-own-hook.mjs" }
+                ] }
+            ]),
+        );
+        let ours = serde_json::json!([
+            { "matcher": "", "hooks": [ { "type": "command", "command": "/new/ai-memory hook --event session-start --agent claude-code --server-url http://new" } ] }
+        ]);
+        overlay_event_hooks(&mut hooks, "SessionStart", &ours);
+        overlay_event_hooks(&mut hooks, "SessionStart", &ours);
+        let joined = serde_json::to_string(&hooks["SessionStart"]).unwrap();
+        assert!(joined.contains("my-own-hook.mjs"), "{joined}");
+        assert!(!joined.contains("/old/ai-memory"), "{joined}");
+        assert_eq!(joined.matches("/new/ai-memory").count(), 1, "{joined}");
+
+        remove_ai_memory_event_hooks(&mut hooks, "SessionStart");
+        let joined = serde_json::to_string(&hooks["SessionStart"]).unwrap();
+        assert!(joined.contains("my-own-hook.mjs"), "{joined}");
+        assert!(!joined.contains("ai-memory"), "{joined}");
     }
 
     #[test]

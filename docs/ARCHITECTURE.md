@@ -1313,7 +1313,10 @@ AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional o
                            Applies to every HTTP API provider: naming ai-memory
                            is how an operator says a vendor endpoint is proxied
                            on purpose. The ChatGPT backend (openai-oauth, codex)
-                           and cursor's CLI have no override
+                           and cursor's CLI have no override. Provider and
+                           embedder clients follow a redirect only on the
+                           origin they sent to, so set the URL a gateway
+                           redirects to rather than one that moves hosts
 LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
                            openai-compat and opencode only. Providers with a
                            fixed vendor endpoint (anthropic, openai, gemini,

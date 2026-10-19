@@ -15,6 +15,7 @@ mod git;
 mod ledger;
 mod markdown;
 pub mod migrations;
+mod okf_index;
 mod watcher;
 mod wiki;
 
@@ -32,6 +33,7 @@ pub use markdown::{
     extract_links, extract_relation_links, parse, rewrite_local_wikilinks,
 };
 pub use migrations::run_pending as run_wiki_migrations;
+pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
     ConditionalWrite, EventLedgerFile, MoveSessionOutcome, PAGE_CHECKPOINT_WALK_LIMIT,

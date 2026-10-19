@@ -210,6 +210,7 @@ impl CopilotAuthState {
             )));
         }
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;

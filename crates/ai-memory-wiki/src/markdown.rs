@@ -44,7 +44,8 @@ pub struct Markdown {
 ///
 /// Recognises only the canonical `---\n<yaml>\n---\n` block at the very
 /// start of the document, with either LF or CRLF line endings on the fence
-/// lines. Anything else is treated as body.
+/// lines. The closing fence may also end the file without a line ending.
+/// Anything else is treated as body.
 ///
 /// A leading UTF-8 BOM is dropped either way. It only means "this file is
 /// UTF-8" while it sits at offset zero; carried into `body` it is a
@@ -69,11 +70,25 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
         (trimmed.strip_prefix("---\n"), "\n")
     };
     let close = format!("\n---{newline}");
-    if let Some(rest) = rest
-        && let Some(end) = rest.find(&close)
-    {
-        let fm_str = rest[..end].trim_end_matches('\r');
-        let body = rest[end + close.len()..].to_string();
+    // The closing fence may also be the file's last line with no line
+    // ending after it: a frontmatter-only file (a `_meta.md` scope manifest,
+    // a stub page) saved by an editor that does not add a final newline.
+    let split = rest.and_then(|rest| {
+        // An empty block puts the closing fence first, with no line before
+        // it to supply the newline `close` starts with.
+        if let Some(body) = rest.strip_prefix(&close[1..]) {
+            return Some(("", body));
+        }
+        if rest == "---" {
+            return Some(("", ""));
+        }
+        rest.find(&close)
+            .map(|end| (&rest[..end], &rest[end + close.len()..]))
+            .or_else(|| rest.strip_suffix("\n---").map(|fm| (fm, "")))
+    });
+    if let Some((fm_str, body)) = split {
+        let fm_str = fm_str.trim_end_matches('\r');
+        let body = body.to_string();
         let fm_json = crate::frontmatter_yaml::parse(fm_str).map_err(WikiError::Yaml)?;
         return Ok(Markdown {
             frontmatter: fm_json,
@@ -116,8 +131,8 @@ pub fn emit(md: &Markdown) -> WikiResult<String> {
 
 /// Derive a page title.
 ///
-/// Priority: frontmatter.title (string) → first `# ` heading in body →
-/// path stem with the `.md` suffix stripped.
+/// Priority: frontmatter.title (string) → first `# ` heading in body
+/// outside fenced code blocks → path stem with the `.md` suffix stripped.
 #[must_use]
 pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath) -> String {
     if let Some(t) = frontmatter.get("title").and_then(serde_json::Value::as_str) {
@@ -126,7 +141,15 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
             return trimmed.to_string();
         }
     }
+    let mut fence = None;
     for line in body.lines() {
+        // A `# ` line inside a fenced block is a shell or Python comment,
+        // not a heading.
+        let (next, in_code) = CodeFence::step(fence, line);
+        fence = next;
+        if in_code {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# ") {
             let trimmed = rest.trim();
             if !trimmed.is_empty() {
@@ -675,9 +698,15 @@ fn resolve_local_wikilink(
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let mut href = relative_href(&page_dir, &target);
+    // The wikilink names a literal path; a Markdown destination is a URL
+    // that `extract_links` decodes once, so a literal `%` leaves as `%25`.
+    let mut href = relative_href(&page_dir, &target).replace('%', "%25");
     href.push_str(suffix);
-    let display = label.map_or(target_part, str::trim).to_string();
+    let display = label
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or(target_part)
+        .to_string();
     Some((href, display))
 }
 
@@ -1301,6 +1330,61 @@ mod tests {
         assert_eq!(md.body, "Body\r\n");
     }
 
+    /// A frontmatter-only file whose closing fence is the last line, saved
+    /// without a final newline (the editor default in several editors). The
+    /// block is still the frontmatter: reading it as body loses the `_meta.md`
+    /// workspace name and a page's tier, pin and TTL, and the OKF file pass
+    /// would write a second frontmatter block above it.
+    #[test]
+    fn parses_frontmatter_closed_at_end_of_file() {
+        let md = parse("---\ntitle: Hello\npinned: true\n---").unwrap();
+        assert_eq!(md.frontmatter["title"], "Hello");
+        assert_eq!(md.frontmatter["pinned"], true);
+        assert_eq!(md.body, "");
+        assert_eq!(
+            emit(&md).unwrap(),
+            "---\ntitle: Hello\npinned: true\n---\n",
+            "re-emitting must keep a single frontmatter block"
+        );
+
+        let crlf = parse("\u{FEFF}---\r\ntitle: Hello\r\n---").unwrap();
+        assert_eq!(crlf.frontmatter["title"], "Hello");
+        assert_eq!(crlf.body, "");
+    }
+
+    /// An empty block (`---` straight after `---`, the Jekyll idiom) is
+    /// frontmatter. Its closing fence has no newline in front of it, so it
+    /// was missed: the page body was read as YAML up to the next `---` rule,
+    /// or the whole file was kept as body.
+    #[test]
+    fn parses_empty_frontmatter_block() {
+        let md = parse("---\n---\n# Title\n\nIntro.\n\n---\n\nMore.\n").unwrap();
+        assert!(md.frontmatter.is_null(), "{:?}", md.frontmatter);
+        assert_eq!(md.body, "# Title\n\nIntro.\n\n---\n\nMore.\n");
+
+        let md = parse("---\n---\nbody").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body");
+
+        let crlf = parse("\u{FEFF}---\r\n---\r\nbody\r\n").unwrap();
+        assert!(crlf.frontmatter.is_null());
+        assert_eq!(crlf.body, "body\r\n");
+
+        let only = parse("---\n---").unwrap();
+        assert!(only.frontmatter.is_null());
+        assert_eq!(only.body, "");
+    }
+
+    /// A body line that merely starts with `---` at the end of the file is
+    /// not a closing fence.
+    #[test]
+    fn trailing_dashes_line_is_not_a_closing_fence() {
+        let src = "---\ntitle: Hello\n----";
+        let md = parse(src).unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, src);
+    }
+
     /// A page a Windows editor saved with a UTF-8 BOM and no frontmatter:
     /// the mark belongs to the file, not to the first line. Left in `body`
     /// it sits in front of the `#`, so the H1 stops being a heading and the
@@ -1636,6 +1720,35 @@ mod tests {
         );
     }
 
+    /// Agent-written pages often open with a fenced command block. A
+    /// `# comment` inside it is code, not the page's H1, so it must not
+    /// become the indexed title.
+    #[test]
+    fn title_skips_comment_lines_inside_code_fences() {
+        let path = PagePath::new("notes/setup.md").unwrap();
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            derive_title(
+                &null,
+                "```bash\n# install deps\nnpm i\n```\n# Real Title\n",
+                &path
+            ),
+            "Real Title"
+        );
+        assert_eq!(
+            derive_title(&null, "~~~python\n# compute\nx = 1\n~~~\nbody\n", &path),
+            "setup",
+            "a fenced comment must not replace the stem fallback"
+        );
+        // An unclosed fence runs to the end of the body.
+        assert_eq!(derive_title(&null, "```sh\n# only code\n", &path), "setup");
+        // A heading after an inline triple-backtick span is still a heading.
+        assert_eq!(
+            derive_title(&null, "```inline``` text\n# Heading\n", &path),
+            "Heading"
+        );
+    }
+
     #[test]
     fn extracts_internal_wiki_and_markdown_links() {
         let path = PagePath::new("concepts/current.md").unwrap();
@@ -1777,6 +1890,41 @@ mod tests {
             rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
             "[the decision](../decisions/b.md)"
         );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_falls_back_to_target_for_an_empty_label() {
+        // An empty or blank `|label` must not export as `[](…)`, a link with
+        // no text to click. The web view and `delink_wikilinks` already show
+        // the target in that case.
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md|]]", &path, "proj"),
+            "[decisions/b.md](../decisions/b.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
+            "[decisions/b](../decisions/b.md)"
+        );
+    }
+
+    /// A wikilink names a literal page path, but the exported Markdown link
+    /// is a URL that `extract_links` decodes once. A `%` in the filename has
+    /// to leave as `%25`, or the export points at another page (`a%20b.md`
+    /// read as `a b.md`) or at none (`95%cap.md` does not decode).
+    #[test]
+    fn rewrite_local_wikilinks_keeps_a_literal_percent_in_the_target() {
+        let page = PagePath::new("notes/here.md").unwrap();
+        for (body, href) in [
+            ("See [[notes/a%20b]].\n", "a%2520b.md"),
+            ("See [[notes/cpu-95%cap]].\n", "cpu-95%25cap.md"),
+        ] {
+            let before = extract_links(body, &page);
+            assert_eq!(before.len(), 1, "{body}");
+            let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
+            assert_eq!(extract_links(&exported, &page), before, "{exported}");
+        }
     }
 
     #[test]

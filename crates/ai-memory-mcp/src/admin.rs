@@ -1027,10 +1027,7 @@ async fn build_okf_bundle_file(
         // prose outside the list structure (some strict OKF validators
         // read §11.3 as rejecting a stray sentence — issue #960 item 1).
         families.sort();
-        let listing: String = families
-            .iter()
-            .map(|f| format!("- [{f}/]({f}/)\n"))
-            .collect();
+        let listing = ai_memory_wiki::okf_directory_listing(&families);
         let index = format!(
             "---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}"
         );
@@ -1309,8 +1306,20 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    // Count "missing" against the configured embedder's stored triple, so
+    // a model swap cannot read as a fully covered index; with no embedder
+    // configured the historical "no vector at all" count is kept.
+    let configured_embedding = state.embedder.as_deref().map(stored_embedding_identity);
     match state.reader.status_counts().await {
-        Ok(counts) => match state.reader.derived_index_status().await {
+        Ok(counts) => match match configured_embedding {
+            Some(identity) => {
+                state
+                    .reader
+                    .derived_index_status_for_embedding(identity)
+                    .await
+            }
+            None => state.reader.derived_index_status().await,
+        } {
             Ok(derived) => {
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
@@ -3085,6 +3094,7 @@ struct ExpireHandoffsRequest {
     workspace: String,
     project: String,
     /// Mandatory. Without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Only expire handoffs at least this many days old. Omitted clears the
     /// whole open backlog for the scope.
@@ -3523,14 +3533,14 @@ async fn handle_pending_write_diff(
     match pending_detail(&state, &id, &query).await {
         Ok((ws, proj, owned)) => {
             let detail = &owned.detail;
-            let before = state
+            let before = match state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
                 .await
-                .ok()
-                .flatten()
-                .map(|p| p.body)
-                .unwrap_or_default();
+            {
+                Ok(page) => page.map(|p| p.body).unwrap_or_default(),
+                Err(e) => return internal_err(e.to_string()),
+            };
             let diff = format!(
                 "--- before/{path}\n+++ after/{path}\n@@\n{before}\n--- proposed ---\n{after}\n",
                 path = detail.summary.target_path.as_str(),
@@ -4095,6 +4105,21 @@ async fn embed_project_pages(
     .map_err(|e| internal_err(e.to_string()))
 }
 
+/// The `(provider, model, dim)` triple rows are stored under for one
+/// embedder: `model_identity()` (which folds in a configured document
+/// prefix), never the bare wire model name. `handle_embed`'s stale-row
+/// purge and `handle_status`'s missing-vector count must both match rows
+/// the way they are written, so they share this instead of each spelling
+/// the triple (a vector counts as covering a page only when this very
+/// identity would store one for it).
+fn stored_embedding_identity(embedder: &dyn Embedder) -> (String, String, u32) {
+    (
+        embedder.provider().to_string(),
+        embedder.model_identity(),
+        embedder.dim(),
+    )
+}
+
 async fn handle_embed(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EmbedRequest>,
@@ -4111,12 +4136,7 @@ async fn handle_embed(
         }
     };
 
-    let provider = embedder.provider().to_string();
-    // Not `.model()`: the purge below must match the identity rows were
-    // actually stored under (a document-prefix change), not the wire
-    // model name. See `Embedder::model_identity`.
-    let model = embedder.model_identity();
-    let dim = embedder.dim();
+    let (provider, model, dim) = stored_embedding_identity(&*embedder);
 
     let mut totals = EmbedBackfillCounts::default();
 
@@ -4398,6 +4418,7 @@ struct PurgeSessionRequest {
     session_id: String,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
@@ -4931,6 +4952,7 @@ struct PurgeProjectRequest {
     project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Purge even when a managed workstream under this project still holds a
     /// live run lease. Off by default: the cascade would delete that lease row
@@ -5521,7 +5543,10 @@ struct CompactRequest {
     /// Mandatory confirmation. Not because compaction destroys anything — it
     /// deletes nothing — but because it takes an exclusive lock and rewrites
     /// the whole database, so every write blocks until it finishes. That is an
-    /// availability decision, and it should be deliberate.
+    /// availability decision, and it should be deliberate. An omitted field
+    /// reads as `false`, so the caller gets the 400 that says what to send
+    /// instead of the extractor's bare 422.
+    #[serde(default)]
     confirm: bool,
 }
 
@@ -5578,6 +5603,7 @@ struct ReclaimLedgerVersionsRequest {
     /// `compact` it is not reversible by re-running anything: the bytes are
     /// only in the markdown the ledger mirrors, and only if the file on disk
     /// still holds them.
+    #[serde(default)]
     confirm: bool,
     /// Report what would go without deleting it. A dry run changes nothing,
     /// so it needs no `confirm` — that is the whole point of it.
@@ -6069,6 +6095,7 @@ struct MoveProjectRequest {
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
@@ -10332,6 +10359,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
+        let web = ai_memory_web::router(store.reader.clone(), wiki.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
@@ -10356,7 +10384,7 @@ mod tests {
             scope_invalidator: None,
             trusted_proxy_identity: false,
         });
-        (tmp, router)
+        (tmp, router.nest("/web", web))
     }
 
     /// The exported tarball is a valid OKF v0.2 bundle: fresh index.md
@@ -10414,6 +10442,87 @@ mod tests {
         let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
         assert!(ai_memory_core::okf::is_conformant(&fm));
         assert_eq!(fm["type"], "Gotcha");
+    }
+
+    #[tokio::test]
+    async fn export_okf_directory_index_links_are_clickable() {
+        let (_tmp, router) = read_page_test_router();
+        let cases = [
+            ("notes", "notes", "notes/"),
+            ("team notes", "team%20notes", "team notes/"),
+            ("notes [draft", "notes%20%5Bdraft", "notes [draft/"),
+            ("c# 50%", "c%23%2050%25", "c# 50%/"),
+            ("日本語", "%E6%97%A5%E6%9C%AC%E8%AA%9E", "日本語/"),
+            ("&copy;", "%26copy%3B", "&amp;copy;/"),
+            ("`draft`", "%60draft%60", "`draft`/"),
+            ("_draft_", "_draft_", "_draft_/"),
+        ];
+        for (family, _, _) in cases {
+            post_write_page(
+                &router,
+                "default",
+                "scratch",
+                &format!("{family}/seed.md"),
+                "# Seed",
+            )
+            .await;
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
+        let mut index = String::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == std::path::Path::new("index.md") {
+                use std::io::Read as _;
+                entry.read_to_string(&mut index).unwrap();
+            }
+        }
+        assert!(
+            index.contains("- [notes/](notes/)\n"),
+            "ordinary listing changed: {index}"
+        );
+        let body = ai_memory_wiki::parse(&index).unwrap().body;
+        post_write_page(&router, "default", "scratch", "export-index.md", &body).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/web/w/default/scratch/p/export-index.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for (family, encoded, label) in cases {
+            assert!(
+                html.contains(&format!(
+                    "<a href=\"w/default/scratch/p/{encoded}\">{label}</a>"
+                )),
+                "rendered directory link missing or changed: {family}: {html}"
+            );
+        }
     }
 
     /// Issue #960 item 1: strict OKF validators read §11.3 ("follows the
@@ -12344,6 +12453,60 @@ mod tests {
                 .is_none(),
             "reject must not write the target page"
         );
+    }
+
+    /// A failed read of the target page must not be rendered as a diff
+    /// against an empty page: that is the same response a proposal for a page
+    /// that does not exist yet gets, so a reviewer would see a create where
+    /// the proposal updates an existing page.
+    #[tokio::test]
+    async fn pending_write_diff_surfaces_a_failed_page_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/pending.md",
+            "# Pending\n\nproposed body",
+        )
+        .await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let request = || {
+            Request::builder()
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"
+                ))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Control: an absent target page still diffs against an empty body.
+        let resp = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Break only the page read; the proposal tables stay readable.
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute_batch("ALTER TABLE pages RENAME TO pages_unreadable")
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/pending.md")
+                .await
+                .is_err(),
+            "fixture must make the page read fail"
+        );
+
+        let resp = router.oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("diff").is_none(), "no fabricated diff: {body}");
     }
 
     #[tokio::test]

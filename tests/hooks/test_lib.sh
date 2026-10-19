@@ -64,6 +64,18 @@ assert_eq "parse project_strategy"    "repo-root"  "$(ai_memory_parse_toml_key "
 assert_eq "absent key returns empty"  ""           "$(ai_memory_parse_toml_key "$TMP/sample.toml" missing)"
 assert_eq "absent file returns empty" ""           "$(ai_memory_parse_toml_key "$TMP/no-such-file.toml" workspace)"
 
+printf '\357\273\277workspace = "bom-workspace"\ndefault_global = true\n' >"$TMP/bom.toml"
+assert_eq "BOM does not hide first-line key" "bom-workspace" \
+    "$(ai_memory_parse_toml_key "$TMP/bom.toml" workspace)"
+assert_eq "BOM does not hide first-line flag" "true" \
+    "$(ai_memory_parse_toml_flag "$TMP/bom.toml" default_global)"
+printf '\357\273\277aliases = ["former-name"]\n' >"$TMP/bom-aliases.toml"
+bom_aliases_declared=no
+ai_memory_marker_declares_settings "$TMP/bom-aliases.toml" && bom_aliases_declared=yes
+assert_eq "BOM does not hide first-line aliases boundary" "yes" "$bom_aliases_declared"
+assert_eq "BOM does not hide first-line aliases value" '["former-name"]' \
+    "$(ai_memory_aliases_json "$TMP/bom-aliases.toml")"
+
 # --- find_marker ------------------------------------------------------
 mkdir -p "$TMP/a/b/c/d"
 printf 'workspace = "deep"\n' >"$TMP/a/.ai-memory.toml"

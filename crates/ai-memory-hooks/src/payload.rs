@@ -597,7 +597,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -661,9 +661,11 @@ impl HookEnvelope {
         } else {
             None
         };
-        if agent == AgentKind::AntigravityCli {
-            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
-        }
+        // Antigravity step output is read from `output.txt` by the client-side
+        // hook (`ai-memory hook`), on the machine that ran the tool. The server
+        // must never open a path a hook payload names: `artifactDirectoryPath`
+        // and `transcriptPath` are caller-controlled, so reading them here would
+        // turn any capture credential into a read of the server's own disk.
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -3832,16 +3834,8 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_post_tool_use_extracts_output_txt_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let step_dir = dir
-            .path()
-            .join(".system_generated")
-            .join("steps")
-            .join("42");
-        std::fs::create_dir_all(&step_dir).unwrap();
-        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
-
+    fn antigravity_post_tool_use_renders_client_enriched_output() {
+        // The client hook reads `output.txt` and sends it as `tool_response`.
         let env = HookEnvelope::from_query_and_body(
             HookQuery {
                 event: "post-tool-use".into(),
@@ -3855,12 +3849,64 @@ mod tests {
                     "args": {"CommandLine": "cargo test"}
                 },
                 "stepIdx": 42,
-                "artifactDirectoryPath": dir.path().to_str().unwrap()
+                "tool_response": "cargo test: 10 passed"
             }),
         );
         let body = env.body_excerpt.expect("body excerpt should be present");
         assert!(body.contains("tool_family: non-file"));
         assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    /// Parsing a hook payload never opens a file the payload names.
+    ///
+    /// `artifactDirectoryPath` and `transcriptPath` come from the caller. If
+    /// envelope parsing (which runs on the server for every `/hook` and
+    /// `/hook/batch` item) followed them, any capture credential could copy
+    /// `<any dir>/.system_generated/steps/<n>/output.txt` from the server's
+    /// disk into a project it can read back.
+    #[test]
+    fn envelope_parsing_never_reads_a_payload_named_antigravity_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "SERVER_DISK_SENTINEL\n").unwrap();
+        let transcript = logs.join("transcript.jsonl");
+
+        for locator in [
+            serde_json::json!({ "artifactDirectoryPath": dir.path().to_str().unwrap() }),
+            serde_json::json!({ "transcriptPath": transcript.to_str().unwrap() }),
+        ] {
+            let mut raw = serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cat secrets"}
+                },
+                "stepIdx": 42
+            });
+            raw.as_object_mut()
+                .unwrap()
+                .extend(locator.as_object().unwrap().clone());
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let body = env.body_excerpt.unwrap_or_default();
+            assert!(
+                !body.contains("SERVER_DISK_SENTINEL"),
+                "envelope parsing read a file named by the payload ({locator}): {body}"
+            );
+        }
     }
 
     #[test]

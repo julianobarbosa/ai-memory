@@ -154,7 +154,10 @@ impl OpenAiOAuthProvider {
                 token_path.display()
             ))
         })?;
-        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()
+            .map_err(LlmError::from)?;
         Ok(Self {
             client,
             model: model.into(),
