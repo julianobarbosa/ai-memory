@@ -276,7 +276,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     Ok(first.embedding)
 }
 
-/// Retried statuses for [`openai_style_embed`]: a rate limit and a
+/// Retried statuses for every remote embedder's request: a rate limit and a
 /// transient "out of capacity" answer. Everything else — other 4xx and
 /// 5xx — is handled exactly as before: no retry.
 fn is_retryable_embedding_status(status: u16) -> bool {
@@ -294,8 +294,8 @@ const MAX_RETRY_AFTER_SECS: u64 = 32;
 /// write-page embed never wait longer than a 429 storm already could.
 const MAX_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(62);
 
-/// Decide the wait before the next attempt of [`openai_style_embed`], or
-/// give up.
+/// Decide the wait before the next attempt of a remote embedding request
+/// (every HTTP embedder shares this policy), or give up.
 ///
 /// Only 429 and 503 are retriable ([`is_retryable_embedding_status`]).
 /// `attempt` is the 1-based index of the attempt being decided: up to
@@ -308,7 +308,7 @@ const MAX_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(62);
 /// stop and report the last status: a non-retriable status, more than
 /// five new attempts, or `waited + delay` exceeding
 /// [`MAX_RETRY_WAIT_BUDGET`].
-fn retry_delay(
+pub(crate) fn retry_delay(
     status: reqwest::StatusCode,
     retry_after: Option<&reqwest::header::HeaderValue>,
     attempt: u32,
@@ -673,13 +673,31 @@ impl Embedder for VoyageEmbedder {
             input: [text],
             model: &self.model,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(self.api_key.expose_secret())
-            .json(&req)
-            .send()
-            .await?;
+        let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
+        let resp = loop {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(self.api_key.expose_secret())
+                .json(&req)
+                .send()
+                .await?;
+            let status = resp.status();
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) else {
+                break resp;
+            };
+            attempt += 1;
+            waited += delay;
+            debug!(
+                attempt,
+                ?delay,
+                status = status.as_u16(),
+                "voyage embeddings 429/503; retrying"
+            );
+            tokio::time::sleep(delay).await;
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;

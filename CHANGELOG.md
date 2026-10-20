@@ -12,6 +12,16 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
+  both Go and Zen instead of the unsupported Chat Completions protocol.
+  ([#1470](https://github.com/akitaonrails/ai-memory/issues/1470))
+- Ignored a UTF-8 byte-order mark at the start of `run --env-file` input so
+  the first environment variable keeps its intended name.
+  ([#1465](https://github.com/akitaonrails/ai-memory/pull/1465))
+- Invoked GitHub Copilot CLI's native Windows lifecycle commands with
+  PowerShell's call operator. Quoted `ai-memory.exe` paths now execute instead
+  of producing a parser error that made fail-closed pre-tool hooks deny every
+  tool call. ([#1462](https://github.com/akitaonrails/ai-memory/issues/1462))
 - Repaired the exact migration checksum recorded by v2.2.1 for the original
   V62 page-window migration before running strict migration validation. This
   removes the false divergence error on every upgraded-server start while
@@ -197,6 +207,17 @@ version in [`docs/changelog/`](docs/changelog/):
   process holds the database, such as an external `wal_checkpoint`, instead
   of failing hook ingestion at once with "database is locked".
   ([#1460](https://github.com/akitaonrails/ai-memory/pull/1460))
+- Retried the Google, Copilot and Voyage embedders on HTTP 503 as well as 429,
+  with the bounded whole-second `Retry-After` policy the OpenAI-style
+  embedders already use. A brief provider overload no longer fails backfill
+  pages, inline page embeds or query vectors. Voyage previously did not retry
+  at all.
+  ([#1466](https://github.com/akitaonrails/ai-memory/issues/1466))
+- Returned MCP `invalid_params` from `memory_query` for conflicting
+  `global`, `scopes`, `workspace`/`project` and `as_of` arguments and for an
+  `as_of` that is not an ISO-8601 instant, instead of misreporting them as
+  internal server errors.
+  ([#1468](https://github.com/akitaonrails/ai-memory/issues/1468))
 
 ## [3.1.1] - 2026-10-17
 

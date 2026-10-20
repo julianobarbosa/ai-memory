@@ -318,6 +318,7 @@ const ANTHROPIC_MESSAGES_MODELS: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
     "claude-sonnet-4",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
     "qwen3.8-flash",
     "qwen3.7-max",
@@ -673,6 +674,11 @@ mod tests {
             ),
             ("gpt-6-luna", OpenCodeApi::Responses, OpenCodeApi::Responses),
             (
+                "claude-haiku-5-5",
+                OpenCodeApi::AnthropicMessages,
+                OpenCodeApi::AnthropicMessages,
+            ),
+            (
                 "qwen3.8-flash",
                 OpenCodeApi::AnthropicMessages,
                 OpenCodeApi::AnthropicMessages,
@@ -741,6 +747,7 @@ mod tests {
             "muse-spark-1.2-contributor",
             "gpt-6-luna",
             "gpt-5.6-luna",
+            "claude-haiku-5-5",
             "qwen3.8-flash",
             "deepseek-v4-flash",
         ] {
@@ -749,7 +756,7 @@ mod tests {
                 let base = format!("{}/{catalogue}/v1", server.uri());
                 let api = match (model, catalogue) {
                     ("minimax-m3" | "minimax-m2.7" | "qwen3.8-max", "zen/go")
-                    | ("qwen3.8-flash", _) => OpenCodeApi::AnthropicMessages,
+                    | ("qwen3.8-flash" | "claude-haiku-5-5", _) => OpenCodeApi::AnthropicMessages,
                     ("muse-spark-1.3-contributor" | "muse-spark-1.2-contributor", "zen/go")
                     | ("gpt-6-luna" | "gpt-5.6-luna", _) => OpenCodeApi::Responses,
                     _ => OpenCodeApi::ChatCompletions,

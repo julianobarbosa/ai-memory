@@ -3130,6 +3130,9 @@ fn resolve_run_env(
     if let Some(path) = env_file {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading --env-file {}", path.display()))?;
+        // A BOM is not whitespace to `trim`, and would become part of the
+        // first line's key.
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
         for (line_number, line) in contents.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -6922,6 +6925,23 @@ mod tests {
         assert!(
             error.to_string().contains("expected KEY=VALUE"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// An env file saved as "UTF-8 with BOM" must still set its first key,
+    /// not one named `\u{feff}KEY` that the harness never reads.
+    #[test]
+    fn resolve_run_env_ignores_a_leading_bom_in_the_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.env");
+        std::fs::write(&path, "\u{feff}FIRST=one\nSECOND=two\n").unwrap();
+        let env = resolve_run_env(None, Some(&path), &[]).unwrap();
+        assert_eq!(
+            env,
+            vec![
+                ("FIRST".to_string(), "one".to_string()),
+                ("SECOND".to_string(), "two".to_string()),
+            ]
         );
     }
 

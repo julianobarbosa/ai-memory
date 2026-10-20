@@ -2211,44 +2211,8 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
-            let event = script
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            // Antigravity's executor wraps the whole command in `cmd /c "…"`
-            // and does not strip inner quotes, so it needs the bare form
-            // (#611); every other Windows agent keeps the double-quoted form.
-            let bare = windows_hook_command_is_bare(context.agent);
-            let quote = if bare {
-                NativeQuote::WindowsBare
-            } else {
-                NativeQuote::Windows
-            };
-            let quote_field = |s: &str| {
-                if bare {
-                    s.to_string()
-                } else {
-                    win_double_quote(s)
-                }
-            };
-            let mut cmd = format!(
-                "{}{}{} hook --event {event} --agent {agent} --server-url {}",
-                powershell_call_operator(context.agent),
-                quote_field(&exe),
-                native_data_dir_arg(context.data_dir, quote),
-                quote_field(server_url),
-                agent = context.agent,
-            );
-            if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
-            }
-            cmd.push_str(&native_project_strategy_arg(
-                context.project_strategy,
-                quote,
-            ));
-            cmd.push_str(native_capture_assistant_arg(context, event));
-            cmd
+            let exe = hook_embedded_exe_path();
+            windows_native_hook_command_with_exe(&exe, script, server_url, auth_token, context)
         }
         HookCommandPlatform::PosixNative => {
             // Native POSIX (opt-in): invoke the binary directly so the hook
@@ -2286,6 +2250,53 @@ fn powershell_encoded_command(program: &str) -> String {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     base64::engine::general_purpose::STANDARD.encode(utf16_le)
+}
+
+fn windows_native_hook_command_with_exe(
+    exe: &Path,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let exe = exe.to_string_lossy();
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    // Antigravity's executor wraps the whole command in `cmd /c "…"` and
+    // does not strip inner quotes, so it needs the bare form (#611); every
+    // other Windows agent keeps the double-quoted form.
+    let bare = windows_hook_command_is_bare(context.agent);
+    let quote = if bare {
+        NativeQuote::WindowsBare
+    } else {
+        NativeQuote::Windows
+    };
+    let quote_field = |s: &str| {
+        if bare {
+            s.to_string()
+        } else {
+            win_double_quote(s)
+        }
+    };
+    let mut cmd = format!(
+        "{}{}{} hook --event {event} --agent {agent} --server-url {}",
+        powershell_call_operator(context.agent),
+        quote_field(&exe),
+        native_data_dir_arg(context.data_dir, quote),
+        quote_field(server_url),
+        agent = context.agent,
+    );
+    if let Some(t) = auth_token {
+        cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
+    }
+    cmd.push_str(&native_project_strategy_arg(
+        context.project_strategy,
+        quote,
+    ));
+    cmd.push_str(native_capture_assistant_arg(context, event));
+    cmd
 }
 
 fn windows_native_exec_spec(
@@ -2463,7 +2474,10 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Grok 1.0.41: every ai-memory hook failed with a ParserError in the
     // session's `hook_execution` updates, and its hooks guide documents the
     // PowerShell `$VAR` rewrite).
-    if matches!(agent, "codex" | "grok") {
+    // Copilot CLI selects the `command` fallback as its PowerShell command on
+    // Windows; without `&`, its quoted executable is only a string expression
+    // and every fail-closed PreToolUse hook denies the tool (#1462).
+    if matches!(agent, "codex" | "grok" | "copilot-cli") {
         "& "
     } else {
         ""
@@ -2506,6 +2520,72 @@ fn grok_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// Copilot CLI evaluates its Windows `command` fallback in PowerShell. A
+/// quoted executable therefore needs the call operator, including when its
+/// path and data directory contain spaces.
+#[test]
+fn copilot_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Copilot must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Copilot hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

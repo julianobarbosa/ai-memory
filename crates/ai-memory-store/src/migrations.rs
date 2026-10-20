@@ -5,6 +5,10 @@ use crate::error::{StoreError, StoreResult};
 refinery::embed_migrations!("migrations");
 
 /// Checksum recorded by refinery for the V62 SQL shipped in v2.2.1.
+///
+/// The historical SQL is pinned in
+/// `testdata/V62__page_ingestion_windows.pre776.sql`; a regression test
+/// derives this value through refinery's own checksum implementation.
 const ORIGINAL_V62_CHECKSUM: u64 = 16_518_128_245_137_964_566;
 const V62_VERSION: u32 = 62;
 const V62_NAME: &str = "page_ingestion_windows";
@@ -1615,6 +1619,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(previous, ("claude-code".into(), "native-1".into()));
+    }
+
+    /// The repair constant comes from the released SQL, not a remembered
+    /// value that could silently drift from its provenance.
+    #[test]
+    fn original_v62_checksum_matches_the_released_sql() {
+        let released_sql = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
+        let checksum = refinery::Migration::unapplied("V62__page_ingestion_windows", released_sql)
+            .expect("the released V62 fixture must remain a valid migration")
+            .checksum();
+
+        assert_eq!(checksum, ORIGINAL_V62_CHECKSUM);
+        let embedded = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == V62_VERSION)
+            .expect("V62 must remain embedded")
+            .checksum();
+        assert_ne!(
+            embedded, checksum,
+            "the V62 repair is unnecessary if the embedded SQL matches v2.2.1"
+        );
     }
 
     /// The one known V62 checksum is repaired before the strict runner sees
