@@ -280,6 +280,58 @@ async fn a_habit_from_two_projects_becomes_a_global_entry_once() {
     assert_eq!(versions_of(&fx, &pages[0].0).len(), 1);
 }
 
+/// The two one-shot prompts from #1648 must stay excluded even when the
+/// capability filter admits ordinary affirmative preferences again.
+#[tokio::test]
+async fn scripted_one_shot_prompts_do_not_become_global_defaults() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "demo").await;
+    let beta = project(&fx, "summarizer").await;
+    prompt(
+        &fx,
+        alpha,
+        "Do not use any tools. Reply with exactly this markdown and nothing else: \
+         Screenshot fixture ready.",
+        1,
+    )
+    .await;
+    prompt(
+        &fx,
+        beta,
+        "Here is a conversation between a user and a coding agent.\n\
+         <conversation>\nUser: Review the test output.\nAgent: The suite passed.\n\
+         </conversation>\nDo not use tools. Summarize the conversation.",
+        3,
+    )
+    .await;
+
+    let report = pass(&fx, &single_user()).await;
+    let pages = profile_pages(&fx, "_global");
+    assert!(pages.is_empty(), "{report:?}\n{pages:#?}");
+}
+
+#[tokio::test]
+async fn capability_bans_stay_out_while_affirmative_habits_need_two_projects() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    let habit = "Always use tools to verify facts.";
+    let ban = "Never use tools to answer questions.";
+    prompt(&fx, alpha, habit, 1).await;
+    prompt(&fx, alpha, ban, 1).await;
+    prompt(&fx, beta, ban, 3).await;
+    let first = pass(&fx, &single_user()).await;
+    assert_eq!(first.candidates_added, 1, "{first:?}");
+    assert!(profile_pages(&fx, "_global").is_empty());
+
+    prompt(&fx, beta, habit, 5).await;
+    let second = pass(&fx, &single_user()).await;
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(second.entries_written, 1, "{second:?}");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].1, habit);
+}
+
 /// A choice said in only one project stays out of the profile unless the
 /// user stated it as general.
 #[tokio::test]

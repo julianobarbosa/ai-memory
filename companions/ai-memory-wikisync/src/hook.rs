@@ -189,11 +189,17 @@ fn hooks_path_config(git: &GitDirs) -> Result<Option<PathBuf>> {
 fn sets_hooks_path(config: &str) -> bool {
     let mut in_core = false;
     for line in config.lines() {
-        let line = line.trim();
+        let mut line = line.trim();
         if let Some(section) = line.strip_prefix('[') {
             let name = section.split([']', ' ', '"']).next().unwrap_or_default();
             in_core = name.eq_ignore_ascii_case("core");
-            continue;
+            // Git reads what follows a section header on the same physical
+            // line as settings of that section, so `[core] hooksPath = x`
+            // must be examined rather than skipped with the header.
+            match line.split_once(']') {
+                Some((_, rest)) if !rest.trim().is_empty() => line = rest.trim(),
+                _ => continue,
+            }
         }
         let key = line.split(['=', ' ', '\t']).next().unwrap_or_default();
         if in_core && key.eq_ignore_ascii_case("hookspath") {
@@ -467,11 +473,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
+            text.contains(&format!(
                 "( command -v ai-memory-wikisync >/dev/null && ai-memory-wikisync sync \
-                 --workspace 'demo' --project 'app' --dest 'docs/wiki' --include 'decisions' ) \
-                 || true"
-            ),
+                 --workspace 'demo' --project 'app' --dest '{}' --include 'decisions' ) \
+                 || true",
+                Path::new("docs").join("wiki").display()
+            )),
             "{text}"
         );
         for flag in [
@@ -601,6 +608,24 @@ mod tests {
     }
 
     #[test]
+    fn hooks_path_on_a_section_header_line_is_refused() {
+        assert!(sets_hooks_path("[core] hooksPath = .githooks\n"));
+        assert!(sets_hooks_path("[Core] HooksPath=.githooks\n"));
+        // The remainder belongs to the section just opened, not to whatever
+        // section preceded it, and a bare header still sets nothing.
+        assert!(!sets_hooks_path("[core]\n[hooks] hookspath = x\n"));
+        assert!(!sets_hooks_path("[core]\n\tbare = false\n"));
+
+        let (_tmp, root) = repo();
+        fs::write(root.join(".git/config"), "[core] hooksPath = .githooks\n").unwrap();
+        let err = install(&install_args(&root.join("docs/wiki")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("core.hooksPath"), "{err}");
+        assert!(!hook_of(&root).exists());
+    }
+
+    #[test]
     fn a_worktree_installs_into_the_shared_hooks_dir() {
         let (_tmp, root) = repo();
         let wt_gitdir = root.join(".git/worktrees/feature");
@@ -616,7 +641,13 @@ mod tests {
 
         install(&install_args(&worktree.join("docs/wiki"))).unwrap();
         let text = fs::read_to_string(hook_of(&root)).unwrap();
-        assert!(text.contains("--dest 'docs/wiki'"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "--dest '{}'",
+                Path::new("docs").join("wiki").display()
+            )),
+            "{text}"
+        );
 
         // A worktree config can set hooksPath too.
         fs::write(wt_gitdir.join("config.worktree"), "[core]\nhooksPath = x\n").unwrap();

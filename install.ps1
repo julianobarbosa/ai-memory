@@ -49,8 +49,18 @@ function Install-AiMemory {
     }
 
     $base = if ($env:AI_MEMORY_RELEASE_BASE_URL) { $env:AI_MEMORY_RELEASE_BASE_URL.TrimEnd('/') } else { $defaultBase }
-    if ($base -eq $defaultBase -or $base.StartsWith('https://github.com/', [StringComparison]::OrdinalIgnoreCase)) {
-        if (-not $base.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) { Fail "refusing a non-https GitHub URL: $base" }
+    # The archive and its `.sha256` come from the same origin, so a plain-http
+    # GitHub base lets an on-path rewrite replace both and the checksum proves
+    # nothing. The previous guard was nested inside a condition whose two arms
+    # (the default base, or an https GitHub prefix) each already implied https,
+    # so its inner scheme test could never fire — and a plain-http GitHub base
+    # matched neither arm, so it skipped the check altogether. A non-GitHub
+    # base stays the operator's trust decision, as the header documents.
+    $baseUri = $null
+    if ([Uri]::TryCreate($base, [UriKind]::Absolute, [ref]$baseUri) -and
+        $baseUri.Scheme -eq 'http' -and
+        $baseUri.Host.TrimEnd('.') -eq 'github.com') {
+        Fail "refusing a non-https GitHub URL: $base"
     }
     $version = $env:AI_MEMORY_VERSION
     if ($version) {
@@ -118,7 +128,18 @@ function Install-AiMemory {
             # An empty or leftover directory with no binary: replace it.
             Remove-Item -LiteralPath $dest -Recurse -Force
         }
-        Move-Item -LiteralPath $staged -Destination $dest
+        # Copy, not move (#1480): an antivirus scan of the binary that just ran
+        # can still hold it open, and Windows refuses to rename or delete a file
+        # in use, which Move-Item needs. Reading it is allowed, and the staged
+        # copy is then removed below on a best-effort basis.
+        try {
+            Copy-Item -LiteralPath $staged -Destination $dest -Recurse
+        } catch {
+            # A partial copy holding ai-memory.exe would pass for an install on
+            # the next run.
+            Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+        }
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -129,11 +150,27 @@ function Install-AiMemory {
         Say "next: & `"$exe`" setup"
         return
     }
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = if ($userPath) { $userPath -split ';' | Where-Object { $_ } } else { @() }
-    if ($entries -notcontains $dest) {
-        [Environment]::SetEnvironmentVariable('Path', (@($entries) + $dest) -join ';', 'User')
-        Say "added $dest to your user PATH"
+    # Read and write the registry value itself (#1509):
+    # [Environment]::GetEnvironmentVariable expands every %VAR% entry, and
+    # SetEnvironmentVariable stores the result as a plain REG_SZ string, so an
+    # entry such as %JAVA_HOME%\bin would stop following its variable. Entries
+    # are still compared expanded, so one naming $dest through a variable counts.
+    $environment = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        $userPath = $environment.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        $entries = if ($userPath) { $userPath -split ';' | Where-Object { $_ } } else { @() }
+        $expanded = $entries | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }
+        if ($expanded -notcontains $dest) {
+            $environment.SetValue('Path', (@($entries) + $dest) -join ';', 'ExpandString')
+            # Removing a variable that does not exist changes nothing, but .NET
+            # still broadcasts WM_SETTINGCHANGE after it, so Explorer and the
+            # terminals it starts pick up the new PATH.
+            $notify = 'ai-memory-install-' + [Guid]::NewGuid().ToString('N')
+            [Environment]::SetEnvironmentVariable($notify, [NullString]::Value, 'User')
+            Say "added $dest to your user PATH"
+        }
+    } finally {
+        $environment.Dispose()
     }
     if (($env:Path -split ';') -notcontains $dest) { $env:Path = "$env:Path;$dest" }
     Say 'next: ai-memory setup'

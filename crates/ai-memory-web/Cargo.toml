@@ -31,8 +31,10 @@ sha2.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 
-# Templating + markdown.
-askama = "0.12"
+# Templating + markdown. askama's default `config` feature only reads an
+# `askama.toml`, which this crate does not have, and pulls in the
+# unmaintained `basic-toml` (RUSTSEC-2026-0374).
+askama = { version = "0.12", default-features = false, features = ["humansize", "num-traits", "urlencode"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [build-dependencies]

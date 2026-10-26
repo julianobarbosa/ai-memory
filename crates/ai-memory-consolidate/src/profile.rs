@@ -34,7 +34,10 @@ use ai_memory_core::{
     ActorContext, AutoImproveProposalId, IdentityKey, PagePath, Tier, UserId, WorkspaceId,
     find_marker_line,
 };
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
     ProfileHarvestProject, ProfileLedgerEntry, ProfilePageRow, ProfileScopePage, ProjectAccess,
@@ -132,6 +135,80 @@ const GENERAL_MARKERS: &[&str] = &[
     "em todos os meus projetos",
     "em todos os projetos",
     "em todo projeto",
+];
+
+/// The agent's own capability surface, named the way a task brief names it.
+/// A sentence that switches one off is an instruction for the session in
+/// front of it ("Do not use any tools.", "Never call browser_close"), not a
+/// habit: promoting it makes every project's agent refuse to work. Such a
+/// sentence is a candidate only when it states cross-project scope (#1648).
+const CAPABILITY_WORDS: &[&str] = &[
+    "tool",
+    "tools",
+    "browser",
+    "browsing",
+    "web search",
+    "search the web",
+    "the internet",
+    "subagent",
+    "subagents",
+    "shell commands",
+    "run commands",
+    "execute commands",
+    "mcp",
+    "ferramenta",
+    "ferramentas",
+    "navegador",
+    "subagente",
+    "subagentes",
+];
+
+/// Disabling language that has no ordinary negation. These words belong to
+/// the capability filter only: treating "off" as "not" in every topic's
+/// ruling would change how unrelated preferences are compared.
+const CAPABILITY_BAN_WORDS: &[&str] = &[
+    "without",
+    "disable",
+    "disabled",
+    "disabling",
+    "deactivate",
+    "deactivated",
+    "deactivating",
+    "off",
+    "sem",
+    "desative",
+    "desativar",
+    "desativado",
+    "desativada",
+    "desativados",
+    "desativadas",
+    "desabilite",
+    "desabilitar",
+    "desabilitado",
+    "desabilitada",
+    "desabilitados",
+    "desabilitadas",
+    "desligue",
+    "desligar",
+    "desligado",
+    "desligada",
+    "desligados",
+    "desligadas",
+];
+
+/// Phrases that mark a prompt as written by a program driving the agent
+/// through its SDK or CLI rather than by the person (#1648): a summarizer
+/// call that wraps a transcript, or a demo that asks for a verbatim reply.
+/// Everything such a prompt says about the agent's habits is the program's
+/// business, so none of it is harvested.
+const SCRIPTED_PROMPT_MARKERS: &[&str] = &[
+    "conversation between a user and",
+    "reply with exactly",
+    "respond with exactly",
+    "answer with exactly",
+    "output exactly",
+    "responda exatamente",
+    "responder exatamente",
 ];
 
 /// A marker sentence must also name an action, so "it always fails" is not a
@@ -645,7 +722,26 @@ fn has_phrase(padded: &str, phrase: &str) -> bool {
 /// LLM classifier sees). Sentences that read like agent output never pass.
 fn has_marker(sentence: &str) -> bool {
     let padded = padded_lower(sentence);
-    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m)) && !looks_agent_written(sentence)
+    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
+        && !looks_agent_written(sentence)
+        && !(forgoes_a_capability(&padded) && generality_of(sentence) != ProfileGenerality::General)
+}
+
+/// Whether `padded` switches off one of the agent's own capabilities.
+fn forgoes_a_capability(padded: &str) -> bool {
+    CAPABILITY_WORDS.iter().any(|word| has_phrase(padded, word))
+        && (ruling_sequence(padded).iter().any(|word| word == "not")
+            || CAPABILITY_BAN_WORDS
+                .iter()
+                .any(|word| has_phrase(padded, word)))
+}
+
+/// Whether `text` was written by a program calling the agent as an API.
+fn looks_like_scripted_prompt(text: &str) -> bool {
+    let padded = padded_lower(text);
+    SCRIPTED_PROMPT_MARKERS
+        .iter()
+        .any(|phrase| has_phrase(&padded, phrase))
 }
 
 /// Whether a sentence reads like agent output rather than a person typing a
@@ -700,6 +796,11 @@ fn classify_sentence(sentence: &str) -> Option<DetectedPreference> {
         return None;
     }
     if !PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m)) {
+        return None;
+    }
+    // A task brief that forbids the tools is not a habit unless the person
+    // said it holds across projects (#1648).
+    if forgoes_a_capability(&padded) && generality_of(sentence) != ProfileGenerality::General {
         return None;
     }
     let self_contained = SELF_CONTAINED_MARKERS
@@ -1716,7 +1817,12 @@ async fn classify_batch(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    let response: ClassifyResponse = complete_structured(llm, request).await?;
+    let response: ClassifyResponse = complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await?;
     let mut out: Vec<Option<DetectedPreference>> = vec![None; batch.len()];
     for item in response.items {
         let Ok(index) = usize::try_from(item.index) else {
@@ -1781,7 +1887,12 @@ async fn merge_entry(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    complete_structured(llm, request).await
+    complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,6 +2042,9 @@ async fn harvest_project(
         let Some(text) = user_written(&prompt.body) else {
             continue;
         };
+        if looks_like_scripted_prompt(&text) {
+            continue;
+        }
         let session_ref = format!("session:{}", prompt.session_id);
         if llm.is_some() {
             pending.extend(sentences(&text).into_iter().filter(|s| has_marker(s)).map(
@@ -2703,6 +2817,116 @@ mod tests {
         commits.candidate.source_ref = "session:alpha-other".to_owned();
         let plan = converge(&[&pnpm, &commits], &[], &[], 2, 1);
         assert_eq!(plan.writes.len(), 1, "{:?}", plan.writes);
+    }
+
+    /// A program's one-shot prompt is not the person's habit (#1648). Both
+    /// sentences here carry a preference marker and an action word, so the
+    /// zero-LLM detector used to promote them; the real ones reached two
+    /// projects and became `profile/tools/do-not-use-any-tools.md`.
+    #[test]
+    fn scripted_prompts_and_capability_bans_are_not_profile_preferences() {
+        for scripted in [
+            "Do not use any tools. Reply with exactly this markdown and nothing else: \n...",
+            "Here is a conversation between a user and a coding agent. Do not use tools.",
+            "Never call browser_close. Do not use the shared browser or start the web dev server.",
+        ] {
+            assert!(
+                detect_preferences(scripted).is_empty(),
+                "a scripted or task-scoped prompt became a preference: {scripted}"
+            );
+        }
+        assert!(
+            looks_like_scripted_prompt("Reply with exactly {\"ok\": true}"),
+            "a verbatim-reply instruction marks a program-written prompt"
+        );
+        assert!(
+            !looks_like_scripted_prompt("Please always reply with the failing test name"),
+            "an ordinary prompt is not a scripted call"
+        );
+
+        // The control: the same shape, now scoped across projects, is what the
+        // person meant to say in the first place.
+        let scoped = detect_preferences("In all my projects, never use tools for a lookup.");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].generality, ProfileGenerality::General);
+
+        // And an ordinary habit that mentions no capability is untouched.
+        let habits =
+            detect_preferences("Never force-push to main. Always run clippy before a commit.");
+        let statements: Vec<&str> = habits.iter().map(|f| f.statement.as_str()).collect();
+        assert_eq!(
+            statements,
+            [
+                "Never force-push to main.",
+                "Always run clippy before a commit."
+            ]
+        );
+    }
+
+    #[test]
+    fn affirmative_capability_preferences_are_still_candidates() {
+        for text in [
+            "Always use tools to verify facts.",
+            "I prefer the browser for visual checks.",
+            "By default use MCP for database lookups.",
+            "Sempre use ferramentas para verificar fatos.",
+            "Prefiro usar o navegador para verificar o resultado.",
+        ] {
+            assert!(
+                has_marker(text),
+                "the LLM gate discarded a preference: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(
+                found.len(),
+                1,
+                "the zero-LLM gate discarded a preference: {text}"
+            );
+            assert_eq!(found[0].generality, ProfileGenerality::Project, "{text}");
+        }
+        for text in [
+            "Do not use any tools.",
+            "Don't use tools for lookups.",
+            "Dont use tools for lookups.",
+            "Never call browser_close.",
+            "Always avoid shell commands.",
+            "Não use ferramentas para consultas.",
+            "Nunca use o navegador.",
+            "Sempre evite usar ferramentas.",
+            "I prefer to work without tools.",
+            "Prefiro trabalhar sem ferramentas.",
+            "I prefer to disable tools.",
+            "By default keep tools disabled.",
+            "Always keep browsing turned off.",
+            "I prefer deactivating browser tools.",
+            "Prefiro desativar ferramentas.",
+            "Prefiro desabilitar ferramentas.",
+            "Prefiro desligar o navegador.",
+            "Sempre mantenha as ferramentas desativadas.",
+            "Sempre mantenha as ferramentas desabilitadas.",
+            "Sempre mantenha o navegador desligado.",
+        ] {
+            assert!(
+                !has_marker(text),
+                "the LLM gate admitted a capability ban: {text}"
+            );
+            assert!(
+                detect_preferences(text).is_empty(),
+                "the zero-LLM gate admitted a capability ban: {text}"
+            );
+        }
+        for text in [
+            "In all my projects, I prefer to work without tools.",
+            "Em todos os meus projetos, prefiro desativar ferramentas.",
+        ] {
+            assert!(
+                has_marker(text),
+                "an explicitly scoped preference was dropped: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].generality, ProfileGenerality::General, "{text}");
+        }
     }
 
     #[test]

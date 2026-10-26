@@ -29,9 +29,12 @@ struct RestorePageResponse {
 /// Run the `restore-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if the server is unreachable, the checkpoint/path cannot be
-/// restored, or the restored page cannot be reindexed.
+/// Returns an error if an explicit scope flag is empty, the server is
+/// unreachable, the checkpoint/path cannot be restored, or the restored page
+/// cannot be reindexed.
 pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -59,7 +62,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
         workspace,
         project,
         resp.restored_from,
-        &resp.page_id[..resp.page_id.len().min(8)]
+        super::write_page::short_page_id(&resp.page_id)
     );
     if let Some(pre) = resp.pre_checkpoint {
         println!("pre-restore checkpoint: {pre}");

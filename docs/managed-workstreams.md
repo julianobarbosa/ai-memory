@@ -7,6 +7,15 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+When the server runs with `--enable-web`, root can inspect all managed ledgers
+at `/web/workstreams`. The read-only page shows trusted lifecycle state, the
+latest harness/run, current harness links, event counts, and activity times. It
+does not infer "waiting for input" from captured prose, and it never displays
+checkout paths, fingerprints, lease-owner strings, native session ids, source
+record ids, or transcript content. This cross-project operator view is not a
+discovery API: `ai-memory resume` and normal run selection remain restricted to
+the exact repository/worktree fingerprints described below.
+
 `ai-memory run` is the preferred way to start a harness: if in doubt, run
 with ai-memory. Besides session continuity, the first time it launches a given
 harness it auto-installs that harness's ai-memory hooks and MCP if they are
@@ -66,21 +75,26 @@ ai-memory run --profile work omp --profile omp-work
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
-Combine that wildcard with `--executable` to launch the right account's
-binary while keeping each account's managed workstream distinguishable in
-your shell history:
+A `claude*` name other than plain `claude` and `claude-code` also picks the
+binary: when no `--executable` is given and an executable with exactly that
+name is on the launch `PATH` (including a `PATH` set with `--env`), `run`
+launches it. Per-account wrapper scripts therefore work without repeating
+yourself:
 
 ```bash
 # ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
 # PATH than the bare `claude`) that each exec the real claude binary with
 # that account's config/credentials directory.
-ai-memory run claude-corp --executable claude-corp --model opus
-ai-memory run claude-personal --executable claude-personal
+ai-memory run claude-corp --model opus
+ai-memory run claude-personal
 ```
 
-Only the `--executable` value matters for which binary actually runs; the
-positional name is free-form as long as it starts with `claude`, so pick
-whatever reads clearly to you.
+If no executable with that name exists, `run` prints a warning on stderr and
+starts plain `claude`, so a mistyped or missing wrapper cannot silently put you
+on the wrong account. An explicit `--executable` always wins, and `claude` and
+`claude-code` always mean the plain `claude` binary. The name must be a bare
+command name found through `PATH` (a shell alias or function is invisible
+here); to use a binary elsewhere, pass `--executable <path>`.
 
 ```bash
 cd /path/to/project
@@ -123,6 +137,16 @@ wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
 "pick up where we left off" means to read the named file before inferring the
 unfinished task. This covers quota exhaustion and other abrupt exits where the
 outgoing harness cannot prepare a handoff.
+
+Outside a managed run there is no dossier, but the server still sees the cut-off
+session's captured observations. When the newest work in the project belongs to
+another session of the same operator that never ended and left no handoff after
+that work,
+`GET /handoff` adds a metadata-only notice (agent kind, session id, age) that
+tells the agent to read that session with `memory_read_session_observations`,
+newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
+(`newer_unended_session`) expose the same pointer to clients whose session start
+injects nothing.
 
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
@@ -434,7 +458,11 @@ linked id in the harness's native store without modifying it. If the transcript
 was deleted, cleared, or lost with a sandbox overlay, ai-memory starts a fresh
 native session and repoints the same workstream when that session is observed.
 An unreadable or malformed store is reported but is not mistaken for a missing
-session. Use `ai-memory run --fresh <harness>` to deliberately skip the linked
+session. Codex compresses a rollout it has not written for a week to
+`rollout-*.jsonl.zst` and restores the plain file when `codex resume` reopens
+it. The compressed copy counts as the linked session, so the launch resumes it
+and the transcript import reads it like the plain file. Use
+`ai-memory run --fresh <harness>` to deliberately skip the linked
 session and the adoption chooser. `--fresh` cannot be combined with a native
 resume, continue, session, or fork selector.
 
@@ -492,7 +520,11 @@ resume, continue, session, or fork selector.
    there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations. The checkout's
+   excluded and recorded as extraction-loss annotations. So is a record over
+   the 1 MiB per-record cap, usually an image in a tool result: it is skipped
+   rather than failing the import, and a note marks the gap. Because the
+   skipped record may have been a tool call, a later result in that turn that
+   carries no call id is treated as having an unknown call. The checkout's
    `[capture] ignore_paths` applies before upload, with the live hook's
    decision table: an excluded tool call and its result never enter the
    ledger, one the policy cannot prove safe keeps only its tool family, and a
@@ -700,7 +732,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Harness | Fresh native session | Returning native session | Read-only source |
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
-| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
+| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl`, or the `rollout-*.jsonl.zst` copy Codex keeps of a rollout idle for a week (the plain file wins when both exist) |
 | OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
 | OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
@@ -711,7 +743,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
-| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts only from `~/.gemini/antigravity-cli/history.jsonl` (assistant and tool steps come from lifecycle-hook capture) |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts from `history.jsonl`, falling back to that conversation's bounded `brain/<id>/.system_generated/logs/transcript{,_full}.jsonl` for print mode (assistant and tool steps come from lifecycle-hook capture) |
 | GitHub Copilot CLI | generated `--session-id` | `--resume=<id>` | `$COPILOT_HOME/session-state/<uuid>/events.jsonl` (`COPILOT_HOME` defaults to `~/.copilot`) |
 
 OMP's agent directory is `~/.omp/agent` for the default profile and

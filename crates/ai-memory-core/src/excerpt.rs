@@ -77,7 +77,10 @@ pub fn leading_prose(body: &str) -> Option<String> {
         end -= 1;
     }
     let mut prose = String::new();
-    for block in body[..end].split("\n\n") {
+    for block in body[..end]
+        .split("\n\n")
+        .flat_map(|block| block.split("\n\r\n"))
+    {
         let block = block.trim();
         if block.starts_with(COMPACTION_FOOTER_PREFIX) {
             continue;
@@ -353,5 +356,17 @@ mod tests {
             e.l0.as_deref(),
             Some("The writer actor owns every SQLite write. - `WriterHandle`")
         );
+    }
+    #[test]
+    fn the_a2_footer_is_not_prose_with_crlf() {
+        let body = "The writer actor owns every SQLite write.\n\n## Retained facts\n\n- `WriterHandle`\n\n_Extractively compacted from a cold episodic page (A2 tier-down). The full pre-compaction body is retained in git history._\n";
+        let expected = "The writer actor owns every SQLite write. - `WriterHandle`";
+        let lf = excerpt(json!({"compacted": true}), body);
+        assert_eq!(lf.l0.as_deref(), Some(expected));
+        assert_eq!(lf.l1.as_deref(), Some(expected));
+        for body in [body.replace('\n', "\r\n"), body.replace("\n\n", "\n\r\n")] {
+            let crlf = excerpt(json!({"compacted": true}), &body);
+            assert_eq!(crlf, lf, "CRLF excerpts must omit the same A2 footer as LF");
+        }
     }
 }

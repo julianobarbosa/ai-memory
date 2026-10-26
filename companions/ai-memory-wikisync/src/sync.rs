@@ -79,6 +79,8 @@ pub struct PlannedWrite {
     pub title: String,
     pub body: String,
     pub etag: Option<String>,
+    /// Hash of the repository file the plan read, or `None` if it was absent.
+    pub expected_disk: Option<String>,
 }
 
 /// A destination file that diverged, with a bounded diff summary.
@@ -133,6 +135,60 @@ pub struct RunArgs {
     pub include: Vec<String>,
     /// Overwrite files that diverged locally since the last export.
     pub force: bool,
+    /// Take over a destination whose baseline belongs to another server,
+    /// workspace or project: the baseline is discarded, so this run treats
+    /// the destination as a fresh export (#1708). Without it a scope change
+    /// refuses before anything is written.
+    pub adopt_scope: bool,
+}
+
+/// Refuse to reuse a baseline recorded for another scope (#1708).
+///
+/// Reusing it made every page of the previous project look "deleted on the
+/// server", which `--propagate-deletes --apply` then removed. Returns the
+/// state a run should use: cleared when `--adopt-scope` takes the
+/// destination over, stamped with this run's scope so the next save records
+/// it.
+pub fn baseline_for(
+    mut state: state::SyncState,
+    scope: &state::SyncScope,
+    adopt: bool,
+) -> Result<state::SyncState> {
+    match state::check_scope(&state, scope) {
+        state::ScopeCheck::Match => {}
+        state::ScopeCheck::Adopted => {
+            if !state.pages.is_empty() {
+                eprintln!(
+                    "ai-memory-wikisync: this destination's baseline predates origin tracking;                      adopting it for {}/{}. A baseline from another project cannot be detected,                      so check the plan before --apply.",
+                    scope.workspace, scope.project
+                );
+            }
+            state.scope = Some(scope.clone());
+        }
+        state::ScopeCheck::Mismatch { recorded } => {
+            if !adopt {
+                bail!(
+                    "this destination's baseline belongs to {} ({}/{}), not {}/{}. \
+                     Reusing it would read that project's pages as deletions here; re-run with \
+                     --adopt-scope to discard the baseline and export fresh",
+                    recorded.server,
+                    recorded.workspace,
+                    recorded.project,
+                    scope.workspace,
+                    scope.project
+                );
+            }
+            eprintln!(
+                "ai-memory-wikisync: discarding the baseline recorded for {}/{}, adopting this                  destination for {}/{}",
+                recorded.workspace, recorded.project, scope.workspace, scope.project
+            );
+            state = state::SyncState {
+                scope: Some(scope.clone()),
+                ..state::SyncState::default()
+            };
+        }
+    }
+    Ok(state)
 }
 
 /// Classify one page from its three versions. Pure: all IO happens around
@@ -190,24 +246,30 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     let Some(server) = server else {
         return "server content unchanged since the last export (revalidated by ETag)".to_string();
     };
-    let local_lines = disk.iter().filter(|byte| **byte == b'\n').count();
-    let server_lines = server.iter().filter(|byte| **byte == b'\n').count();
+    let local_lines = line_count(disk);
+    let server_lines = line_count(server);
+    // Compare the first missing line too, even when the shared prefix is identical.
     let first_difference = disk
         .split(|byte| *byte == b'\n')
-        .zip(server.split(|byte| *byte == b'\n'))
+        .map(Some)
+        .chain(std::iter::once(None))
+        .zip(
+            server
+                .split(|byte| *byte == b'\n')
+                .map(Some)
+                .chain(std::iter::once(None)),
+        )
         .position(|(local, remote)| local != remote)
         .map_or(0, |index| index + 1);
     let local_line = disk
         .split(|byte| *byte == b'\n')
-        .nth(first_difference.saturating_sub(1))
-        .unwrap_or_default();
+        .nth(first_difference.saturating_sub(1));
     let server_line = server
         .split(|byte| *byte == b'\n')
-        .nth(first_difference.saturating_sub(1))
-        .unwrap_or_default();
+        .nth(first_difference.saturating_sub(1));
     format!(
         "local {} bytes/{} lines vs server {} bytes/{} lines; first difference at line \
-         {}: local {:?} vs server {:?}",
+         {}: local {} vs server {}",
         disk.len(),
         local_lines,
         server.len(),
@@ -218,8 +280,20 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     )
 }
 
-fn preview(line: &[u8]) -> String {
-    line.iter()
+/// Lines in a file's bytes. Content not ending in a newline still has a
+/// final line, which the first-difference position below also counts, so
+/// the two numbers in one summary cannot contradict each other.
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+}
+
+fn preview(line: Option<&[u8]>) -> String {
+    let Some(line) = line else {
+        return "<end of file>".to_string();
+    };
+    let text: String = line
+        .iter()
         .take(60)
         .map(|byte| {
             if byte.is_ascii_graphic() || *byte == b' ' {
@@ -228,7 +302,8 @@ fn preview(line: &[u8]) -> String {
                 '?'
             }
         })
-        .collect()
+        .collect();
+    format!("{text:?}")
 }
 
 /// Atomic file replacement inside the destination: write a hidden tmp file
@@ -316,6 +391,24 @@ pub(crate) fn read_disk(dest_root: &Path, path: &str) -> Result<Option<Vec<u8>>>
     }
 }
 
+/// Write `bytes` over a repository file only while it is still the file the
+/// plan classified: `expected` is that file's hash, or `None` when there was
+/// no file. Returns `false`, writing nothing, when an edit landed after the
+/// plan. The check and atomic replacement are deliberately adjacent.
+pub(crate) fn write_if_unchanged(
+    dest_root: &Path,
+    rel: &str,
+    expected: Option<&str>,
+    bytes: &[u8],
+) -> Result<bool> {
+    let current = read_disk(dest_root, rel)?;
+    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
+        return Ok(false);
+    }
+    atomic_write(dest_root, rel, bytes)?;
+    Ok(true)
+}
+
 /// Fetch and classify every allowlisted page. In [`Mode::Apply`] (and only
 /// when allowed past the divergence guard) also performs the write batch
 /// and persists the new state atomically.
@@ -395,7 +488,18 @@ async fn run_batch(
     let applied = mode == Mode::Apply && (report.divergent.is_empty() || args.force);
     if applied {
         for write in &report.writes {
-            atomic_write(dest_root, &write.path, write.body.as_bytes())?;
+            if !write_if_unchanged(
+                dest_root,
+                &write.path,
+                write.expected_disk.as_deref(),
+                write.body.as_bytes(),
+            )? {
+                bail!(
+                    "{} changed in the repository during this run; left untouched. \
+                     Earlier exports may have completed; export state was not advanced",
+                    write.path
+                );
+            }
         }
         // Only after the whole batch is on disk does the state move: a
         // crash mid-batch leaves the old state, and the next run's
@@ -461,6 +565,7 @@ fn record_decision(
                 title: page.title,
                 body,
                 etag,
+                expected_disk: disk.map(state::sha256_hex),
             });
         }
         Classification::Divergent(reason) => {
@@ -488,6 +593,7 @@ fn record_decision(
                         title: page.title.clone(),
                         body: body.clone(),
                         etag,
+                        expected_disk: disk.map(state::sha256_hex),
                     });
                 }
             }
@@ -578,7 +684,8 @@ pub(crate) fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
 pub async fn run(args: &RunArgs, mode: Mode) -> Result<()> {
     let families = validate_allowlist(&args.include)?;
     let dest_root = resolve_dest(&args.dest, mode)?;
-    let old_state = state::load(&dest_root)?;
+    let scope = state::SyncScope::of(&args.server, &args.workspace, &args.project);
+    let old_state = baseline_for(state::load(&dest_root)?, &scope, args.adopt_scope)?;
     let client = ApiClient::new(&args.server, args.token.clone())?;
 
     let (report, _new_state, applied) =
@@ -672,6 +779,82 @@ mod tests {
         assert!(summary.contains("local"), "{summary}");
         let revalidated = diff_summary(Some(disk), None);
         assert!(revalidated.contains("revalidated by ETag"), "{revalidated}");
+    }
+
+    #[test]
+    fn diff_summary_reports_appended_and_removed_lines() {
+        type Case<'a> = (&'a [u8], &'a [u8], usize, &'a str, &'a str);
+        let cases: &[Case<'_>] = &[
+            (b"one", b"one\nextra", 2, "<end of file>", "\"extra\""),
+            (b"one\nextra", b"one", 2, "\"extra\"", "<end of file>"),
+            (b"one\n", b"one\nextra\n", 2, "\"\"", "\"extra\""),
+            (b"one\nextra\n", b"one\n", 2, "\"extra\"", "\"\""),
+            (b"", b"extra", 1, "\"\"", "\"extra\""),
+            (b"extra", b"", 1, "\"extra\"", "\"\""),
+            (b"one", b"one\n", 2, "<end of file>", "\"\""),
+            (b"one\n", b"one", 2, "\"\"", "<end of file>"),
+            (b"", b"\n", 2, "<end of file>", "\"\""),
+            (b"\n", b"", 2, "\"\"", "<end of file>"),
+            (
+                b"one",
+                b"one\n<end of file>",
+                2,
+                "<end of file>",
+                "\"<end of file>\"",
+            ),
+        ];
+        for (disk, server, line, local_preview, server_preview) in cases {
+            let summary = diff_summary(Some(disk), Some(server));
+            let expected = format!(
+                "first difference at line {line}: local {local_preview} vs server {server_preview}"
+            );
+            assert!(summary.ends_with(&expected), "{summary}");
+        }
+    }
+
+    #[test]
+    fn diff_summary_counts_a_final_unterminated_line() {
+        type Case<'a> = (&'a [u8], &'a [u8], &'a str);
+        let cases: &[Case<'_>] = &[
+            (
+                b"one",
+                b"one\nextra",
+                "local 3 bytes/1 lines vs server 9 bytes/2 lines",
+            ),
+            (
+                b"one\n",
+                b"one\nextra\n",
+                "local 4 bytes/1 lines vs server 10 bytes/2 lines",
+            ),
+            // Control: an empty file has no final line to count.
+            (
+                b"",
+                b"extra",
+                "local 0 bytes/0 lines vs server 5 bytes/1 lines",
+            ),
+        ];
+        for (disk, server, expected) in cases {
+            let summary = diff_summary(Some(disk), Some(server));
+            assert!(summary.starts_with(expected), "{summary}");
+        }
+
+        // A difference inside both files must not sit past a reported count.
+        let summary = diff_summary(Some(b"---\n---\nbody"), Some(b"---\n---\nbodyX"));
+        assert!(
+            summary.starts_with("local 12 bytes/3 lines vs server 13 bytes/3 lines"),
+            "{summary}"
+        );
+        assert!(summary.contains("first difference at line 3"), "{summary}");
+    }
+
+    #[test]
+    fn diff_summary_keeps_previews_bounded_and_printable() {
+        let mut disk = vec![b'a'; 57];
+        disk.extend_from_slice("é\x1b[31mhidden".as_bytes());
+        let summary = diff_summary(Some(&disk), Some(b"changed"));
+        let expected = format!("local \"{}???\" vs server \"changed\"", "a".repeat(57));
+        assert!(summary.ends_with(&expected), "{summary}");
+        assert!(!summary.contains('\x1b'), "{summary}");
     }
 
     #[test]

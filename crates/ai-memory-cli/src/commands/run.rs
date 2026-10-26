@@ -188,20 +188,70 @@ struct AutoSessionCandidate {
 #[derive(Debug, Default)]
 struct HeartbeatHealth {
     consecutive_failures: u64,
+    last_failure_kind: Option<HeartbeatFailureKind>,
+    /// Set while the harness owns the terminal: a line written to stderr then
+    /// lands inside its TUI (the prompt box, mid-render), so notices are held
+    /// until the harness exits.
+    defer_notices: bool,
+    first_deferred: Option<String>,
+    last_deferred: Option<String>,
+    deferred_count: u64,
 }
 
 impl HeartbeatHealth {
-    fn record_failure(&mut self) -> bool {
-        let first = self.consecutive_failures == 0;
+    fn deferring() -> Self {
+        Self {
+            defer_notices: true,
+            ..Self::default()
+        }
+    }
+
+    fn notify(&mut self, notice: String) {
+        if !self.defer_notices {
+            eprintln!("{notice}");
+            return;
+        }
+        self.deferred_count = self.deferred_count.saturating_add(1);
+        if self.first_deferred.is_none() {
+            self.first_deferred = Some(notice);
+        } else {
+            self.last_deferred = Some(notice);
+        }
+    }
+
+    /// The held notices, bounded to the first and the latest so a server that
+    /// flapped all day does not replay hundreds of lines.
+    fn into_deferred(self) -> Vec<String> {
+        let mut lines: Vec<String> = self.first_deferred.into_iter().collect();
+        let skipped = self.deferred_count.saturating_sub(2);
+        if skipped > 0 {
+            lines.push(format!(
+                "ai-memory: ({skipped} more managed workstream notices while the harness ran)"
+            ));
+        }
+        lines.extend(self.last_deferred);
+        lines
+    }
+
+    fn record_failure(&mut self, kind: HeartbeatFailureKind) -> bool {
+        let changed = self.last_failure_kind != Some(kind);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        first
+        self.last_failure_kind = Some(kind);
+        changed
     }
 
     fn record_success(&mut self) -> bool {
         let recovered = self.consecutive_failures > 0;
         self.consecutive_failures = 0;
+        self.last_failure_kind = None;
         recovered
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatFailureKind {
+    Unreachable,
+    Rejected,
 }
 
 fn resolve_opencode_for_launch(
@@ -425,6 +475,10 @@ fn apply_after_run_action(
         AfterRunAction::Rerun => run_harness_choice(outcome.harness),
     };
     args.harness = Some(choice);
+    // A switch leaves the account the typed wrapper named; a rerun stays on it.
+    if action != AfterRunAction::Rerun {
+        args.claude_wrapper = None;
+    }
     args.native_args =
         if action == AfterRunAction::Rerun && outcome.harness == ManagedHarness::KiroV3 {
             vec![OsString::from("--v3")]
@@ -508,6 +562,12 @@ async fn run_once_with_wiring(
             "--executable requires an explicit harness; try `ai-memory run --executable <path> codex`"
         ));
     }
+    default_claude_wrapper(
+        &mut executable,
+        requested_harness,
+        args.claude_wrapper.as_deref(),
+        executable_search,
+    );
     let resolved_opencode =
         resolve_opencode_for_launch(requested_harness, executable.as_deref(), &child_env)?;
     if matches!(requested_harness, Some(RunHarnessChoice::OpenCode))
@@ -1186,6 +1246,8 @@ async fn run_once_with_wiring(
             ));
         }
     };
+    // The harness owns the terminal from here until it exits.
+    let mut heartbeat_health = HeartbeatHealth::deferring();
     if (harness == ManagedHarness::Crush || grok_context.is_some())
         && let Err(error) = post_empty_with_retry(
             &endpoint,
@@ -1194,19 +1256,18 @@ async fn run_once_with_wiring(
         )
         .await
     {
-        eprintln!(
+        heartbeat_health.notify(format!(
             "ai-memory: {error}; the context may be delivered again on the next {} run",
             harness.as_str()
-        );
+        ));
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
-    let mut heartbeat_health = HeartbeatHealth::default();
-    let status = loop {
+    let waited = loop {
         tokio::select! {
-            result = child.wait() => break acquired_try!(result.context("waiting for managed harness")),
+            result = child.wait() => break result,
             _ = heartbeat.tick() => {
                 let _ = send_managed_heartbeat(
                     &endpoint,
@@ -1216,6 +1277,10 @@ async fn run_once_with_wiring(
             }
         }
     };
+    for notice in heartbeat_health.into_deferred() {
+        eprintln!("{notice}");
+    }
+    let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
 
     let server_status = if plan.mode == LaunchMode::Session {
@@ -2078,13 +2143,21 @@ async fn capture_interrupts(interrupted: CancellationToken) {
 /// finished, cancelled, or expired by a later prepare. Reporting it as an
 /// outage sends the operator looking for a server that never went away.
 fn heartbeat_failure_notice(error: &anyhow::Error) -> String {
+    if heartbeat_failure_kind(error) == HeartbeatFailureKind::Rejected {
+        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+    } else {
+        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+    }
+}
+
+fn heartbeat_failure_kind(error: &anyhow::Error) -> HeartbeatFailureKind {
     if error
         .chain()
         .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some())
     {
-        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+        HeartbeatFailureKind::Rejected
     } else {
-        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+        HeartbeatFailureKind::Unreachable
     }
 }
 
@@ -2109,14 +2182,15 @@ async fn send_managed_heartbeat_with_timeout(
         .and_then(|result| result);
     match &result {
         Ok(()) if health.record_success() => {
-            eprintln!(
+            health.notify(
                 "ai-memory: server connection restored; managed workstream heartbeat resumed"
+                    .to_string(),
             );
         }
         Ok(()) => {}
-        Err(error) if health.record_failure() => {
+        Err(error) if health.record_failure(heartbeat_failure_kind(error)) => {
             tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
-            eprintln!("{}", heartbeat_failure_notice(error));
+            health.notify(heartbeat_failure_notice(error));
         }
         Err(_) => {}
     }
@@ -3381,6 +3455,42 @@ fn store_mismatch_error(
     ))
 }
 
+/// Points an unset `--executable` at the typed `claude*` wrapper, warning on
+/// stderr when none is installed. An explicit `--executable` is never touched.
+fn default_claude_wrapper(
+    executable: &mut Option<OsString>,
+    requested: Option<RunHarnessChoice>,
+    spelling: Option<&str>,
+    search: ExecutableSearch<'_>,
+) {
+    if executable.is_some() || requested != Some(RunHarnessChoice::Claude) {
+        return;
+    }
+    let Some(spelling) = spelling else { return };
+    match claude_wrapper_executable(spelling, search) {
+        Ok(wrapper) => *executable = Some(wrapper),
+        Err(warning) => eprintln!("{warning}"),
+    }
+}
+
+/// The executable a `claude*` harness spelling selects when `--executable` is
+/// absent: the exact spelling when it resolves on the launch `PATH`, else a
+/// warning that plain `claude` runs instead, so a mistyped or missing wrapper
+/// cannot silently start the wrong account.
+fn claude_wrapper_executable(
+    spelling: &str,
+    search: ExecutableSearch<'_>,
+) -> std::result::Result<OsString, String> {
+    let bare_name = !spelling.contains(['/', '\\']);
+    if bare_name && executable_available(OsStr::new(spelling), search) {
+        return Ok(OsString::from(spelling));
+    }
+    Err(format!(
+        "ai-memory: no `{spelling}` executable found on PATH; running plain `claude`. \
+         To use a wrapper, put it on PATH or pass `--executable <path>`"
+    ))
+}
+
 fn ensure_executable_available(
     harness: ManagedHarness,
     executable: Option<&OsStr>,
@@ -3391,10 +3501,24 @@ fn ensure_executable_available(
         return Ok(());
     }
     Err(anyhow!(
-        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. Docker users should run `ai-memory upgrade` to refresh the host wrapper",
+        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. {}",
         harness.as_str(),
-        program.to_string_lossy()
+        program.to_string_lossy(),
+        docker_host_client_hint(),
     ))
+}
+
+/// The Docker-wrapper advice appended to a missing-harness error, split by OS
+/// because the two wrappers upgrade differently (#1545): the POSIX wrapper's
+/// `upgrade` re-downloads its checksum-verified native host client, while the
+/// PowerShell wrapper's `upgrade` only pulls the image, so a Windows Docker
+/// user needs the native client's installer instead.
+fn docker_host_client_hint() -> &'static str {
+    if cfg!(windows) {
+        "Docker Desktop users: managed launches run through the native Windows client, not the container; install it with `irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex` (docs/windows.md)"
+    } else {
+        "Docker users should run `ai-memory upgrade` to refresh the host wrapper"
+    }
 }
 
 /// Whether this harness's default executable resolves through `PATH`.
@@ -3496,7 +3620,14 @@ fn resolve_candidate(
         extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
-            .map(|extension| path.with_extension(extension.trim_start_matches('.')))
+            .map(|extension| {
+                // PATHEXT is appended to the full command name, including any
+                // dots in a wrapper name such as `agent.tool.cmd`.
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(".");
+                candidate.push(extension.trim_start_matches('.'));
+                PathBuf::from(candidate)
+            })
             .find(|candidate| executable_file(candidate))
     }
     #[cfg(not(windows))]
@@ -4478,6 +4609,7 @@ pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
         "kiro-v3" => Some(ManagedHarness::KiroV3),
         "grok" => Some(ManagedHarness::Grok),
         "antigravity" => Some(ManagedHarness::Antigravity),
+        "copilot" => Some(ManagedHarness::Copilot),
         _ => None,
     }
 }
@@ -4503,6 +4635,65 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    /// Every harness a journal entry can name.
+    const EVERY_MANAGED_HARNESS: &[ManagedHarness] = &[
+        ManagedHarness::Claude,
+        ManagedHarness::Codex,
+        ManagedHarness::OpenCode,
+        ManagedHarness::OpenCode2,
+        ManagedHarness::Pi,
+        ManagedHarness::Crush,
+        ManagedHarness::Omp,
+        ManagedHarness::Kimi,
+        ManagedHarness::CommandCode,
+        ManagedHarness::Kiro,
+        ManagedHarness::KiroV3,
+        ManagedHarness::Grok,
+        ManagedHarness::Antigravity,
+        ManagedHarness::Copilot,
+    ];
+
+    /// The exact spelling `append_journal_entry` records for each harness,
+    /// pinned here so a rename cannot silently orphan existing journals. This
+    /// match is also the compile-time lever: a new `ManagedHarness` variant
+    /// fails to build until it is given a journal name and listed in
+    /// `EVERY_MANAGED_HARNESS` above, which drags it into the round trip.
+    const fn journal_name(harness: ManagedHarness) -> &'static str {
+        match harness {
+            ManagedHarness::Claude => "claude",
+            ManagedHarness::Codex => "codex",
+            ManagedHarness::OpenCode => "opencode",
+            ManagedHarness::OpenCode2 => "opencode2",
+            ManagedHarness::Pi => "pi",
+            ManagedHarness::Crush => "crush",
+            ManagedHarness::Omp => "omp",
+            ManagedHarness::Kimi => "kimi",
+            ManagedHarness::CommandCode => "command-code",
+            ManagedHarness::Kiro => "kiro",
+            ManagedHarness::KiroV3 => "kiro-v3",
+            ManagedHarness::Grok => "grok",
+            ManagedHarness::Antigravity => "antigravity",
+            ManagedHarness::Copilot => "copilot",
+        }
+    }
+
+    #[test]
+    fn the_journal_round_trips_every_managed_harness_name() {
+        for &harness in EVERY_MANAGED_HARNESS {
+            let name = journal_name(harness);
+            assert_eq!(
+                harness.as_str(),
+                name,
+                "{harness:?} no longer writes {name:?} into the recovery journal"
+            );
+            assert_eq!(
+                harness_from_journal_name(name),
+                Some(harness),
+                "the recovery journal writes {name:?} for {harness:?} but cannot parse it back"
+            );
+        }
     }
 
     #[test]
@@ -5114,6 +5305,7 @@ mod tests {
             env: vec![("MODEL_HOME".into(), "custom".into())],
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--model"), OsString::from("opus")],
         }
     }
@@ -5397,6 +5589,124 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn path_with_fake_executables(names: &[&str]) -> (tempfile::TempDir, EffectiveChildEnv) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in names {
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = EffectiveChildEnv::for_tests([("PATH", bin.as_os_str())]);
+        (temp, env)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_spelling_defaults_the_executable_to_the_matching_wrapper() {
+        let (_temp, env) = path_with_fake_executables(&["claude", "claude-glm"]);
+        let mut executable = None;
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            env.executable_search(),
+        );
+        assert_eq!(executable, Some(OsString::from("claude-glm")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_spelling_without_a_wrapper_warns_and_keeps_plain_claude() {
+        let (_temp, env) = path_with_fake_executables(&["claude"]);
+        let search = env.executable_search();
+        let warning = claude_wrapper_executable("claude-glm", search).unwrap_err();
+        assert!(warning.contains("`claude-glm`"), "{warning}");
+        assert!(warning.contains("plain `claude`"), "{warning}");
+        assert!(warning.contains("--executable"), "{warning}");
+
+        let mut executable = None;
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            search,
+        );
+        assert_eq!(executable, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_executable_beats_the_claude_spelling() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm", "claude-other"]);
+        let mut executable = Some(OsString::from("claude-other"));
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            env.executable_search(),
+        );
+        assert_eq!(executable, Some(OsString::from("claude-other")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_wrapper_lookup_accepts_bare_names_only() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm"]);
+        let search = env.executable_search();
+        assert!(claude_wrapper_executable("claude-glm", search).is_ok());
+        assert!(claude_wrapper_executable("claude-glm2", search).is_err());
+        // A path-like spelling is never resolved relative to anything.
+        assert!(claude_wrapper_executable("./claude-glm", search).is_err());
+        assert!(claude_wrapper_executable("../bin/claude-glm", search).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_harnesses_and_bare_claude_never_get_a_wrapper() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm", "codex"]);
+        let search = env.executable_search();
+        for (requested, spelling) in [
+            (Some(RunHarnessChoice::Codex), Some("claude-glm")),
+            (Some(RunHarnessChoice::Claude), None),
+            (None, Some("claude-glm")),
+        ] {
+            let mut executable = None;
+            default_claude_wrapper(&mut executable, requested, spelling, search);
+            assert_eq!(executable, None, "{requested:?} {spelling:?}");
+        }
+    }
+
+    #[test]
+    fn switching_harness_drops_the_claude_wrapper_but_rerun_keeps_it() {
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "ws".into(),
+            degraded: false,
+        };
+        let mut args = run_args_for_after_run_test();
+        args.claude_wrapper = Some("claude-glm".into());
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Rerun
+        ));
+        assert_eq!(args.claude_wrapper.as_deref(), Some("claude-glm"));
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        ));
+        assert_eq!(args.claude_wrapper, None);
+    }
+
     #[test]
     fn resolved_run_env_overlays_windows_keys_case_insensitively() {
         let mut entries = vec![("Path".to_string(), "C:\\base".to_string())];
@@ -5508,6 +5818,54 @@ mod tests {
         assert!(status.success(), "the resolved wrapper exits successfully");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_dotted_harness_name_launches_its_own_pathext_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            dir.join("agent.tool.cmd"),
+            "@echo off\r\necho intended-harness\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("agent.cmd"), "@echo off\r\necho wrong-harness\r\n").unwrap();
+        let native = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "agent.tool"])
+            .env("PATH", dir)
+            .env("PATHEXT", ".EXE;.CMD")
+            .current_dir(dir)
+            .output()
+            .expect("native cmd lookup launches");
+        assert!(
+            native.status.success(),
+            "native cmd lookup must accept dotted basename: {:?}",
+            native
+        );
+        let native_stdout = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            native_stdout.trim(),
+            "intended-harness",
+            "independent Windows lookup appends PATHEXT to dotted basename"
+        );
+        println!("NATIVE_WINDOWS_CONTROL={}", native_stdout.trim());
+        let search = ExecutableSearch {
+            path: Some(dir.as_os_str()),
+            extensions: Some(OsStr::new(".EXE;.CMD")),
+        };
+        let path =
+            resolve_program(OsStr::new("agent.tool"), search).expect("dotted harness resolves");
+        let output = std::process::Command::new(path)
+            .output()
+            .expect("resolved harness launches");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout.trim(),
+            "intended-harness",
+            "PATHEXT must preserve the complete dotted harness name"
+        );
+    }
+
     /// Unix has no PATHEXT: the file itself is the answer.
     #[cfg(not(windows))]
     #[test]
@@ -5594,12 +5952,44 @@ mod tests {
     fn heartbeat_health_reports_each_outage_and_recovery_once() {
         let mut health = HeartbeatHealth::default();
 
-        assert!(health.record_failure());
-        assert!(!health.record_failure());
-        assert!(!health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(!health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(health.record_failure(HeartbeatFailureKind::Rejected));
+        assert!(!health.record_failure(HeartbeatFailureKind::Rejected));
         assert!(health.record_success());
         assert!(!health.record_success());
-        assert!(health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
+    }
+
+    #[test]
+    fn deferred_heartbeat_notices_wait_for_the_harness_to_exit() {
+        assert!(HeartbeatHealth::deferring().into_deferred().is_empty());
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage 1".to_string());
+        health.notify("restored 1".to_string());
+        health.notify("outage 2".to_string());
+        health.notify("restored 2".to_string());
+
+        assert_eq!(
+            health.into_deferred(),
+            [
+                "outage 1".to_string(),
+                "ai-memory: (2 more managed workstream notices while the harness ran)".to_string(),
+                "restored 2".to_string(),
+            ]
+        );
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage".to_string());
+        assert_eq!(health.into_deferred(), ["outage".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_notices_print_immediately_when_nothing_owns_the_terminal() {
+        let mut health = HeartbeatHealth::default();
+        health.notify("outage".to_string());
+        assert!(health.into_deferred().is_empty());
     }
 
     #[tokio::test]
@@ -6868,6 +7258,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
 
@@ -7214,6 +7605,7 @@ mod tests {
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--version")],
         };
 
@@ -7320,6 +7712,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
         (temp, config, args)
@@ -7816,6 +8209,7 @@ mod tests {
             )],
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
 
@@ -7910,6 +8304,52 @@ mod tests {
         .unwrap();
         assert!(orphaned.is_none());
         assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// Codex compresses a rollout idle for a week to `.jsonl.zst`. The launch
+    /// still resumes that linked session instead of treating it as missing.
+    #[test]
+    fn compressed_codex_rollout_is_resumed_not_orphaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let day = temp.path().join(".codex/sessions/2026/10/05");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let record = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+        let compressed = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl.zst"));
+        std::fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                format!("{record}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let env = EffectiveChildEnv::default();
+        let plan = || {
+            build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                temp.path(),
+                &cwd,
+                &env,
+            )
+            .unwrap()
+        };
+
+        let (resumed, orphaned) = plan();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "resume"));
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id));
+
+        std::fs::remove_file(&compressed).unwrap();
+        let (fresh, orphaned) = plan();
+        assert_eq!(orphaned.as_deref(), Some(id));
+        assert!(!fresh.args.iter().any(|arg| arg == "resume"));
     }
 
     /// A linked session missing from this launch's store is only replaced
@@ -8573,6 +9013,7 @@ mod tests {
             ],
             env_file: None,
             harness: Some(RunHarnessChoice::OpenCode),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--help")],
         };
 
@@ -8699,6 +9140,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--version")],
         };
 
@@ -8983,6 +9425,7 @@ mod tests {
             env,
             env_file: None,
             harness: Some(harness),
+            claude_wrapper: None,
             native_args: native_args.iter().map(OsString::from).collect(),
         }
     }

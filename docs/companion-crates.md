@@ -142,6 +142,11 @@ Initial source support is intentionally narrow:
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
+- one explicitly selected local text/Markdown, text-layer PDF, DOCX, PPTX,
+  XLSX, VTT, or SRT document (`document`, Unix-only). Extraction is bounded and
+  sanitized, pages carry source digest and extractor provenance, and writes
+  use MCP `create_only` so reruns are idempotent and conflicts never overwrite
+  another page. OCR, images, and raw audio/video stay outside the companion.
 
 Future sources can include:
 
@@ -300,6 +305,13 @@ directions are family-scoped and dry-run by default.
   state, server body): files edited locally since the last export are
   reported with a diff summary and the whole batch is refused without
   `--force`.
+- The state file records the server origin, workspace and project it was
+  exported from. Reusing a destination for another scope refuses before
+  anything is written — otherwise that project's pages read as "deleted on
+  the server" and `--propagate-deletes --apply` removes them — and
+  `--adopt-scope` is the explicit way to discard the baseline and start
+  fresh (#1708). A baseline written before the field existed is adopted on
+  its first run, with a warning.
 - `plan` and `export` never delete; `sync` deletes only with
   `--propagate-deletes`. It never runs git, commits, or pushes; it prints
   the commands (`git add`, `git rm`) the operator may run.
@@ -678,10 +690,11 @@ unclaimed tree. Building the guard on ai-memory's captured
   (agentmemory #221), so by design there is no synchronous veto channel back to
   the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
-  stored observation is reduced to a `tool_family` label plus outcome; raw
-  arguments, paths, and tool names are extracted only transiently for
-  denylist matching, then dropped (`CaptureDecision` "never retains raw
-  arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
+  stored observation is reduced to a `tool_family` label plus outcome (and an
+  MCP tool's validated server and tool names); raw arguments, paths, and other
+  tool names are extracted only transiently for denylist matching, then dropped
+  (`CaptureDecision` "never retains raw arguments, paths, or arbitrary tool
+  names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
 Reversing either (persisting paths, or adding a blocking hook) would trade away a
