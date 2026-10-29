@@ -221,7 +221,8 @@ async fn stage_then_swap(
     //    live is touched. Dropping the store joins the writer thread and
     //    closes every connection, so the directory can be renamed afterwards
     //    on Windows as well.
-    let store = Store::open(staging).context("opening restored store")?;
+    let store =
+        Store::open_snapshot(staging).context("opening restored store from its snapshot")?;
     let has_api_credentials = store.reader.api_credentials_exist().await?;
     let has_pepper_verifier = store
         .reader
@@ -931,6 +932,101 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_snapshot_is_missing() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(
+            scratch.path(),
+            "missing-db.tar.gz",
+            &gz_tarball(&[("wiki/default/project/notes/new.md", b"new page")]),
+        );
+
+        let error = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
+        assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_snapshot_is_zero_bytes() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(
+            scratch.path(),
+            "empty-db.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", b""),
+            ]),
+        );
+
+        let error = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
+        assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_snapshot_has_no_schema() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let snapshot = scratch.path().join("blank.sqlite");
+        let conn = rusqlite::Connection::open(&snapshot).unwrap();
+        conn.execute_batch("VACUUM").unwrap();
+        drop(conn);
+        let db = std::fs::read(&snapshot).unwrap();
+        assert!(
+            !db.is_empty(),
+            "the fixture must be a non-empty SQLite file"
+        );
+        let from = write_tarball(
+            scratch.path(),
+            "uninitialized-db.tar.gz",
+            &gz_tarball(&[("db/memory.sqlite", &db)]),
+        );
+
+        let error = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
+        assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
+    async fn restore_accepts_an_initialized_snapshot_without_pages() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = migrated_sqlite_bytes();
+        let from = write_tarball(
+            scratch.path(),
+            "empty-store.tar.gz",
+            &gz_tarball(&[("db/memory.sqlite", &db)]),
+        );
+
+        restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(data.path().join("db/memory.sqlite")).unwrap();
+        let pages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pages, 0);
+        assert!(!data.path().join("wiki").exists());
+        assert_eq!(
+            std::fs::read(data.path().join("config.toml")).unwrap(),
+            b"# old config\n"
+        );
+        assert!(restore_scratch_dirs(data.path()).is_empty());
     }
 
     #[tokio::test]

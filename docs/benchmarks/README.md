@@ -13,6 +13,8 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-26** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.6 release)** | **0.951** | [longmemeval-s-3.2.6-release.md](longmemeval-s-3.2.6-release.md) |
+| **2026-10-26** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.6 release)** | **0.945** | [longmemeval-s-3.2.6-release.md](longmemeval-s-3.2.6-release.md) |
 | **2026-10-25** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.4 release)** | **0.951** | [longmemeval-s-3.2.4-release.md](longmemeval-s-3.2.4-release.md) |
 | **2026-10-25** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.4 release)** | **0.945** | [longmemeval-s-3.2.4-release.md](longmemeval-s-3.2.4-release.md) |
 | **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.2 release)** | **0.951** | [longmemeval-s-3.2.2-release.md](longmemeval-s-3.2.2-release.md) |
@@ -34,6 +36,12 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 3.2.6 patch-release run found FTS identical to 3.2.4 at every accuracy
+and recall cutoff. Local embeddings kept the same `hit@5` and `hit@10`
+overall, while `recall@10` improved. See the
+[3.2.6 release report](longmemeval-s-3.2.6-release.md) for provenance, slice
+movement, and the load-sensitive latency comparison.
 
 The 3.2.4 patch-release run found FTS identical to 3.2.2 at every accuracy
 cutoff and local embeddings unchanged at `hit@5` overall and on every slice.

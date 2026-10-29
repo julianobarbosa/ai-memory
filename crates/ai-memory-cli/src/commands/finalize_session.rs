@@ -52,8 +52,9 @@ struct FinalizeSessionReport {
 /// Run the `finalize-session` subcommand.
 ///
 /// # Errors
-/// Returns an error if the configured server cannot list the scope's open
-/// sessions or rejects a synthetic `session-end` hook.
+/// Returns an error if an explicit scope flag is empty, the configured server
+/// cannot list the scope's open sessions, or the server rejects a synthetic
+/// `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let (workspace, project, finalized) = finalize(config, &args).await?;
     let agent = args.agent;
@@ -67,6 +68,8 @@ pub(crate) async fn finalize(
     config: &Config,
     args: &FinalizeSessionArgs,
 ) -> Result<(String, String, Vec<String>)> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
@@ -629,5 +632,44 @@ mod tests {
                 ("project".to_string(), "project".to_string()),
             ]
         );
+    }
+
+    fn finalize_args(workspace: Option<&str>, project: Option<&str>) -> FinalizeSessionArgs {
+        FinalizeSessionArgs {
+            agent: AgentKind::AntigravityCli,
+            workspace: workspace.map(Into::into),
+            project: project.map(Into::into),
+            all_owners: false,
+            all: false,
+            session_id: None,
+            reopen: false,
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_is_refused_before_server_or_scope_work() {
+        for empty in ["", " \t "] {
+            let error = finalize(&Config::default(), &finalize_args(Some(empty), None))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--workspace was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_is_refused_before_server_or_scope_work() {
+        for empty in ["", " \t "] {
+            let error = finalize(&Config::default(), &finalize_args(None, Some(empty)))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--project was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

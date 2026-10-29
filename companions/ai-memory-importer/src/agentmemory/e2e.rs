@@ -254,4 +254,36 @@ async fn e2e_export_import_rebuilds_chains_and_honours_ttl() {
     let second = manifest(&fixture.manifest);
     assert_eq!(second["written_versions"], 0, "a rerun writes 0");
     assert_eq!(second["present_versions"], 14);
+
+    // The destination can evolve independently between imports. Keeping the
+    // attribution footer does not mean the current body is still ours.
+    let edited_body = format!(
+        "Keep this destination correction.\n\n{}",
+        latest["body"].as_str().unwrap()
+    );
+    let edited = tool(
+        &server,
+        "memory_write_page",
+        json!({"workspace": "acme", "project": "acme-api",
+            "path": "imported/agentmemory/memories/mem-q1.md",
+            "body": edited_body, "expected_page_id": latest["page_id"]}),
+    )
+    .await;
+    data["memories"].as_array_mut().unwrap().push(json!({
+        "id": "mem_q4", "version": 4, "parentId": "mem_q3",
+        "supersedes": ["mem_q3"], "project": "api",
+        "title": "A new source version", "content": "Do not replace the destination edit."
+    }));
+    std::fs::write(&fixture.file, serde_json::to_vec(&data).unwrap()).unwrap();
+    assert!(export::run(args()).await.is_err());
+    let current = tool(
+        &server,
+        "memory_read_page",
+        json!({"workspace": "acme", "project": "acme-api",
+            "path": "imported/agentmemory/memories/mem-q1.md"}),
+    )
+    .await;
+    assert_eq!(current["page_id"], edited["page_id"]);
+    assert_eq!(current["body"], edited_body);
+    assert_eq!(manifest(&fixture.manifest)["status"], "failed");
 }

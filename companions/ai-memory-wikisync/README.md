@@ -173,7 +173,10 @@ Safety rules:
   import; the refusal names the keys. Such pages still export.
 - **Every write is conditional.** Each import carries the page version the
   plan classified (`expected_page_id`), or `create_only` for a new page, and
-  each delete carries the version too. A page that changes on the server
+  each delete carries the version too. An edited repository file triggers a
+  full page read, so classification and the write precondition use the same
+  server version. Unchanged files still use ETag revalidation. A page that
+  changes on the server
   after it was classified is refused by the server, reported as "changed
   during this run", and left with its old state for the next run; the other
   pages still sync, and the run exits non-zero. A server without these

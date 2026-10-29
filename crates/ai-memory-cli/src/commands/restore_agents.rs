@@ -150,7 +150,12 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
                 return Err(error).with_context(|| format!("inspecting {}", target_path.display()));
             }
         };
-        let identical = exists && files_have_same_digest(&target_path, staged)?;
+        let identical = exists
+            && files_have_same_digest(&target_path, staged)?
+            && entry
+                .mode
+                .zip(portable_mode(&target_path)?)
+                .is_none_or(|(expected, actual)| expected == actual);
         if identical {
             identical_count += 1;
         } else {

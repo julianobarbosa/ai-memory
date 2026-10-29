@@ -340,7 +340,44 @@ pub(crate) fn relocated_session_dir_with(
 /// platform-specific directory name. A harness left out of this list simply
 /// produces no report line, which is the documented behavior for "location
 /// unknown" rather than an error.
-const HARNESSES_WITH_KNOWN_NATIVE_MEMORY: &[ManagedHarness] = &[ManagedHarness::Claude];
+const HARNESSES_WITH_KNOWN_NATIVE_MEMORY: &[ManagedHarness] =
+    &[ManagedHarness::Claude, ManagedHarness::Antigravity];
+
+fn count_regular_files_recursive(dir: &Path) -> usize {
+    let mut count = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_file() {
+                count += 1;
+            } else if ft.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    count
+}
+
+fn synthetic_read_probe(harness: ManagedHarness, probe_path: &Path) -> serde_json::Value {
+    match harness {
+        ManagedHarness::Antigravity => serde_json::json!({
+            "toolCall": {
+                "name": "view_file",
+                "args": { "AbsolutePath": probe_path.to_string_lossy() },
+            }
+        }),
+        _ => serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": probe_path.to_string_lossy() },
+        }),
+    }
+}
 
 /// For every harness in [`HARNESSES_WITH_KNOWN_NATIVE_MEMORY`] that actually
 /// has a memory store for this checkout, report its location, how many
@@ -375,23 +412,23 @@ fn native_memory_reports(home: &Path, cwd: &Path) -> Vec<NativeMemoryReport> {
         else {
             continue;
         };
-        let file_count = std::fs::read_dir(&memory_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
-                    .count()
-            })
-            .unwrap_or(0);
+        let file_count = match harness {
+            ManagedHarness::Antigravity => count_regular_files_recursive(&memory_dir),
+            _ => std::fs::read_dir(&memory_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+                        .count()
+                })
+                .unwrap_or(0),
+        };
         let status = if super::hook_capture::capture_config_problem(repo_root_str).is_some() {
             "marker invalid"
         } else {
             let policy = super::hook_capture::capture_policy(repo_root_str);
             let probe_path = memory_dir.join("probe.md");
-            let raw = serde_json::json!({
-                "tool_name": "Read",
-                "tool_input": { "file_path": probe_path.to_string_lossy() },
-            });
+            let raw = synthetic_read_probe(harness, &probe_path);
             let decision = policy.inspect(harness.agent_kind(), &raw, repo_root_str);
             match decision.protocol().disposition() {
                 CaptureDisposition::Drop => "excluded",
@@ -1698,6 +1735,65 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a claude-code report; got {reports:?}"))
     }
 
+    fn push_protobuf_varint(buf: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            buf.push(((value & 0x7f) as u8) | 0x80);
+            value >>= 7;
+        }
+        buf.push(value as u8);
+    }
+
+    fn push_protobuf_bytes(buf: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+        push_protobuf_varint(buf, (field << 3) | 2);
+        push_protobuf_varint(buf, bytes.len() as u64);
+        buf.extend_from_slice(bytes);
+    }
+
+    fn antigravity_metadata(uri: &str) -> Vec<u8> {
+        let mut nested = Vec::new();
+        push_protobuf_varint(&mut nested, 2 << 3);
+        push_protobuf_varint(&mut nested, 7);
+        push_protobuf_bytes(&mut nested, 1, uri.as_bytes());
+        push_protobuf_bytes(&mut nested, 4, b"fixture-metadata");
+
+        let mut outer = Vec::new();
+        push_protobuf_bytes(&mut outer, 3, b"unrelated");
+        push_protobuf_bytes(&mut outer, 1, &nested);
+        push_protobuf_varint(&mut outer, 5 << 3);
+        push_protobuf_varint(&mut outer, 1);
+        outer
+    }
+
+    fn antigravity_memory_fixture(home: &Path, cwd: &Path) -> PathBuf {
+        let root = home.join(".gemini/antigravity-cli/conversations");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("11111111-2222-3333-4444-555555555555.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE trajectory_metadata_blob (id text DEFAULT \"main\", data blob, PRIMARY KEY (id))",
+                [],
+            )
+            .unwrap();
+        let uri = format!("file://{}", cwd.display());
+        connection
+            .execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                rusqlite::params![antigravity_metadata(&uri)],
+            )
+            .unwrap();
+        let knowledge = home.join(".gemini/antigravity-cli/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        knowledge
+    }
+
+    fn find_antigravity_report(reports: &[NativeMemoryReport]) -> &NativeMemoryReport {
+        reports
+            .iter()
+            .find(|r| r.agent == "antigravity-cli")
+            .unwrap_or_else(|| panic!("expected an antigravity-cli report; got {reports:?}"))
+    }
+
     #[test]
     fn native_memory_reports_is_not_excluded_without_a_marker() {
         let home = tempfile::tempdir().unwrap();
@@ -1821,5 +1917,58 @@ mod tests {
         let reports = native_memory_reports(home.path(), &subdir);
         let claude = find_claude_report(&reports);
         assert_eq!(claude.file_count, 1);
+    }
+
+    #[test]
+    fn native_memory_reports_includes_antigravity_when_present() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let knowledge = antigravity_memory_fixture(home.path(), cwd.path());
+        std::fs::write(knowledge.join("fact.md"), "x").unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let ag = find_antigravity_report(&reports);
+        assert_eq!(ag.status, "not excluded");
+        assert_eq!(ag.file_count, 1);
+    }
+
+    #[test]
+    fn native_memory_reports_antigravity_counts_nested_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let knowledge = antigravity_memory_fixture(home.path(), cwd.path());
+        let item_dir = knowledge.join("item-1/artifacts");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        std::fs::write(item_dir.join("summary.md"), "summary").unwrap();
+        std::fs::write(knowledge.join("root-fact.md"), "fact").unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let ag = find_antigravity_report(&reports);
+        assert_eq!(ag.file_count, 2);
+    }
+
+    #[test]
+    fn native_memory_reports_antigravity_excluded_when_marker_covers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let knowledge = antigravity_memory_fixture(home.path(), cwd.path());
+        std::fs::write(knowledge.join("fact.md"), "x").unwrap();
+
+        let pattern = format!(
+            "{}/knowledge/**",
+            home.path()
+                .join(".gemini/antigravity-cli")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        std::fs::write(
+            cwd.path().join(".ai-memory.toml"),
+            format!("[capture]\nignore_paths = [\"{}\"]\n", pattern),
+        )
+        .unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let ag = find_antigravity_report(&reports);
+        assert_eq!(ag.status, "excluded");
     }
 }

@@ -5950,16 +5950,35 @@ function sessionID(ctx: any): string | undefined {{
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }}
 
+// OMP rebinds this extension into every subagent session (task tool, eval
+// `agent()`, `/tan` clones) and reports the agent a session runs as
+// `ctx.agent`. An advisor's tool calls reach the session they advise with
+// `kind: "sub"` under that session's id, so only a session's own lifecycle
+// events record it. Pi reports no `ctx.agent`, so every Pi session stays
+// top-level. https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
+const subagentSessions = new Map<string, string>();
+
+function noteSubagent(ctx: any): void {{
+  const id = sessionID(ctx);
+  const agent = ctx?.agent;
+  if (!id || agent?.kind !== "sub") return;
+  subagentSessions.set(id, typeof agent.id === "string" && agent.id ? agent.id : "sub");
+}}
+
 function modelName(model: any): string | undefined {{
   const name = model?.id ?? model?.name ?? model?.model;
   return typeof name === "string" && name.length > 0 ? name : undefined;
 }}
 
 function sessionPayload(ctx: any): Record<string, unknown> {{
+  const id = sessionID(ctx);
+  const agentID = id ? subagentSessions.get(id) : undefined;
   return {{
-    sessionID: sessionID(ctx),
+    sessionID: id,
     cwd: ctx?.cwd,
     model: modelName(ctx?.model),
+    // `agent_id` marks a subagent session; a top-level one has none.
+    ...(agentID ? {{ agent_id: agentID }} : {{}}),
   }};
 }}
 
@@ -6060,10 +6079,12 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
 
 export default function AiMemoryExtension(api: any): void {{
   api.on("session_start", (_event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
   }});
 
   api.on("before_agent_start", async (event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
     postHook("user-prompt", {{
       ...sessionPayload(ctx),
@@ -6072,7 +6093,8 @@ export default function AiMemoryExtension(api: any): void {{
     }});
 
     const id = sessionID(ctx);
-    if (!id || handoffChecked.has(id)) return;
+    // The baton belongs to the next top-level session, never to a subagent.
+    if (!id || subagentSessions.has(id) || handoffChecked.has(id)) return;
     handoffChecked.add(id);
     const handoff = await fetchHandoff(ctx?.cwd ?? "", id);
     if (!handoff) return;
@@ -6127,6 +6149,7 @@ export default function AiMemoryExtension(api: any): void {{
   }});
 
   api.on("session_shutdown", async (_event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
     await drainHookQueueForDispose();
@@ -13511,6 +13534,50 @@ model = "gpt-5"
         );
     }
 
+    /// OMP rebinds the extension into every subagent session and reports the
+    /// session's agent as `ctx.agent` (`docs/extensions.md`, "Handler
+    /// context"). A subagent session forwards `agent_id` and never claims the
+    /// baton. Only the session's own lifecycle events record the kind: an
+    /// advisor's tool calls reach the session they advise as `kind: "sub"`.
+    #[test]
+    fn omp_extension_marks_subagent_sessions_and_skips_their_handoff() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        // Slice a single `api.on("...")` handler so an assertion cannot be
+        // satisfied by a call that lives in a neighbouring one.
+        let handler = |event: &str| {
+            let needle = format!("api.on(\"{event}\"");
+            let start = extension
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{event} handler missing"));
+            let rest = &extension[start..];
+            let end = rest[needle.len()..]
+                .find("api.on(")
+                .map(|offset| offset + needle.len())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(extension.contains("if (!id || agent?.kind !== \"sub\") return;"));
+        assert!(extension.contains("...(agentID ? { agent_id: agentID } : {}),"));
+        assert!(
+            handler("before_agent_start")
+                .contains("if (!id || subagentSessions.has(id) || handoffChecked.has(id)) return;"),
+            "a subagent's first prompt must not claim the baton"
+        );
+        for event in ["session_start", "before_agent_start", "session_shutdown"] {
+            assert!(
+                handler(event).contains("noteSubagent(ctx);"),
+                "{event} carries the session's own agent and must record it"
+            );
+        }
+        for event in ["tool_call", "tool_result", "agent_end"] {
+            assert!(
+                !handler(event).contains("noteSubagent"),
+                "{event} can carry an advisor's identity and must not record it"
+            );
+        }
+    }
+
     #[test]
     fn omp_extension_bakes_repo_root_default() {
         let extension = build_omp_extension(
@@ -14282,22 +14349,18 @@ console.log(JSON.stringify({
 process.exit(0);
 "#;
 
-        #[test]
-        fn omp_extension_never_claims_a_handoff_without_a_directory() {
-            if !Command::new("node")
+        fn node_strips_types() -> bool {
+            Command::new("node")
                 .args(["--experimental-strip-types", "--version"])
                 .output()
                 .is_ok_and(|output| output.status.success())
-            {
-                eprintln!("skipping: node lacks --experimental-strip-types");
-                return;
-            }
-            let tmp = TempDir::new().unwrap();
-            let project = tmp.path().join("project");
-            fs::create_dir(&project).unwrap();
-            // This test proves scope selection, not the production handoff
-            // deadline. A Windows runner executes it beside the full Rust
-            // suite, where a cold Node fetch can exceed one second.
+        }
+
+        /// The rendered OMP extension with a wider handoff deadline. These
+        /// tests prove which session claims, not the production deadline. A
+        /// Windows runner executes them beside the full Rust suite, where a
+        /// cold Node fetch can exceed one second.
+        fn extension_under_test() -> String {
             let extension = build_omp_extension(PLACEHOLDER_SERVER, None, None, "denylist")
                 .replacen(
                     "signal: timeoutSignal(1000)",
@@ -14305,8 +14368,19 @@ process.exit(0);
                     1,
                 );
             assert!(extension.contains("signal: timeoutSignal(5000)"));
+            extension
+        }
+
+        /// Runs `harness` against `extension` in Node with `tmp` as its home
+        /// and returns the JSON line the harness prints last.
+        fn run_harness(
+            tmp: &TempDir,
+            extension: String,
+            harness: &str,
+            project: &std::path::Path,
+        ) -> serde_json::Value {
             fs::write(tmp.path().join("ext.template.ts"), extension).unwrap();
-            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            fs::write(tmp.path().join("harness.ts"), harness).unwrap();
             let mut command = Command::new("node");
             for (key, _) in std::env::vars_os() {
                 let key_text = key.to_string_lossy();
@@ -14316,7 +14390,7 @@ process.exit(0);
             }
             let output = command
                 .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
-                .arg(&project)
+                .arg(project)
                 .current_dir(tmp.path())
                 .env("HOME", tmp.path())
                 .env("USERPROFILE", tmp.path())
@@ -14332,14 +14406,26 @@ process.exit(0);
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let run: serde_json::Value = serde_json::from_slice(
+            serde_json::from_slice(
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .last()
                     .unwrap()
                     .as_bytes(),
             )
-            .unwrap();
+            .unwrap()
+        }
+
+        #[test]
+        fn omp_extension_never_claims_a_handoff_without_a_directory() {
+            if !node_strips_types() {
+                eprintln!("skipping: node lacks --experimental-strip-types");
+                return;
+            }
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let run = run_harness(&tmp, extension_under_test(), HARNESS, &project);
             // Only the scoped context claims, and it names its directory.
             assert_eq!(
                 run["claims"],
@@ -14348,6 +14434,169 @@ process.exit(0);
             );
             assert_eq!(run["unscoped"], serde_json::Value::Null, "{run}");
             assert_eq!(run["scoped"], "OTHER-PROJECT-HANDOFF", "{run}");
+        }
+
+        /// Drives one top-level OMP session the way OMP reports it
+        /// (`ctx.agent`, `docs/extensions.md` "Handler context"): its advisor's
+        /// tool calls, a task subagent, a `/tan` clone, a revived subagent this
+        /// process never saw, and a session without `ctx.agent` (Pi). Records
+        /// every `/handoff` claim by session id and every `/hook` event with
+        /// the `agent_id` it carried.
+        const SUBAGENT_HARNESS: &str = r#"import { createServer } from "node:http";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const project = process.argv[2]!;
+const claims: string[] = [];
+const hooks: { event: string; sessionID: unknown; agent_id: unknown }[] = [];
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => { body += chunk; });
+  req.on("end", () => {
+    if (url.pathname === "/handoff") {
+      claims.push(url.searchParams.get("session_id") ?? "<none>");
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("PENDING-HANDOFF");
+      return;
+    }
+    if (url.pathname === "/hook") {
+      const payload = JSON.parse(body);
+      hooks.push({
+        event: url.searchParams.get("event") ?? "",
+        sessionID: payload.sessionID ?? null,
+        agent_id: payload.agent_id ?? null,
+      });
+    }
+    res.writeHead(204);
+    res.end();
+  });
+});
+await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+const port = (server.address() as any).port;
+writeFileSync(
+  "./ext.ts",
+  readFileSync("./ext.template.ts", "utf8").replace("http://127.0.0.1:65535", `http://127.0.0.1:${port}`),
+);
+const { default: AiMemoryExtension } = await import("./ext.ts");
+const handlers: Record<string, any> = {};
+AiMemoryExtension({ on: (name: string, fn: any) => { handlers[name] = fn; } });
+const MAIN = { kind: "main", id: "Main", name: "main", depth: 0 };
+const TASK = { kind: "sub", id: "0-Explore", name: "explore", depth: 1, parentId: "Main" };
+const CLONE = { kind: "sub", id: "1-Clone", name: "sub", depth: 0, parentId: "Main" };
+const ADVISOR = { kind: "sub", id: "advisor", name: "advisor", depth: 0, parentId: "Main" };
+const ctx = (id: string, agent?: object) => ({
+  sessionManager: { getSessionId: () => id },
+  cwd: project,
+  ...(agent === undefined ? {} : { agent }),
+});
+const tool = {
+  toolName: "read",
+  toolCallId: "call-1",
+  input: { path: "README.md" },
+  content: [{ type: "text", text: "ok" }],
+};
+const delivered: Record<string, unknown> = {};
+async function prompt(id: string, agent?: object, event: object = { prompt: "continue" }) {
+  const result = await handlers["before_agent_start"](event, ctx(id, agent));
+  delivered[id] = result?.message?.content ?? null;
+}
+await handlers["session_start"]({}, ctx("main", MAIN));
+await prompt("main", MAIN);
+await handlers["tool_call"](tool, ctx("main", ADVISOR));
+await handlers["tool_result"](tool, ctx("main", ADVISOR));
+for (const [id, agent] of [["task", TASK], ["clone", CLONE]] as const) {
+  await handlers["session_start"]({}, ctx(id, agent));
+  await prompt(id, agent);
+  await handlers["tool_call"](tool, ctx(id, agent));
+  await handlers["agent_end"]({}, ctx(id, agent));
+  await handlers["session_shutdown"]({}, ctx(id, agent));
+}
+await handlers["session_start"]({}, ctx("revived", TASK));
+await prompt("revived", TASK, { prompt: "", reason: "revive" });
+await prompt("legacy");
+await handlers["session_shutdown"]({}, ctx("main", MAIN));
+// The extension delivers in order, so the main session's end arrives last.
+const deadline = Date.now() + 20000;
+while (!hooks.some((hook) => hook.event === "session-end" && hook.sessionID === "main")) {
+  if (Date.now() > deadline) break;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+console.log(JSON.stringify({ claims, delivered, hooks }));
+process.exit(0);
+"#;
+
+        #[test]
+        fn omp_extension_keeps_subagent_sessions_off_the_baton() {
+            if !node_strips_types() {
+                eprintln!("skipping: node lacks --experimental-strip-types");
+                return;
+            }
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let run = run_harness(&tmp, extension_under_test(), SUBAGENT_HARNESS, &project);
+            // Only the top-level session and the session without `ctx.agent`
+            // claim; no subagent asks for the baton, not even a revived one.
+            assert_eq!(
+                run["claims"],
+                serde_json::json!(["main", "legacy"]),
+                "{run}"
+            );
+            assert_eq!(run["delivered"]["main"], "PENDING-HANDOFF", "{run}");
+            for id in ["task", "clone", "revived"] {
+                assert_eq!(run["delivered"][id], serde_json::Value::Null, "{id}: {run}");
+            }
+            let hooks = run["hooks"].as_array().unwrap();
+            let session = |id: &str| -> Vec<(String, serde_json::Value)> {
+                hooks
+                    .iter()
+                    .filter(|hook| hook["sessionID"] == id)
+                    .map(|hook| {
+                        (
+                            hook["event"].as_str().unwrap().to_string(),
+                            hook["agent_id"].clone(),
+                        )
+                    })
+                    .collect()
+            };
+            // Every event of a subagent session is marked, its end included,
+            // so the server leaves no baton and can drop it on request.
+            for (id, agent_id, end) in [
+                ("task", "0-Explore", true),
+                ("clone", "1-Clone", true),
+                ("revived", "0-Explore", false),
+            ] {
+                let events = session(id);
+                assert!(
+                    events.iter().any(|(event, _)| event == "session-start"),
+                    "{id}: {run}"
+                );
+                assert_eq!(
+                    events.iter().any(|(event, _)| event == "session-end"),
+                    end,
+                    "{id}: {run}"
+                );
+                assert!(
+                    events.iter().all(|(_, marker)| marker == agent_id),
+                    "every {id} event must carry agent_id {agent_id}: {run}"
+                );
+            }
+            // The advisor's tool calls reach the top-level session as
+            // `kind: "sub"` and must not mark it, or an opted-in project
+            // would drop the rest of that session, its end included.
+            let main = session("main");
+            for event in ["pre-tool-use", "post-tool-use", "session-end"] {
+                assert!(main.iter().any(|(seen, _)| seen == event), "{event}: {run}");
+            }
+            assert!(
+                main.iter().all(|(_, marker)| marker.is_null()),
+                "the top-level session must stay unmarked: {run}"
+            );
+            assert!(
+                session("legacy").iter().all(|(_, marker)| marker.is_null()),
+                "{run}"
+            );
         }
     }
 

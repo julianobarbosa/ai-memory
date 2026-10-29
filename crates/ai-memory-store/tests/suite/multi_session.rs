@@ -4673,3 +4673,218 @@ async fn briefing_activity_windows_ignore_expired_pages() {
         .unwrap();
     assert_eq!(global.activity_7d.pages_updated, 1);
 }
+
+/// Multiple concurrent sessions of the same human operator under
+/// `ActiveProjectMode::PerActor` must isolate active project pointers
+/// per `(user, session_id)` tuple.
+///
+/// Mappings must not leak across session IDs:
+/// 1. Unscoped read resolution resolves each session to its own project with
+///    `ScopeSource::Session`.
+/// 2. An unbound session of the same operator fails closed on write with
+///    `AmbiguousUnscopedWrite` and falls back on read with `ScopeSource::DefaultAfterMismatch`
+///    (invariant: never silently guess or leak another session's project).
+/// 3. Updating the active project in Session 1 leaves Session 2's pointer intact.
+/// 4. Concurrent unscoped writes and reads land in the respective projects without
+///    cross-scope contamination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_operator_multiple_sessions_isolate_active_project_pointers_and_resolution() {
+    use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorKey};
+    use ai_memory_store::{ProjectPrincipal, ScopeResolutionError, ScopeResolver, ScopeSource};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("acme".to_string())
+        .await
+        .unwrap();
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+
+    let proj_alpha = store
+        .writer
+        .get_or_create_project(ws, "project-alpha".to_string(), None)
+        .await
+        .unwrap();
+    let proj_beta = store
+        .writer
+        .get_or_create_project(ws, "project-beta".to_string(), None)
+        .await
+        .unwrap();
+    let proj_gamma = store
+        .writer
+        .get_or_create_project(ws, "project-gamma".to_string(), None)
+        .await
+        .unwrap();
+
+    let alice = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice-multisession".into(),
+                name: Some("Alice".into()),
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    for proj in [proj_alpha, proj_beta, proj_gamma] {
+        store
+            .writer
+            .grant_memory(alice, proj, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+    }
+
+    let active = ActiveProject::with_config(
+        ActiveProjectMode::PerActor,
+        Duration::from_secs(60),
+        ai_memory_core::DEFAULT_MAX_ENTRIES,
+    );
+
+    let alice_session_1 = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-alpha".into()),
+    };
+    let alice_session_2 = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-beta".into()),
+    };
+    let alice_session_unbound = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-fresh".into()),
+    };
+
+    active.set_for(&alice_session_1, ws, proj_alpha, false);
+    active.set_for(&alice_session_2, ws, proj_beta, false);
+
+    assert_eq!(active.get_for(&alice_session_1), Some((ws, proj_alpha)));
+    assert_eq!(active.get_for(&alice_session_2), Some((ws, proj_beta)));
+
+    let resolve_read = |actor: ActorKey| {
+        let reader = store.reader.clone();
+        let active = active.clone();
+        async move {
+            ScopeResolver::new(&reader, ws, proj_alpha)
+                .with_active_project(&active)
+                .with_project_authz(ProjectPrincipal::user(alice), true)
+                .resolve_read_args_traced(None, None, &actor)
+                .await
+        }
+    };
+
+    let resolve_write = |actor: ActorKey| {
+        let reader = store.reader.clone();
+        let writer = store.writer.clone();
+        let active = active.clone();
+        async move {
+            ScopeResolver::new(&reader, ws, proj_alpha)
+                .with_writer(&writer)
+                .with_active_project(&active)
+                .with_project_authz(ProjectPrincipal::user(alice), true)
+                .resolve_write_args(None, None, &actor)
+                .await
+        }
+    };
+
+    let (res_1, res_2) = tokio::join!(
+        resolve_read(alice_session_1.clone()),
+        resolve_read(alice_session_2.clone()),
+    );
+    let (scope_1, source_1) = res_1.unwrap();
+    let (scope_2, source_2) = res_2.unwrap();
+
+    assert_eq!(scope_1.project_id, proj_alpha);
+    assert_eq!(source_1, ScopeSource::Session);
+    assert_eq!(scope_2.project_id, proj_beta);
+    assert_eq!(source_2, ScopeSource::Session);
+
+    let write_unbound = resolve_write(alice_session_unbound.clone()).await;
+    assert!(
+        matches!(
+            write_unbound,
+            Err(ScopeResolutionError::AmbiguousUnscopedWrite)
+        ),
+        "an unbound session of an operator with active sessions must fail closed with AmbiguousUnscopedWrite: {write_unbound:?}"
+    );
+    let (read_unbound_scope, read_unbound_source) =
+        resolve_read(alice_session_unbound.clone()).await.unwrap();
+    assert_eq!(read_unbound_scope.project_id, proj_alpha);
+    assert_eq!(
+        read_unbound_source,
+        ScopeSource::DefaultAfterMismatch,
+        "an unbound session on read must fall back to the default scope with DefaultAfterMismatch rather than leaking another session's project"
+    );
+
+    active.set_for(&alice_session_1, ws, proj_gamma, false);
+    assert_eq!(active.get_for(&alice_session_1), Some((ws, proj_gamma)));
+    assert_eq!(
+        active.get_for(&alice_session_2),
+        Some((ws, proj_beta)),
+        "session 1 pointer mutation must not move session 2's pointer"
+    );
+
+    let (scope_1_shifted, _) = resolve_read(alice_session_1.clone()).await.unwrap();
+    let (scope_2_steady, _) = resolve_read(alice_session_2.clone()).await.unwrap();
+    assert_eq!(scope_1_shifted.project_id, proj_gamma);
+    assert_eq!(scope_2_steady.project_id, proj_beta);
+
+    let (write_1, write_2) = tokio::join!(
+        resolve_write(alice_session_1.clone()),
+        resolve_write(alice_session_2.clone()),
+    );
+    let write_1 = write_1.unwrap();
+    let write_2 = write_2.unwrap();
+
+    assert_eq!(write_1.scope.project_id, proj_gamma);
+    assert_eq!(write_2.scope.project_id, proj_beta);
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            write_1.scope.project_id,
+            "notes/session.md",
+            "Gamma Session",
+            "written from session 1",
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            write_2.scope.project_id,
+            "notes/session.md",
+            "Beta Session",
+            "written from session 2",
+        ))
+        .await
+        .unwrap();
+
+    let body_gamma = store
+        .reader
+        .page_body_by_ids(ws, proj_gamma, "notes/session.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body_gamma.body.contains("written from session 1"));
+
+    let body_beta = store
+        .reader
+        .page_body_by_ids(ws, proj_beta, "notes/session.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body_beta.body.contains("written from session 2"));
+}

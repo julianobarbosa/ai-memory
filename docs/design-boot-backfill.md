@@ -229,6 +229,9 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   contacting the server.
 - **Emptiness + lease** prevent a backfill from overwriting or racing an established
   project's real history.
+- **Detached Windows execution stays hidden.** Git CLI fallbacks and repository
+  probes use `CREATE_NO_WINDOW`, and one backfill caches the session directory per
+  harness instead of repeating the same checkout probe for every selected session.
 - **Multi-user posture.** On a shared server, default-on retro-import of a long local
   history is more sensitive than on a single-user box. Backfill attributes to the booting
   operator, imports only into an *empty* project scope, and is opt-outable per project via

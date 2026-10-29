@@ -48,9 +48,10 @@ use ai_memory_core::{
     ActorContext, PageEvidence, PageEvidenceKind, PageId, PagePath, ProjectId, Tier, WorkspaceId,
 };
 use ai_memory_store::{
-    DecayCandidate, DecayParams, ReaderPool, WriterHandle, retention_score_with_breadth,
+    DecayCandidate, DecayParams, PagePrecondition, ReaderPool, WriterHandle,
+    retention_score_with_breadth,
 };
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{ConditionalBatchWrite, Wiki, WritePageRequest};
 use jiff::Timestamp;
 use serde::Serialize;
 use thiserror::Error;
@@ -791,7 +792,7 @@ pub(crate) async fn run_sweep_at(
         if !compacted.is_empty() {
             match wiki {
                 Some(wiki) => {
-                    let mut requests: Vec<WritePageRequest> = Vec::new();
+                    let mut requests: Vec<(WritePageRequest, PagePrecondition)> = Vec::new();
                     let mut request_index: Vec<usize> = Vec::new();
                     for (i, page) in compacted.iter().enumerate() {
                         let path = match PagePath::new(page.path.clone()) {
@@ -811,29 +812,39 @@ pub(crate) async fn run_sweep_at(
                         };
                         let (frontmatter, body) =
                             build_compacted_markdown(&markdown.frontmatter, &markdown.body);
-                        requests.push(WritePageRequest {
-                            workspace_id,
-                            project_id,
-                            path,
-                            frontmatter,
-                            body,
-                            tier: Tier::Episodic,
-                            pinned: false,
-                            title: None,
-                            admission_ctx: None,
-                            author_id: None,
-                            actor: ActorContext::anonymous(),
-                            evidence: Vec::new(),
-                        });
+                        requests.push((
+                            WritePageRequest {
+                                workspace_id,
+                                project_id,
+                                path,
+                                frontmatter,
+                                body,
+                                tier: Tier::Episodic,
+                                pinned: false,
+                                title: None,
+                                admission_ctx: None,
+                                author_id: None,
+                                actor: ActorContext::anonymous(),
+                                evidence: Vec::new(),
+                            },
+                            PagePrecondition::Latest(page.id),
+                        ));
                         request_index.push(i);
                     }
                     if !requests.is_empty() {
-                        match wiki.apply_batch(requests).await {
-                            Ok(new_ids) => {
+                        match wiki.apply_batch_if(requests).await {
+                            Ok(ConditionalBatchWrite::Written(new_ids)) => {
                                 for (slot, new_id) in request_index.into_iter().zip(new_ids) {
                                     compacted[slot].compacted = true;
                                     compacted[slot].new_id = Some(new_id);
                                 }
+                            }
+                            Ok(ConditionalBatchWrite::Mismatch { index, current }) => {
+                                tracing::debug!(
+                                    index,
+                                    ?current,
+                                    "forget sweep: page changed during compaction; retrying batch on next sweep"
+                                );
                             }
                             Err(error) => tracing::warn!(
                                 %error,

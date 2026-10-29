@@ -359,6 +359,22 @@ impl AdmissionChain {
                 webhooks.len()
             ))));
         }
+
+        // Validate each webhook URL scheme before any HTTP client is built.
+        // Only http and https are accepted; file://, ftp://, custom schemes,
+        // or bare hostnames would otherwise let an attacker that controls the
+        // operator config redirect writes to local files or unexpected
+        // network targets.
+        for hook in &webhooks {
+            if !is_supported_webhook_url(&hook.url) {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "admission webhook '{}' has unsupported URL scheme '{}'; \
+                     only http:// and https:// are allowed",
+                    hook.name, hook.url,
+                ))));
+            }
+        }
+
         let client = reqwest::Client::builder().build().map_err(|e| {
             WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
         })?;
@@ -737,6 +753,22 @@ impl AdmissionChain {
 /// timeout and an unreachable host all continue the operation unchanged.
 fn decides(hook: &WebhookConfig) -> bool {
     hook.blocking && matches!(hook.failure_policy, FailurePolicy::Reject)
+}
+
+/// Accept only `http://` and `https://` admission webhook URLs.
+///
+/// Rejects `file://`, `ftp://`, custom schemes, and bare hostnames — any of
+/// those would let a misconfigured or attacker-controlled operator config
+/// send page payloads to the local filesystem, non-HTTP services, or
+/// unresolvable targets. Relative URLs are also refused: every webhook must
+/// be an absolute, network-addressable endpoint.
+fn is_supported_webhook_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 fn webhook_timeout(timeout_ms: u64) -> Duration {

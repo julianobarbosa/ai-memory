@@ -465,9 +465,15 @@ async fn build_plan(
         let mut etag = None;
         let mut rendered = None;
         if on_server.contains(&path) {
-            let hint = disk
-                .as_ref()
-                .and(base.and_then(|base| base.etag.as_deref()));
+            // An edited file needs metadata and a version id from the same
+            // read we classify. Following a 304 with a full read could pick
+            // up a concurrent edit and import over it without a conflict.
+            let hint = base
+                .filter(|base| {
+                    disk.as_ref()
+                        .is_some_and(|disk| state::sha256_hex(disk) == base.hash)
+                })
+                .and_then(|base| base.etag.as_deref());
             let read = api
                 .read_page(&run_args.workspace, &run_args.project, &path, hint)
                 .await?;

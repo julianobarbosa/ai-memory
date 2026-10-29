@@ -22,6 +22,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
+    super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     // Rename happens inside one workspace, so the marker resolves it the same
     // way it does for every other command. `--to` stays literal: it names the
@@ -77,7 +78,7 @@ fn renamed_from(summary: &serde_json::Value, requested: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::renamed_from;
+    use super::*;
 
     #[test]
     fn a_rename_by_id_rekeys_the_link_under_the_resolved_name() {
@@ -85,5 +86,50 @@ mod tests {
         let summary = serde_json::json!({ "from": "api", "to": "api-v2" });
         assert_eq!(renamed_from(&summary, id.clone()), "api");
         assert_eq!(renamed_from(&serde_json::json!({}), id.clone()), id);
+    }
+
+    fn test_args() -> RenameProjectArgs {
+        RenameProjectArgs {
+            workspace: None,
+            from: Some("old".into()),
+            project_id: None,
+            to: "new".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.to = "   ".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--to was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.from = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--from was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.workspace = Some("  ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
     }
 }

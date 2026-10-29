@@ -188,6 +188,10 @@ pub(crate) enum WriteCmd {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
     },
+    UpsertPageBatchIf {
+        pages: Vec<(NewPage, ops::PagePrecondition)>,
+        reply: oneshot::Sender<StoreResult<ops::ConditionalBatchUpsert>>,
+    },
     DeletePage {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -2831,6 +2835,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically upsert a batch only when every latest-version precondition
+    /// still holds in the write transaction.
+    pub async fn upsert_pages_batch_if(
+        &self,
+        pages: Vec<(NewPage, ops::PagePrecondition)>,
+    ) -> StoreResult<ops::ConditionalBatchUpsert> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertPageBatchIf { pages, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Upsert a page (creating it or superseding the existing latest
     /// version when the body has changed).
     ///
@@ -3994,6 +4010,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);
                 send_or_warn(reply, result, "upsert_pages_batch");
+            }
+            WriteCmd::UpsertPageBatchIf { pages, reply } => {
+                let result = ops::upsert_pages_batch_if(&mut conn, &pages);
+                send_or_warn(reply, result, "upsert_pages_batch_if");
             }
             WriteCmd::BeginSession { session, reply } => {
                 let result = ops::begin_session(&mut conn, &session);

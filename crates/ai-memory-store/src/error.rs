@@ -70,6 +70,14 @@ pub enum StoreError {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// A restore source would initialize a new store instead of opening a
+    /// database that ai-memory already migrated.
+    #[error(
+        "backup has no initialized ai-memory database snapshot at db/memory.sqlite; \
+         restore requires an existing snapshot with applied migration history"
+    )]
+    UninitializedSnapshot,
+
     /// The store's schema is newer than this binary: an applied migration is
     /// above the highest compiled-in version (refinery reports this as
     /// `MissingVersion`). The data was written by a newer ai-memory build than

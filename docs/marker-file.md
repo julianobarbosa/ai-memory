@@ -328,7 +328,10 @@ always stored regardless, including Claude Code sessions launched with
 parent's `session_id`, so only the events carrying `agent_id` (plus
 `SubagentStart`/`SubagentStop`) are dropped and the parent session's own
 prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
-still identifies subagent captures. This is per-project on purpose: there is no server-global
+still identifies subagent captures. The OMP extension posts every event of a
+subagent session with `agent_id`, so the whole subagent session is dropped,
+while an advisor's tool calls stay with the session they advise. This is
+per-project on purpose: there is no server-global
 switch, so opting one noisy project in never sheds subagent captures for the
 others on a shared instance.
 

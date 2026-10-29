@@ -11,9 +11,9 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    ConditionalUpsert, FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagePrecondition,
-    PagesMode, PurgeSessionSummary, ReaderPool, ScopeRow, WriterHandle, artifact_path_for,
-    f32_vec_to_bytes,
+    ConditionalBatchUpsert, ConditionalUpsert, FailAutoImproveProposal, MoveSessionSummary,
+    MoveSummary, PagePrecondition, PagesMode, PurgeSessionSummary, ReaderPool, ScopeRow,
+    WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -2718,8 +2718,34 @@ impl Wiki {
     /// Returns [`WikiError`] for any filesystem, parsing, or store
     /// error.
     pub async fn apply_batch(&self, requests: Vec<WritePageRequest>) -> WikiResult<Vec<PageId>> {
+        match self.apply_batch_inner(requests, None).await? {
+            ConditionalBatchWrite::Written(ids) => Ok(ids),
+            ConditionalBatchWrite::Mismatch { .. } => Err(ai_memory_wiki_error(
+                "an unconditional page batch reported a precondition mismatch",
+            )),
+        }
+    }
+
+    /// Atomically apply a batch only when every page is still at the version
+    /// the caller derived its replacement from. One mismatch writes nothing.
+    ///
+    /// # Errors
+    /// As [`Self::apply_batch`].
+    pub async fn apply_batch_if(
+        &self,
+        requests: Vec<(WritePageRequest, PagePrecondition)>,
+    ) -> WikiResult<ConditionalBatchWrite> {
+        let (requests, preconditions): (Vec<_>, Vec<_>) = requests.into_iter().unzip();
+        self.apply_batch_inner(requests, Some(preconditions)).await
+    }
+
+    async fn apply_batch_inner(
+        &self,
+        requests: Vec<WritePageRequest>,
+        preconditions: Option<Vec<PagePrecondition>>,
+    ) -> WikiResult<ConditionalBatchWrite> {
         if requests.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ConditionalBatchWrite::Written(Vec::new()));
         }
         // Reject any path that cannot be materialised and checkpointed on every
         // supported platform, before anything is written.
@@ -2814,6 +2840,22 @@ impl Wiki {
                 .map(|(req, _, _, _)| (req.workspace_id, req.project_id, req.path.clone()))
                 .collect();
             let _page_guards = self.lock_pages(&batch_keys).await;
+            if let (Some(preconditions), Some(reader)) = (&preconditions, &self.store_reader) {
+                for (index, ((req, _, _, _), precondition)) in
+                    staged.iter().zip(preconditions).enumerate()
+                {
+                    let current = reader
+                        .latest_page_id_by_ids(
+                            req.workspace_id,
+                            req.project_id,
+                            req.path.as_str().to_string(),
+                        )
+                        .await?;
+                    if !precondition_holds(*precondition, current) {
+                        return Ok(ConditionalBatchWrite::Mismatch { index, current });
+                    }
+                }
+            }
             let mut staged_files: Vec<(
                 WritePageRequest,
                 tempfile::NamedTempFile,
@@ -2885,8 +2927,30 @@ impl Wiki {
                 dispatches.push((req.path, req.frontmatter, req.body, ctx));
             }
 
-            let ids = match self.writer.upsert_pages_batch(pages).await {
-                Ok(ids) => ids,
+            let write = match &preconditions {
+                Some(preconditions) => {
+                    let pages = pages
+                        .into_iter()
+                        .zip(preconditions.iter().copied())
+                        .collect();
+                    self.writer.upsert_pages_batch_if(pages).await
+                }
+                None => self
+                    .writer
+                    .upsert_pages_batch(pages)
+                    .await
+                    .map(ConditionalBatchUpsert::Upserted),
+            };
+            let ids = match write {
+                Ok(ConditionalBatchUpsert::Upserted(ids)) => ids,
+                Ok(ConditionalBatchUpsert::Mismatch { index, current }) => {
+                    rollback_or_inconsistent(
+                        &self.git,
+                        &installed,
+                        &ai_memory_wiki_error("conditional page batch changed during write"),
+                    )?;
+                    return Ok(ConditionalBatchWrite::Mismatch { index, current });
+                }
                 Err(e) => {
                     rollback_or_inconsistent(&self.git, &installed, &e)?;
                     return Err(e.into());
@@ -2920,7 +2984,7 @@ impl Wiki {
             }
         }
 
-        Ok(ids)
+        Ok(ConditionalBatchWrite::Written(ids))
     }
 
     /// Acquire the per-path write lock for one page, serializing concurrent
@@ -3352,6 +3416,20 @@ pub enum ConditionalWrite {
     /// The precondition did not hold and nothing was written.
     Mismatch {
         /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// Outcome of an atomic conditional page batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalBatchWrite {
+    /// Every precondition held and all page versions were written.
+    Written(Vec<PageId>),
+    /// One precondition changed, so no page version was written.
+    Mismatch {
+        /// Index of the refused request in the supplied batch.
+        index: usize,
+        /// Current latest page version, if the path exists.
         current: Option<PageId>,
     },
 }
@@ -6616,6 +6694,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_rejects_every_page_when_one_version_changed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let first = PagePath::new("batch/first.md").unwrap();
+        let second = PagePath::new("batch/second.md").unwrap();
+        let first_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                first.as_str(),
+                "first original",
+                serde_json::json!({"title": "First"}),
+            ))
+            .await
+            .unwrap();
+        let stale_second_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                second.as_str(),
+                "second original",
+                serde_json::json!({"title": "Second"}),
+            ))
+            .await
+            .unwrap();
+        let current_second_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                second.as_str(),
+                "second concurrent update",
+                serde_json::json!({"title": "Second"}),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = wiki
+            .apply_batch_if(vec![
+                (
+                    req(
+                        ws,
+                        proj,
+                        first.as_str(),
+                        "first stale replacement",
+                        serde_json::json!({"title": "First"}),
+                    ),
+                    PagePrecondition::Latest(first_id),
+                ),
+                (
+                    req(
+                        ws,
+                        proj,
+                        second.as_str(),
+                        "second stale replacement",
+                        serde_json::json!({"title": "Second"}),
+                    ),
+                    PagePrecondition::Latest(stale_second_id),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ConditionalBatchWrite::Mismatch {
+                index: 1,
+                current: Some(current_second_id),
+            }
+        );
+        assert_eq!(
+            wiki.read_page(ws, proj, &first).unwrap().body,
+            "first original"
+        );
+        assert_eq!(
+            wiki.read_page(ws, proj, &second).unwrap().body,
+            "second concurrent update"
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, first.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "first original"
+        );
     }
 
     #[tokio::test]

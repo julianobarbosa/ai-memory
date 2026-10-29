@@ -946,6 +946,9 @@ pub async fn list_native_sessions(
 /// file's own recorded `cwd` until one matches — and returns that file's
 /// parent directory, which is correct on any platform by construction.
 ///
+/// Antigravity CLI keeps Knowledge Items under `<home>/.gemini/antigravity-cli/knowledge/`
+/// beside its `conversations/` directory.
+///
 /// Callers should pass the checkout's **repository root**, not an arbitrary
 /// subdirectory: Claude Code keys this store by repository root, so a
 /// worktree or a subdirectory shares the root's `memory/` directory. This
@@ -964,7 +967,7 @@ pub fn native_memory_dir(
     cwd: &Path,
     session_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if harness != ManagedHarness::Claude {
+    if harness != ManagedHarness::Claude && harness != ManagedHarness::Antigravity {
         return None;
     }
     let mut files = collect_session_files(harness, home, session_dir).ok()?;
@@ -978,7 +981,11 @@ pub fn native_memory_dir(
             continue;
         };
         if same_path(&recorded_cwd, cwd) {
-            let memory_dir = path.parent()?.join("memory");
+            let memory_dir = match harness {
+                ManagedHarness::Claude => path.parent()?.join("memory"),
+                ManagedHarness::Antigravity => path.parent()?.parent()?.join("knowledge"),
+                _ => return None,
+            };
             return memory_dir.is_dir().then_some(memory_dir);
         }
     }
@@ -11036,6 +11043,63 @@ mod tests {
         // must return None unconditionally rather than guess at a location.
         assert_eq!(
             native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::write(knowledge.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            Some(knowledge)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_antigravity_session_matches_this_cwd() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        let other_cwd = fixture.temp.path().join("unrelated-checkout");
+        fs::create_dir_all(&other_cwd).unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &other_cwd,
+                None
+            ),
             None
         );
     }

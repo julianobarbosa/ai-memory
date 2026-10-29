@@ -433,13 +433,24 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
 
     // Import each selected session, oldest-first so the imported history reads
     // chronologically, until the total-events circuit breaker trips.
+    let mut session_dirs: Vec<(ManagedHarness, Option<PathBuf>)> = Vec::new();
     for session in selected.into_iter().rev() {
         if report.imported_events >= MAX_EVENTS_TOTAL {
             report.skipped_for_cap += 1;
             continue;
         }
-        match import_one(
-            &endpoint, &workspace, &project, &home, &cwd, &capture, &session,
+        let session_dir = cached_session_dir(&mut session_dirs, session.harness, || {
+            import_session_dir(&home, &cwd, session.harness)
+        });
+        match import_one_with_session_dir(
+            &endpoint,
+            &workspace,
+            &project,
+            &home,
+            &cwd,
+            &capture,
+            &session,
+            session_dir.as_deref(),
         )
         .await
         {
@@ -715,6 +726,7 @@ fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usi
 /// every event, so retroactive text crosses the same trust boundary as live
 /// capture, and `capture` drops or strips tool events the checkout's
 /// `[capture] ignore_paths` excludes before anything is posted.
+#[cfg(all(test, unix))]
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
@@ -724,11 +736,51 @@ async fn import_one(
     capture: &TranscriptCapture,
     session: &SessionRef,
 ) -> Result<usize> {
+    let session_dir = import_session_dir(home, cwd, session.harness);
+    import_one_with_session_dir(
+        endpoint,
+        workspace,
+        project,
+        home,
+        cwd,
+        capture,
+        session,
+        session_dir.as_deref(),
+    )
+    .await
+}
+
+fn import_session_dir(home: &Path, cwd: &Path, harness: ManagedHarness) -> Option<PathBuf> {
     let roots = LaunchRoots { home, cwd };
-    let session_dir =
-        build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
-            .ok()
-            .and_then(|plan| plan.session_dir);
+    build_launch_plan_with_env(harness, None, Vec::new(), None, &[], Some(roots))
+        .ok()
+        .and_then(|plan| plan.session_dir)
+}
+
+fn cached_session_dir(
+    cache: &mut Vec<(ManagedHarness, Option<PathBuf>)>,
+    harness: ManagedHarness,
+    resolve: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((_, session_dir)) = cache.iter().find(|(cached, _)| *cached == harness) {
+        return session_dir.clone();
+    }
+    let session_dir = resolve();
+    cache.push((harness, session_dir.clone()));
+    session_dir
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_one_with_session_dir(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    capture: &TranscriptCapture,
+    session: &SessionRef,
+    session_dir: Option<&Path>,
+) -> Result<usize> {
     import_exact_session(
         endpoint,
         workspace,
@@ -737,7 +789,7 @@ async fn import_one(
         cwd,
         session.harness,
         &session.native_session_id,
-        session_dir.as_deref(),
+        session_dir,
         None,
         capture,
     )
@@ -1383,6 +1435,24 @@ mod tests {
             vec!["new", "mid"],
             "newest first, capped to 2"
         );
+    }
+
+    #[test]
+    fn session_directory_resolution_is_cached_per_harness() {
+        let mut cache = Vec::new();
+        let mut calls = 0;
+        let first = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("crush-data"))
+        });
+        let second = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("wrong"))
+        });
+
+        assert_eq!(first, Some(PathBuf::from("crush-data")));
+        assert_eq!(second, first);
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -448,6 +448,48 @@ async fn chain_rejects_more_than_max_admission_webhooks() {
     );
 }
 
+#[test]
+fn chain_rejects_non_http_webhook_urls_at_construction() {
+    // Only http:// and https:// webhook URLs are accepted: anything else
+    // (file://, ftp://, a custom scheme, a bare hostname, an empty value)
+    // can never produce a working webhook — reqwest has no handler for it —
+    // so the chain refuses it at construction rather than erroring on every
+    // write at request time.
+    let hook = |url: &str| WebhookConfig {
+        name: "hook".into(),
+        url: url.into(),
+        timeout_ms: 1_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::WritePage],
+        blocking: true,
+    };
+    for bad in [
+        "file:///etc/passwd",
+        "ftp://example.com/hook",
+        "gopher://example.com/hook",
+        "example.com/bare-hostname",
+        "",
+        "   ",
+    ] {
+        let err = AdmissionChain::new(vec![hook(bad)])
+            .expect_err("non-http(s) webhook URL must be refused");
+        assert!(
+            err.to_string().contains("unsupported URL scheme"),
+            "{bad:?}: unexpected error message: {err}"
+        );
+    }
+    // Legitimate controls: a blanket refusal must not be mistaken for
+    // correctness, and scheme matching is case-insensitive like URL parsing.
+    for good in [
+        "http://127.0.0.1:1/hook",
+        "https://example.com/hook",
+        "HTTP://EXAMPLE.COM/hook",
+    ] {
+        AdmissionChain::new(vec![hook(good)])
+            .unwrap_or_else(|e| panic!("http(s) webhook URL {good:?} must be accepted: {e}"));
+    }
+}
+
 #[tokio::test]
 async fn oversized_response_is_treated_as_noop() {
     // A webhook returning > MAX_RESPONSE_BYTES gets dropped — never

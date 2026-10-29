@@ -139,7 +139,10 @@ Stored in the root of the generated tarball:
      are rolled back; timestamped copies of overwritten files remain available.
    - Non-managed custom files are never overwritten without explicit `--force`.
    - Portable Unix execute/read/write bits are restored; set-id and sticky bits
-     are never accepted from a manifest.
+     are never accepted from a manifest. A file with matching content but
+     different recorded permissions still needs `--apply --force` to restore
+     its mode. Without a recorded mode, or on platforms without portable Unix
+     permissions, matching content remains a no-op.
 5. **Active Content:**
    - Skills, plugins, and instruction files can contain executable code or
      model-visible instructions. Restore is dry-run by default and prints this

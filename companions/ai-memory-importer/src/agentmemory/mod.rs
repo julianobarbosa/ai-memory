@@ -8,9 +8,10 @@
 //! `imported/agentmemory`).
 //!
 //! Each page version ends with a provenance line naming its stable ingest key
-//! (a UUIDv5 of the agentmemory record id). A rerun finds the key in the page
-//! the server already holds and skips what is there, so an interrupted import
-//! resumes without duplicates and a finished one writes nothing.
+//! (a UUIDv5 of the agentmemory record id). A rerun matches the complete body
+//! against its planned versions before skipping what is there, so an
+//! interrupted import resumes without duplicates and a finished one writes
+//! nothing. A destination edit retaining the key is still a conflict.
 
 pub(crate) mod export;
 pub(crate) mod vault;
@@ -66,8 +67,8 @@ pub(crate) fn ingest_key(record: &str, id: &str) -> String {
     Uuid::new_v5(&key_namespace(), format!("{record}:{id}").as_bytes()).to_string()
 }
 
-/// The line that ends every imported page version. Its key is what a rerun
-/// looks for in the page the server already holds.
+/// The attribution line that ends every imported page version. A rerun
+/// compares the complete body, including this line, before skipping a version.
 pub(crate) fn provenance_line(record: &str, id: &str, version: Option<u64>, key: &str) -> String {
     let version = version.map_or_else(String::new, |v| format!(", version {v}"));
     format!(
@@ -516,8 +517,9 @@ async fn apply_page(
                 index += 1;
             }
             Err(error) if error.downcast_ref::<PreconditionFailed>().is_some() => {
-                // The page exists or moved on. Resume only from a version
-                // this import wrote; anything else is somebody else's page.
+                // The page exists or moved on. The attribution key can survive
+                // a destination edit, so only an identical planned body can
+                // supply the version id for the next conditional write.
                 let current = client
                     .mcp_read_page(
                         &page.destination.workspace,
@@ -529,7 +531,7 @@ async fn apply_page(
                 let Some(found) = page
                     .versions
                     .iter()
-                    .rposition(|v| current.body.contains(&key_marker(&v.key)))
+                    .rposition(|v| current.body == v.body)
                     .filter(|found| *found >= index)
                 else {
                     let entry = &mut manifest.pages[page_index].versions[index];

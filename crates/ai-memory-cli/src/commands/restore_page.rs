@@ -1,6 +1,6 @@
 //! `ai-memory restore-page` — restore one wiki page from a git checkpoint.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::RestorePageArgs;
@@ -29,12 +29,18 @@ struct RestorePageResponse {
 /// Run the `restore-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if an explicit scope flag is empty, the server is
-/// unreachable, the checkpoint/path cannot be restored, or the restored page
-/// cannot be reindexed.
+/// Returns an error if an explicit scope flag, `--path`, or `--from` is empty;
+/// the server is unreachable; the checkpoint/path cannot be restored; or the
+/// restored page cannot be reindexed.
 pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    if args.path.trim().is_empty() {
+        bail!("--path was passed empty; specify the wiki page path to restore");
+    }
+    if args.from.trim().is_empty() {
+        bail!("--from was passed empty; specify the git checkpoint to restore from");
+    }
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -71,4 +77,45 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
         println!("restore checkpoint: {cp}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(path: &str, from: &str) -> RestorePageArgs {
+        RestorePageArgs {
+            path: path.into(),
+            from: from.into(),
+            workspace: None,
+            project: None,
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_path_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(&Config::default(), args(empty, "HEAD~1"))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--path was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_revision_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(&Config::default(), args("notes/example.md", empty))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--from was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
 }

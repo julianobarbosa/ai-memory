@@ -2280,6 +2280,15 @@ loaded at startup. The ai-memory CLI accepts `--client omp` (or
 `--client oh-my-pi`) for MCP and `--agent omp` (or `--agent oh-my-pi`)
 for hooks; both target OMP's native `.omp` integration surface.
 
+OMP runs subagents (the task tool, eval `agent()`, `/tan` clones) inside its
+own process and loads the extension into each one. The extension reads the
+agent a session runs from OMP's `ctx.agent` (OMP 18.3.2 and later) and posts a
+subagent session's events with `agent_id`. A subagent never claims the
+pending handoff, its end leaves no handoff behind, and a project that sets
+`drop_subagent_captures` drops it. An advisor's tool calls stay with the
+session they advise. An older OMP reports no `ctx.agent`, so every session
+there counts as top-level.
+
 ### Pi
 
 Pi does not read a native `mcp.json`. ai-memory supports Pi through one

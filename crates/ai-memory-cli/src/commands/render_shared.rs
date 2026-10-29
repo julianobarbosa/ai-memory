@@ -2437,7 +2437,7 @@ fn windows_native_hook_command_with_exe(
     };
     let quote_field = |s: &str| {
         if bare {
-            s.to_string()
+            cmd_bare_escape(s)
         } else {
             win_double_quote(s)
         }
@@ -2527,10 +2527,10 @@ enum NativeQuote {
     /// Windows, but with NO surrounding double quotes. Antigravity's hook
     /// executor runs the `command` string through `cmd /c "<string>"`, and
     /// cmd does not strip the inner quotes, so a quoted `"C:\…\ai-memory.exe"`
-    /// is reported as "not recognized" and crashes the session (#611). The
-    /// whole-string wrapping means a bare path is what actually runs; a path
-    /// with a space in it is a known residual limitation (as it was before
-    /// the native-hook rendering added quotes).
+    /// is reported as "not recognized" and crashes the session (#611).
+    /// Spaces and cmd metacharacters are caret-escaped per field instead
+    /// (#1767). A literal `"` is stripped so it cannot be written back into
+    /// the command. `%` is left unchanged: caret does not stop percent expansion.
     WindowsBare,
 }
 
@@ -2553,7 +2553,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     match quote {
         NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
         NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
-        NativeQuote::WindowsBare => format!(" --data-dir {path}"),
+        NativeQuote::WindowsBare => format!(" --data-dir {}", cmd_bare_escape(&path)),
     }
 }
 
@@ -2567,7 +2567,9 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     match quote {
         NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
         NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
-        NativeQuote::WindowsBare => format!(" --project-strategy {strategy}"),
+        NativeQuote::WindowsBare => {
+            format!(" --project-strategy {}", cmd_bare_escape(strategy))
+        }
     }
 }
 
@@ -2671,13 +2673,46 @@ fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
 }
 
+/// Escape one field for Antigravity's bare command (#1767).
+///
+/// The executor wraps the whole string in `cmd /c "…"` and does not strip
+/// inner quotes (#611), so this must not emit `"`. Escape only characters
+/// inside the field; the caller keeps the separating spaces bare.
+///
+/// Existing `^` is doubled first. `Felipe^ Leite` therefore becomes
+/// `Felipe^^^ Leite`: `^^` is a literal caret and `^ ` is a literal space.
+/// `Felipe^^ Leite` is one escape short and cmd still splits the token.
+fn cmd_bare_escape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    for c in field.chars() {
+        if c == '"' {
+            continue;
+        }
+        if c == '^' {
+            out.push_str("^^");
+            continue;
+        }
+        if matches!(c, ' ' | '\t' | '&' | '|' | '<' | '>' | '(' | ')') {
+            out.push('^');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[test]
 fn powershell_call_operator_is_limited_to_known_powershell_runners() {
     for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
         assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
     }
 
-    for agent in ["claude-code", "kiro-cli", "opencode", "qwen-code"] {
+    for agent in [
+        "claude-code",
+        "kiro-cli",
+        "opencode",
+        "qwen-code",
+        "antigravity-cli",
+    ] {
         assert_eq!(powershell_call_operator(agent), "", "agent: {agent}");
     }
 }
@@ -4663,6 +4698,191 @@ if (inheritOnly) {
             other_cmd.contains('"'),
             "non-antigravity Windows agents keep their double quotes: {other_cmd}"
         );
+        assert!(
+            !other_cmd.contains("^ "),
+            "quoted agents must not caret-escape spaces: {other_cmd}"
+        );
+    }
+
+    #[test]
+    fn cmd_bare_escape_escapes_fields_without_emitting_quotes() {
+        assert_eq!(cmd_bare_escape(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(cmd_bare_escape("Felipe Leite"), "Felipe^ Leite");
+        // `^^` is a literal caret and `^ ` is a literal space. Two carets
+        // leave the space unescaped, which cmd still splits.
+        assert_eq!(cmd_bare_escape("Felipe^ Leite"), "Felipe^^^ Leite");
+        assert_eq!(cmd_bare_escape("Felipe (Work)"), "Felipe^ ^(Work^)");
+        assert_eq!(cmd_bare_escape("a&b|c<d>e"), "a^&b^|c^<d^>e");
+        assert!(!cmd_bare_escape("ai\"memory").contains('"'));
+    }
+
+    #[test]
+    fn antigravity_bare_command_caret_escapes_spaced_fields() {
+        let cmd = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com?a=1&b=2",
+            Some("tok en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+                Some("repo root"),
+            ),
+        );
+        assert!(!cmd.contains('"'), "must not reopen #611: {cmd}");
+        assert!(
+            cmd.contains(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(cmd.contains(" --auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains(" --project-strategy repo^ root"), "{cmd}");
+        assert!(cmd.contains("https://memory.example.com?a=1^&b=2"), "{cmd}");
+        assert!(
+            cmd.contains(" hook --event pre-tool-use --agent antigravity-cli"),
+            "separator spaces must stay bare: {cmd}"
+        );
+        assert!(
+            !cmd.contains("^ --"),
+            "do not escape separator spaces: {cmd}"
+        );
+        assert!(
+            !cmd.starts_with('&'),
+            "antigravity must not gain a call operator: {cmd}"
+        );
+
+        let metacharacters = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe (Work)\AppData")),
+                None,
+            ),
+        );
+        assert!(!metacharacters.contains('"'), "{metacharacters}");
+        assert!(
+            metacharacters.contains(r"C:\Users\Felipe^^^ Leite\.local\bin\ai-memory.exe"),
+            "existing caret must be doubled before the space escape: {metacharacters}"
+        );
+        assert!(
+            metacharacters.contains(r"--data-dir C:\Users\Felipe^ ^(Work^)\AppData"),
+            "parentheses must be escaped on the rendered command: {metacharacters}"
+        );
+
+        let quoted_field = windows_native_hook_command_with_exe(
+            Path::new("C:\\Users\\me\\ai\"memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            Some("tok\"en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new("C:\\Users\\me\\App\"Data")),
+                Some("repo\"root"),
+            ),
+        );
+        assert!(
+            !quoted_field.contains('"'),
+            "a quote in a field must not be written back: {quoted_field}"
+        );
+    }
+
+    #[test]
+    fn antigravity_pre_tool_use_escapes_spaces_and_other_agents_keep_quotes() {
+        let ag = build_antigravity_payload_for_platform(
+            Path::new(r"C:\hooks"),
+            "https://memory.example.com",
+            Some("tok en"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+            Some("repo root"),
+        );
+        let cmd = ag
+            .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("PreToolUse command");
+        assert!(!cmd.contains('"'), "{cmd}");
+        assert!(!cmd.starts_with('&'), "{cmd}");
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("hook --event pre-tool-use --agent antigravity-cli"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("--auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains("--project-strategy repo^ root"), "{cmd}");
+
+        for agent in ["grok", "gemini-cli"] {
+            let other = build_antigravity_payload_for_platform(
+                Path::new(r"C:\hooks"),
+                "https://memory.example.com",
+                None,
+                HookCommandPlatform::WindowsNative,
+                agent,
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData")),
+                None,
+            );
+            let other_cmd = other
+                .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+                .and_then(|v| v.as_str())
+                .expect(agent);
+            assert!(
+                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
+            );
+            assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");
+            if agent == "gemini-cli" {
+                assert!(
+                    other_cmd.starts_with("& "),
+                    "gemini call operator must be the command prefix: {other_cmd}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn antigravity_bare_escape_runs_under_cmd_outer_quotes() {
+        let root = std::env::temp_dir().join(format!("ai-memory-1767-{}", std::process::id()));
+        let dir = root.join("Felipe Leite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("where.exe");
+        std::fs::copy(r"C:\Windows\System32\where.exe", &dest).unwrap();
+        let escaped = cmd_bare_escape(&dest.to_string_lossy());
+        let command = format!("{escaped} where");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let quoted = format!("\"{}\" where", dest.display());
+        let rejected = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &quoted])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            !rejected.status.success() && stderr.contains('"'),
+            "inner quotes must still be rejected: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -274,6 +274,20 @@ pub enum ConditionalUpsert {
     },
 }
 
+/// The outcome of an atomic conditional page batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalBatchUpsert {
+    /// Every precondition held and all pages were written.
+    Upserted(Vec<PageId>),
+    /// One precondition did not hold, so no page was written.
+    Mismatch {
+        /// Index of the refused page in the caller's batch.
+        index: usize,
+        /// The latest version at that path, if one exists.
+        current: Option<PageId>,
+    },
+}
+
 /// [`upsert_page`] only when `precondition` holds, checked in the same
 /// transaction as the write so no other writer can land in between.
 pub fn upsert_page_if(
@@ -294,6 +308,32 @@ pub fn upsert_page_if(
     let id = upsert_page_in_tx(&tx, page, now)?;
     tx.commit()?;
     Ok(ConditionalUpsert::Upserted(id))
+}
+
+/// Upsert a batch only when every page precondition holds in the batch's
+/// transaction. A single mismatch writes nothing.
+pub fn upsert_pages_batch_if(
+    conn: &mut Connection,
+    pages: &[(NewPage, PagePrecondition)],
+) -> StoreResult<ConditionalBatchUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    for (index, (page, precondition)) in pages.iter().enumerate() {
+        let current = latest_page_id_in_tx(&tx, page)?;
+        let holds = match precondition {
+            PagePrecondition::Absent => current.is_none(),
+            PagePrecondition::Latest(expected) => current == Some(*expected),
+        };
+        if !holds {
+            return Ok(ConditionalBatchUpsert::Mismatch { index, current });
+        }
+    }
+    let mut ids = Vec::with_capacity(pages.len());
+    for (page, _) in pages {
+        ids.push(upsert_page_in_tx(&tx, page, now)?);
+    }
+    tx.commit()?;
+    Ok(ConditionalBatchUpsert::Upserted(ids))
 }
 
 fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
@@ -11359,6 +11399,64 @@ pub(crate) mod tests {
             entities: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    #[test]
+    fn conditional_page_batch_is_all_or_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let first_path = "notes/first.md";
+        let second_path = "notes/second.md";
+        let first_id = upsert_page(&mut conn, &page(ws, proj, first_path, "first-v1")).unwrap();
+        let second_id = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v1")).unwrap();
+        let concurrent = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v2")).unwrap();
+
+        let stale = vec![
+            (
+                page(ws, proj, first_path, "first-stale-batch"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-stale-batch"),
+                PagePrecondition::Latest(second_id),
+            ),
+        ];
+        assert_eq!(
+            upsert_pages_batch_if(&mut conn, &stale).unwrap(),
+            ConditionalBatchUpsert::Mismatch {
+                index: 1,
+                current: Some(concurrent),
+            }
+        );
+        fn latest_body(conn: &Connection, ws: WorkspaceId, proj: ProjectId, path: &str) -> String {
+            conn.query_row(
+                "SELECT body FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+                 AND path = ?3 AND is_latest = 1",
+                params![ws.as_bytes(), proj.as_bytes(), path],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v1");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v2");
+
+        let fresh = vec![
+            (
+                page(ws, proj, first_path, "first-v2"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-v3"),
+                PagePrecondition::Latest(concurrent),
+            ),
+        ];
+        let ConditionalBatchUpsert::Upserted(ids) =
+            upsert_pages_batch_if(&mut conn, &fresh).unwrap()
+        else {
+            panic!("current preconditions must admit the whole batch");
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v2");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v3");
     }
 
     /// The V65 A2 marker is derived from the `compacted: true` frontmatter

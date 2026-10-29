@@ -354,6 +354,10 @@ events = ["write_page", "consolidate", "delete", "purge_project", "move_project"
 blocking = false                                         # fire-and-forget after the write; never blocks it
 ```
 
+Only `http://` and `https://` webhook URLs are accepted; any other scheme, a
+bare hostname, or an empty `url` fails server startup when the chain is
+built.
+
 ### `blocking` (default `true`)
 
 A webhook is either **blocking** or **non-blocking**:

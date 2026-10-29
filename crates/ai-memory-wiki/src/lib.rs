@@ -36,8 +36,8 @@ pub use migrations::run_pending as run_wiki_migrations;
 pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalWrite, EventLedgerFile, MoveSessionOutcome, PAGE_CHECKPOINT_WALK_LIMIT,
-    PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
+    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MoveSessionOutcome,
+    PAGE_CHECKPOINT_WALK_LIMIT, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 
 // Integration tests compile into this crate's test harness instead of a

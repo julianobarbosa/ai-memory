@@ -71,6 +71,9 @@ struct Fixture {
     /// Rewrite this page's body on its Nth read (1-based), to simulate an
     /// edit landing between a sync's classification and its write.
     edit_on_read: Option<(&'static str, usize)>,
+    /// Edit after capturing the Nth read's snapshot, before the next request.
+    /// The response still describes the old version, whether 200 or 304.
+    edit_after_read: Option<(&'static str, usize)>,
     /// Save an editor's local change while the next page request is in flight.
     repository_edit_on_read: Mutex<Option<(PathBuf, Vec<u8>)>>,
     /// Text the fixture's write path redacts, like the server's sanitizer.
@@ -112,6 +115,7 @@ impl Fixture {
             project_exists: true,
             unreachable: None,
             edit_on_read: None,
+            edit_after_read: None,
             repository_edit_on_read: Mutex::new(None),
             redact: None,
             edit_before_mcp: None,
@@ -299,6 +303,12 @@ async fn page_handler(
     // Like the server: the ETag covers the whole projection, so a change to
     // metadata alone also changes it.
     let etag = format!("\"{}\"", state::sha256_hex(document.to_string().as_bytes()));
+    if let Some((target, nth)) = fixture.edit_after_read
+        && target == path
+        && nth == read_count
+    {
+        fixture.update(&path, |page| page.body.push_str("edited concurrently\n"));
+    }
     if let Some(if_none_match) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -977,6 +987,12 @@ async fn sync_exports_metadata_and_round_trips_without_writes() {
     );
 
     sync(addr, &dest).await.expect("second sync");
+    assert_eq!(fixture.page_reads_200.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.page_reads_304.load(Ordering::SeqCst),
+        1,
+        "an unchanged repository file still revalidates with its ETag"
+    );
     assert_eq!(
         fixture.mcp_writes.load(Ordering::SeqCst),
         0,
@@ -993,6 +1009,7 @@ async fn sync_imports_a_repo_edit_with_its_metadata() {
     let (addr, fixture) = serve(Fixture::with_pages(vec![decision()])).await;
     let (_tmp, dest) = temp_dest();
     sync(addr, &dest).await.expect("first sync");
+    let base = state::load(&dest).unwrap().pages["decisions/db.md"].clone();
 
     let edited =
         "---\ntitle: \"DB\"\ntags: [\"db\", \"ops\"]\npinned: true\n---\n# DB\nUse Postgres 17.\n";
@@ -1002,8 +1019,19 @@ async fn sync_imports_a_repo_edit_with_its_metadata() {
         .await
         .expect("dry run");
     assert_eq!(fixture.mcp_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.page_reads_200.load(Ordering::SeqCst),
+        2,
+        "classifying an edited file needs one full read"
+    );
+    assert_eq!(fixture.page_reads_304.load(Ordering::SeqCst), 0);
 
     sync(addr, &dest).await.expect("import");
+    assert_eq!(
+        fixture.mcp_calls.lock().unwrap()[0]["arguments"]["expected_page_id"],
+        base.page_id.unwrap(),
+        "the write is conditional on the version that was classified"
+    );
     let page = fixture.page("decisions/db.md").unwrap();
     assert_eq!(page.body, "# DB\nUse Postgres 17.\n");
     assert!(
@@ -1178,6 +1206,42 @@ async fn sync_import_sends_the_classified_version_and_records_the_new_one() {
             "{path}: the written version is the new base"
         );
     }
+}
+
+/// A 304 used to trigger a second, full read for an import's metadata. If
+/// that read saw a concurrent edit, its id silently replaced the classified
+/// version and the import overwrote it instead of failing its precondition.
+#[tokio::test]
+async fn sync_does_not_rebase_an_import_onto_a_concurrent_server_edit() {
+    let (addr, fixture) = serve(Fixture {
+        edit_after_read: Some(("decisions/db.md", 2)),
+        ..Fixture::with_pages(vec![decision()])
+    })
+    .await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+    let base = state::load(&dest).unwrap().pages["decisions/db.md"].clone();
+    let edited = DECISION_FILE.replace("Use Postgres.", "Repo edit.");
+    fs::write(dest.join("decisions/db.md"), &edited).unwrap();
+
+    let err = sync(addr, &dest)
+        .await
+        .expect_err("the concurrent server edit must be preserved");
+    assert!(err.to_string().contains("changed during this run"), "{err}");
+    let page = fixture.page("decisions/db.md").unwrap();
+    assert!(page.body.contains("edited concurrently"), "{}", page.body);
+    assert!(!page.body.contains("Repo edit"), "{}", page.body);
+    assert_eq!(fixture.mcp_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.mcp_calls.lock().unwrap()[0]["arguments"]["expected_page_id"],
+        base.page_id.as_ref().unwrap().as_str(),
+        "the import must keep the version it classified"
+    );
+    assert_eq!(state::load(&dest).unwrap().pages["decisions/db.md"], base);
+    assert_eq!(
+        fs::read_to_string(dest.join("decisions/db.md")).unwrap(),
+        edited
+    );
 }
 
 /// The race slice 3 could only narrow: another writer lands between the

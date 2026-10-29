@@ -866,7 +866,7 @@ pub fn discover_main_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> 
 
 #[cfg(windows)]
 fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapError> {
-    let is_bare = std::process::Command::new("git")
+    let is_bare = git_command()
         .arg("-C")
         .arg(start)
         .args(["rev-parse", "--is-bare-repository"])
@@ -877,7 +877,7 @@ fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapEr
     }
     let is_bare = String::from_utf8_lossy(&is_bare.stdout).trim() == "true";
 
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(start)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -1039,7 +1039,7 @@ fn collect_git_commits_fallback(
         path = %repo_path.display(),
         "git2 failed to open repository; falling back to git CLI"
     );
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_path)
         .args([
@@ -1094,6 +1094,16 @@ fn collect_git_commits_fallback(
     }
     debug!(count = out.len(), "collected git commits");
     Ok(out)
+}
+
+#[cfg(windows)]
+fn git_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new("git");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(not(windows))]

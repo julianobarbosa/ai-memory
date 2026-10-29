@@ -204,8 +204,9 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
 `--manifest-out`, auth and path rules, with these differences:
 
 - Writes use MCP `memory_write_page` only, each conditional, so the server
-  refuses a page that appears or changes during the import. A destination page this import did not write is never
-  replaced; the run stops and names it.
+  refuses a page that appears or changes after the version read. A resume
+  accepts an existing page only when its complete body matches a planned
+  version; a different body stops the run and names the page.
 - `--dest-prefix` must be relative and portable. `..`, absolute paths, a
   Windows drive, and a first segment that is reserved (`sessions`,
   `session-logs`, `procedures`, `decisions`, `gotchas`, `profile`) or starts
@@ -218,10 +219,15 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
   the manifest or any request exists. Record ids that look like credentials
   are refused.
 - Each record has a stable ingest key, a UUIDv5 of its agentmemory id, written
-  on the page's last line. A rerun finds the key in the page the server
-  already holds and skips it, so an interrupted import resumes without
-  duplicates and a finished one writes nothing. The manifest records each
-  version as `written`, `present` (already there) or `failed`.
+  on the page's last line. A rerun compares the entire sanitized planned body,
+  including that line, with the page the server already holds before skipping
+  it. Editing the body while keeping its attribution footer therefore cannot
+  authorize a later imported version to replace the edit. Server-side
+  sanitation that changes the body also stops automatic resumption. This
+  comparison covers the body, not frontmatter-only edits; a later imported
+  version still applies its planned metadata. An identical interrupted import
+  resumes without duplicates and a finished one writes nothing. The manifest
+  records each version as `written`, `present` (already there) or `failed`.
 - Without `--create-destination`, every destination must already exist; the
   check is a read, which never creates a scope.
 

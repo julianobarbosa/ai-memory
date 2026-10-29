@@ -745,6 +745,150 @@ fn restore_agents_binary_safe_preserves_raw_bytes() {
 }
 
 #[test]
+#[cfg(unix)]
+fn restore_agents_checks_permissions_before_skipping_identical_content() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugin_dir = home.path().join(".claude/plugins/test-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let script = plugin_dir.join("run.sh");
+    let body = b"#!/bin/sh\nexit 0\n";
+    fs::write(&script, body).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    let mode = || fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+
+    let archive = project.path().join("backup.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "claude-code",
+            "--scope",
+            "global",
+        ])
+        .output()
+        .unwrap();
+    assert!(backup.status.success());
+
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o640)).unwrap();
+    let preview = command_with_env(home.path(), project.path())
+        .args(["restore-agents", "-i", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("[OVERWRITE]"));
+    assert_eq!(mode(), 0o640, "preview must not restore permissions");
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 1);
+
+    let without_force = command_with_env(home.path(), project.path())
+        .args(["restore-agents", "-i", archive.to_str().unwrap(), "--apply"])
+        .output()
+        .unwrap();
+    assert!(without_force.status.success());
+    assert!(String::from_utf8_lossy(&without_force.stdout).contains("[SKIP]"));
+    assert_eq!(mode(), 0o640, "permission changes still require --force");
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 1);
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(mode(), 0o750, "identical bytes must not hide mode changes");
+    assert_eq!(fs::read(&script).unwrap(), body);
+    let backup_path = fs::read_dir(&plugin_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run.sh.bak-"))
+        })
+        .expect("permission restore must keep a backup copy");
+    assert_eq!(fs::read(&backup_path).unwrap(), body);
+    assert_eq!(
+        fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    let identical = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(identical.status.success());
+    assert!(String::from_utf8_lossy(&identical.stdout).contains("already identical"));
+    assert_eq!(mode(), 0o750);
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn restore_agents_without_archived_permissions_keeps_identical_file_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let body = b"# instructions";
+    let target = project.path().join("CLAUDE.md");
+    fs::write(&target, body).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).unwrap();
+    let archive = project.path().join("without-mode.tar.gz");
+    write_agent_archive(
+        &archive,
+        serde_json::json!([{
+            "agent": "claude-code",
+            "asset_kind": "instruction",
+            "scope": "project",
+            "archive_path": "project/CLAUDE.md",
+            "target_relative": "CLAUDE.md",
+            "sha256": sha256(body),
+        }]),
+        &[("project/CLAUDE.md", body)],
+    );
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    assert!(String::from_utf8_lossy(&restore.stdout).contains("already identical"));
+    assert_eq!(fs::read(&target).unwrap(), body);
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert_eq!(fs::read_dir(project.path()).unwrap().count(), 2);
+}
+
+#[test]
 fn restore_agents_verifies_sha256_integrity() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();

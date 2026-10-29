@@ -61,16 +61,16 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalUpsert,
-    DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
-    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
-    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
-    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
-    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
-    backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalBatchUpsert,
+    ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
+    EntityBackfillSummary, HookSessionAdmission, IdentityResolution, IdleEndAction,
+    IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
+    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary,
+    PagesMode, ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary,
+    ReorgSummary, RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate,
+    SessionTimesSkipReason, SkippedSessionTimes, StaleAfterRepair, backfill_entity_index,
+    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
@@ -158,6 +158,49 @@ pub struct Store {
 }
 
 impl Store {
+    /// Open an existing backup snapshot, applying any outstanding migrations.
+    /// Unlike [`Self::open`], this refuses to initialize an absent or blank
+    /// database: a restore must validate what the archive supplied before it
+    /// replaces the live data. Applied history is required even when the
+    /// snapshot contains no pages; refinery still validates that history.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::UninitializedSnapshot`] when the snapshot is
+    /// absent, empty, or has no applied migration history. Other I/O, SQLite
+    /// and migration errors propagate as for [`Self::open`].
+    pub fn open_snapshot(data_dir: &Path) -> StoreResult<Self> {
+        let db_path = data_dir.join("db").join(DB_FILENAME);
+        match std::fs::metadata(&db_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+            Ok(_) => return Err(StoreError::UninitializedSnapshot),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::UninitializedSnapshot);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // Read-only and without CREATE: this check must not manufacture the
+        // evidence that distinguishes a snapshot from a fresh database.
+        let conn =
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_history: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'refinery_schema_history')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_history
+            || !conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM refinery_schema_history)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(StoreError::UninitializedSnapshot);
+        }
+        drop(conn);
+        Self::open(data_dir)
+    }
+
     /// Open the SQLite file at `<data_dir>/db/memory.sqlite`, applying any
     /// outstanding migrations, then spawn the writer thread and prepare
     /// the read-only connection pool.
@@ -330,6 +373,26 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn open_snapshot_migrates_a_snapshot_from_the_first_schema() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("db")).unwrap();
+        let path = tmp.path().join("db").join(DB_FILENAME);
+        let mut conn = Connection::open(&path).unwrap();
+        migrations::run_to(&mut conn, 1).unwrap();
+        drop(conn);
+
+        let store = Store::open_snapshot(tmp.path()).unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(applied > 1, "the historical snapshot must still migrate");
     }
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {

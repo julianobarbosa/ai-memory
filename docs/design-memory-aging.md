@@ -192,20 +192,26 @@ Everything in A works with no provider and does not require ranking changes.
   mcp-memory-service ship extractive compression with no LLM. Tier-down beats
   eviction because the durable facts survive.
 - *Mechanism:* a new sweep pass, before the decay-eviction pass, that rewrites the
-  page through `Wiki::write_page`/`apply_batch` (supersession + git preserve the
+  page through the wiki's conditional batch write (supersession + git preserve the
   original, so it is **reversible**: the full body stays in the version chain and git
-  history). Regex keep-token miner lives beside the sanitizer's patterns. Needs a
+  history). Every replacement is conditional on the selected source `PageId`, and
+  the writer validates the whole batch in the same SQLite transaction: one page
+  changed by a concurrent user leaves every replacement unwritten for the next
+  sweep. Regex keep-token miner lives beside the sanitizer's patterns. Needs a
   **`tier_state`/`compacted` marker** (frontmatter flag + a `pages` column, V65) so
   the sweep and `curator.rs` distinguish a *deliberately short* page from a *cold*
   one and never re-compact or misread it as cold.
 - *Schema delta:* V65 `pages.compacted_at` (nullable) + frontmatter mirror.
 - *Invariants:* mutation through the wiki layer only (#16 supersession keeps the
-  loser reachable); zero-LLM (#13).
+  loser reachable); one conditional writer transaction for the batch (#2 and #3);
+  zero-LLM (#13).
 - *R2 bar:* compaction must not drop recall on R2 vs. the pre-compaction corpus
   (the keep-token set is the hypothesis: facts survive, prose doesn't matter).
 - *Failure modes:* keep-token miner drops a load-bearing sentence → the original is
   one supersession-restore away; `restore-page` covers it. Re-compaction loop →
-  the `compacted_at` marker blocks it.
+  the `compacted_at` marker blocks it. Concurrent user correction → the selected
+  source id no longer matches and the full batch is retried later rather than
+  replacing the correction.
 
 **A3. Cold-cluster dedup (DBSCAN, adaptive eps).**
 - *What:* cluster near-duplicate cold pages by embedding and collapse each cluster

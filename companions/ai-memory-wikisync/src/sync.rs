@@ -159,7 +159,9 @@ pub fn baseline_for(
         state::ScopeCheck::Adopted => {
             if !state.pages.is_empty() {
                 eprintln!(
-                    "ai-memory-wikisync: this destination's baseline predates origin tracking;                      adopting it for {}/{}. A baseline from another project cannot be detected,                      so check the plan before --apply.",
+                    "ai-memory-wikisync: this destination's baseline predates origin tracking; \
+                     adopting it for {}/{}. A baseline from another project cannot be detected, \
+                     so check the plan before --apply.",
                     scope.workspace, scope.project
                 );
             }
@@ -179,7 +181,8 @@ pub fn baseline_for(
                 );
             }
             eprintln!(
-                "ai-memory-wikisync: discarding the baseline recorded for {}/{}, adopting this                  destination for {}/{}",
+                "ai-memory-wikisync: discarding the baseline recorded for {}/{}, adopting this \
+                 destination for {}/{}",
                 recorded.workspace, recorded.project, scope.workspace, scope.project
             );
             state = state::SyncState {

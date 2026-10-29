@@ -871,7 +871,10 @@ ai_memory_state_dir() {
     elif [ -n "${XDG_DATA_HOME:-}" ]; then
         printf '%s/ai-memory' "$XDG_DATA_HOME"
     elif [ -n "${HOME:-}" ]; then
-        printf '%s/.local/share/ai-memory' "$HOME"
+        case "$(uname -s 2>/dev/null || printf '')" in
+            Darwin) printf '%s/Library/Application Support/ai-memory' "$HOME" ;;
+            *) printf '%s/.local/share/ai-memory' "$HOME" ;;
+        esac
     else
         printf '.ai-memory'
     fi
@@ -925,7 +928,7 @@ ai_memory_clear_session_id() {
 # Path of the `Authorization:` header file `install-hooks --apply` writes
 # (0600, inside the 0700 data dir). Printed only when readable.
 ai_memory_auth_header_file() {
-    _amhf="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-memory}/auth-header"
+    _amhf="$(ai_memory_state_dir)/auth-header"
     [ -r "$_amhf" ] && printf '%s' "$_amhf"
 }
 

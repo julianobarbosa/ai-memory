@@ -4778,10 +4778,12 @@ async fn process_authorized(
         // read.
         let handoff_owner = owner_stamp_for_event(state, session_owner.as_ref()).await;
         // An OpenCode child session has its own id and forwards its parent as
-        // `agent_id`; its end must not hand the next session a sub-task baton.
-        // Other harnesses are not gated: Claude Code also sets `agent_type` on
-        // a top-level `--agent` session, which still owns its baton.
-        let child_session = env.agent == AgentKind::OpenCode && body_is_subagent(&env.raw);
+        // `agent_id`, and the OMP extension marks a subagent session the same
+        // way; its end must not hand the next session a sub-task baton. Other
+        // harnesses are not gated: Claude Code also sets `agent_type` on a
+        // top-level `--agent` session, which still owns its baton.
+        let child_session =
+            matches!(env.agent, AgentKind::OpenCode | AgentKind::Omp) && body_is_subagent(&env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
@@ -11288,6 +11290,81 @@ pub(crate) mod tests {
         );
     }
 
+    /// `drop_subagent_captures` reaches OMP through the extension's `agent_id`:
+    /// a marked subagent session is dropped through its end, while a top-level
+    /// OMP session in the same project is stored.
+    #[tokio::test]
+    async fn drop_subagent_captures_drops_an_omp_subagent_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let url = |event: &str| format!("http://h/hook?event={event}&agent=omp&drop_subagent=1");
+        let subagent = serde_json::json!({
+            "sessionID": "omp-sub", "agent_id": "0-Explore", "prompt": "Find the config loader"
+        });
+        let top_level = serde_json::json!({ "sessionID": "omp-top", "prompt": "Ship the fix" });
+        let items = vec![
+            HookBatchItem {
+                url: url("user-prompt"),
+                body: subagent.clone(),
+            },
+            HookBatchItem {
+                url: url("session-end"),
+                body: subagent.clone(),
+            },
+            HookBatchItem {
+                url: url("user-prompt"),
+                body: top_level.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3, "all acked: 2 dropped + 1 processed");
+
+        let omp_prompt = || HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("omp".into()),
+            ..Default::default()
+        };
+        let sub_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(omp_prompt(), subagent)).unwrap();
+        let top_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(omp_prompt(), top_level))
+                .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an opted-in project drops the OMP subagent session"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the top-level OMP session is kept"
+        );
+    }
+
     #[tokio::test]
     async fn subagent_start_event_seeds_the_session_so_its_tail_drops() {
         let tmp = TempDir::new().unwrap();
@@ -14938,6 +15015,62 @@ pub(crate) mod tests {
                 .await
                 .unwrap(),
             Some(session)
+        );
+    }
+
+    /// The OMP extension posts a subagent session's events with `agent_id`
+    /// (OMP runs subagents in the parent's process); that session's end closes
+    /// and summarizes it without a baton. A top-level OMP session in the same
+    /// project still leaves one, so the gate is per session, not per agent.
+    #[tokio::test]
+    async fn omp_subagent_session_end_closes_and_summarizes_without_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let omp_event = |session: SessionId, event: &str, agent_id: Option<&str>| {
+            let mut body = serde_json::json!({
+                "sessionID": session.to_string(),
+                "prompt": "Find where the config is loaded",
+            });
+            if let Some(agent_id) = agent_id {
+                body["agent_id"] = serde_json::json!(agent_id);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("omp".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        let subagent = SessionId::new();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let env = omp_event(subagent, event, Some("0-Explore"));
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(
+            !open_handoff_exists(&state).await,
+            "an OMP subagent's end must not leave a baton"
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(subagent)
+        );
+
+        let top_level = SessionId::new();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let env = omp_event(top_level, event, None);
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(
+            open_handoff_exists(&state).await,
+            "a top-level OMP session still hands over its baton"
         );
     }
 

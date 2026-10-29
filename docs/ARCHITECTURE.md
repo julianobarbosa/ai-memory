@@ -63,7 +63,9 @@ from hook paths.
    high-latency operators can raise the drain/handoff/background caps with
    minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP
-   429 instead of queueing unbounded work.
+   429 instead of queueing unbounded work. A native spool drain pauses that
+   endpoint for the rest of its pass without charging retry attempts; queued
+   events for other endpoints still deliver with their own credentials.
    For supported native commands and generated OpenCode/OMP/Pi/OpenClaw
     integrations, the nearest-marker capture policy runs first: a dropped
     recognized file-tool event never enters spool, queue, transport, logs, or
@@ -607,7 +609,10 @@ to keep its L0 `abstract:`, an L1 first-paragraph summary, and an L2 regex-mined
 keep-token set (paths, URLs, code spans, error codes, identifiers), dropping the
 prose, instead of being tombstoned. The rewrite supersedes the prior version,
 so the full body stays reachable (git + supersession chain; `restore-page`
-recovers it). The `V65` `pages.compacted_at` marker makes a compacted page
+recovers it). The batched rewrite is conditional on every source version still
+being latest, checked inside the writer transaction; any concurrent edit rejects
+the whole batch without replacing the edit or partially compacting its peers.
+The `V65` `pages.compacted_at` marker makes a compacted page
 terminal for the decay pass (never re-compacted, never re-evicted, never
 re-reported as cold). Zero-LLM, off by default; the R2 recall no-regression
 proof gates any future default-on.

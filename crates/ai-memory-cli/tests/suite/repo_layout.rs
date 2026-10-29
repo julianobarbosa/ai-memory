@@ -119,6 +119,7 @@ fn codeql_model_targets_exist() {
             "ai_memory_client",
             repo_root.join("companions/ai-memory-client/src"),
         ),
+        ("ai_memory_wiki", crates_dir().join("ai-memory-wiki/src")),
     ];
     let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
     let mut targets = 0;
@@ -165,4 +166,30 @@ fn codeql_model_targets_exist() {
         "stale CodeQL model targets:\n{}",
         problems.join("\n")
     );
+}
+
+/// Advanced CodeQL setup does not reliably auto-load repository-local model
+/// packs. Keep the explicit Rust analysis path wired to the checked-in pack.
+#[test]
+fn codeql_workflow_loads_local_models() {
+    let workflow = fs::read_to_string(
+        crates_dir()
+            .parent()
+            .expect("crates/ lives in the repository root")
+            .join(".github/workflows/codeql.yml"),
+    )
+    .expect("read CodeQL workflow");
+    for required in [
+        "skip-queries: ${{ matrix.language == 'rust' }}",
+        "--additional-packs=.github/codeql/extensions",
+        "--model-packs=akitaonrails/ai-memory-models",
+        "--ram=\"$CODEQL_RAM\"",
+        "--threads=\"$CODEQL_THREADS\"",
+        "codeql/rust-queries:codeql-suites/rust-code-scanning.qls",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "CodeQL workflow omitted {required}"
+        );
+    }
 }
