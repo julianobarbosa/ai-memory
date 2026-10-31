@@ -622,6 +622,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".commandcode/",
                 ".kimi/",
                 ".qwen/",
+                ".qoder/",
             ];
             let allowed = rel_path == ".claude.json"
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));

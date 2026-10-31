@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::cli::{LlmProviderChoice, LlmTestArgs};
 use crate::config::Config;
+use crate::http_client::{ServerEndpoint, post_json};
 
 /// Run the `llm-test` subcommand.
 ///
@@ -13,14 +14,22 @@ use crate::config::Config;
 /// Returns an error if the provider cannot be constructed, the env
 /// lacks the required keys, or the HTTP call fails.
 pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
-    let provider = ProviderChoice::from(args.provider);
+    if args.server {
+        return run_against_server(config).await;
+    }
+    let provider = ProviderChoice::from(
+        args.provider
+            .context("--provider is required unless --server is passed")?,
+    );
     let api_key_override = args
         .api_key
         .filter(|s| !s.is_empty())
         .map(secrecy::SecretString::from);
     let provider_config = ProviderConfig {
         provider,
-        model: args.model,
+        model: args
+            .model
+            .context("--model is required unless --server is passed")?,
         auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
@@ -37,7 +46,10 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         model = client.model(),
         "sending prompt",
     );
-    let request = representative_request(args.prompt);
+    let request = representative_request(
+        args.prompt
+            .context("--prompt is required unless --server is passed")?,
+    );
     if args.structured {
         let value = client
             .complete_structured_raw(
@@ -113,6 +125,22 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Cursor => Self::Cursor,
         }
     }
+}
+
+/// Probe the server's own configured provider (`--server`).
+///
+/// The server runs the probe with a fixed short prompt against what its
+/// configuration holds, so this works from a machine that has no keys at all —
+/// which is the whole point (#1639).
+async fn run_against_server(config: &Config) -> Result<()> {
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let report: serde_json::Value = post_json(&endpoint, "/admin/llm-test", &()).await?;
+    let provider = report["provider"].as_str().unwrap_or("(unknown)");
+    let model = report["model"].as_str().unwrap_or("(unknown)");
+    let latency = report["latency_ms"].as_u64().unwrap_or(0);
+    println!("--- server provider: {provider} / {model} ({latency} ms) ---");
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 #[cfg(test)]

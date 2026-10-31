@@ -95,6 +95,14 @@ each successful write batch): per page, the SHA-256 of the bytes last
 written plus the server `ETag` and version id observed at that write.
 Nothing else is stored: no tokens and no server credentials.
 
+Mutating `export --apply` and `sync --apply` runs take an exclusive OS lock
+for the destination before loading this state and hold it through planning,
+writes, and the final state save. A second mutating run fails promptly with a
+busy-destination error; a crash releases the lock automatically. Read-only
+`plan`, dry-run export/sync, and `sync --check` do not create or take the lock,
+so they remain strictly non-mutating; when run alongside an apply, their report
+may describe the state before that apply finishes.
+
 The state is per clone. The state directory carries a `.gitignore` of `*`,
 so committing the destination never commits the state: two clones that
 shared one would conflict on every merge and trust each other's baselines.
@@ -199,9 +207,12 @@ Safety rules:
   the whole run. A pinned server page is never deleted unless `--prefer repo`
   is given. A file is deleted only through the same path checks as a write
   (no symlinked file or directory, nothing outside `--dest`) and only if it
-  still holds the bytes the plan classified. The tool never runs git: it
-  prints the `git rm` to stage the deletes. Apply order is imports, exports,
-  server deletes, file deletes.
+  still holds the bytes the plan classified. Before deleting a server page,
+  the tool rechecks that its repository file is still absent. A file restored
+  during planning keeps the server page and baseline, even with `--prefer repo`;
+  the run reports the change and exits non-zero so the next sync can reconsider
+  it. The tool never runs git: it prints the `git rm` to stage the deletes.
+  Apply order is imports, exports, server deletes, file deletes.
 
 ## CI and post-merge
 

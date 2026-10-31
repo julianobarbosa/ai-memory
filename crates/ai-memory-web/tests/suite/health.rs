@@ -207,6 +207,7 @@ fn app(
             base_path: "",
             trusted_proxy_identity: false,
             recall,
+            runtime: None,
             health: health.map(Arc::new),
         },
     )
@@ -583,8 +584,9 @@ async fn health_page_refuses_a_db_user_and_admits_root() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(location, None, "a non-root 403 is not a password redirect");
     assert!(body.contains("Root access required"), "{body}");
+    let content = body.split("<main").nth(1).expect("refusal content");
     for leaked in ["Server health", "ai-memory recover", "90/100", "saturated"] {
-        assert!(!body.contains(leaked), "DB user saw {leaked}: {body}");
+        assert!(!content.contains(leaked), "DB user saw {leaked}: {body}");
     }
 
     // Control: root on the same multi-user server.

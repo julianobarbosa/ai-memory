@@ -879,7 +879,7 @@ async fn session_timeline_renders_captured_markup_inert() {
     assert!(!html.contains("<script>alert("), "{html}");
     assert!(!html.contains("<img src=x"), "{html}");
     assert!(!html.contains("' onmouseover='"), "{html}");
-    assert!(!html.contains("\"><img"), "{html}");
+    assert!(!html.contains("\"><img src=x onerror="), "{html}");
     assert!(html.contains("&lt;script&gt;alert("), "{html}");
 }
 

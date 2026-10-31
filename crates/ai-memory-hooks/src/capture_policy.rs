@@ -187,6 +187,85 @@ pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
     })
 }
 
+/// Longest harness tool name kept by `[ingest] record_tool_names`, the same
+/// bound as an MCP tool name: every documented harness tool name fits.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Longest skill or subagent identifier kept by `[ingest] record_tool_names`.
+/// Plugin skills carry a `plugin:skill` prefix, so this is wider than a name.
+const MAX_TOOL_DESCRIPTOR_CHARS: usize = 128;
+
+/// A closed-tool call's own name, plus the one identifier that says which
+/// skill or subagent it ran. Kept only when the operator opts in with
+/// `[ingest] record_tool_names`; [`crate::HookEnvelope::record_tool_name`]
+/// writes it into the observation.
+///
+/// Never an argument. A shell command, a prompt, a path or a URL stays out:
+/// the name and the two descriptors are kept only when they are short
+/// identifiers, so free text a harness put in those fields is refused whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedToolName {
+    pub(crate) name: String,
+    /// `tool_input.skill` of Claude Code's `Skill` tool.
+    pub(crate) skill: Option<String>,
+    /// `tool_input.subagent_type` of Claude Code's `Agent` (formerly `Task`)
+    /// tool.
+    pub(crate) subagent_type: Option<String>,
+}
+
+/// The tool name a closed-tool event carries, read from the same adapter
+/// fields [`tool_observation_metadata`] uses, and refused unless it is at most
+/// 64 ASCII letters, digits, `_` or `-`.
+///
+/// The skill and subagent identifiers are Claude Code's own `tool_input`
+/// fields (<https://code.claude.com/docs/en/hooks>, "PreToolUse input": the
+/// `Agent` tool's `subagent_type`; the `Skill` tool's `skill`), so they are
+/// read for Claude Code only. Each is kept when it is at most 128 ASCII
+/// letters, digits, `_`, `-`, `.` or `:`.
+pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<RecordedToolName> {
+    let (name, _) = tool_payload_fields(agent, raw)?;
+    if !valid_tool_name(name) {
+        return None;
+    }
+    let input = if agent == AgentKind::ClaudeCode {
+        raw.get("tool_input")
+    } else {
+        None
+    };
+    let descriptor = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_descriptor(value))
+            .map(str::to_owned)
+    };
+    Some(RecordedToolName {
+        name: name.to_owned(),
+        skill: (name == "Skill").then(|| descriptor("skill")).flatten(),
+        subagent_type: matches!(name, "Agent" | "Task")
+            .then(|| descriptor("subagent_type"))
+            .flatten(),
+    })
+}
+
+/// A harness tool name as `[ingest] record_tool_names` keeps it: an
+/// identifier, never free text.
+pub(crate) fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_CHARS
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_tool_descriptor(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOOL_DESCRIPTOR_CHARS
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 /// Safe outcome class for a completed tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolOutcome {
@@ -247,7 +326,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CodeBuddy
         | AgentKind::IbmBob
         | AgentKind::Dsh
-        | AgentKind::QwenCode => (
+        | AgentKind::QwenCode
+        | AgentKind::Qoder => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -338,6 +418,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
                             | AgentKind::QwenCode
+                            | AgentKind::Qoder
                     ) {
                         "tool_input"
                     } else {
@@ -402,7 +483,7 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode
+        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode | AgentKind::Qoder
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1187,6 +1268,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Cursor
         | AgentKind::GeminiCli
         | AgentKind::QwenCode
+        | AgentKind::Qoder
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
@@ -4709,6 +4791,7 @@ mod tests {
             AgentKind::Muse,
             AgentKind::CodeBuddy,
             AgentKind::QwenCode,
+            AgentKind::Qoder,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,

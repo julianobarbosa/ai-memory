@@ -127,6 +127,7 @@ fn web(f: &Fixture, recall: Recall) -> axum::Router {
             base_path: "",
             trusted_proxy_identity: false,
             recall,
+            runtime: None,
             health: None,
         },
     )

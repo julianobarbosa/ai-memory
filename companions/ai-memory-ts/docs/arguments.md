@@ -28,6 +28,18 @@ Methods: `pages.write`, `pages.update`
 | `expected_page_id` | `expectedPageId` |
 | `create_only` | `createOnly` |
 
+## `memory_patch_page`
+
+Methods: `pages.patch`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `path` | `path` |
+| `expected_page_id` | `expectedPageId` |
+| `edits` | `edits` |
+
 ## `memory_read_page`
 
 Methods: `pages.read`, `pages.update`
@@ -36,10 +48,12 @@ Methods: `pages.read`, `pages.update`
 |---|---|
 | `workspace` | `workspace` |
 | `project` | `project` |
+| `scope` | `scope` |
 | `path` | `path` |
 | `query` | `query` |
 | `include_related` | `includeRelated` |
 | `related_depth` | `relatedDepth` |
+| `max_chars` | `maxChars` |
 
 ## `memory_delete_page`
 
@@ -154,6 +168,8 @@ Methods: `messages.send`
 | `from_project` | `fromProject` |
 | `body` | `body` |
 | `subject` | `subject` |
+| `nature` | `nature` |
+| `evidence` | `evidence` |
 
 ## `memory_message_list`
 
@@ -175,6 +191,7 @@ Methods: `messages.pop`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `message_id` | `messageId` |
+| `agent` | `agent` |
 
 ## `memory_message_cancel`
 

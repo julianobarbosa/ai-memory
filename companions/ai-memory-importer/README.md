@@ -55,7 +55,9 @@ Two routes read what agentmemory exports. Both write through the MCP
 `memory_write_page` tool with explicit `workspace` and `project`, every write
 conditional: `create_only` for a page's first version and `expected_page_id`
 for each later one. They refuse a server older than ai-memory 3.0, which would
-ignore those arguments. Pages land under `--dest-prefix` (default
+ignore those arguments. The client performs the MCP initialization handshake,
+so these routes work with both the default stateless transport and
+`serve --http-stateful`. Pages land under `--dest-prefix` (default
 `imported/agentmemory`), never under ai-memory's own `sessions/` or any other
 reserved family.
 
@@ -145,9 +147,16 @@ by formatting may still be extracted; deleted revisions and field instructions
 are excluded. Review `--show-body` before every live import of a document whose
 visibility rules matter.
 
+DOCX and PPTX extraction preserves explicit run-level line breaks, including
+DOCX carriage returns and formatted PPTX breaks, and DOCX tabs. Paired XML
+start/end tags and self-closing tags produce the same separators.
+Paragraph tab-stop definitions are formatting and do not insert text.
+
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
-their cue text.
+their cue text. WebVTT character references such as `&amp;` and `&#233;` are
+decoded once before sanitization. Escaped tags remain literal text, and SRT
+character references retain their original spelling.
 
 ## Safety contract
 

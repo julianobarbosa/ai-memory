@@ -33,6 +33,7 @@ async fn prepare(store: &Store) -> ai_memory_store::PreparedWorkstreamRun {
     store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: "repo".into(),

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { AiMemoryClient } from "../../src/client.js";
+import { Core } from "../../src/core.js";
 import {
   AbortError,
   AuthError,
@@ -62,42 +63,47 @@ describe("JSON-RPC response parsing", () => {
 
   it("raises ProtocolError when the body holds no JSON-RPC message", async () => {
     const server = new FakeServer();
-    server.mcp = async () => text("event: ping\n\n", 200, { "content-type": "text/event-stream" });
+    server.tools.set("memory_status", () =>
+      text("event: ping\n\n", 200, { "content-type": "text/event-stream" }),
+    );
     await assert.rejects(client(server).callTool("memory_status", {}), ProtocolError);
   });
 
   it("decodes an SSE answer to a tool call", async () => {
     const server = new FakeServer();
-    server.mcp = async (request) => {
+    server.tools.set("memory_status", (_args, request) => {
       const id = (request.body as { id: number }).id;
       const result = { content: [{ type: "text", text: '{"a":1}' }], isError: false };
       return text(`data: \n\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result })}\n\n`, 200, {
         "content-type": "text/event-stream",
       });
-    };
+    });
     assert.deepEqual(await client(server).callTool("memory_status", {}), { a: 1 });
   });
 
   it("refuses an answer to a different request id", async () => {
     const server = new FakeServer();
-    server.mcp = async () => json({ jsonrpc: "2.0", id: 999, result: {} });
+    server.tools.set("memory_status", () => json({ jsonrpc: "2.0", id: 999, result: {} }));
     await assert.rejects(client(server).callTool("memory_status", {}), ProtocolError);
   });
 
   it("raises ProtocolError for a result with no result member", async () => {
     const server = new FakeServer();
-    server.mcp = async (r) => json({ jsonrpc: "2.0", id: (r.body as { id: number }).id });
+    server.tools.set("memory_status", (_args, r) =>
+      json({ jsonrpc: "2.0", id: (r.body as { id: number }).id }),
+    );
     await assert.rejects(client(server).callTool("memory_status", {}), ProtocolError);
   });
 
   it("raises ProtocolError when the tool text is not JSON", async () => {
     const server = new FakeServer();
-    server.mcp = async (r) =>
+    server.tools.set("memory_status", (_args, r) =>
       json({
         jsonrpc: "2.0",
         id: (r.body as { id: number }).id,
         result: { content: [{ type: "text", text: "plain words" }] },
-      });
+      }),
+    );
     await assert.rejects(client(server).callTool("memory_status", {}), ProtocolError);
   });
 
@@ -123,7 +129,7 @@ describe("error taxonomy", () => {
     ];
     for (const [status, expected] of cases) {
       const server = new FakeServer();
-      server.mcp = async () => json({ error: `status ${status}` }, status);
+      server.tools.set("memory_status", () => json({ error: `status ${status}` }, status));
       await assert.rejects(client(server).callTool("memory_status", {}), (error: unknown) => {
         assert.ok(error instanceof expected, `status ${status}`);
         assert.equal((error as HttpError).status, status);
@@ -178,12 +184,13 @@ describe("error taxonomy", () => {
 
   it("raises ToolError for result.isError", async () => {
     const server = new FakeServer();
-    server.mcp = async (r) =>
+    server.tools.set("memory_status", (_args, r) =>
       json({
         jsonrpc: "2.0",
         id: (r.body as { id: number }).id,
         result: { content: [{ type: "text", text: "tool blew up" }], isError: true },
-      });
+      }),
+    );
     await assert.rejects(client(server).callTool("memory_status", {}), (error: unknown) => {
       assert.ok(error instanceof ToolError);
       assert.equal(error.detail, "tool blew up");
@@ -266,7 +273,7 @@ describe("timeouts and aborts", () => {
 describe("response bounds", () => {
   it("refuses a body over maxResponseBytes", async () => {
     const server = new FakeServer();
-    server.mcp = async () => text("x".repeat(4096));
+    server.tools.set("memory_status", () => text("x".repeat(4096)));
     await assert.rejects(
       client(server, { maxResponseBytes: 1024 }).callTool("memory_status", {}),
       ProtocolError,
@@ -282,6 +289,110 @@ describe("response bounds", () => {
 });
 
 describe("stateful sessions", () => {
+  it("a failed probe cannot discard a newer raw call's pending handshake", async () => {
+    const server = new FakeServer();
+    server.sessionId = "retry-session";
+    server.tools.set("memory_lint", () => ({ report: "ok" }));
+    let failFirst = () => {};
+    let releaseRetries = () => {};
+    const firstGate = new Promise<void>((resolve) => {
+      failFirst = resolve;
+    });
+    const retryGate = new Promise<void>((resolve) => {
+      releaseRetries = resolve;
+    });
+    let initializations = 0;
+    const core = new Core(
+      new Transport({
+        serverUrl: "http://127.0.0.1:49374",
+        fetch: async (url, init) => {
+          const body = JSON.parse(init.body as string) as { method: string };
+          if (body.method === "initialize") {
+            initializations += 1;
+            if (initializations === 1) {
+              await firstGate;
+              return json({ error: "unavailable" }, 503);
+            }
+            await retryGate;
+          }
+          return server.fetch(url, init);
+        },
+      }),
+      SCOPE,
+    );
+
+    // Observe the core directly so the retry runs before the old probe's
+    // rejection handler, without relying on a fixed number of microtasks.
+    let retry: Promise<unknown> | undefined;
+    const first = core.callTool("memory_lint", {}, true).catch((error: unknown) => {
+      assert.ok(error instanceof HttpError);
+      retry = core.callTool("memory_lint", {}, true);
+    });
+    const wrapped = assert.rejects(core.invoke("memory_status", SCOPE, false), HttpError);
+    failFirst();
+    await Promise.all([first, wrapped]);
+    assert.ok(retry !== undefined);
+    const third = core.callTool("memory_lint", {}, true);
+    try {
+      assert.equal(initializations, 2, "the third call must share the pending retry session");
+    } finally {
+      releaseRetries();
+      assert.deepEqual(await Promise.all([retry, third]), [{ report: "ok" }, { report: "ok" }]);
+    }
+    assert.equal(server.toolCalls().length, 2);
+    for (const request of server.requests.slice(1)) {
+      assert.equal(request.headers["mcp-session-id"], "retry-session");
+    }
+  });
+
+  it("raw and wrapped calls share one handshake and refresh opens a new session", async () => {
+    const server = new FakeServer();
+    server.sessionId = "session-raw";
+    server.tools.set("memory_status", () => payloads.status);
+    server.tools.set("memory_lint", () => ({ report: "ok" }));
+    const memory = client(server);
+    await Promise.all([
+      memory.callTool("memory_lint", { dry_run: true }),
+      memory.status(),
+    ]);
+    const count = (method: string) =>
+      server.requests.filter(
+        (r) => (r.body as { method?: string } | undefined)?.method === method,
+      ).length;
+    assert.equal(count("initialize"), 1);
+    assert.equal(count("notifications/initialized"), 1);
+    assert.equal(count("tools/list"), 1);
+    for (const request of server.requests.slice(1)) {
+      assert.equal(request.headers["mcp-session-id"], "session-raw");
+    }
+
+    server.sessionId = "session-refreshed";
+    await memory.capabilities({ refresh: true });
+    await memory.callTool("memory_lint", { dry_run: true });
+    assert.equal(count("initialize"), 2);
+    assert.equal(count("notifications/initialized"), 2);
+    assert.equal(server.requests.at(-1)?.headers["mcp-session-id"], "session-refreshed");
+  });
+
+  it("a failed handshake sends no raw mutation and a later call can initialize", async () => {
+    const server = new FakeServer();
+    server.sessionId = "session-recovered";
+    server.tools.set("memory_lint", () => ({ report: "ok" }));
+    server.mcp = async () => json({ error: "unavailable" }, 503);
+    const memory = client(server);
+    await assert.rejects(memory.callTool("memory_lint", {}), HttpError);
+    assert.equal(server.requests.length, 1, "no automatic retry or mutation after failure");
+    assert.equal(server.toolCalls().length, 0);
+
+    server.mcp = undefined;
+    assert.deepEqual(await memory.callTool("memory_lint", {}), { report: "ok" });
+    assert.deepEqual(
+      server.requests.map((r) => (r.body as { method: string }).method),
+      ["initialize", "initialize", "notifications/initialized", "tools/call"],
+    );
+    assert.equal(server.requests.at(-1)?.headers["mcp-session-id"], "session-recovered");
+  });
+
   it("keeps Mcp-Session-Id, sends notifications/initialized and attaches it", async () => {
     const server = new FakeServer();
     server.sessionId = "session-123";

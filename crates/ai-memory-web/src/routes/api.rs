@@ -1,5 +1,6 @@
 //! JSON routes for third-party read-only frontends.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::{ObservationKind, PagePath, ProjectId, SessionId, WorkspaceId};
@@ -28,6 +29,15 @@ const PAGE_CACHE_MAX_AGE: u32 = 300;
 /// Build the `/api/v1` router from a shared [`WebState`].
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
+        .route(
+            "/docs/features/status",
+            axum::routing::get(super::documentation::api_status),
+        )
+        .route("/docs", axum::routing::get(super::documentation::api_index))
+        .route(
+            "/docs/{slug}",
+            axum::routing::get(super::documentation::api_page),
+        )
         .route("/workspaces", axum::routing::get(workspaces_handler))
         .route("/projects", axum::routing::get(projects_handler))
         .route(
@@ -642,7 +652,14 @@ async fn recent_handler(
             .list_unexpired_pages(&workspace, &project)
             .await
             .map_err(internal_error)?;
-        pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // RFC3339's variable fractional precision is not lexically ordered.
+        // The reader's empty fallback for an invalid timestamp stays last.
+        pages.sort_by_cached_key(|page| {
+            (
+                Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+                page.path.clone(),
+            )
+        });
         pages.truncate(limit);
         return Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE));
     }
@@ -870,6 +887,23 @@ pub(crate) fn owner_filter_for(
     ai_memory_core::OwnerFilter::for_actor_context(
         &actor.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
     )
+}
+
+/// The owner filter for reading sessions and the token usage recorded on them.
+///
+/// Root is the operator: it already lists every handoff with `all_owners`, and
+/// the dashboard counts every user's sessions. Filtering root's drilldowns by
+/// its own identity hid the sessions those counts promise (#1867). Every other
+/// caller keeps [`owner_filter_for`]: their own sessions plus shared ones.
+pub(crate) fn session_owner_filter_for(
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+) -> ai_memory_core::OwnerFilter {
+    if matches!(auth, Some(axum::Extension(ai_memory_core::AuthLevel::Root))) {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        owner_filter_for(actor)
+    }
 }
 
 /// May this request read the prompt-derived body of a handoff?
@@ -1161,6 +1195,7 @@ async fn sessions_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<SessionListQuery>,
 ) -> Result<Response, Response> {
@@ -1171,7 +1206,7 @@ async fn sessions_handler(
         .sessions_for_scope(
             workspace_id,
             project_id,
-            owner_filter_for(actor),
+            session_owner_filter_for(actor, auth),
             query.include_open,
             query.limit.clamp(1, SESSION_LIST_MAX_LIMIT),
             query.offset,
@@ -1187,6 +1222,7 @@ async fn session_observations_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project, session_id)): Path<(String, String, String)>,
     Query(query): Query<SessionObservationsQuery>,
 ) -> Result<Response, Response> {
@@ -1246,7 +1282,7 @@ async fn session_observations_handler(
             workspace_id,
             project_id,
             session_id,
-            owner_filter_for(actor),
+            session_owner_filter_for(actor, auth),
         )
         .await
         .map_err(internal_error)?

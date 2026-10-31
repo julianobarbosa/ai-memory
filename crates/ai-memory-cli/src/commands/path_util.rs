@@ -61,6 +61,18 @@ pub(crate) fn agent_config_home(env_override: Option<std::ffi::OsString>) -> Opt
     ai_memory_workstream::env_dir_override(env_override)
 }
 
+/// Hermes profile ids follow `^[a-z0-9][a-z0-9_-]{0,63}$`.
+pub(crate) fn is_hermes_profile_id(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= 64
+        && bytes
+            .first()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+}
+
 /// Claude Code's relocated config root: `$CLAUDE_CONFIG_DIR` when set, else
 /// `None`. Named alias kept so Claude call sites read for what they resolve.
 pub(crate) fn claude_config_dir(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {

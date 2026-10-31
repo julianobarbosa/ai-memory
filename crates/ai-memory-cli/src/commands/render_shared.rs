@@ -170,6 +170,19 @@ pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Qoder CLI/IDE events used for capture and handoff delivery. Qoder exposes
+/// additional policy and notification events that do not carry memory data.
+pub(crate) const QODER_EVENTS: [(&str, &str); 8] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
 /// IBM Bob IDE's common lifecycle vocabulary. Bob Shell also supports these
 /// five events; its additional compaction events are intentionally omitted so
 /// one global settings file remains valid in both products. Bob has no
@@ -1336,6 +1349,28 @@ pub(crate) fn build_codebuddy_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qoder's `~/.qoder/settings.json`.
+pub(crate) fn build_qoder_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QODER_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qoder",
             data_dir,
             project_strategy,
         ),

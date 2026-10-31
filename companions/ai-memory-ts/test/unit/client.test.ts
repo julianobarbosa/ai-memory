@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { AiMemoryClient } from "../../src/client.js";
 import { TOOL_COVERAGE } from "../../src/coverage.js";
 import {
+  AbortError,
   ArgumentError,
   PreconditionFailedError,
   ProtocolError,
@@ -94,6 +95,40 @@ describe("pages", () => {
     );
   });
 
+  it("patch sends typed anchored edits and decodes the new version", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_patch_page", () => payloads.patch);
+    const result = await memory.pages.patch({
+      path: "notes/retries.md",
+      expectedPageId: payloads.PAGE_ID,
+      edits: [
+        { op: "append", target: "section", anchor: "Log", content: "next" },
+        {
+          op: "replace_section",
+          anchor: "Open",
+          sectionSha256: "a".repeat(64),
+          content: "none",
+        },
+      ],
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      path: "notes/retries.md",
+      expected_page_id: payloads.PAGE_ID,
+      edits: [
+        { op: "append", target: "section", anchor: "Log", content: "next" },
+        {
+          op: "replace_section",
+          anchor: "Open",
+          section_sha256: "a".repeat(64),
+          content: "none",
+        },
+      ],
+    });
+    assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
+  });
+
   it("read by path or query, never both, and decodes the page", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_read_page", () => payloads.read);
@@ -101,6 +136,8 @@ describe("pages", () => {
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", path: "notes/retries.md" });
     assert.equal(page.pageId, payloads.PAGE_ID);
     assert.equal(page.body, payloads.read.body);
+    assert.equal(page.sections[0]?.anchor, "Retry policy");
+    assert.equal(page.sectionsTruncated, false);
     assert.equal(page.related, undefined);
     await memory.pages.read({ query: "retry", includeRelated: true, relatedDepth: 2 });
     assert.deepEqual(server.lastArgs(), {
@@ -110,6 +147,33 @@ describe("pages", () => {
       include_related: true,
       related_depth: 2,
     });
+    server.tools.set("memory_read_page", () => ({
+      ...payloads.read,
+      truncated: true,
+      total_chars: 40_000,
+    }));
+    const capped = await memory.pages.read({ path: "notes/retries.md", maxChars: 500 });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      path: "notes/retries.md",
+      max_chars: 500,
+    });
+    assert.equal(capped.truncated, true);
+    assert.equal(capped.totalChars, 40_000);
+    await memory.pages.read({ path: "preferences/style.md", global: true });
+    assert.deepEqual(server.lastArgs(), {
+      scope: "global",
+      path: "preferences/style.md",
+    });
+    await assert.rejects(
+      memory.pages.read({ path: "preferences/style.md", global: true, scope: OTHER }),
+      ArgumentError,
+    );
+    server.tools.set("memory_read_page", () => payloads.read);
+    const older = await memory.pages.read({ path: "notes/retries.md" });
+    assert.equal(older.truncated, undefined);
+    assert.equal(older.totalChars, undefined);
     const before = server.requests.length;
     await assert.rejects(
       memory.pages.read({ path: "a", query: "b" } as never),
@@ -243,6 +307,25 @@ describe("query", () => {
     assert.equal(result.globalScopeHits.length, 1);
   });
 
+  it("decodes optional answer context accounting and accepts older responses", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_query", () => ({ hits: [payloads.hit] }));
+    const legacy = await memory.query({ query: "retry" });
+    assert.equal(legacy.answerContext, undefined);
+    assert.equal(Object.hasOwn(legacy, "answerContext"), false);
+    server.tools.set("memory_query", () => ({
+      hits: [payloads.hit],
+      answer_unavailable: "no evidence space",
+      answer_context: { admitted: 0, omitted: 1, clipped: 0, estimated_input_tokens: 2000,
+        reserved_output_tokens: 2000, max_context_tokens: 1000 },
+    }));
+    const result = await memory.query({ query: "retry", answer: true });
+    assert.deepEqual(result.answerContext, { admitted: 0, omitted: 1, clipped: 0,
+      estimatedInputTokens: 2000, reservedOutputTokens: 2000, maxContextTokens: 1000 });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.answerUnavailable, "no evidence space");
+  });
+
   it("raises ProtocolError when a promised field is missing", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_query", () => ({ hits: [{ path: "notes/a.md" }] }));
@@ -322,7 +405,13 @@ describe("messages", () => {
   it("send uses the client scope as sender and names the recipient", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_message_send", () => ({ message_id: payloads.MESSAGE_ID }));
-    const sent = await memory.messages.send({ to: OTHER, body: "please do X", subject: "hi" });
+    const sent = await memory.messages.send({
+      to: OTHER,
+      body: "please do X",
+      subject: "hi",
+      nature: "measured",
+      evidence: "tests/export.test.ts:42",
+    });
     assert.deepEqual(server.lastArgs(), {
       to_workspace: "demo",
       to_project: "other",
@@ -330,6 +419,8 @@ describe("messages", () => {
       from_project: "app",
       body: "please do X",
       subject: "hi",
+      nature: "measured",
+      evidence: "tests/export.test.ts:42",
     });
     assert.equal(sent.messageId, payloads.MESSAGE_ID);
   });
@@ -345,7 +436,16 @@ describe("messages", () => {
     const listed = await memory.messages.list({ box: "outbox", limit: 3 });
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", box: "outbox", limit: 3 });
     assert.equal(listed.messages[0]?.body, "please do X");
-    const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID });
+    assert.equal(listed.messages[0]?.nature, "reported");
+    assert.equal(listed.messages[0]?.evidence, "source message 42");
+    assert.equal(listed.messages[0]?.toAgent, null);
+    const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID, agent: "codex" });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      message_id: payloads.MESSAGE_ID,
+      agent: "codex",
+    });
     assert.equal(popped.message?.state, "claimed");
     assert.equal(popped.securityNotice, "UNTRUSTED");
     const cancelled = await memory.messages.cancel();
@@ -437,6 +537,66 @@ describe("reads", () => {
 });
 
 describe("capability gating", () => {
+  it("cancels concurrent capability waits independently", async () => {
+    for (const heldMethod of ["initialize", "tools/list"] as const) {
+      for (const cancelled of ["first", "second"] as const) {
+      const server = new FakeServer();
+      let announce!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { announce = resolve; });
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      server.mcp = async (request) => {
+        const body = request.body as { id?: number; method: string };
+        const reply = (result: unknown) => json({ jsonrpc: "2.0", id: body.id, result });
+        if (body.method === "initialize") {
+          if (heldMethod === "initialize") {
+            announce();
+            await held;
+          }
+          return reply({
+            protocolVersion: "2025-03-26",
+            serverInfo: { name: "ai-memory", version: "3.2.10" },
+            capabilities: {},
+          });
+        }
+        if (body.method === "tools/list") {
+          if (heldMethod === "tools/list") {
+            announce();
+            await held;
+          }
+          return reply({
+            tools: [{
+              name: "memory_status",
+              inputSchema: { properties: { workspace: {}, project: {} } },
+            }],
+          });
+        }
+        if (body.method === "tools/call") {
+          return reply({ content: [{ type: "text", text: JSON.stringify(payloads.status) }] });
+        }
+        throw new Error(`unexpected method ${body.method}`);
+      };
+      const memory = new AiMemoryClient({
+        serverUrl: "http://127.0.0.1:49374",
+        scope: SCOPE,
+        fetch: server.fetch,
+      });
+      const firstController = new AbortController();
+      const secondController = new AbortController();
+      const first = memory.status({}, { signal: firstController.signal });
+      await started;
+      const second = memory.status({}, { signal: secondController.signal });
+
+      (cancelled === "first" ? firstController : secondController).abort();
+      const cancelledCall = cancelled === "first" ? first : second;
+      await assert.rejects(cancelledCall, AbortError);
+      release();
+      const survivingCall = cancelled === "first" ? second : first;
+      assert.equal((await survivingCall).scope.project, "app");
+      }
+    }
+  });
+
   it("a server without expected_page_id refuses a conditional write before tools/call", async () => {
     const { server, memory } = setup();
     const write = server.schemas["memory_write_page"];
@@ -492,13 +652,14 @@ describe("capability gating", () => {
     assert.equal(caps.identity, null);
   });
 
-  it("callTool skips probing and returns the decoded JSON", async () => {
+  it("callTool initializes without schema probing and returns the decoded JSON", async () => {
     const { server, memory } = setup();
+    delete server.schemas["memory_lint"];
     server.tools.set("memory_lint", () => ({ report: "ok" }));
     assert.deepEqual(await memory.callTool("memory_lint", { dry_run: true }), { report: "ok" });
     assert.deepEqual(
       server.requests.map((r) => (r.body as { method: string }).method),
-      ["tools/call"],
+      ["initialize", "tools/call"],
     );
   });
 });
@@ -527,7 +688,18 @@ describe("wire names", () => {
         expectedPageId: "v",
       }),
       memory.pages.write({ path: "p", body: "b", createOnly: true }),
-      memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2 }),
+      memory.pages.patch({
+        path: "p",
+        expectedPageId: "v",
+        edits: [
+          { op: "append", target: "section", anchor: "A", content: "a" },
+          { op: "append", target: "end_of_page", content: "b" },
+          { op: "add_section", anchor: "## B", content: "c" },
+          { op: "replace_section", anchor: "C", sectionSha256: "h", content: "d" },
+        ],
+      }),
+      memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2, maxChars: 500 }),
+      memory.pages.read({ path: "global", global: true }),
       memory.pages.read({ query: "q" }),
       memory.pages.delete({ path: "p", expectedPageId: "v" }),
       memory.query({
@@ -571,9 +743,16 @@ describe("wire names", () => {
       memory.handoffs.list({ anyOwner: true, limit: 1 }),
       memory.handoffs.accept({ handoffId: "h", anyOwner: true }),
       memory.handoffs.cancel({ handoffId: "h", anyOwner: true }),
-      memory.messages.send({ to: OTHER, from: SCOPE, body: "b", subject: "s" }),
+      memory.messages.send({
+        to: OTHER,
+        from: SCOPE,
+        body: "b",
+        subject: "s",
+        nature: "measured",
+        evidence: "test:1",
+      }),
       memory.messages.list({ box: "inbox", limit: 1 }),
-      memory.messages.pop({ messageId: "m" }),
+      memory.messages.pop({ messageId: "m", agent: "codex" }),
       memory.messages.cancel({ messageId: "m" }),
     ];
     await Promise.allSettled(calls);

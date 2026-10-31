@@ -2,7 +2,7 @@
 //! bearer token on this install's own server (`auth enable`).
 
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_memory_llm::{
     CODEX_CLIENT_ID, CopilotToken, DeviceAuthorizationResponse, GITHUB_ACCESS_TOKEN_URL,
@@ -120,7 +120,6 @@ async fn poll_oidc_device(
     device: &DeviceAuthorizationResponse,
     timeout: Duration,
 ) -> Result<OidcTokenResponse> {
-    let started = Instant::now();
     let mut interval = Duration::from_secs(
         device
             .interval
@@ -130,19 +129,37 @@ async fn poll_oidc_device(
     );
     let device_timeout = Duration::from_secs(device.expires_in.unwrap_or(600).max(1));
     let timeout = timeout.min(device_timeout);
-    loop {
-        if started.elapsed() >= timeout {
-            bail!("timed out waiting for oidc-device authorization");
+    with_authorization_timeout(timeout, "oidc-device", async {
+        loop {
+            match poll_token_once(client, discovery, client_id, &device.device_code).await? {
+                PollOutcome::Token(token) => return Ok(*token),
+                PollOutcome::Pending => {}
+                PollOutcome::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
+                PollOutcome::Denied => bail!("oidc-device authorization denied"),
+                PollOutcome::Expired => bail!("oidc-device code expired before authorization"),
+                PollOutcome::Other(error) => bail!("oidc-device authorization failed: {error}"),
+            }
+            sleep(interval).await;
         }
-        match poll_token_once(client, discovery, client_id, &device.device_code).await? {
-            PollOutcome::Token(token) => return Ok(*token),
-            PollOutcome::Pending => {}
-            PollOutcome::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
-            PollOutcome::Denied => bail!("oidc-device authorization denied"),
-            PollOutcome::Expired => bail!("oidc-device code expired before authorization"),
-            PollOutcome::Other(error) => bail!("oidc-device authorization failed: {error}"),
-        }
-        sleep(interval).await;
+    })
+    .await
+}
+
+/// Cancel the whole poll, including a response body or provider-directed sleep.
+/// A ready deadline wins over a simultaneously ready token, so a late result
+/// cannot reach the credential store. The interval between requests is unchanged.
+async fn with_authorization_timeout<T>(
+    timeout: Duration,
+    provider: &str,
+    authorization: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if timeout.is_zero() {
+        bail!("timed out waiting for {provider} authorization");
+    }
+    tokio::select! {
+        biased;
+        () = sleep(timeout) => bail!("timed out waiting for {provider} authorization"),
+        result = authorization => result,
     }
 }
 
@@ -350,7 +367,6 @@ async fn poll_device_authorization(
     device: &DeviceAuthorization,
     timeout: Duration,
 ) -> Result<DeviceAuthorizationCode> {
-    let started = Instant::now();
     let interval = Duration::from_secs(
         device
             .interval
@@ -359,34 +375,34 @@ async fn poll_device_authorization(
             .max(1)
             .saturating_add(POLLING_SAFETY_MARGIN_SECS),
     );
-    loop {
-        if started.elapsed() >= timeout {
-            bail!("timed out waiting for openai-oauth authorization");
-        }
-        let resp = client
-            .post(DEVICE_TOKEN_URL)
-            .json(&DeviceTokenRequest {
-                device_auth_id: &device.device_auth_id,
-                user_code: &device.user_code,
-            })
-            .send()
-            .await
-            .context("polling openai-oauth device authorization")?;
-        if resp.status().is_success() {
-            return resp
-                .json::<DeviceAuthorizationCode>()
+    with_authorization_timeout(timeout, "openai-oauth", async {
+        loop {
+            let resp = client
+                .post(DEVICE_TOKEN_URL)
+                .json(&DeviceTokenRequest {
+                    device_auth_id: &device.device_auth_id,
+                    user_code: &device.user_code,
+                })
+                .send()
                 .await
-                .context("parsing openai-oauth authorization code");
+                .context("polling openai-oauth device authorization")?;
+            if resp.status().is_success() {
+                return resp
+                    .json::<DeviceAuthorizationCode>()
+                    .await
+                    .context("parsing openai-oauth authorization code");
+            }
+            if resp.status() != reqwest::StatusCode::FORBIDDEN
+                && resp.status() != reqwest::StatusCode::NOT_FOUND
+            {
+                let status = resp.status();
+                let body = provider_error_body(resp).await;
+                bail!("openai-oauth authorization polling failed ({status}): {body}");
+            }
+            sleep(interval).await;
         }
-        if resp.status() != reqwest::StatusCode::FORBIDDEN
-            && resp.status() != reqwest::StatusCode::NOT_FOUND
-        {
-            let status = resp.status();
-            let body = provider_error_body(resp).await;
-            bail!("openai-oauth authorization polling failed ({status}): {body}");
-        }
-        sleep(interval).await;
-    }
+    })
+    .await
 }
 
 async fn exchange_authorization_code(
@@ -442,52 +458,51 @@ async fn poll_github_device_authorization(
     device: &GitHubDeviceAuthorization,
     timeout: Duration,
 ) -> Result<String> {
-    let started = Instant::now();
     let mut interval = Duration::from_secs(device.interval.unwrap_or(5).max(1));
     let device_timeout = Duration::from_secs(device.expires_in.max(1));
     let timeout = timeout.min(device_timeout);
-    loop {
-        if started.elapsed() >= timeout {
-            bail!("timed out waiting for copilot GitHub authorization");
-        }
-        let resp = client
-            .post(GITHUB_ACCESS_TOKEN_URL)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .form(&[
-                ("client_id", client_id),
-                ("device_code", device.device_code.as_str()),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ])
-            .send()
-            .await
-            .context("polling copilot GitHub device authorization")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            bail!("copilot GitHub authorization polling failed ({status}): {body}");
-        }
-        let body = resp
-            .json::<GitHubDeviceAccessToken>()
-            .await
-            .context("parsing copilot GitHub token response")?;
-        if let Some(token) = body.access_token {
-            return Ok(token);
-        }
-        match body.error.as_deref() {
-            Some("authorization_pending") => {}
-            Some("slow_down") => interval = interval.saturating_add(Duration::from_secs(5)),
-            Some("expired_token") => bail!("copilot GitHub device code expired"),
-            Some("access_denied") => bail!("copilot GitHub authorization denied"),
-            Some(error) => {
-                let description = body.error_description.unwrap_or_default();
-                return Err(anyhow!(
-                    "copilot GitHub authorization failed: {error} {description}"
-                ));
+    with_authorization_timeout(timeout, "copilot GitHub", async {
+        loop {
+            let resp = client
+                .post(GITHUB_ACCESS_TOKEN_URL)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .form(&[
+                    ("client_id", client_id),
+                    ("device_code", device.device_code.as_str()),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ])
+                .send()
+                .await
+                .context("polling copilot GitHub device authorization")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = provider_error_body(resp).await;
+                bail!("copilot GitHub authorization polling failed ({status}): {body}");
             }
-            None => bail!("copilot GitHub token response did not include access_token"),
+            let body = resp
+                .json::<GitHubDeviceAccessToken>()
+                .await
+                .context("parsing copilot GitHub token response")?;
+            if let Some(token) = body.access_token {
+                return Ok(token);
+            }
+            match body.error.as_deref() {
+                Some("authorization_pending") => {}
+                Some("slow_down") => interval = interval.saturating_add(Duration::from_secs(5)),
+                Some("expired_token") => bail!("copilot GitHub device code expired"),
+                Some("access_denied") => bail!("copilot GitHub authorization denied"),
+                Some(error) => {
+                    let description = body.error_description.unwrap_or_default();
+                    return Err(anyhow!(
+                        "copilot GitHub authorization failed: {error} {description}"
+                    ));
+                }
+                None => bail!("copilot GitHub token response did not include access_token"),
+            }
+            sleep(interval).await;
         }
-        sleep(interval).await;
-    }
+    })
+    .await
 }
 
 fn format_duration_until(expires_at_ms: u64) -> String {
@@ -561,6 +576,60 @@ mod tests {
     #[test]
     fn expiry_status_does_not_print_exact_token_time() {
         assert_eq!(format_duration_until(0), "expired");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorization_timeout_covers_pending_work_and_keeps_provider_error_messages() {
+        for provider in ["oidc-device", "openai-oauth", "copilot GitHub"] {
+            let started = tokio::time::Instant::now();
+            let result = with_authorization_timeout(Duration::from_secs(1), provider, async {
+                sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+            .await;
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("timed out waiting for {provider} authorization"),
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorization_timeout_wins_when_the_token_and_deadline_are_ready() {
+        let result = with_authorization_timeout(Duration::from_secs(1), "oidc-device", async {
+            sleep(Duration::from_secs(1)).await;
+            Ok("late token")
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorization_timeout_zero_does_not_start_a_request() {
+        let requested = std::cell::Cell::new(false);
+        let result = with_authorization_timeout(Duration::ZERO, "oidc-device", async {
+            requested.set(true);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!requested.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorization_timeout_preserves_a_prompt_provider_error() {
+        let started = tokio::time::Instant::now();
+        let result: Result<()> =
+            with_authorization_timeout(Duration::from_secs(60), "oidc-device", async {
+                bail!("oidc-device authorization denied")
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "oidc-device authorization denied"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]

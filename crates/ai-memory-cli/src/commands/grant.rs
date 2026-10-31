@@ -119,8 +119,11 @@ pub async fn list_for_user(ep: &ServerEndpoint, args: &UserGrantsArgs) -> Result
 /// `ai-memory project grants --workspace W --project P`.
 ///
 /// # Errors
-/// Transport failures, a non-root token, or an unknown project.
+/// Empty `--workspace` or `--project`; transport failures, a non-root token,
+/// or an unknown project.
 pub async fn list_for_project(ep: &ServerEndpoint, args: &ProjectGrantsArgs) -> Result<()> {
+    super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
+    super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
     let resp: GrantList = get_json(
         ep,
         "/admin/projects/grants",
@@ -141,8 +144,13 @@ struct GrantResponse {
 /// `ai-memory user grant --user U --workspace W --project P --level L`.
 ///
 /// # Errors
-/// Transport failures, a non-root token, an unknown user, project or level.
+/// Empty `--user`, `--workspace`, `--project`, or `--level`; transport
+/// failures, a non-root token, an unknown user, project or level.
 pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
+    super::refuse_empty_explicit(Some(args.user.as_str()), "--user")?;
+    super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
+    super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
+    super::refuse_empty_explicit(Some(args.level.as_str()), "--level")?;
     let body = GrantRequest {
         workspace: &args.workspace,
         project: &args.project,
@@ -181,8 +189,12 @@ struct RevokeResponse {
 /// `ai-memory user revoke --user U --workspace W --project P`.
 ///
 /// # Errors
-/// Transport failures, a non-root token, an unknown user or project.
+/// Empty `--user`, `--workspace`, or `--project`; transport failures, a
+/// non-root token, an unknown user or project.
 pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
+    super::refuse_empty_explicit(Some(args.user.as_str()), "--user")?;
+    super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
+    super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
     let body = GrantRequest {
         workspace: &args.workspace,
         project: &args.project,
@@ -272,5 +284,131 @@ mod tests {
                 "{cjk}"
             );
         }
+    }
+    fn grants_args() -> ProjectGrantsArgs {
+        ProjectGrantsArgs {
+            workspace: "default".into(),
+            project: "app".into(),
+            json: false,
+        }
+    }
+
+    fn dead_ep() -> ServerEndpoint {
+        ServerEndpoint::from_pair(Some("http://127.0.0.1:1".into()), None)
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_listing_grants() {
+        let mut a = grants_args();
+        a.project = "   ".into();
+        let error = list_for_project(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_listing_grants() {
+        let mut a = grants_args();
+        a.workspace = "".into();
+        let error = list_for_project(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+    fn grant_args() -> UserGrantArgs {
+        UserGrantArgs {
+            user: "ana".into(),
+            workspace: "default".into(),
+            project: "app".into(),
+            level: "write".into(),
+        }
+    }
+
+    fn revoke_args() -> UserRevokeArgs {
+        UserRevokeArgs {
+            user: "ana".into(),
+            workspace: "default".into(),
+            project: "app".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_user_flag_is_refused_before_granting() {
+        let mut a = grant_args();
+        a.user = "   ".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--user was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_granting() {
+        let mut a = grant_args();
+        a.workspace = "".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_granting() {
+        let mut a = grant_args();
+        a.project = "  ".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_level_flag_is_refused_before_granting() {
+        let mut a = grant_args();
+        a.level = "".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--level was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_user_flag_is_refused_before_revoking() {
+        let mut a = revoke_args();
+        a.user = "   ".into();
+        let error = super::revoke(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--user was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_revoking() {
+        let mut a = revoke_args();
+        a.workspace = "".into();
+        let error = super::revoke(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_revoking() {
+        let mut a = revoke_args();
+        a.project = "  ".into();
+        let error = super::revoke(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
     }
 }

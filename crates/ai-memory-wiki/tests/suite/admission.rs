@@ -17,7 +17,7 @@ use ai_memory_wiki::{
     AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, Markdown, WebhookConfig,
 };
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -725,4 +725,151 @@ async fn non_blocking_webhook_skipped_by_run_but_dispatched_async() {
         fired.load(Ordering::SeqCst),
         "dispatch_async must fire the non-blocking webhook"
     );
+}
+
+#[tokio::test]
+async fn cross_origin_redirect_is_refused_without_forwarding_payload_or_mutating() {
+    let seen = Arc::new(AtomicBool::new(false));
+    let seen_in_handler = seen.clone();
+    let foreign_app = Router::new().route(
+        "/collect",
+        post(move || {
+            let seen = seen_in_handler.clone();
+            async move {
+                seen.store(true, Ordering::SeqCst);
+                Json(json!({ "page": { "body": "foreign body\n" } }))
+            }
+        }),
+    );
+    let foreign_base = spawn_server(foreign_app).await;
+
+    let target = format!("{foreign_base}/collect");
+    let origin_app = Router::new().route(
+        "/admit",
+        post(move || {
+            let target = target.clone();
+            async move { Redirect::temporary(&target) }
+        }),
+    );
+    let origin_base = spawn_server(origin_app).await;
+
+    let reject_chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "policy".into(),
+        url: format!("{origin_base}/admit"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
+        blocking: true,
+    }])
+    .unwrap();
+
+    let (path, mut md) = page();
+    let err = reject_chain
+        .run(&path, &mut md, &AdmissionContext::default())
+        .await
+        .expect_err("cross-origin redirect must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refused a redirect to another origin"),
+        "expected cross-origin refusal in error: {msg}"
+    );
+    assert!(
+        msg.contains(&foreign_base),
+        "expected refused target origin in error: {msg}"
+    );
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "foreign origin must not receive the webhook payload"
+    );
+    assert_eq!(md.body, "body content\n");
+
+    let delete_ctx = AdmissionContext {
+        op: AdmissionOp::Delete,
+        ..AdmissionContext::default()
+    };
+    let notify_err = reject_chain
+        .notify(Some(path.as_str()), &delete_ctx)
+        .await
+        .expect_err("cross-origin redirect must fail notify");
+    let notify_msg = notify_err.to_string();
+    assert!(
+        notify_msg.contains("refused a redirect to another origin"),
+        "expected cross-origin refusal in notify error: {notify_msg}"
+    );
+    assert!(
+        notify_msg.contains(&foreign_base),
+        "expected refused target origin in notify error: {notify_msg}"
+    );
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "foreign origin must not receive the delete notification"
+    );
+
+    let ignore_chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "observer".into(),
+        url: format!("{origin_base}/admit"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::WritePage],
+        blocking: true,
+    }])
+    .unwrap();
+
+    let (path, mut md) = page();
+    ignore_chain
+        .run(&path, &mut md, &AdmissionContext::default())
+        .await
+        .unwrap();
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "foreign origin must not receive the payload under Ignore policy"
+    );
+    assert_eq!(md.body, "body content\n");
+}
+
+#[tokio::test]
+async fn same_origin_redirect_still_reaches_the_webhook() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let absolute_hop = format!("{base}/v2");
+    let app = Router::new()
+        .route(
+            "/legacy",
+            post(move || {
+                let target = absolute_hop.clone();
+                async move { Redirect::temporary(&target) }
+            }),
+        )
+        .route("/v2", post(|| async { Redirect::temporary("/enrich") }))
+        .route(
+            "/enrich",
+            post(|Json(payload): Json<Value>| async move {
+                assert_eq!(payload["page"]["path"], json!("gotchas/example.md"));
+                let mut fm = payload["page"]["frontmatter"].clone();
+                fm["reviewed"] = json!(true);
+                Json(json!({ "page": { "frontmatter": fm } }))
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "reviewer".into(),
+        url: format!("{base}/legacy"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::WritePage],
+        blocking: true,
+    }])
+    .unwrap();
+
+    let (path, mut md) = page();
+    chain
+        .run(&path, &mut md, &AdmissionContext::default())
+        .await
+        .unwrap();
+
+    assert_eq!(md.frontmatter["reviewed"], json!(true));
+    assert_eq!(md.body, "body content\n");
 }

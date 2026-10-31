@@ -29,8 +29,8 @@ pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
-    is_codex_memory_agent_cwd, looks_like_codex_instructions, looks_like_codex_memory_agent_prompt,
-    looks_like_markup_block, looks_like_scaffolding,
+    is_codex_memory_agent_cwd, looks_like_codex_generated_prompt, looks_like_codex_instructions,
+    looks_like_codex_memory_agent_prompt, looks_like_markup_block, looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;
@@ -79,10 +79,13 @@ pub use ids::{
     portable_page_key,
 };
 pub use message::{
-    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
-    UNTRUSTED_MESSAGE_NOTICE,
+    AgentMessage, MessageBox, MessageClaim, MessageNature, MessageOrigin, MessageState,
+    NewAgentMessage, UNTRUSTED_MESSAGE_NOTICE,
 };
-pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
+pub use observation::{
+    NewObservation, NewSession, NewSessionUsage, Observation, ObservationKind, TokenCall,
+    TokenCallContext, TokenToolRef, TokenToolRelation,
+};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
@@ -109,6 +112,7 @@ pub use user::{
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedNativeSessionReference,
+    ManagedProjectCandidatesRequest, ManagedProjectCandidatesResponse, ManagedProjectScope,
     ManagedRunContextResponse, ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity,
     NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
     RenameManagedWorkstreamRequest, RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE,

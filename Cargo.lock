@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -170,6 +170,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "git2",
  "icu_normalizer",
  "jiff",
@@ -188,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -211,13 +212,14 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -240,6 +242,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tar",
  "tempfile",
@@ -253,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -261,6 +264,7 @@ dependencies = [
  "base64 0.22.1",
  "fs2",
  "getrandom 0.3.4",
+ "icu_normalizer",
  "jiff",
  "parking_lot",
  "refinery",
@@ -274,16 +278,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode_categories",
  "uuid",
 ]
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.2.9"
+version = "3.3.0"
 
 [[package]]
 name = "ai-memory-web"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -310,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -342,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.2.9"
+version = "3.3.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -2375,9 +2380,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.28"
+version = "1.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc3a226e576f50782b3305c5ccf458698f92798987f551c6a02efe8276721e22"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
 dependencies = [
  "cc",
  "libc",
@@ -5367,7 +5372,7 @@ dependencies = [
 [[package]]
 name = "zip"
 version = "8.6.0"
-source = "git+https://github.com/zip-rs/zip2?rev=771dfc534d2614158af5497ea3dff4d4208d7db1#771dfc534d2614158af5497ea3dff4d4208d7db1"
+source = "git+https://github.com/zip-rs/zip2?rev=507c5c76ddd4cde767e64832fc6f848c51a99e44#507c5c76ddd4cde767e64832fc6f848c51a99e44"
 dependencies = [
  "crc32fast",
  "flate2",

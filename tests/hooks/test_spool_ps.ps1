@@ -1,8 +1,9 @@
 # Behavioral evidence for the PowerShell bundle's offline spool: the
 # entry writer's on-disk contract (file name, SpoolEntry fields, no BOM,
 # token handling) and a refused-connection drain pass that keeps the
-# backlog. Pure functions plus a connection-refused loopback POST — no
-# live server. Invoked by tests/hooks/test_lib.sh when pwsh is available;
+# backlog, plus a stubbed mixed queue proving native OIDC entries stay queued.
+# Pure functions plus a connection-refused loopback POST — no live server.
+# Invoked by tests/hooks/test_lib.sh when pwsh is available;
 # exits non-zero on any failed assertion.
 
 param([Parameter(Mandatory = $true)] [string] $PsLib)
@@ -64,6 +65,47 @@ Assert-True ($kept.Count -eq 2) "refused connection keeps the backlog"
 Remove-Item -Recurse -Force (Join-Path $root "data")
 Invoke-AiMemoryDrainSpool -Max 8
 
+# 7. Native OIDC entries require auth.json resolution. Even a server accepting
+#    an anonymous request must not receive them from the script drain; eligible
+#    entries behind them still deliver. A body mentioning auth_mode is data.
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$oidcPath = Join-Path $dir "0000000000000-1-0000000000000000.json"
+$oidcJson = [ordered]@{
+    url = "http://127.0.0.1:49374/hook?event=oidc"
+    body = '{"e":"native-oidc"}'
+    created_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    auth_mode = "oidc"
+    attempts = 0
+} | ConvertTo-Json -Compress
+[IO.File]::WriteAllText($oidcPath, $oidcJson, [Text.UTF8Encoding]::new($false))
+$env:AI_MEMORY_AUTH_TOKEN = "probe-bearer"
+Write-AiMemorySpoolEvent -Url "http://127.0.0.1:49374/hook?event=static" -Body '{"auth_mode":"oidc"}'
+Remove-Item Env:\AI_MEMORY_AUTH_TOKEN -ErrorAction SilentlyContinue
+Write-AiMemorySpoolEvent -Url "http://127.0.0.1:49374/hook?event=none" -Body '{"auth_mode":"oidc"}'
+$legacyJson = [ordered]@{
+    url = "http://127.0.0.1:49374/hook?event=legacy"
+    body = '{"auth_mode":"oidc"}'
+    created_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    attempts = 0
+} | ConvertTo-Json -Compress
+[IO.File]::WriteAllText((Join-Path $dir "9999999999999-1-0000000000000000.json"), $legacyJson, [Text.UTF8Encoding]::new($false))
+$script:OidcRequests = [Collections.Generic.List[object]]::new()
+function Invoke-WebRequest {
+    param([switch] $UseBasicParsing, [switch] $NoProxy, [int] $TimeoutSec,
+        [string] $Method, [string] $Uri, $Headers, [string] $ContentType, $Body)
+    $script:OidcRequests.Add([pscustomobject]@{ Url = $Uri; Authorization = $Headers["Authorization"] })
+}
+Invoke-AiMemoryDrainSpool -Max 8
+Assert-True ((Test-Path $oidcPath) -and [IO.File]::ReadAllText($oidcPath) -ceq $oidcJson) "OIDC entry stays untouched"
+Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match 'event=oidc$' }).Count -eq 0) "OIDC entry is never posted"
+Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match 'event=static$' -and $_.Authorization -ceq 'Bearer probe-bearer' }).Count -eq 1) "static control delivers with its bearer"
+foreach ($control in @("none", "legacy")) {
+    Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match "event=$control`$" -and -not $_.Authorization }).Count -eq 1) "$control control delivers without a bearer"
+}
+Assert-True ($script:OidcRequests.Count -eq 3) "only eligible entries are posted"
+$kept = @(Get-ChildItem -LiteralPath $dir -Filter "*.json" -File)
+Assert-True ($kept.Count -eq 1 -and $kept[0].FullName -eq $oidcPath) "only the OIDC entry stays queued"
+
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
-Write-Output "spool ps behavioral probe: ok checks=15"
+Write-Output "spool ps behavioral probe: ok checks=22"
 exit 0

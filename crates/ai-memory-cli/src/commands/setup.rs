@@ -249,6 +249,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         if let Some(dir) = qwen_code_detected(&home) {
             found.push((AgentChoice::QwenCode, Found::ConfigDir(dir)));
         }
+        if let Some(dir) = qoder_detected(&home) {
+            found.push((AgentChoice::Qoder, Found::ConfigDir(dir)));
+        }
         found
             .into_iter()
             .map(|(agent, found)| (agent, Some(found)))
@@ -437,6 +440,11 @@ fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
 /// by [`detect_agents`].
 fn qwen_code_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".qwen")).filter(|dir| dir.is_dir())
+}
+
+/// Qoder's shared CLI/IDE configuration directory, `~/.qoder`, when present.
+fn qoder_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".qoder")).filter(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -1250,6 +1258,22 @@ mod tests {
         assert_eq!(
             AgentPlan::new(AgentChoice::QwenCode, None).mcp,
             Some(McpClient::QwenCode)
+        );
+    }
+
+    #[test]
+    fn qoder_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(qoder_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".qoder")).unwrap();
+        assert_eq!(
+            qoder_detected(home.path()),
+            Some(home.path().join(".qoder"))
+        );
+        assert_eq!(skills_for(AgentChoice::Qoder), InstallSkillsAgent::Agents);
+        assert_eq!(
+            AgentPlan::new(AgentChoice::Qoder, None).mcp,
+            Some(McpClient::Qoder)
         );
     }
 

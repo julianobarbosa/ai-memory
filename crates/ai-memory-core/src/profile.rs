@@ -474,18 +474,7 @@ impl ProfileEntry {
         body: &str,
         frontmatter: &serde_json::Value,
     ) -> Option<Self> {
-        let from_frontmatter = ["summary", "abstract"].iter().find_map(|key| {
-            frontmatter
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        });
-        let statement = from_frontmatter
-            .or_else(|| first_prose_line(body))
-            .or_else(|| Some(title.trim().to_owned()).filter(|t| !t.is_empty()))?;
-        let statement = collapse_whitespace(&statement);
+        let statement = profile_statement(title, body, frontmatter)?;
         let statement = truncate_utf8_bytes(&statement, ENTRY_STATEMENT_MAX_BYTES);
         let applies_to = match frontmatter.get("applies_to") {
             Some(serde_json::Value::String(one)) => vec![one.trim().to_ascii_lowercase()],
@@ -547,6 +536,29 @@ impl ProfileEntry {
             || self.applies_to.is_empty()
             || self.applies_to.iter().any(|tag| project_tags.contains(tag))
     }
+}
+
+/// Select and normalize the uncapped statement a profile digest would use.
+/// Writers use this before persistence so any truncation warning and the
+/// eventual session-start digest cannot disagree about the source text.
+#[must_use]
+pub fn profile_statement(
+    title: &str,
+    body: &str,
+    frontmatter: &serde_json::Value,
+) -> Option<String> {
+    let from_frontmatter = ["summary", "abstract"].iter().find_map(|key| {
+        frontmatter
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    from_frontmatter
+        .or_else(|| first_prose_line(body))
+        .or_else(|| Some(title.trim().to_owned()).filter(|title| !title.is_empty()))
+        .map(|statement| collapse_whitespace(&statement))
 }
 
 fn first_prose_line(body: &str) -> Option<String> {

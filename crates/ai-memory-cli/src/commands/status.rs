@@ -76,6 +76,38 @@ struct Report {
     /// Wiki-format state (2.0 servers).
     #[serde(default)]
     wiki_format: Option<WikiFormatReport>,
+    /// SessionEnd consolidation queue (#1692). Absent from older servers, and
+    /// skipped on the way out so their shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consolidation: Option<ConsolidationReport>,
+}
+
+/// Consolidation queue as the server reports it: counts plus the sessions that
+/// gave up, so a watchdog reads one JSON field instead of parsing logs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsolidationReport {
+    #[serde(default)]
+    pending: u64,
+    #[serde(default)]
+    running: u64,
+    #[serde(default)]
+    completed: u64,
+    #[serde(default)]
+    failed: u64,
+    #[serde(default)]
+    failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session from [`ConsolidationReport`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FailedConsolidationSession {
+    session_id: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    failed_at_us: i64,
+    #[serde(default)]
+    last_error: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -373,6 +405,36 @@ pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     }
 }
 
+/// This binary's version. `report.version` is the server's, and the two drift
+/// apart when a split install (native client, server in a container or on
+/// another host) upgrades only one side.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The client line of the human report, plus a warning when the client and
+/// the server differ in major version, the only difference the semver policy
+/// treats as breaking. A version that does not start with a number never
+/// warns.
+fn client_version_lines(server_version: &str, client_version: &str) -> Vec<String> {
+    let mut lines = vec![format!("ai-memory {client_version} (client)")];
+    let major = |version: &str| -> Option<u64> {
+        version
+            .trim_start_matches('v')
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    };
+    if let (Some(server), Some(client)) = (major(server_version), major(client_version))
+        && server != client
+    {
+        lines.push(format!(
+            "⚠ The client is {client_version} but the server is {server_version}: across a \
+             major version they may not understand each other's requests. Upgrade the older side."
+        ));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn json_report(
     report: Report,
@@ -409,13 +471,22 @@ fn json_report(
         },
         "capture_mode": capture_mode,
         "ingest": report.ingest,
-        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "client": {
+            "version": CLIENT_VERSION,
+            "server_url": endpoint.url,
+            "auth": endpoint.auth_token.is_some(),
+        },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     });
     // Absent when there is nothing to say, so the shape consumers read is
     // unchanged.
     if let Some(problem) = windows_logon {
         value["windows_logon"] = serde_json::json!(problem);
+    }
+    // Present whenever the server reports it; an older server has no queue in
+    // `/admin/status`, and its shape stays exactly as before (#1692).
+    if let Some(consolidation) = report.consolidation {
+        value["consolidation"] = serde_json::json!(consolidation);
     }
     value
 }
@@ -535,6 +606,87 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
+
+        // The server's version stays at the top level; the client's is new.
+        assert_eq!(value["version"], "2.6.0");
+        assert_eq!(value["client"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["client"]["server_url"], "http://127.0.0.1:49374");
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
 
         // A missing logon binary (#1280) adds one key and changes no other.
         let problem = super::super::user_service::MissingLogonBinary {
@@ -567,6 +719,29 @@ mod tests {
         let mut without = warned.clone();
         without.as_object_mut().unwrap().remove("windows_logon");
         assert_eq!(without, value);
+    }
+
+    #[test]
+    fn client_version_line_warns_only_across_a_major_version() {
+        let same = client_version_lines("3.1.1", "3.1.1");
+        assert_eq!(same, ["ai-memory 3.1.1 (client)"]);
+        // A minor or patch difference is shown, not warned about.
+        assert_eq!(client_version_lines("3.2.0", "3.1.1").len(), 1);
+        assert_eq!(client_version_lines("v3.0.0", "3.1.1").len(), 1);
+
+        let across = client_version_lines("2.6.0", "3.1.1");
+        assert_eq!(across.len(), 2, "{across:?}");
+        assert!(
+            across[1].contains("client is 3.1.1 but the server is 2.6.0"),
+            "{across:?}"
+        );
+        assert_eq!(client_version_lines("4.0.0", "3.1.1").len(), 2);
+    }
+
+    #[test]
+    fn client_version_line_never_warns_on_an_unparseable_version() {
+        assert_eq!(client_version_lines("dev", "3.1.1").len(), 1);
+        assert_eq!(client_version_lines("", "3.1.1").len(), 1);
     }
 
     #[test]

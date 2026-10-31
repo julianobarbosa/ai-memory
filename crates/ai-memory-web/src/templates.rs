@@ -77,6 +77,61 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Compact human-readable token count (`12345` → `"12.3k"`, `2_100_000` →
+/// `"2.1M"`). Values under 1000 render as a plain integer.
+#[must_use]
+pub(crate) fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Human-readable label for an agent-kind badge (`claude-code` → `Claude
+/// Code`). Purely a display concern — the wire form
+/// ([`ai_memory_core::AgentKind::as_str`]) stays the identity used
+/// everywhere else.
+#[must_use]
+pub(crate) fn agent_label(kind: ai_memory_core::AgentKind) -> &'static str {
+    use ai_memory_core::AgentKind;
+    match kind {
+        AgentKind::ClaudeCode => "Claude Code",
+        AgentKind::Codex => "Codex",
+        AgentKind::OpenCode => "OpenCode",
+        AgentKind::Cursor => "Cursor",
+        AgentKind::GeminiCli => "Gemini CLI",
+        AgentKind::ClaudeDesktop => "Claude Desktop",
+        AgentKind::OpenClaw => "OpenClaw",
+        AgentKind::AntigravityCli => "Antigravity CLI",
+        AgentKind::Omp => "Oh My Pi",
+        AgentKind::Pi => "Pi",
+        AgentKind::Crush => "Crush",
+        AgentKind::Grok => "Grok Build CLI",
+        AgentKind::Zero => "Zero",
+        AgentKind::Devin => "Devin",
+        AgentKind::KimiCode => "Kimi Code",
+        AgentKind::KiroCli => "Kiro CLI",
+        AgentKind::CommandCode => "Command Code",
+        AgentKind::Hermes => "Hermes",
+        AgentKind::Pool => "Pool",
+        AgentKind::Zcode => "ZCode",
+        AgentKind::CopilotCli => "Copilot CLI",
+        AgentKind::Grizzybot => "GrizzyBot",
+        AgentKind::Droid => "Droid",
+        AgentKind::Muse => "Muse",
+        AgentKind::CodeBuddy => "CodeBuddy",
+        AgentKind::IbmBob => "IBM Bob",
+        AgentKind::Dsh => "DSH",
+        AgentKind::Cline => "Cline",
+        AgentKind::QwenCode => "Qwen Code",
+        AgentKind::Qoder => "Qoder",
+        AgentKind::Other => "Other",
+    }
+}
+
 pub(crate) fn encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -132,18 +187,63 @@ pub(crate) fn humanize(iso: &str) -> String {
     format!("{years} year{} ago", if years == 1 { "" } else { "s" })
 }
 
+/// Humanised session duration between two ISO-8601 timestamps, or `"open"`
+/// when `ended` is absent. Falls back to `"—"` on any parse error rather
+/// than a raw/misleading duration.
+#[must_use]
+pub(crate) fn duration_between(started: &str, ended: Option<&str>) -> String {
+    let Some(ended) = ended else {
+        return "open".to_owned();
+    };
+    let (Ok(start), Ok(end)) = (
+        started.parse::<jiff::Timestamp>(),
+        ended.parse::<jiff::Timestamp>(),
+    ) else {
+        return "—".to_owned();
+    };
+    let secs = (end.as_microsecond() - start.as_microsecond())
+        .abs()
+        .saturating_div(1_000_000);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    format!("{days}d")
+}
+
 // ---------------------------------------------------------------------------
 // projects.html
 // ---------------------------------------------------------------------------
 
 /// One card on the project-list page.
 pub(crate) struct ProjectCard {
+    pub agent_summary: String,
+    pub inbox_href: String,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
     pub project: String,
     /// Number of latest pages.
     pub page_count: u64,
+    /// Captured sessions, whether or not they have produced a page yet.
+    pub session_count: u64,
+    /// Sanitized hook observations recorded for the project.
+    pub observation_count: u64,
+    /// Sessions that have not emitted SessionEnd yet.
+    pub open_session_count: u64,
     /// Humanised timestamp (e.g. "3 hours ago"), or empty string.
     pub last_updated_relative: String,
     /// Messages from other projects waiting for an agent here; `0` hides the
@@ -151,6 +251,28 @@ pub(crate) struct ProjectCard {
     pub pending_inbox: u64,
     /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
     pub href: String,
+}
+
+/// Aggregate metadata for the human-only dashboard. Prompt bodies, command
+/// output, paths, and handoff prose intentionally do not appear here.
+pub(crate) struct DashboardStats {
+    pub project_count: usize,
+    pub page_count: u64,
+    pub session_count: u64,
+    pub observation_count: u64,
+    pub open_session_count: u64,
+    pub last_activity_relative: String,
+    /// Process-local hook capture health. Empty only for standalone embeds;
+    /// the production server always supplies it.
+    pub ingest: Option<IngestStats>,
+}
+
+/// Content-free snapshot of hook ingestion health since this server started.
+pub(crate) struct IngestStats {
+    pub accepted: u64,
+    pub dropped_by_policy: u64,
+    pub shed_saturated: u64,
+    pub shed_rate_limited: u64,
 }
 
 /// One project named in the home page's pending-mail summary.
@@ -184,6 +306,8 @@ pub(crate) struct OkfDialog {
 pub(crate) struct ProjectsView {
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
+    /// Privacy-preserving aggregate signals above the project cards.
+    pub dashboard: DashboardStats,
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,
@@ -212,12 +336,27 @@ pub(crate) struct PageRow {
     pub kind: String,
     /// Humanised updated timestamp.
     pub updated_relative: String,
+    /// Harness that most recently contributed evidence to this page
+    /// version, if any is recorded (P2 evidence substrate). `None` for
+    /// hand-written pages or writes that predate it — omitted from the
+    /// badge row rather than shown as "unknown".
+    pub agent_label: Option<&'static str>,
+}
+
+/// One agent-kind badge with a session count, for the project stats card.
+pub(crate) struct AgentBadge {
+    /// Human-readable label (`Claude Code`, `Codex`, ...).
+    pub label: &'static str,
+    /// Sessions recorded for this agent in the project.
+    pub count: u64,
 }
 
 /// One pending inbox message on the project page.
 pub(crate) struct MailboxRow {
     /// Subject line, or a placeholder when the sender gave none.
     pub subject: String,
+    /// Epistemic classification supplied by the sender.
+    pub nature: &'static str,
     /// `workspace/project` of the sender, or a neutral label when the viewer
     /// may not read it.
     pub sender: String,
@@ -247,10 +386,17 @@ pub(crate) struct Folder {
 #[derive(Template)]
 #[template(path = "project.html")]
 pub(crate) struct ProjectView {
+    pub agents: Vec<crate::operations::AgentCard>,
+    pub inbox_href: String,
+    pub project_href: String,
+    pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
     pub project: String,
+    /// Capture metadata for the project. Deliberately excludes raw prompt,
+    /// command and observation bodies from the human dashboard.
+    pub stats: ProjectMemoryStats,
     /// Sidebar folder tree — knowledge pages only.
     pub folders: Vec<Folder>,
     /// Machinery pages (lint reports, sessions, logs, indexes),
@@ -258,6 +404,9 @@ pub(crate) struct ProjectView {
     pub system: Vec<Folder>,
     /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+    /// Sessions grouped by the agent CLI that ran them, most-used first.
+    /// Empty when the project has no sessions yet.
+    pub by_agent: Vec<AgentBadge>,
     /// Pending inbox messages, oldest first, capped at the route's limit.
     pub mailbox: Vec<MailboxRow>,
     /// All pending messages for the project; exceeds `mailbox.len()` when the
@@ -273,6 +422,12 @@ pub(crate) struct ProjectView {
 
 /// One recent session on the project page.
 pub(crate) struct SessionRow {
+    /// Human-readable harness label.
+    pub agent_label: &'static str,
+    /// Session duration or open marker.
+    pub duration: String,
+    /// Reported token usage or an em dash when unavailable.
+    pub tokens: String,
     /// Link to the session timeline.
     pub href: String,
     /// Agent kind as stored (`claude-code`, `codex`, …).
@@ -285,6 +440,23 @@ pub(crate) struct SessionRow {
     pub started_relative: String,
     /// The session has not ended.
     pub open: bool,
+}
+
+/// Privacy-preserving project-level capture summary.
+pub(crate) struct ProjectMemoryStats {
+    /// Number of compiled memory pages.
+    pub page_count: u64,
+    /// Sessions recorded for this project.
+    pub session_count: u64,
+    /// Sanitized events recorded for the project.
+    pub observation_count: u64,
+    /// Sessions without a SessionEnd event.
+    pub open_session_count: u64,
+    /// Humanised latest capture timestamp, if one exists.
+    pub last_activity_relative: String,
+    /// Compact total input+output tokens across every session with a
+    /// reported usage, or "—" when none has reported any yet.
+    pub tokens_total: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +572,7 @@ pub(crate) struct RelatedRow {
 #[derive(Template)]
 #[template(path = "page.html")]
 pub(crate) struct PageView {
+    pub knowledge: crate::knowledge::KnowledgeView,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -585,6 +758,7 @@ pub(crate) struct SessionObservationRow {
 #[derive(Template)]
 #[template(path = "session.html")]
 pub(crate) struct SessionView {
+    pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -1001,6 +1175,70 @@ pub(crate) struct ChangePasswordView {
     /// Sanitised post-change redirect target (absolute path under the wiki root).
     pub next: String,
 }
+/// Metadata-only operational view of measured responses.
+pub(crate) struct TokenUsagePanel {
+    pub model: String,
+    pub session: String,
+    pub from: String,
+    pub until: String,
+    pub turn: String,
+    pub tool: String,
+    pub agents: Vec<UsageAgentOption>,
+    pub matching_tokens: String,
+    pub search: String,
+    pub recent: bool,
+    pub signals_only: bool,
+    pub matching: u64,
+    pub shown_start: u64,
+    pub shown_end: u64,
+    pub previous_href: String,
+    pub next_href: String,
+    pub observation_offset: usize,
+    pub observation_limit: usize,
+    pub count: u64,
+    pub input: String,
+    pub output: String,
+    pub cache_write: String,
+    pub cache_read: String,
+    pub hit_rate: String,
+    pub rows: Vec<TokenUsageRow>,
+}
+pub(crate) struct TokenUsageRow {
+    pub turn: String,
+    pub turn_href: String,
+    pub response_native: String,
+    pub session: String,
+    pub recorded_at: String,
+    pub time_basis: &'static str,
+    pub tools: Vec<UsageTool>,
+    pub total_value: u64,
+    pub observed_at: String,
+    pub href: String,
+    pub id: String,
+    pub model: String,
+    pub agent: String,
+    pub input: String,
+    pub output: String,
+    pub cache: String,
+    pub total: String,
+    pub when: String,
+    pub signal: String,
+}
+
+pub(crate) struct UsageAgentOption {
+    pub value: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+pub(crate) struct UsageTool {
+    pub id: String,
+    pub name: String,
+    pub relation: &'static str,
+    pub is_error: Option<bool>,
+    pub href: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

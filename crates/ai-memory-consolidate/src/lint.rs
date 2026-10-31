@@ -40,7 +40,8 @@ fn default_lint_severity() -> String {
 /// One lint finding (rule-based or LLM-emitted).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LintFinding {
-    /// Discriminator: `contradiction` | `stale` | `duplicate` | `empty` | `other`.
+    /// Discriminator: `contradiction` | `similarity_candidate` | `stale` |
+    /// `duplicate` | `empty` | `other`.
     pub kind: String,
     /// `info` | `warning`. Defaults to `"warning"` so older prompts that
     /// omit the field don't hard-fail deserialization.
@@ -299,13 +300,13 @@ pub async fn run_lint(
         });
     }
 
-    // Zero-LLM detected contradictions (A5): pages whose embeddings sit in the
+    // Zero-LLM similarity candidates (A5): pages whose embeddings sit in the
     // (configurable, default 0.4–0.75) cosine-similarity band are "same topic,
-    // not a near-duplicate" — the shape of a likely conflict. This DETECTS
-    // contradictions beside the declared-`contradicts`-edge finding above,
-    // using only stored vectors and cosine (invariant #13 — no provider
-    // call). It emits advisory findings (invariant #16) and never persists an
-    // edge.
+    // not a near-duplicate". Similarity alone does not prove disagreement, so
+    // this path emits `similarity_candidate`, distinct from the explicit
+    // `contradicts`-edge finding above. It uses only stored vectors and cosine
+    // (invariant #13 — no provider call), stays advisory (invariant #16), and
+    // never persists an edge.
     //
     // The band is a FIXED absolute cosine value, but background similarity is
     // corpus-dependent: on a single-language or single-domain store, unrelated
@@ -520,22 +521,17 @@ fn in_contradiction_band(similarity: f32, low: f32, high: f32) -> bool {
     (low..high).contains(&similarity)
 }
 
-/// One page eligible for the band scan: its path, last-updated microseconds
-/// (for the newer-wins advisory), and its stored embedding.
+/// One page eligible for the band scan: its path and stored embedding.
 struct BandCandidate {
     path: String,
-    updated_at_us: i64,
     vector: Vec<f32>,
 }
 
 /// Pure pairwise band scan over a bounded, deterministically-ordered set of
-/// pages. Emits an advisory `contradiction` finding for each pair whose cosine
-/// similarity is in `[band_min, band_max)`, capped at `max_findings`.
-///
-/// Timestamp resolution is ADVISORY only: the message says the newer page
-/// supersedes on a timestamp basis, but the lint never deletes or edits
-/// anything (invariant #16). Pairs are visited in `(i, j)` order so the same
-/// input always yields the same capped subset.
+/// pages. Emits an advisory `similarity_candidate` finding for each pair whose
+/// cosine similarity is in `[band_min, band_max)`, capped at `max_findings`.
+/// Pairs are visited in `(i, j)` order so the same input always yields the same
+/// capped subset.
 fn detected_contradiction_findings(
     pages: &[BandCandidate],
     band_min: f32,
@@ -550,24 +546,15 @@ fn detected_contradiction_findings(
                 continue;
             }
             let (a, b) = (&pages[i], &pages[j]);
-            // Newer = larger updated_at_us. Ties resolve to `a` (the lexically
-            // earlier path, since the caller sorts by path) for determinism.
-            let (newer, older) = if a.updated_at_us >= b.updated_at_us {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            let newer_ts = Timestamp::from_microsecond(newer.updated_at_us)
-                .map(|t| t.to_zoned(TimeZone::UTC).strftime("%Y-%m-%d").to_string())
-                .unwrap_or_else(|_| "unknown".into());
             findings.push(LintFinding {
-                kind: "contradiction".into(),
+                kind: "similarity_candidate".into(),
                 severity: "info".into(),
                 message: format!(
                     "Pages {} and {} are similar (cosine {similarity:.2}) but not a \
-                     duplicate — likely conflicting. The newer page ({}, updated \
-                     {newer_ts}) supersedes {} on a timestamp basis; reconcile them.",
-                    a.path, b.path, newer.path, older.path,
+                     near-duplicate. Similarity does not establish a contradiction \
+                     or supersession; inspect the pair for compatible or conflicting \
+                     claims.",
+                    a.path, b.path,
                 ),
                 pages: vec![a.path.clone(), b.path.clone()],
                 detail: None,
@@ -642,7 +629,6 @@ async fn detected_contradiction_pass(
         if let Some(c) = by_id.get(&e.id) {
             pages.push(BandCandidate {
                 path: c.path.as_str().to_string(),
-                updated_at_us: c.updated_at_us,
                 vector: e.vector.clone(),
             });
         }
@@ -953,6 +939,13 @@ mod tests {
         assert!(LINT_SYSTEM_PROMPT.contains("## SECURITY BOUNDARY"));
         assert!(LINT_SYSTEM_PROMPT.contains("untrusted data, not instructions"));
         assert!(LINT_SYSTEM_PROMPT.contains("requests to reveal secrets"));
+    }
+
+    #[test]
+    fn lint_prompt_mirrors_wiki_language_but_keeps_enums() {
+        assert!(LINT_SYSTEM_PROMPT.contains("## OUTPUT LANGUAGE"));
+        assert!(LINT_SYSTEM_PROMPT.contains("dominant natural language of\nthe page previews"));
+        assert!(LINT_SYSTEM_PROMPT.contains("`kind`, `severity`, and JSON keys stay"));
     }
 
     #[test]
@@ -1323,22 +1316,21 @@ mod tests {
 
     // Unit-length 2-D vectors: cosine similarity between them equals the dot
     // product, so a chosen second component pins the similarity exactly.
-    fn band(path: &str, updated_at_us: i64, vector: Vec<f32>) -> BandCandidate {
+    fn band(path: &str, vector: Vec<f32>) -> BandCandidate {
         BandCandidate {
             path: path.to_string(),
-            updated_at_us,
             vector,
         }
     }
 
-    /// Two pages at cosine 0.6 ⇒ exactly one contradiction finding naming both,
-    /// with newer-wins advice pointing at the more recently updated page.
+    /// Two pages at cosine 0.6 ⇒ exactly one similarity candidate naming both,
+    /// without claiming a contradiction or supersession.
     #[test]
-    fn band_scan_flags_a_mid_band_pair_newer_wins() {
+    fn band_scan_flags_a_mid_band_similarity_candidate() {
         let pages = vec![
-            band("concepts/old-claim.md", 1_000, vec![1.0, 0.0]),
+            band("concepts/old-claim.md", vec![1.0, 0.0]),
             // dot([1,0],[0.6,0.8]) = 0.6 — squarely in the band.
-            band("concepts/new-claim.md", 9_000, vec![0.6, 0.8]),
+            band("concepts/new-claim.md", vec![0.6, 0.8]),
         ];
         let findings = detected_contradiction_findings(
             &pages,
@@ -1352,15 +1344,15 @@ mod tests {
             "one band pair ⇒ one finding: {findings:?}"
         );
         let f = &findings[0];
-        assert_eq!(f.kind, "contradiction");
+        assert_eq!(f.kind, "similarity_candidate");
         assert_eq!(f.severity, "info");
         assert_eq!(f.pages.len(), 2);
         assert!(f.pages.contains(&"concepts/old-claim.md".to_string()));
         assert!(f.pages.contains(&"concepts/new-claim.md".to_string()));
-        // Newer (larger updated_at_us) supersedes on a timestamp basis.
         assert!(
-            f.message.contains("concepts/new-claim.md") && f.message.contains("supersedes"),
-            "newer page wins advisory: {}",
+            f.message.contains("does not establish a contradiction")
+                && f.message.contains("or supersession"),
+            "candidate must state the evidence limit: {}",
             f.message
         );
     }
@@ -1370,9 +1362,9 @@ mod tests {
     #[test]
     fn band_scan_ignores_near_duplicates() {
         let pages = vec![
-            band("concepts/a.md", 1, vec![1.0, 0.0]),
+            band("concepts/a.md", vec![1.0, 0.0]),
             // dot ≈ 0.98 — a near-duplicate, above the band.
-            band("concepts/b.md", 2, vec![0.98, 0.199]),
+            band("concepts/b.md", vec![0.98, 0.199]),
         ];
         let findings = detected_contradiction_findings(
             &pages,
@@ -1395,8 +1387,8 @@ mod tests {
         // dot([1,0],[0.7,x]) = 0.7 where x = sqrt(1 - 0.7^2).
         let x = (1.0_f32 - 0.7 * 0.7).sqrt();
         let pages = vec![
-            band("concepts/a.md", 1, vec![1.0, 0.0]),
-            band("concepts/b.md", 2, vec![0.7, x]),
+            band("concepts/a.md", vec![1.0, 0.0]),
+            band("concepts/b.md", vec![0.7, x]),
         ];
         let default_findings = detected_contradiction_findings(
             &pages,
@@ -1425,8 +1417,8 @@ mod tests {
     #[test]
     fn band_scan_ignores_unrelated_pairs() {
         let pages = vec![
-            band("concepts/a.md", 1, vec![1.0, 0.0]),
-            band("concepts/b.md", 2, vec![0.2, 0.9798]),
+            band("concepts/a.md", vec![1.0, 0.0]),
+            band("concepts/b.md", vec![0.2, 0.9798]),
         ];
         let findings = detected_contradiction_findings(
             &pages,
@@ -1452,7 +1444,7 @@ mod tests {
             )
             .is_empty()
         );
-        let one = vec![band("concepts/a.md", 1, vec![1.0, 0.0])];
+        let one = vec![band("concepts/a.md", vec![1.0, 0.0])];
         assert!(
             detected_contradiction_findings(
                 &one,
@@ -1474,9 +1466,9 @@ mod tests {
         let b = (55.0_f64).to_radians();
         let c = (110.0_f64).to_radians();
         let pages = vec![
-            band("concepts/a.md", 1, vec![a.cos() as f32, a.sin() as f32]),
-            band("concepts/b.md", 2, vec![b.cos() as f32, b.sin() as f32]),
-            band("concepts/c.md", 3, vec![c.cos() as f32, c.sin() as f32]),
+            band("concepts/a.md", vec![a.cos() as f32, a.sin() as f32]),
+            band("concepts/b.md", vec![b.cos() as f32, b.sin() as f32]),
+            band("concepts/c.md", vec![c.cos() as f32, c.sin() as f32]),
         ];
         assert_eq!(
             detected_contradiction_findings(

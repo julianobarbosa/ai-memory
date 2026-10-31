@@ -749,7 +749,13 @@ impl Embedder for HealthRecordingEmbedder {
     }
 }
 
-fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
+/// The HTTP status and a bounded, redacted message for `err`.
+///
+/// The admin `llm-test` route answers with this so a server-side probe reports
+/// the same error class the health snapshot records, never the provider's full
+/// body (#1639).
+#[must_use]
+pub fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
     match err {
         LlmError::Http(e) => (
             e.status().map(|status| status.as_u16()),

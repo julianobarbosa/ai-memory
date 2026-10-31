@@ -57,6 +57,49 @@ fn body_with_content(content: &str) -> serde_json::Value {
     })
 }
 
+/// Reasoning tags inside the answer are data, including when the endpoint
+/// falls back from strict output or wraps the answer in prose/reasoning.
+#[rstest::rstest]
+#[case::plain("", "", false, 1)]
+#[case::fenced("```json\n", "\n```", false, 1)]
+#[case::prose("Here is the result: ", "", false, 1)]
+#[case::reasoning("<think>Draft {\"answer\":\"discard\"}</think>\n", "", false, 1)]
+#[case::unopened("Draft {\"answer\":\"discard\"}</think>\n", "", false, 1)]
+#[case::strict_fallback("```json\n", "\n```", true, 2)]
+#[case::strict_control("", "", true, 1)]
+#[tokio::test]
+async fn structured_reply_preserves_literal_reasoning_tags(
+    #[case] prefix: &str,
+    #[case] suffix: &str,
+    #[case] strict: bool,
+    #[case] requests: u64,
+) {
+    let expected = json!({"answer": concat!(
+        "Keep <think>thought</think>, <thinking>quoted</thinking>, ",
+        "<analysis>analysis</analysis>, <REASONING>reason</REASONING>, ",
+        "a lone </think>, \"quotes\", \\paths, {braces}, and café."
+    )});
+    let content = format!("{prefix}{expected}{suffix}");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body_with_content(&content)))
+        .expect(requests)
+        .mount(&server)
+        .await;
+    let provider = OpenAiCompatProvider::new(server.uri(), None, "model-x")
+        .unwrap()
+        .with_strict(strict);
+    let actual = provider
+        .complete_structured_raw(
+            tiny_request(),
+            json!({"type":"object", "properties":{"answer":{"type":"string"}}}),
+        )
+        .await
+        .expect("a complete JSON answer");
+    assert_eq!(actual, expected);
+}
+
 /// Counts every request hitting the mock server so a test can assert
 /// "only one call was made" (strict succeeded) vs "two calls were made"
 /// (strict raw, then tolerant fallback). The response itself is cloned

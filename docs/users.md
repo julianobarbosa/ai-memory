@@ -228,6 +228,13 @@ to, and consumed by, the next session to start, whoever it belongs to.
   descending and then agent name. An unknown scope returns 404 without creating
   it. Like every `/admin/*` route, this endpoint is root-only when the
   deployment distinguishes operators.
+- The web session views (a project's Sessions, Agents and Token usage tabs,
+  each agent's page and each session's page) and the read-only
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` and
+  `.../sessions/{id}/observations` routes follow the same rule for a user:
+  their own sessions plus the shared ones, and another operator's session
+  reads as not found. The root operator sees every operator's sessions there,
+  matching the dashboard's counts, which already include everyone.
 - The read-only handoff listing (`GET
   /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
   fields (`summary`, `open_questions`, `next_steps`) to a caller the server

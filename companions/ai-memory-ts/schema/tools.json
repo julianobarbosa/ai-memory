@@ -491,6 +491,12 @@
   },
   "memory_message_pop": {
     "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "message_id": {
         "type": [
           "null",
@@ -517,6 +523,12 @@
       "body": {
         "type": "string"
       },
+      "evidence": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "from_project": {
         "type": [
           "null",
@@ -528,6 +540,15 @@
           "null",
           "string"
         ]
+      },
+      "nature": {
+        "enum": [
+          "inferred",
+          "measured",
+          "reported",
+          "unknown"
+        ],
+        "type": "string"
       },
       "subject": {
         "type": [
@@ -546,6 +567,39 @@
       "body",
       "to_project",
       "to_workspace"
+    ]
+  },
+  "memory_patch_page": {
+    "properties": {
+      "edits": {
+        "items": {
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "expected_page_id": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "edits",
+      "expected_page_id",
+      "path"
     ]
   },
   "memory_query": {
@@ -678,6 +732,12 @@
       "include_related": {
         "type": "boolean"
       },
+      "max_chars": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "path": {
         "type": [
           "null",
@@ -700,6 +760,12 @@
         "type": [
           "integer",
           "null"
+        ]
+      },
+      "scope": {
+        "type": [
+          "null",
+          "string"
         ]
       },
       "workspace": {

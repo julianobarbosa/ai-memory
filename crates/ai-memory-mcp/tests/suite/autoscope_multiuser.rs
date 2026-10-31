@@ -184,6 +184,7 @@ impl MultiUserHarness {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
             skip_wiki_checkpoints: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(

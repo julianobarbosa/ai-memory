@@ -153,6 +153,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         with:
           node-version: "24"
+      # Browser tooling is test-only. Building/distributing the Rust server
+      # and its embedded web UI still needs Cargo alone.
+      - name: Install pinned Chromium for dashboard regression tests
+        if: matrix.os == 'ubuntu-latest'
+        run: npx --yes playwright@1.63.0 install --with-deps --only-shell chromium
+      - name: Real dashboard browser tests and mutation checks
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
+        run: node tests/e2e/web_dashboard_mutations.mjs
+      - name: Dashboard Rust mutation checks
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check-dashboard-core-mutations.py
       - name: Generated capture-policy TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
@@ -477,8 +490,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo install cargo-audit --locked
+      # zip is versioned 8.6.0 for Candle compatibility but pinned to
+      # upstream's official 8.x fix commit (507c5c76) for this GHSA.
       - run: >
           cargo audit
+          --ignore GHSA-m665-v7pm-7grj
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock

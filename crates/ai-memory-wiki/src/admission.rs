@@ -375,9 +375,12 @@ impl AdmissionChain {
             }
         }
 
-        let client = reqwest::Client::builder().build().map_err(|e| {
-            WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
-        })?;
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirects())
+            .build()
+            .map_err(|e| {
+                WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
+            })?;
         Ok(Self {
             webhooks: Arc::new(webhooks),
             client,
@@ -505,11 +508,16 @@ impl AdmissionChain {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(webhook = %hook.name, error = %e, "admission request failed");
+                    let detail = format_request_error(&e);
+                    tracing::warn!(
+                        webhook = %hook.name,
+                        error = %detail,
+                        "admission request failed",
+                    );
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
                         return Err(AdmissionFailure::into_error(
                             true,
-                            format!("admission webhook {} request failed: {}", hook.name, e),
+                            format!("admission webhook {} request failed: {detail}", hook.name),
                         ));
                     }
                 }
@@ -635,11 +643,16 @@ impl AdmissionChain {
                 }
             }
             Err(e) => {
-                tracing::warn!(webhook = %hook.name, error = %e, "admission notify request failed");
+                let detail = format_request_error(&e);
+                tracing::warn!(
+                    webhook = %hook.name,
+                    error = %detail,
+                    "admission notify request failed",
+                );
                 if matches!(hook.failure_policy, FailurePolicy::Reject) {
                     return Err(WikiError::Io(std::io::Error::other(format!(
-                        "admission webhook {} request failed: {}",
-                        hook.name, e
+                        "admission webhook {} request failed: {detail}",
+                        hook.name
                     ))));
                 }
             }
@@ -740,7 +753,12 @@ impl AdmissionChain {
                     tracing::warn!(webhook = %name, status = %resp.status(), "admission async error response");
                 }
                 Err(e) => {
-                    tracing::warn!(webhook = %name, error = %e, "admission async request failed");
+                    let detail = format_request_error(&e);
+                    tracing::warn!(
+                        webhook = %name,
+                        error = %detail,
+                        "admission async request failed",
+                    );
                 }
             }
         });
@@ -769,6 +787,43 @@ fn is_supported_webhook_url(url: &str) -> bool {
     }
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Same redirect hop limit as `reqwest`'s default policy.
+const MAX_WEBHOOK_REDIRECTS: usize = 10;
+
+/// Follow a redirect only when it stays on the scheme, host, and port of the
+/// previous request.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.origin() == attempt.url().origin());
+        if !same_origin {
+            let target = attempt.url().origin().ascii_serialization();
+            attempt.error(format!(
+                "refused a redirect to another origin ({target}); set the endpoint to its final URL"
+            ))
+        } else if attempt.previous().len() > MAX_WEBHOOK_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Format a `reqwest::Error` together with its `Error::source` chain so
+/// custom redirect-policy refusals and transport causes survive stringification.
+fn format_request_error(err: &reqwest::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn webhook_timeout(timeout_ms: u64) -> Duration {

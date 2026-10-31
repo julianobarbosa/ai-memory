@@ -23,6 +23,7 @@ use crate::STATE_DIR;
 
 const STATE_FILE: &str = "state.json";
 const IGNORE_FILE: &str = ".gitignore";
+const LOCK_FILE: &str = "write.lock";
 /// Ignores the state directory, this file included. Two clones that both
 /// commit their state would conflict on every merge and replay each other's
 /// baselines.
@@ -140,6 +141,51 @@ impl Default for SyncState {
 /// Path of the single state file inside a destination root.
 pub fn state_path(dest_root: &Path) -> PathBuf {
     dest_root.join(STATE_DIR).join(STATE_FILE)
+}
+
+/// Exclusive ownership of one destination's read/plan/write lifecycle.
+/// Keeping the file handle alive keeps the OS lock alive; process exit also
+/// releases it, so a crashed sync never leaves a stale lease to clean up.
+#[derive(Debug)]
+pub struct WriteLock {
+    _file: fs::File,
+}
+
+/// Fail promptly when another mutating run owns this destination.
+///
+/// The lock lives beside clone-local state and covers the whole operation,
+/// not only [`save`]: two plans derived from one baseline must not both apply.
+pub fn acquire_write_lock(dest_root: &Path) -> Result<WriteLock> {
+    let dir = dest_root.join(STATE_DIR);
+    ensure_real_state_dir(&dir)?;
+    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    ensure_real_state_dir(&dir)?;
+    ignore_state_dir(&dir)?;
+
+    let path = dir.join(LOCK_FILE);
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("write lock is a symlink: {}", path.display());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("cannot open write lock {}", path.display()))?;
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("write lock became a symlink: {}", path.display());
+    }
+    fs2::FileExt::try_lock_exclusive(&file).with_context(|| {
+        format!(
+            "destination {} is already being modified by another ai-memory-wikisync run",
+            dest_root.display()
+        )
+    })?;
+    Ok(WriteLock { _file: file })
 }
 
 /// The state directory must be a real directory, never a symlink: a symlink
@@ -322,6 +368,33 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn write_lock_is_exclusive_and_released_with_its_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let first = acquire_write_lock(&root).unwrap();
+        let err = acquire_write_lock(&root).unwrap_err().to_string();
+        assert!(err.contains("already being modified"), "{err}");
+
+        drop(first);
+        acquire_write_lock(&root).expect("closing the first handle releases the OS lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_lock_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir = root.join(STATE_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(root.join("elsewhere"), b"").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), dir.join(LOCK_FILE)).unwrap();
+
+        let err = acquire_write_lock(&root).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
     }
 
     #[test]

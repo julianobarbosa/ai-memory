@@ -248,7 +248,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::CodeBuddy
         | AgentChoice::IbmBob
         | AgentChoice::Cline
-        | AgentChoice::QwenCode => {
+        | AgentChoice::QwenCode
+        | AgentChoice::Qoder => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )

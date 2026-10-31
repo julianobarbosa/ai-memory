@@ -13,6 +13,7 @@
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">session {{ session_id }}</span>
 </nav>
 
+<p class="section-note"><a href="{{ project_href }}/agents/{{ agent_kind }}">← All {{ agent_kind }} sessions</a></p>
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">Session timeline</h1>
 <p class="mb-1 text-sm text-slate-500 dark:text-slate-400">
   <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ agent_kind }}</span>
@@ -22,6 +23,8 @@
   Captured observations, in order. They were sanitized when captured and are shown as plain text.
   {% if elided_other_scope > 0 %}This session also left {{ elided_other_scope }} observation{% if elided_other_scope != 1 %}s{% endif %} in another project, not shown here.{% endif %}
 </p>
+
+{% include "_usage_panel.html" %}
 
 <nav id="scrubber" aria-label="Session scrubber" data-total="{{ total }}" data-limit="{{ limit }}" data-start="{{ shown_start }}"
      class="sticky top-14 z-10 mb-6 flex flex-wrap items-center gap-3 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-3 py-2 text-sm">
@@ -113,4 +116,5 @@
   });
 })();
 </script>
+{% include "_dashboard_refresh.html" %}
 {% endblock %}

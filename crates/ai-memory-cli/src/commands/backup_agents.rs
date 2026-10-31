@@ -506,6 +506,43 @@ pub fn discover_assets(
         }
     }
 
+    // 4c. Qoder CLI and IDE
+    if filter_agent(AgentKind::Qoder) {
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                home.join(".qoder").join("settings.json"),
+                ".qoder/settings.json",
+                "qoder/settings.json",
+            );
+            if !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+                collect_dir_assets(
+                    &mut assets,
+                    AgentKind::Qoder,
+                    AgentAssetKind::Skill,
+                    AgentAssetScope::Global,
+                    &home.join(".agents").join("skills"),
+                    ".agents/skills",
+                    "qoder/skills/agents",
+                )?;
+            }
+        }
+        if want_project && !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::Instruction,
+                AgentAssetScope::Project,
+                cwd.join("AGENTS.md"),
+                "AGENTS.md",
+                "project/qoder/AGENTS.md",
+            );
+        }
+    }
+
     // 4. Cursor
     if filter_agent(AgentKind::Cursor) {
         if want_global {

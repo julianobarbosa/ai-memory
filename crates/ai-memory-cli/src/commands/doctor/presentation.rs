@@ -41,6 +41,7 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
     terminal.text(&render_capture_health(report));
     terminal.text(&render_plugins(&report.plugins));
     terminal.text(&render_muse(report.muse.as_ref()));
+    terminal.text(&hermes::render(&report.hermes));
     terminal.text(&super::super::agentmemory_residue::render(
         &report.agentmemory_residue,
     ));

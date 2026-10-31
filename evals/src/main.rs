@@ -1,18 +1,21 @@
 //! `ai-memory-eval` — offline evaluation harnesses for ai-memory.
 //!
-//! Three subcommands:
+//! Four subcommands:
 //!
 //! - `ab` — live A/B comparison of two LLM providers on the production
 //!   consolidation prompt, with literal-fidelity scoring (see [`ab`],
 //!   [`fidelity`] and `evals/README.md`).
 //! - `projection` — the zero-LLM half of that scoring: which fixture facts
 //!   and literal tokens the observation projection lets into the prompt.
-//! - `retrieval` — LongMemEval retrieval benchmark driven end-to-end
+//! - `retrieval` — pinned retrieval benchmarks driven end-to-end
 //!   through a real `ai-memory serve` subprocess: hook-shaped ingestion,
 //!   real search stack, R@k / hit@k per question category (see
 //!   [`retrieval`] and `docs/benchmarks/`).
+//! - `abstention` — offline evidence-sufficiency signals, threshold sweeps,
+//!   and optional structured LLM answerability evaluation.
 
 mod ab;
+mod abstention;
 mod fidelity;
 mod generate;
 mod projection;
@@ -39,8 +42,10 @@ enum Command {
     /// Zero-LLM: which facts the consolidation prompt's observation
     /// projection keeps, per fixture.
     Projection(projection::ProjectionArgs),
-    /// LongMemEval retrieval benchmark through the real server stack.
+    /// Pinned retrieval benchmarks through the real server stack.
     Retrieval(Box<retrieval::RetrievalArgs>),
+    /// Offline evidence-sufficiency and abstention benchmark.
+    Abstention(Box<abstention::AbstentionArgs>),
 }
 
 #[tokio::main]
@@ -56,5 +61,6 @@ async fn main() -> Result<()> {
         Command::Ab(args) => ab::run(*args).await,
         Command::Projection(args) => projection::run(args),
         Command::Retrieval(args) => retrieval::run(*args).await,
+        Command::Abstention(args) => abstention::run(*args).await,
     }
 }

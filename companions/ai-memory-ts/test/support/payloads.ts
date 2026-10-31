@@ -11,6 +11,7 @@ export const MESSAGE_ID = "01a135d1-3ecf-79d3-a65b-c0094a535f63";
 export const SESSION_ID = "b2f3725b-265c-5da4-9866-35db4765d1b9";
 
 export const write = { page_id: NEXT_PAGE_ID, path: "notes/retries.md", checkpoint: "b04977fb" };
+export const patch = write;
 
 export const read = {
   path: "notes/retries.md",
@@ -30,6 +31,8 @@ export const read = {
     type: "Note",
     generated: { by: "process:ai-memory/3.0.0", at: "2026-10-13T15:10:47Z" },
   },
+  sections: [{ anchor: "Retry policy", level: 1, sha256: "a".repeat(64) }],
+  sections_truncated: false,
 };
 
 export const del = {
@@ -129,8 +132,11 @@ export const messageRow = {
   from_project_id: "p",
   from_agent: "other",
   from_owner_user: null,
+  to_agent: null,
   subject: "hi",
   body: "please do X",
+  nature: "reported",
+  evidence: "source message 42",
   state: "pending",
   created_at: "2026-10-13T15:11:07.983842Z",
   claimed_at: null,

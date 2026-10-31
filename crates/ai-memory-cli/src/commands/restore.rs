@@ -206,6 +206,11 @@ async fn stage_then_swap(
     let mut archive = tar::Archive::new(decoder);
     unpack_checked_archive(&mut archive, staging)
         .with_context(|| format!("extracting {} into {}", from.display(), staging.display()))?;
+    // tar stops at its zero header, before the gzip decoder necessarily reads
+    // the checksum/size trailer. Finish the member before trusting its files.
+    // https://docs.rs/tar/latest/tar/struct.Archive.html#method.set_ignore_zeros
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .with_context(|| format!("verifying gzip stream in {}", from.display()))?;
     info!(from = %from.display(), into = %staging.display(), "tarball extracted into staging");
 
     let placement = if !staging.join(CONFIG_FILE).is_file() {
@@ -251,10 +256,9 @@ async fn stage_then_swap(
             bail!("the restored API-key pepper verifier could not be bound");
         }
     }
-    // Keeping the live config instead of the archived one must not leave a
-    // server that refuses to start: the pepper this command loaded has to be
-    // the one the restored API keys were hashed with.
-    if placement == ConfigPlacement::Divert && has_api_credentials {
+    // Keeping the live config must not leave a server that refuses to start:
+    // its loaded pepper must match the restored API keys.
+    if placement != ConfigPlacement::Install && has_api_credentials {
         let matches = match (
             token_pepper.filter(|value| !value.trim().is_empty()),
             store.reader.api_credential_pepper_verifier().await?,
@@ -267,6 +271,14 @@ async fn stage_then_swap(
             _ => false,
         };
         if !matches {
+            if placement == ConfigPlacement::Absent {
+                bail!(
+                    "the backup does not contain config.toml and the configured \
+                     [auth].token_pepper is missing or does not match its API keys; restore \
+                     the original config or token_pepper before retrying (the live data \
+                     was not changed)"
+                );
+            }
             bail!(
                 "the backup's API keys were hashed with a different [auth].token_pepper than \
                  the live config's; rerun with --with-config to restore the backup's \
@@ -881,6 +893,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_gzip_checksum_is_invalid() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let mut bytes = good_archive();
+        // All tar entries are readable, but the gzip trailer's CRC32 is wrong.
+        let checksum_offset = bytes.len() - 8;
+        bytes[checksum_offset] ^= 0x80;
+        let from = write_tarball(scratch.path(), "bad-crc.tar.gz", &bytes);
+
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("verifying gzip stream"),
+            "unexpected error: {err:#}"
+        );
+        assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_gzip_trailer_is_missing() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let bytes = good_archive();
+        // Keep the compressed tar, including its end marker, but remove the
+        // gzip checksum and original-size trailer.
+        let from = write_tarball(
+            scratch.path(),
+            "no-trailer.tar.gz",
+            &bytes[..bytes.len() - 8],
+        );
+
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("verifying gzip stream"),
+            "unexpected error: {err:#}"
+        );
+        assert_live_data_untouched(data.path());
+    }
+
+    #[tokio::test]
     async fn restore_force_keeps_live_data_when_an_entry_is_outside_the_allowed_layout() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
@@ -1246,6 +1305,70 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn restoring_without_archived_config_checks_the_live_pepper_before_swap() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = api_key_sqlite_bytes(Some("archive-pepper")).await;
+        let from = write_tarball(
+            scratch.path(),
+            "keys-without-config.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+            ]),
+        );
+
+        // The flag cannot supply a config the archive does not contain.
+        for with_config in [false, true] {
+            for live_pepper in [Some("different-live-pepper"), None, Some(" \t")] {
+                let data = tempfile::TempDir::new().unwrap();
+                seed_live_data(data.path());
+                let err = restore_data_dir_with_legacy_pepper(
+                    data.path(),
+                    &from,
+                    true,
+                    with_config,
+                    live_pepper,
+                    false,
+                )
+                .await
+                .unwrap_err();
+                let message = err.to_string();
+                assert!(message.contains("does not contain config.toml"), "{err:#}");
+                assert!(message.contains("[auth].token_pepper"), "{err:#}");
+                assert!(!message.contains("--with-config"), "{err:#}");
+                assert_live_data_untouched(data.path());
+                assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
+            }
+
+            let data = tempfile::TempDir::new().unwrap();
+            seed_live_data(data.path());
+            let outcome = restore_data_dir_with_legacy_pepper(
+                data.path(),
+                &from,
+                true,
+                with_config,
+                Some("archive-pepper"),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ConfigOutcome::NotInArchive);
+            assert_eq!(
+                std::fs::read(data.path().join("config.toml")).unwrap(),
+                b"# old config\n"
+            );
+            assert_eq!(
+                std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
+                b"new page"
+            );
+            assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
+            assert!(restore_scratch_dirs(data.path()).is_empty());
+            let restored = Store::open(data.path()).unwrap();
+            assert!(restored.reader.api_credentials_exist().await.unwrap());
+        }
     }
 
     /// Keeping the live config must not leave a server that refuses to start

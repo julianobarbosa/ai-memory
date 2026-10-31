@@ -69,6 +69,14 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     };
     let selected = &candidates[index];
     let target = continue_session::resolve_target(config, &selected.link)?;
+    let project_id = project_registry::project_binding(
+        config,
+        &endpoint,
+        &selected.link.workspace,
+        &selected.link.project,
+        &target,
+    )?
+    .map(|scope| scope.project_id);
     let harness = selected_harness(harness_indices[index], &harnesses);
     eprintln!(
         "resuming workstream '{}' with harness '{}' in {} at {}",
@@ -83,7 +91,8 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
         config,
         RunArgs {
             workspace: Some(selected.link.workspace.clone()),
-            project: Some(selected.link.project.clone()),
+            project: project_id.is_none().then(|| selected.link.project.clone()),
+            project_id,
             workstream: Some(selected.summary.name.clone()),
             new_workstream: None,
             executable: None,
@@ -94,6 +103,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             fresh: args.fresh,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -125,9 +135,14 @@ async fn candidates_for_checkout(
             terminal_text(args.workspace.as_deref().unwrap_or_default())
         );
     }
-    let summaries =
-        workstreams::list_all_for_checkout(endpoint, &link.workspace, &link.project, &link.path)
-            .await?;
+    let summaries = workstreams::list_all_for_checkout(
+        config,
+        endpoint,
+        &link.workspace,
+        &link.project,
+        &link.path,
+    )
+    .await?;
     if summaries.is_empty() {
         bail!(
             "no managed workstreams for the current checkout ({}); launch one here with `ai-memory run <harness>` first",
@@ -193,6 +208,7 @@ async fn candidates_across_checkouts(
             }
         };
         let summaries = match workstreams::list_all_for_checkout(
+            config,
             endpoint,
             &link.workspace,
             &link.project,

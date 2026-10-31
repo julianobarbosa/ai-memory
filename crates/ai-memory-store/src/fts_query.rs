@@ -260,6 +260,10 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     }
     let mut phrases = Vec::new();
     for token in bounded.split_whitespace() {
+        // Grouping must not turn `(title:term)` into an unqualified match.
+        // Like prepare_fts5_token, peel opening parentheses before the column:
+        // https://www.sqlite.org/fts5.html#fts5_column_filters
+        let token = token.trim_start_matches('(');
         let (column, text) = match token.split_once(':') {
             Some((column @ ("title" | "body"), text)) => (Some(column), text),
             _ => (None, token),
@@ -571,9 +575,22 @@ mod tests {
         let title = prepare_cjk_fts5_query("title:支付服务").unwrap();
         assert_eq!(title, "title:\"支付 付服 服务\"");
         assert_parses(&title);
+        for query in ["(title:支付服务)", "((title:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, title, "query={query}");
+            assert_parses(&grouped);
+        }
         let body = prepare_cjk_fts5_query("body:支付服务").unwrap();
         assert_eq!(body, "body:\"支付 付服 服务\"");
         assert_parses(&body);
+        for query in ["(body:支付服务)", "((body:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, body, "query={query}");
+            assert_parses(&grouped);
+        }
+        let alternatives = prepare_cjk_fts5_query("((title:支付服务) OR (body:支付服务))").unwrap();
+        assert_eq!(alternatives, format!("{title} OR {body}"));
+        assert_parses(&alternatives);
         let single = prepare_cjk_fts5_query("title:支").unwrap();
         assert_eq!(single, "title:\"支\"");
         assert_parses(&single);

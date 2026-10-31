@@ -28,6 +28,8 @@ COPY evals ./evals
 # `docs/logo*.png` are include_bytes!'d by ai-memory-web's static
 # routes at compile time, so they must be in the build context.
 COPY docs ./docs
+# Product documentation embeds the current changelog into the web binary.
+COPY CHANGELOG.md ./
 # `ai-memory setup` renders the user service from these packaged templates,
 # include_str!'d at compile time.
 COPY packaging/systemd ./packaging/systemd

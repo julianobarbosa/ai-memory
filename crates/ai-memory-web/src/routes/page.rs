@@ -1,5 +1,6 @@
 //! `GET /w/:workspace/:project/p/*path` — rendered markdown page.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
@@ -24,6 +25,8 @@ const NAMESPACE_PAGE_SIZE: usize = 25;
 /// default instead of becoming axum's 400.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct NamespaceQuery {
+    #[serde(flatten)]
+    knowledge: crate::knowledge::KnowledgeQuery,
     sort: Option<String>,
     page: Option<String>,
 }
@@ -32,6 +35,7 @@ pub(crate) struct NamespaceQuery {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
     query: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Response {
@@ -113,6 +117,20 @@ pub(crate) async fn handler(
         outline
     };
 
+    let knowledge = match crate::knowledge::view(
+        &state,
+        &meta,
+        &workspace,
+        &project,
+        viewer_id,
+        super::api::owner_filter_for(actor),
+        &query.knowledge,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
     let project_href = project_href(&workspace, &project);
     let supersedes_path = meta.supersedes.unwrap_or_default();
     let supersedes_href = if supersedes_path.is_empty() {
@@ -134,6 +152,7 @@ pub(crate) async fn handler(
 
     let history_href = history_href(&workspace, &project, &path);
     match (PageView {
+        knowledge,
         workspace,
         project,
         project_href,
@@ -219,20 +238,16 @@ async fn namespace_or_not_found(
     }
     let sort_title = query.sort.as_deref() == Some("title");
     // Titles repeat (session pages), so ties fall back to recency, then path.
-    let newest_first = |a: &PageSummary, b: &PageSummary| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.path.cmp(&b.path))
+    let newest_first = |page: &PageSummary| {
+        (
+            Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+            page.path.clone(),
+        )
     };
     if sort_title {
-        under.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| newest_first(a, b))
-        });
+        under.sort_by_cached_key(|page| (page.title.to_lowercase(), newest_first(page)));
     } else {
-        under.sort_by(newest_first);
+        under.sort_by_cached_key(newest_first);
     }
     let total = under.len();
     let last_page = total.div_ceil(NAMESPACE_PAGE_SIZE);
@@ -253,6 +268,7 @@ async fn namespace_or_not_found(
             title: p.title,
             kind: p.kind,
             updated_relative: humanize(&p.updated_at),
+            agent_label: None,
         })
         .collect();
     // Resolved against the injected `<base href>`, so a bare `?sort=`

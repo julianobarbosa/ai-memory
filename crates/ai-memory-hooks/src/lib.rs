@@ -71,9 +71,10 @@ pub use payload::{
 };
 pub use recap::RECAP_BUDGET_MIN;
 pub use router::{
-    CwdProbes, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
-    DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
-    ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
+    BACKFILL_MARKER_PREFIX, CwdProbes, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
+    DEFAULT_INGEST_GATE_MAX_ENTRIES, DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates,
+    IngestRateLimiter, ProjectCache, ProjectCacheStore, SubagentSessionSet, SubagentSessions,
+    hook_router,
 };
 pub use synth::{SessionDigest, synthesize_session_page};
 pub use workstream::{WorkstreamState, workstream_router};

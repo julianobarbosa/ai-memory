@@ -168,6 +168,26 @@ fn codeql_model_targets_exist() {
     );
 }
 
+/// CodeQL's Rust extractor does not currently materialize an `Ok(0)` field
+/// barrier for source-defined `Result<PathBuf, _>` functions. A narrower model
+/// silently matches no flow node and reopens every confinement false positive.
+#[test]
+fn codeql_path_barriers_model_the_realized_return_node() {
+    let model = fs::read_to_string(
+        crates_dir()
+            .parent()
+            .expect("crates/ lives in the repository root")
+            .join(".github/codeql/extensions/ai-memory-models/models/path-barriers.model.yml"),
+    )
+    .expect("read path barrier model");
+
+    assert!(model.contains("\"ReturnValue\", \"path-injection\""));
+    assert!(
+        !model.contains("ReturnValue.Field[core::result::Result::Ok(0)]"),
+        "Rust Result field barriers are not realized for these source functions"
+    );
+}
+
 /// Advanced CodeQL setup does not reliably auto-load repository-local model
 /// packs. Keep the explicit Rust analysis path wired to the checked-in pack.
 #[test]

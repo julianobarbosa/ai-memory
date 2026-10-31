@@ -1057,7 +1057,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Session start
+is a permanent rejection and is not retried. Script drains leave native OIDC
+entries untouched for `ai-memory hook-drain`, which resolves or refreshes their
+credentials from `auth.json`; they continue with other eligible entries within
+the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -1071,6 +1074,19 @@ transaction complete finishes any interrupted wiki commit, durable provider
 enqueue, and ingest-key completion without adding a second handoff. Those
 incomplete effects remain at-least-once until the server marks the event
 complete.
+
+If the harness is terminated before it can send `SessionEnd` (including an API
+quota or 429 cutoff), the next session start does not need a synthetic close to
+recover context. The server picks the most recently active substantive open
+session in the same project and owner boundary and injects a read-only snapshot
+of its newest 64 sanitized observations, capped at 6,000 characters. It makes no
+rolling transcript copy, reads no observations from another project, and does
+not close the source session, which may still be a valid parallel agent. Recent
+prompts and bounded tool and lifecycle metadata are always available. The latest
+assistant status appears only when Claude Code assistant capture was enabled as
+described above. Use `finalize-session` later, once you know the abandoned
+source is no longer live.
+
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
@@ -1670,6 +1686,37 @@ does not document a stable native transcript store. Start a new Qwen session
 after installing so it reloads `settings.json`. See [the Qwen Code MCP and
 hook details](mcp-install.md#qwen-code).
 
+### Qoder
+
+Qoder CLI and IDE share `~/.qoder/settings.json`. Install MCP and lifecycle
+capture together:
+
+```bash
+ai-memory install-mcp --client qoder --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent qoder --apply \
+    --server-url "https://memory.example" \
+    --auth-token "$TOKEN"
+```
+
+The MCP entry runs `ai-memory mcp-bridge --no-session-id` using Qoder's stdio
+shape. It therefore reaches local or remote ai-memory servers without starting
+a second server, but remains a static client: project-scoped MCP calls must pass
+`workspace` and `project`. The hook installer preserves other settings,
+servers, and handlers while adding `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, and
+`SessionEnd`. A pending handoff is delivered as SessionStart
+`hookSpecificOutput.additionalContext`; capture-only context hooks stay silent.
+When a payload omits `cwd`, only Qoder's documented `QODER_PROJECT_DIR` is used.
+
+`ai-memory setup` detects `~/.qoder`; `backup-agents` preserves its settings and
+shared `~/.agents/skills` / `AGENTS.md` assets when Qoder owns those shared
+paths. Restart Qoder after changing hooks. Managed `ai-memory run qoder` and
+native transcript backfill are not claimed because Qoder does not document a
+stable transcript-store contract. See [the detailed MCP and hook
+notes](mcp-install.md#qoder).
+
 ### Kiro CLI
 
 Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
@@ -2090,6 +2137,19 @@ file, `--apply` included: `~/.hermes/config.yaml` is YAML you also edit, and
 Hermes gates user hooks behind its own acceptance prompt (`hooks_auto_accept`).
 Paste the block, let Hermes accept it, and restart Hermes and its gateway.
 
+Hermes runs a hook only when its exact `(event, command)` pair is in that
+home's `shell-hooks-allowlist.json`, or when `hooks_auto_accept`,
+`--accept-hooks` or `HERMES_ACCEPT_HOOKS` approves it. Each profile
+(`~/.hermes/profiles/<name>`) is a home of its own with its own allowlist, so
+pasting the block into a profile's `config.yaml` is not enough: approve it
+there once with `hermes -p <name> --accept-hooks chat`, or run `hermes -p
+<name>` and accept the prompt. A gateway has no terminal to prompt on, so it
+skips an unapproved hook and logs `not allowlisted — skipped` on every event.
+`ai-memory doctor` checks the root home and every profile and names each
+profile whose ai-memory hooks are not approved. It reads both files and never
+changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set only in the
+gateway's environment.
+
 Six events are wired, each with a 20-second timeout:
 
 | Hermes event | ai-memory event | What it does |
@@ -2119,8 +2179,21 @@ instead, the variable Hermes exports `terminal.cwd` through, when it names an
 existing absolute directory. A multiplexing gateway serves every profile from
 the default profile's process and exports only the default profile's
 `terminal.cwd`, so inside a gateway the variable is used only for events the
-`default` profile fired; another profile's events keep the process directory.
-A tool call can still move to another checkout
+`default` profile fired. Another profile's events keep the process directory
+unless that profile's own Hermes home (`~/.hermes/profiles/<name>`, under the
+gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then the
+hook routes them by that marker. This is how the bots of one gateway reach the
+project they work for:
+
+```toml
+# ~/.hermes/profiles/sc-seo/.ai-memory.toml
+workspace = "default"
+project = "smart-compost"
+```
+
+The marker is an ordinary local marker, so its `[capture]` exclusions and
+`server` profile govern that profile's events. A profile without one is left
+where it was. A tool call can still move to another checkout
 when its absolute location proves one: `terminal`'s `workdir`, a file tool's
 `path`, or `search_files`' `path`. With neither, an event stays with the
 process directory and, under `capture_mode = allowlist`, is captured only if
@@ -2162,6 +2235,12 @@ docker run --rm akitaonrails/ai-memory:latest \
     --auth-token "$TOKEN"
 ```
 
+OpenCode 1.x runs each `task` subagent in a child session, and the task tool can
+resume an earlier one by its `task_id`. The plugin recognizes a child session from
+the parent OpenCode reports for it: a subagent never claims the pending handoff, and
+its end, including the one the plugin posts when OpenCode exits, leaves no handoff
+behind.
+
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup. The generic `opencode` client/agent spelling runs the installed
 `opencode --version` directly, accepts only major 1 or 2, and selects the matching
@@ -2170,10 +2249,10 @@ and launch share the same captured environment plus `--env` / `--env-file`
 overrides. Malformed output, a timeout, or an unsupported future major fails with
 an actionable error instead of guessing.
 
-### OpenCode 2 (beta)
+### OpenCode V2 compatibility
 
 The generated plugin targets the OpenCode 2.0.10+ event API (checked against
-2.0.14). OpenCode 2 runs one long-lived service behind every CLI, so closing a
+2.0.14). OpenCode V2 runs one long-lived service behind every CLI, so closing a
 terminal is not a session end: each completed root turn instead writes a
 deterministic checkpoint (no LLM call) of `sessions/<id>.md` and refreshes the
 session's automatic handoff, keeping one open baton per live session. The next
@@ -2198,9 +2277,10 @@ For a commented `opencode.jsonc`, preview `install-mcp --client opencode2` and
 merge the entry into the existing `mcp.servers` object by hand: the apply path
 writes strict JSON.
 
-The `opencode2`, `opencode-v2`, and `open-code2` spellings remain compatibility
-aliases that force the V2 contracts without probing. They share V1's config dir
-and session store. Prefer the generic `opencode` spelling for normal installs:
+The `opencode2`, `opencode-v2`, and `open-code2` spellings are legacy
+compatibility aliases that force the V2 contracts without probing. They share
+the generic OpenCode config directory and session store and are not a separate
+harness. Prefer the generic `opencode` spelling for normal installs:
 
 ```bash
 # Host-side generic commands auto-detect V2; compatibility aliases force it.
@@ -2225,19 +2305,13 @@ preserved. Repeating either install is
 byte-idempotent, and `uninstall` continues to recognize both historical files
 and MCP locations.
 
-> **Back up `~/.local/share/opencode` before running the beta against
-> your real data.** The two binaries share the one `opencode.db` file and
-> the beta has migrated its schema in place before, leaving stable
-> `opencode` 1.x broken
-> ([upstream #42260](https://github.com/anomalyco/opencode/issues/42260)).
-> ai-memory only ever opens that database read-only; the migration risk
-> comes from launching `opencode2` itself, not from this integration.
->
-> **The beta's background service defaults to port 49374, which is also ai-memory's
-> default.** Running both on defaults crash-loops the opencode2 service
+> **OpenCode V2's shared background service defaults to port 49374, which is
+> also ai-memory's default.** Running both on defaults prevents the OpenCode service
 > (`Managed service port 49374 ... is already in use`). Move one side:
-> `opencode2 service set port <free-port>`, or start ai-memory with
+> `opencode service set port <free-port>`, or start ai-memory with
 > `--bind 127.0.0.1:<free-port>` (and matching `--server-url` installs).
+> `ai-memory run --jail opencode` avoids the shared-service collision by using
+> OpenCode's private `--standalone` server inside the jail.
 
 **On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
 tool schemas to the configured provider verbatim, and Google's `Schema`

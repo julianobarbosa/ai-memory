@@ -207,6 +207,12 @@ pub struct HookEnvelope {
     /// [`HookEnvelope::occurred_at_micros`]; never trust it unchecked.
     #[serde(default)]
     pub occurred_at: Option<String>,
+    /// The closed-tool call's validated name and skill/subagent identifier,
+    /// read at parse time and written into the title and body only by
+    /// [`HookEnvelope::record_tool_name`] (`[ingest] record_tool_names`).
+    /// The metadata-only rebuilds clear it.
+    #[serde(skip)]
+    pub(crate) recorded_tool: Option<crate::capture_policy::RecordedToolName>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
 }
@@ -257,6 +263,7 @@ impl std::fmt::Debug for HookEnvelope {
                 "body_excerpt",
                 &self.body_excerpt.as_ref().map(|_| "<redacted>"),
             )
+            .field("recorded_tool", &self.recorded_tool.is_some())
             .field("raw", &"<redacted>")
             .finish()
     }
@@ -690,6 +697,11 @@ impl HookEnvelope {
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
+        let recorded_tool = if closed_tool_event && tool_metadata.is_some() {
+            crate::capture_policy::recorded_tool_name(agent, &raw)
+        } else {
+            None
+        };
         let title_hint = if closed_tool_event {
             tool_metadata.as_ref().map(safe_tool_title).or_else(|| {
                 (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
@@ -764,7 +776,50 @@ impl HookEnvelope {
             title_hint,
             body_excerpt,
             occurred_at,
+            recorded_tool,
             raw,
+        }
+    }
+
+    /// Name a closed-tool call (`[ingest] record_tool_names`): the title
+    /// `tool <family>` becomes `tool <family>: <name>`, and the body gains a
+    /// `tool_name:` line, plus `skill:` or `subagent_type:` when the call ran
+    /// one. The family stays first, so [`tool_family_from_title`] still reads
+    /// it.
+    ///
+    /// Does nothing unless the title is still the family label this module
+    /// wrote. A metadata-only rebuild writes a bare family and clears
+    /// [`Self::recorded_tool`], so a call a capture policy reduced to metadata
+    /// never gets its name back.
+    pub fn record_tool_name(&mut self) {
+        let Some(tool) = self.recorded_tool.take() else {
+            return;
+        };
+        let Some(title) = self
+            .title_hint
+            .as_deref()
+            .filter(|title| matches!(split_tool_title(title), Some((_, None))))
+            .filter(|title| title.starts_with("tool "))
+        else {
+            return;
+        };
+        self.title_hint = Some(format!("{title}: {}", tool.name));
+        if let Some(body) = self.body_excerpt.take() {
+            let mut lines = format!("tool_name: {}", tool.name);
+            for (key, value) in [
+                ("skill", &tool.skill),
+                ("subagent_type", &tool.subagent_type),
+            ] {
+                if let Some(value) = value {
+                    lines.push_str(&format!("\n{key}: {value}"));
+                }
+            }
+            // The body opens with the `tool_family:` line; the name goes
+            // right under it, above the call id and the output.
+            self.body_excerpt = Some(match body.split_once('\n') {
+                Some((family, rest)) => format!("{family}\n{lines}\n{rest}"),
+                None => format!("{body}\n{lines}"),
+            });
         }
     }
 
@@ -875,6 +930,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Dsh
             | AgentKind::Cline
             | AgentKind::QwenCode
+            | AgentKind::Qoder
     )
 }
 
@@ -888,7 +944,8 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
 }
 
 /// `true` when `title` is one this module produced from a [`ToolFamily`]
-/// rather than from the harness's own tool name.
+/// rather than from the harness's own tool name: `tool <family>`, or
+/// `tool <family>: <name>` once `[ingest] record_tool_names` named the call.
 ///
 /// Derived from the same serde representation [`safe_tool_title`] writes, so
 /// a new `ToolFamily` variant is recognised here without a second edit — the
@@ -898,16 +955,59 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
 /// not a name for what they did, so a reader gains nothing from being told a
 /// session spent itself "across tool non-file and tool unknown".
 pub(crate) fn is_safe_tool_title(title: &str) -> bool {
-    title.strip_prefix("tool ").is_some_and(|family| {
-        serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).is_ok()
-    })
+    title.starts_with("tool ") && split_tool_title(title).is_some()
+}
+
+/// Split a tool label this crate wrote into its family and, when
+/// `[ingest] record_tool_names` named the call, the tool name: `tool <family>`,
+/// `tool <family>: <name>`, or the bare `<family>` the reserved-protocol path
+/// writes. `None` for anything else, a harness's own raw tool name included.
+fn split_tool_title(title: &str) -> Option<(ToolFamily, Option<&str>)> {
+    let (label, name) = match title.strip_prefix("tool ") {
+        Some(rest) => match rest.split_once(": ") {
+            Some((family, name)) if crate::capture_policy::valid_tool_name(name) => {
+                (family, Some(name))
+            }
+            Some(_) => return None,
+            None => (rest, None),
+        },
+        None => (title, None),
+    };
+    let family =
+        serde_json::from_value::<ToolFamily>(serde_json::Value::String(label.to_owned())).ok()?;
+    Some((family, name))
+}
+
+/// The name a reader should see for a tool observation title: the recorded
+/// tool name of a `tool <family>: <name>` label, or `None` for a bare family
+/// label, which names no tool. Any other title is a harness's own tool name
+/// and is returned as is.
+pub(crate) fn listable_tool_name(title: &str) -> Option<&str> {
+    if title.is_empty() {
+        return None;
+    }
+    match split_tool_title(title) {
+        Some((_, name)) => name,
+        None => Some(title),
+    }
+}
+
+/// The text to show for a tool observation title in a count: the recorded
+/// name when there is one, the title itself otherwise, so a bare family label
+/// still shows as `tool non-file`.
+pub(crate) fn tool_title_display(title: &str) -> &str {
+    match split_tool_title(title) {
+        Some((_, Some(name))) => name,
+        _ => title,
+    }
 }
 
 /// Map a stored observation title back to the [`ToolFamily`] it was derived
 /// from, recognising **both** spellings this crate emits for a family label:
 /// the bare `canonical_tool_name` form the reserved-protocol path writes
 /// ("file" / "search-list" / "non-file" / "unknown") and the `"tool "`-prefixed
-/// [`safe_tool_title`] form every closed-tool agent writes ("tool file", …).
+/// [`safe_tool_title`] form every closed-tool agent writes ("tool file", …),
+/// with or without the `: <name>` that [`HookEnvelope::record_tool_name`] adds.
 ///
 /// Returns `None` for a harness's own raw tool name ("edit", "bash", "Read"),
 /// which is never one of these labels. That distinction is load-bearing: it is
@@ -916,8 +1016,7 @@ pub(crate) fn is_safe_tool_title(title: &str) -> bool {
 /// representation with [`safe_tool_title`] and [`is_safe_tool_title`], so a new
 /// `ToolFamily` variant is recognised here without a second edit.
 pub(crate) fn tool_family_from_title(title: &str) -> Option<ToolFamily> {
-    let family = title.strip_prefix("tool ").unwrap_or(title);
-    serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).ok()
+    split_tool_title(title).map(|(family, _)| family)
 }
 
 fn safe_tool_body(
@@ -2285,6 +2384,7 @@ mod tests {
         assert_eq!(parse_agent("qwen-code"), AgentKind::QwenCode);
         assert_eq!(parse_agent("qwen"), AgentKind::QwenCode);
         assert_eq!(parse_agent("qwencode"), AgentKind::QwenCode);
+        assert_eq!(parse_agent("qoder"), AgentKind::Qoder);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -4424,5 +4524,213 @@ mod tests {
             post.body_excerpt.as_deref(),
             Some("tool_family: non-file\ntool_call_id: omp-1\noutcome: unknown\n---\ntests passed")
         );
+    }
+
+    fn claude_tool_event(event: &str, body: serde_json::Value) -> HookEnvelope {
+        HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            body,
+        )
+    }
+
+    /// `[ingest] record_tool_names`: a Claude Code shell call keeps its family
+    /// first and gains its name, never its command.
+    #[test]
+    fn record_tool_name_names_the_call_and_never_keeps_its_arguments() {
+        let mut env = claude_tool_event(
+            "PostToolUse",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_1",
+                "tool_input": {"command": "curl -H 'Authorization: Bearer sk-secret' https://x"},
+                "tool_response": {"stdout": "ok"}
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+        env.record_tool_name();
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file: Bash"));
+        let body = env.body_excerpt.as_deref().unwrap();
+        assert!(
+            body.starts_with("tool_family: non-file\ntool_name: Bash\ntool_call_id: toolu_1\n"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("curl") && !body.contains("sk-secret"),
+            "{body}"
+        );
+        assert_eq!(
+            tool_family_from_title(env.title_hint.as_deref().unwrap()),
+            Some(ToolFamily::NonFile)
+        );
+    }
+
+    /// Claude Code's `Skill` and `Agent` calls also keep the skill and the
+    /// subagent type (<https://code.claude.com/docs/en/hooks>), and nothing
+    /// else from their input.
+    #[test]
+    fn record_tool_name_keeps_the_skill_and_the_subagent_type() {
+        let mut skill = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Skill",
+                "tool_use_id": "toolu_2",
+                "tool_input": {"skill": "visual-explainer:diff-review", "args": "free text the user typed"}
+            }),
+        );
+        skill.record_tool_name();
+        assert_eq!(skill.title_hint.as_deref(), Some("tool unknown: Skill"));
+        let body = skill.body_excerpt.as_deref().unwrap();
+        assert!(
+            body.contains("\ntool_name: Skill\nskill: visual-explainer:diff-review\n"),
+            "{body}"
+        );
+        assert!(!body.contains("free text"), "{body}");
+
+        for name in ["Agent", "Task"] {
+            let mut agent = claude_tool_event(
+                "PreToolUse",
+                serde_json::json!({
+                    "session_id": "s",
+                    "tool_name": name,
+                    "tool_input": {"subagent_type": "Explore", "prompt": "find the auth code", "description": "search"}
+                }),
+            );
+            agent.record_tool_name();
+            assert_eq!(
+                agent.title_hint.as_deref(),
+                Some(format!("tool unknown: {name}").as_str())
+            );
+            let body = agent.body_excerpt.as_deref().unwrap();
+            assert!(body.contains("\nsubagent_type: Explore"), "{body}");
+            assert!(!body.contains("find the auth code"), "{body}");
+        }
+    }
+
+    /// Free text in a name or descriptor field is refused whole: no partial
+    /// name, no truncated skill.
+    #[test]
+    fn record_tool_name_refuses_free_text_names_and_descriptors() {
+        let mut spaced = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Bash; rm -rf /",
+                "tool_input": {"command": "ls"}
+            }),
+        );
+        spaced.record_tool_name();
+        assert_eq!(spaced.title_hint.as_deref(), Some("tool unknown"));
+        assert!(
+            !spaced
+                .body_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("tool_name")
+        );
+
+        let mut long = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({"session_id": "s", "tool_name": "x".repeat(65), "tool_input": {}}),
+        );
+        long.record_tool_name();
+        assert_eq!(long.title_hint.as_deref(), Some("tool unknown"));
+
+        let mut skill = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Skill",
+                "tool_input": {"skill": "review then email alice@example.com"}
+            }),
+        );
+        skill.record_tool_name();
+        assert_eq!(skill.title_hint.as_deref(), Some("tool unknown: Skill"));
+        let body = skill.body_excerpt.as_deref().unwrap();
+        assert!(
+            !body.contains("skill:") && !body.contains("alice"),
+            "{body}"
+        );
+    }
+
+    /// The descriptors are Claude Code's own fields: another agent's `Skill`
+    /// tool keeps its name only.
+    #[test]
+    fn record_tool_name_reads_descriptors_for_claude_code_only() {
+        let mut env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PreToolUse".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"session_id": "s", "tool_name": "Skill", "tool_input": {"skill": "x"}}),
+        );
+        env.record_tool_name();
+        assert_eq!(env.title_hint.as_deref(), Some("tool unknown: Skill"));
+        assert!(!env.body_excerpt.as_deref().unwrap().contains("skill:"));
+    }
+
+    /// Off by default: without the call, the envelope is what it always was.
+    #[test]
+    fn an_envelope_is_unnamed_until_record_tool_name_runs() {
+        let env = claude_tool_event(
+            "PostToolUse",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Edit",
+                "tool_use_id": "toolu_3",
+                "tool_input": {"file_path": "/repo/a.rs", "old_string": "a", "new_string": "b"},
+                "tool_response": {"filePath": "/repo/a.rs"}
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert!(!env.body_excerpt.as_deref().unwrap().contains("tool_name"));
+    }
+
+    /// A title that is not this module's bare family label (a metadata-only
+    /// rebuild's bare `non-file`, or one already named) is never renamed.
+    #[test]
+    fn record_tool_name_leaves_other_titles_alone() {
+        let mut env = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({"session_id": "s", "tool_name": "Bash", "tool_input": {"command": "ls"}}),
+        );
+        env.title_hint = Some("non-file".into());
+        env.record_tool_name();
+        assert_eq!(env.title_hint.as_deref(), Some("non-file"));
+
+        let mut twice = claude_tool_event(
+            "PreToolUse",
+            serde_json::json!({"session_id": "s", "tool_name": "Bash", "tool_input": {"command": "ls"}}),
+        );
+        twice.record_tool_name();
+        twice.record_tool_name();
+        assert_eq!(twice.title_hint.as_deref(), Some("tool non-file: Bash"));
+    }
+
+    #[test]
+    fn named_tool_titles_keep_their_family_and_list_by_name() {
+        assert!(is_safe_tool_title("tool file: Edit"));
+        assert_eq!(
+            tool_family_from_title("tool file: Edit"),
+            Some(ToolFamily::File)
+        );
+        assert_eq!(listable_tool_name("tool file: Edit"), Some("Edit"));
+        assert_eq!(tool_title_display("tool file: Edit"), "Edit");
+
+        assert_eq!(listable_tool_name("tool non-file"), None);
+        assert_eq!(tool_title_display("tool non-file"), "tool non-file");
+        assert_eq!(listable_tool_name("edit"), Some("edit"));
+        assert_eq!(listable_tool_name(""), None);
+
+        for not_ours in ["tool file: two words", "tool nope: Bash", "Tool file: Edit"] {
+            assert!(!is_safe_tool_title(not_ours), "{not_ours}");
+            assert_eq!(tool_family_from_title(not_ours), None, "{not_ours}");
+        }
     }
 }

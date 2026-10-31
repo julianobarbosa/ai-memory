@@ -69,6 +69,7 @@ async fn harness() -> Harness {
         ingest_gates: ai_memory_hooks::IngestGates::default(),
         cwd_probes: ai_memory_hooks::CwdProbes::default(),
         ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+        record_tool_names: false,
         skip_wiki_checkpoints: false,
         consolidate_on_session_end: false,
         session_consolidation_notify: None,

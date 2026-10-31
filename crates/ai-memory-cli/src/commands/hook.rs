@@ -34,8 +34,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
     HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
-    marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
+    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_for_subagent_brief,
+    marker_query_suffix_without_briefing, marker_requests_briefing,
+    marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -148,6 +149,221 @@ fn spawn_background_drainer(data_dir: &Path, live_token: Option<&str>) -> std::i
 
 fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
+}
+
+/// Best-effort: compute this session's cumulative token usage from the
+/// harness's own transcript, for the agents that have a known transcript
+/// format (see `session_usage`). Every failure path — an unsupported agent,
+/// a payload missing the field this agent needs, an unreadable or
+/// unparseable transcript — returns `None` rather than a zeroed report;
+/// callers must never treat `None` as "zero usage".
+fn compute_session_usage(
+    agent_kind: AgentKind,
+    json: &serde_json::Value,
+    session_id: Option<&str>,
+) -> Option<super::session_usage::SessionUsage> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            let path = json
+                .get("transcript_path")
+                .and_then(serde_json::Value::as_str)?;
+            super::session_usage::extract_claude_code_usage(Path::new(path))
+        }
+        AgentKind::Codex => {
+            let session_id = session_id?;
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let rollout = super::session_usage::locate_codex_rollout(&codex_home, session_id)?;
+            super::session_usage::extract_codex_usage(&rollout)
+        }
+        _ => None,
+    }
+}
+
+fn compute_live_calls(
+    agent: AgentKind,
+    json: &serde_json::Value,
+    session_id: Option<&str>,
+    runtime_env: &RuntimeEnv,
+    home: Option<&Path>,
+    data_dir: &Path,
+    routing_key: &str,
+) -> Option<super::session_usage::LiveCallBatch> {
+    let path = match agent {
+        AgentKind::ClaudeCode => json
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from),
+        AgentKind::Codex => json
+            .get("transcript_path")
+            .or_else(|| json.get("rollout_path"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .or_else(|| {
+                session_id.and_then(|id| {
+                    let home = runtime_env
+                        .var_os("CODEX_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| home.map(|p| p.join(".codex")))?;
+                    super::session_usage::locate_codex_rollout(&home, id)
+                })
+            }),
+        _ => None,
+    };
+    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
+}
+
+/// A stale interrupted-session candidate found in the session-start handoff
+/// text, eligible for a best-effort backfill-close.
+struct BackfillCandidate {
+    session_id: String,
+    agent_kind: AgentKind,
+    cwd: Option<String>,
+}
+
+/// Parse and strip the backfill marker embedded by the server (see
+/// `ai_memory_hooks::BACKFILL_MARKER_PREFIX` / `render_backfill_marker`)
+/// from fetched handoff text. Returns the candidate (if any) plus the text
+/// with the marker line removed — the receiving agent must never see raw
+/// protocol metadata in its injected context. The server already escapes
+/// any occurrence of the marker prefix inside untrusted observation
+/// content, so the first matching line is always the trusted one.
+fn extract_backfill_marker(handoff: &str) -> (Option<BackfillCandidate>, String) {
+    let Some(marker_line) = handoff
+        .lines()
+        .find(|line| line.starts_with(ai_memory_hooks::BACKFILL_MARKER_PREFIX))
+    else {
+        return (None, handoff.to_owned());
+    };
+    let stripped = handoff
+        .lines()
+        .filter(|line| *line != marker_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (parse_backfill_marker(marker_line), stripped)
+}
+
+fn parse_backfill_marker(line: &str) -> Option<BackfillCandidate> {
+    use base64::Engine as _;
+    let inner = line
+        .trim()
+        .strip_prefix(ai_memory_hooks::BACKFILL_MARKER_PREFIX)?
+        .trim_end()
+        .strip_suffix("-->")?
+        .trim();
+    let mut session_id = None;
+    let mut agent_kind = None;
+    let mut cwd = None;
+    for field in inner.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "session_id" if !value.is_empty() => session_id = Some(value.to_owned()),
+            "agent_kind" if !value.is_empty() => agent_kind = Some(AgentKind::from_wire(value)),
+            "cwd" if !value.is_empty() => {
+                cwd = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+            }
+            _ => {}
+        }
+    }
+    Some(BackfillCandidate {
+        session_id: session_id?,
+        agent_kind: agent_kind?,
+        cwd,
+    })
+}
+
+/// Best-effort: locate and extract token usage for a session other than the
+/// current one (the old, abandoned session named by a backfill marker).
+/// Mirrors [`compute_session_usage`], but locates the transcript file
+/// independently instead of reading a `transcript_path` the current
+/// event's own payload provided — that field only ever describes the
+/// current session.
+fn compute_backfill_usage(
+    agent_kind: AgentKind,
+    old_session_id: &str,
+    old_cwd: Option<&str>,
+) -> Option<super::session_usage::SessionUsage> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            let cwd = old_cwd?;
+            let claude_config_dir =
+                super::path_util::claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"))
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))?;
+            let path = super::session_usage::locate_claude_code_transcript(
+                &claude_config_dir,
+                cwd,
+                old_session_id,
+            )?;
+            super::session_usage::extract_claude_code_usage(&path)
+        }
+        AgentKind::Codex => {
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let rollout = super::session_usage::locate_codex_rollout(&codex_home, old_session_id)?;
+            super::session_usage::extract_codex_usage(&rollout)
+        }
+        _ => None,
+    }
+}
+
+/// Best-effort client-side half of close-on-continuation:
+/// given a backfill candidate named by the server, try to compute the old
+/// session's usage locally, then enqueue a normal synthetic `session-end`
+/// for it through the existing spool — reusing the server's ordinary
+/// session-end admission and consolidation path (safe even if the old
+/// session turns out to still be live: `SessionEndDisposition::
+/// ReEndWithNewWork` already re-runs the full end path when more
+/// observations arrive after an early close). Every failure is logged and
+/// swallowed; this must never delay or fail the real session-start hook.
+fn dispatch_backfill_close(
+    candidate: &BackfillCandidate,
+    dd: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    oidc_present: bool,
+) {
+    let usage = compute_backfill_usage(
+        candidate.agent_kind,
+        &candidate.session_id,
+        candidate.cwd.as_deref(),
+    );
+    let mut body = serde_json::json!({});
+    if let Some(usage) = &usage {
+        body["_ai_memory_usage"] = serde_json::json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "model": usage.model,
+        });
+    }
+    let Ok(payload) = serde_json::to_string(&body) else {
+        eprintln!("ai-memory hook warning: could not serialize backfill-close body; skipped");
+        return;
+    };
+    let cwd_qs = candidate
+        .cwd
+        .as_deref()
+        .filter(|cwd| !cwd.is_empty())
+        .map_or_else(String::new, |cwd| format!("&cwd={}", url_encode(cwd)));
+    let base = server_url.trim_end_matches('/');
+    let event_url = format!(
+        "{base}/hook?event=session-end&agent={agent}&session_id={session_id}{cwd_qs}",
+        agent = candidate.agent_kind.as_str(),
+        session_id = url_encode(&candidate.session_id),
+    );
+    let spool = hook_spool::spool_dir(dd);
+    let entry = hook_spool::entry_for(event_url, payload, auth_token, oidc_present);
+    if let Err(e) = hook_spool::enqueue_with_config(&spool, &entry, None) {
+        eprintln!("ai-memory hook warning: failed to spool backfill-close event: {e}");
+    }
 }
 
 /// Zero runs hooks in a sandbox started with `--die-with-parent`, which kills
@@ -367,6 +583,11 @@ fn resolve_hook_cwd_with(
         extract_cwd(raw)
             .or_else(|| env_lookup(QWEN_PROJECT_DIR_ENV))
             .filter(|s| !s.trim().is_empty())
+    } else if agent_kind == AgentKind::Qoder {
+        let mut env_lookup = env_lookup;
+        extract_cwd(raw)
+            .or_else(|| env_lookup(QODER_PROJECT_DIR_ENV))
+            .filter(|s| !s.trim().is_empty())
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
     }
@@ -377,6 +598,9 @@ const CODEBUDDY_PROJECT_DIR_ENV: &str = "CODEBUDDY_PROJECT_DIR";
 
 /// The project directory Qwen Code exports to every command hook process.
 const QWEN_PROJECT_DIR_ENV: &str = "QWEN_PROJECT_DIR";
+
+/// The project directory Qoder exports to hook subprocesses.
+const QODER_PROJECT_DIR_ENV: &str = "QODER_PROJECT_DIR";
 
 fn cwd_query_suffix(
     agent: &str,
@@ -825,7 +1049,11 @@ fn write_success_response<W: std::io::Write>(
         Ok(())
     } else if matches!(
         agent,
-        AgentKind::Muse | AgentKind::CodeBuddy | AgentKind::IbmBob | AgentKind::QwenCode
+        AgentKind::Muse
+            | AgentKind::CodeBuddy
+            | AgentKind::IbmBob
+            | AgentKind::QwenCode
+            | AgentKind::Qoder
     ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
@@ -1001,6 +1229,17 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
     }
 }
 
+/// The `claude-code` agent adds a `SubagentStart` hook's `additionalContext`
+/// to the subagent's context before its first prompt.
+fn subagent_start_brief_envelope(brief: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": brief,
+        }
+    })
+}
+
 /// Hermes adds a hook's stdout to the turn only as a JSON object whose
 /// `context` is a non-blank string (`_parse_context` in
 /// `agent/shell_hooks.py`); plain text and every other key are dropped.
@@ -1030,10 +1269,7 @@ const HERMES_GATEWAY_HOST_PROFILE: &str = "default";
 /// fired. A standalone gateway of another profile loses it too: nothing in
 /// the hook's environment tells it apart from a multiplexed one.
 fn hermes_terminal_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
-    let in_gateway = runtime_env
-        .var_os(HERMES_GATEWAY_ENV)
-        .is_some_and(|value| value == "1");
-    if in_gateway && profile != Some(HERMES_GATEWAY_HOST_PROFILE) {
+    if hermes_in_gateway(runtime_env) && profile != Some(HERMES_GATEWAY_HOST_PROFILE) {
         return None;
     }
     let path = PathBuf::from(runtime_env.var_os(HERMES_TERMINAL_CWD_ENV)?);
@@ -1041,6 +1277,58 @@ fn hermes_terminal_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Optio
         return None;
     }
     path.to_str().map(str::to_owned)
+}
+
+fn hermes_in_gateway(runtime_env: &RuntimeEnv) -> bool {
+    runtime_env
+        .var_os(HERMES_GATEWAY_ENV)
+        .is_some_and(|value| value == "1")
+}
+
+/// A gateway event of a profile other than the host's, routed by an
+/// `.ai-memory.toml` the operator placed in that profile's own Hermes home.
+/// Its `terminal.cwd` never reaches the hook (see `hermes_terminal_cwd`), so
+/// without this every bot profile of a gateway lands in the gateway's own
+/// cwd. The profile directory is used only when it holds its own marker: an
+/// unmarked profile keeps the process cwd it always had, rather than turning
+/// into a project named after the profile.
+///
+/// The name comes from the payload, so it must be a Hermes profile id
+/// (`PROFILE_ID_RE` in `hermes_constants.py`) before it becomes a path
+/// component. Profiles live in `<root>/profiles/<name>` (`get_profile_dir` in
+/// `hermes_cli/profiles.py`), where the root is the gateway's `HERMES_HOME`,
+/// else `~/.hermes`; a standalone gateway of a named profile runs with that
+/// profile's directory as its `HERMES_HOME`.
+fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
+    if !hermes_in_gateway(runtime_env) || runtime_env.ignore_marker() {
+        return None;
+    }
+    let profile = profile.filter(|name| {
+        *name != HERMES_GATEWAY_HOST_PROFILE
+            && crate::commands::path_util::is_hermes_profile_id(name)
+    })?;
+    let hermes_home = crate::commands::path_util::agent_config_home(
+        runtime_env.var_os("HERMES_HOME"),
+    )
+    .or_else(|| {
+        runtime_env
+            .home_dir()
+            .map(|home| Path::new(home).join(".hermes"))
+    })?;
+    let standalone = hermes_home.file_name() == Some(std::ffi::OsStr::new(profile))
+        && hermes_home
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == "profiles");
+    let dir = if standalone {
+        hermes_home
+    } else {
+        hermes_home.join("profiles").join(profile)
+    };
+    if !dir.is_absolute() || !dir.join(".ai-memory.toml").is_file() {
+        return None;
+    }
+    dir.to_str().map(str::to_owned)
 }
 
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
@@ -1141,6 +1429,9 @@ where
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.
         || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff())
+        // A subagent start delivers the `[briefing] inject_on_subagent_start`
+        // brief.
+        || (hook_event == HookEvent::SubagentStart && agent_kind.subagent_start_injects_context())
         // On an Antigravity build without SessionStart, the first turn's
         // PreInvocation delivers the handoff in its place.
         || (agent_kind == AgentKind::AntigravityCli
@@ -1277,10 +1568,14 @@ where
     // Hermes reports its own process cwd on every event, which for a gateway
     // is wherever the gateway started. The session's working directory is
     // `terminal.cwd`, which Hermes exports to hooks as `TERMINAL_CWD`, so that
-    // replaces the reported cwd. A tool event can still move to another
-    // checkout its own absolute locations prove (below).
+    // replaces the reported cwd; a gateway's other profiles route by a marker
+    // in their own Hermes home instead. A tool event can still move to
+    // another checkout its own absolute locations prove (below).
     let payload_cwd = match (agent_kind == AgentKind::Hermes)
-        .then(|| hermes_terminal_cwd(&runtime_env, hermes_profile.as_deref()))
+        .then(|| {
+            hermes_terminal_cwd(&runtime_env, hermes_profile.as_deref())
+                .or_else(|| hermes_profile_marker_cwd(&runtime_env, hermes_profile.as_deref()))
+        })
         .flatten()
     {
         Some(cwd) => {
@@ -1458,6 +1753,63 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    let mut live_batch = None;
+    if matches!(
+        args.event.as_str(),
+        "post-tool-use" | "stop" | "pre-compact" | "session-end"
+    ) {
+        live_batch = compute_live_calls(
+            agent_kind,
+            &json,
+            canonical_session_id.as_deref(),
+            &runtime_env,
+            home.as_deref(),
+            &dd,
+            &format!(
+                "{}\n{qs}\n{}",
+                profile
+                    .as_ref()
+                    .map_or(args.server_url.as_str(), |p| p.url.as_str()),
+                canonical_session_id.as_deref().unwrap_or_default()
+            ),
+        );
+        if let Some(batch) = &live_batch
+            && !batch.calls.is_empty()
+            && let Some(object) = json.as_object_mut()
+        {
+            object.insert(
+                "_ai_memory_usage_calls".into(),
+                serde_json::to_value(&batch.calls)?,
+            );
+            payload = serde_json::to_string(&json)?;
+        }
+    }
+
+    // Token-usage visibility (docs: token-cost tracking): only at
+    // session-end, which fires once per session — never on the frequent
+    // `stop`/`post-tool-use` path — so the bounded transcript read this
+    // performs (a full linear scan for Claude Code, a bounded tail read for
+    // Codex) never touches the hot path. Spliced the same way
+    // `_ai_memory_capture` is above, so it rides the existing session-end
+    // POST/spool/retry path with no new wire format.
+    if args.event == "session-end"
+        && let Some(usage) =
+            compute_session_usage(agent_kind, &json, canonical_session_id.as_deref())
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert(
+            "_ai_memory_usage".into(),
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
+                "model": usage.model,
+            }),
+        );
+        payload = serde_json::to_string(&json)?;
+    }
+
     // `GET /handoff` claims the newest open baton in whatever project the
     // server resolves. With no cwd the request names none, and the server
     // falls back to its default or the caller's last active project, so an
@@ -1560,6 +1912,8 @@ where
                 eprintln!(
                     "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
                 );
+            } else if let Some(batch) = live_batch.take() {
+                batch.commit();
             }
         }
         if let Some(prompts) = antigravity_prompts {
@@ -1659,6 +2013,16 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
+                let (backfill_candidate, handoff) = extract_backfill_marker(&handoff);
+                if let Some(candidate) = &backfill_candidate {
+                    dispatch_backfill_close(
+                        candidate,
+                        &dd,
+                        &args.server_url,
+                        effective_token,
+                        oidc_present,
+                    );
+                }
                 if matches!(agent_kind, AgentKind::KiroCli | AgentKind::IbmBob) {
                     // Kiro v2/v3 and IBM Bob consume SessionStart stdout
                     // verbatim and define no wrapper envelope.
@@ -1669,6 +2033,39 @@ where
                 }
                 return Ok(());
             }
+        }
+    }
+
+    // subagent-start: a repository that opted into `[briefing]
+    // inject_on_subagent_start` gives each subagent its project brief, for
+    // agents whose `SubagentStart` hook injects context. A subagent runs
+    // inside its parent's session, so the brief comes from the read-only
+    // `/brief`, never from `/handoff`, whose fetch would claim the parent's
+    // baton; a server that predates `/brief` answers 404 and the subagent
+    // gets the `{}` it always got. Cursor also runs these hook settings, and
+    // its handling of this envelope is unverified, so a Cursor payload gets
+    // nothing.
+    if hook_event == HookEvent::SubagentStart
+        && agent_kind.subagent_start_injects_context()
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && marker_requests_subagent_briefing(cwd)
+    {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let brief_url = format!(
+            "{base}/brief?agent={}{}",
+            args.agent,
+            marker_query_suffix_for_subagent_brief(
+                cwd,
+                args.project_strategy.and_then(|s| s.baked())
+            )
+        );
+        if let Some(brief) =
+            get_handoff(&client, &brief_url, bearer.as_deref(), handoff_timeout()).await
+        {
+            writeln!(stdout, "{}", subagent_start_brief_envelope(&brief))?;
+            return Ok(());
         }
     }
 
@@ -1936,7 +2333,9 @@ where
     if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
         drain_session_end_in_process(&spool, &dd, max_attempts).await;
     } else if !external_capture
-        && (incremental_background_drain || should_spawn_background_drainer(&args.event))
+        && (incremental_background_drain
+            || should_spawn_background_drainer(&args.event)
+            || json.get("_ai_memory_usage_calls").is_some())
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
             // The install's own token, resolved the same way an install-default
@@ -2654,6 +3053,66 @@ mod tests {
         assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
     }
 
+    /// Close-on-continuation client half: the marker line
+    /// is parsed correctly and, critically, removed from what the receiving
+    /// agent actually sees — raw protocol metadata must never leak into
+    /// injected context.
+    #[test]
+    fn extract_backfill_marker_parses_and_strips_the_line() {
+        use base64::Engine as _;
+        let sid = SessionId::new();
+        let cwd_b64 = base64::engine::general_purpose::STANDARD.encode("/home/alice/proj");
+        let handoff = format!(
+            "> some recovery preamble\n\
+             {prefix}session_id={sid} agent_kind=codex cwd={cwd_b64} -->\n\
+             \u{2015}\u{2015}\u{2015}\n\
+             untrusted history here\n",
+            prefix = ai_memory_hooks::BACKFILL_MARKER_PREFIX,
+        );
+        let (candidate, stripped) = extract_backfill_marker(&handoff);
+        let candidate = candidate.expect("marker must parse");
+        assert_eq!(candidate.session_id, sid.to_string());
+        assert_eq!(candidate.agent_kind, AgentKind::Codex);
+        assert_eq!(candidate.cwd.as_deref(), Some("/home/alice/proj"));
+        assert!(
+            !stripped.contains(ai_memory_hooks::BACKFILL_MARKER_PREFIX),
+            "the marker line must never reach the receiving agent: {stripped}"
+        );
+        assert!(stripped.contains("some recovery preamble"));
+        assert!(stripped.contains("untrusted history here"));
+    }
+
+    #[test]
+    fn extract_backfill_marker_absent_returns_text_unchanged() {
+        let handoff = "> plain handoff text\nwith no marker at all\n";
+        let (candidate, stripped) = extract_backfill_marker(handoff);
+        assert!(candidate.is_none());
+        assert_eq!(stripped, handoff);
+    }
+
+    #[test]
+    fn extract_backfill_marker_missing_session_id_or_agent_is_none() {
+        let handoff = format!(
+            "{prefix}agent_kind=codex cwd= -->\n",
+            prefix = ai_memory_hooks::BACKFILL_MARKER_PREFIX
+        );
+        let (candidate, _) = extract_backfill_marker(&handoff);
+        assert!(
+            candidate.is_none(),
+            "a marker missing the required session_id must not parse"
+        );
+    }
+
+    #[test]
+    fn compute_backfill_usage_unsupported_agent_is_none() {
+        assert!(compute_backfill_usage(AgentKind::Cursor, "some-session", Some("/proj")).is_none());
+    }
+
+    #[test]
+    fn compute_backfill_usage_claude_code_without_cwd_is_none() {
+        assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
+    }
+
     #[test]
     fn persisted_mode_defaults_to_denylist_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2916,6 +3375,9 @@ mod tests {
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
+            (AgentKind::Qoder, HookEvent::SessionStart, b"".as_slice()),
+            (AgentKind::Qoder, HookEvent::UserPrompt, b"".as_slice()),
+            (AgentKind::Qoder, HookEvent::PostToolUse, b"{}\n".as_slice()),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
@@ -3615,6 +4077,29 @@ mod tests {
         assert_eq!(
             resolve_hook_cwd_with("claude-code", &bare, project_dir, process),
             None
+        );
+    }
+
+    #[test]
+    fn qoder_missing_cwd_uses_qoder_project_dir_only() {
+        let bare = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"});
+        let project_dir =
+            |name: &str| (name == "QODER_PROJECT_DIR").then(|| "env-project".to_owned());
+        let process = || Some(PathBuf::from("process-project"));
+
+        assert_eq!(
+            resolve_hook_cwd_with("qoder", &bare, project_dir, process).as_deref(),
+            Some("env-project")
+        );
+        assert_eq!(
+            resolve_hook_cwd_with("qoder", &bare, |_| None, process),
+            None
+        );
+        let with_cwd =
+            serde_json::json!({"hook_event_name": "SessionStart", "cwd": "payload-project"});
+        assert_eq!(
+            resolve_hook_cwd_with("qoder", &with_cwd, project_dir, process).as_deref(),
+            Some("payload-project")
         );
     }
 
@@ -7474,6 +7959,221 @@ mod tests {
         assert_eq!(run("droid", "user-prompt-submit").await.trim(), "{}");
     }
 
+    // ── `[briefing] inject_on_subagent_start` ─────────────────────────────
+
+    fn subagent_start_payload(cwd: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "parent-session",
+            "transcript_path": cwd.join("parent.jsonl"),
+            "cwd": cwd,
+            "hook_event_name": "SubagentStart",
+            "agent_id": "agent-abc123",
+            "agent_type": "Explore"
+        })
+    }
+
+    async fn run_subagent_start(
+        data_dir: &Path,
+        args: HookArgs,
+        payload: serde_json::Value,
+    ) -> String {
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.to_path_buf()),
+            args,
+            payload.to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        String::from_utf8(stdout).unwrap()
+    }
+
+    async fn recorded_requests(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<String> {
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(requests).await {
+            recorded.push(request);
+        }
+        recorded
+    }
+
+    /// A repository that opted into `[briefing] inject_on_subagent_start`
+    /// hands its subagents the project brief: the hook reads it from the
+    /// read-only `/brief` route and prints the `SubagentStart` envelope the
+    /// agent adds to the subagent's context. It never asks `/handoff`, whose
+    /// fetch would claim the parent session's baton, and the event itself is
+    /// still captured.
+    #[tokio::test]
+    async fn subagent_start_delivers_the_opted_in_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(
+            tmp.path(),
+            "repo",
+            "[briefing]\ninject_on_subagent_start = true\nmax_chars = 6000\n",
+        );
+        let (base, mut requests) = serve_requests("200 OK", "SUBAGENT-BRIEF").await;
+
+        let stdout = run_subagent_start(
+            &data_dir,
+            claude_args("subagent-start", &base),
+            subagent_start_payload(&repo),
+        )
+        .await;
+
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStart",
+                    "additionalContext": "SUBAGENT-BRIEF",
+                }
+            })
+        );
+        let recorded = recorded_requests(&mut requests).await;
+        let brief = recorded
+            .iter()
+            .find(|request| request.starts_with("GET /brief?"))
+            .unwrap_or_else(|| panic!("no brief fetch: {recorded:?}"));
+        assert!(brief.contains("agent=claude-code"), "{brief}");
+        assert!(brief.contains("&cwd="), "{brief}");
+        assert!(brief.contains("&briefing=true"), "{brief}");
+        assert!(brief.contains("&briefing_budget=6000"), "{brief}");
+        assert!(
+            !recorded
+                .iter()
+                .any(|request| request.starts_with("GET /handoff")),
+            "a subagent start must never fetch the handoff: {recorded:?}"
+        );
+        let spooled = spooled_entries(&data_dir);
+        assert_eq!(spooled.len(), 1, "the event is still captured");
+        assert_eq!(
+            query_param(&spooled[0].url, "event"),
+            Some("subagent-start")
+        );
+    }
+
+    /// Without the subagent opt-in nothing changes: no request, and the `{}`
+    /// a subagent start always printed — also when the repository opted into
+    /// the session-start brief only.
+    #[tokio::test]
+    async fn subagent_start_without_the_opt_in_prints_what_it_always_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "SUBAGENT-BRIEF").await;
+        for (name, marker) in [
+            ("unmarked", None),
+            (
+                "session-brief-only",
+                Some("[briefing]\ninject_on_session_start = true\n"),
+            ),
+            (
+                "opted-out",
+                Some("[briefing]\ninject_on_subagent_start = false\n"),
+            ),
+        ] {
+            let repo = match marker {
+                Some(marker) => repo_with_marker(tmp.path(), name, marker),
+                None => {
+                    let repo = tmp.path().join(name);
+                    std::fs::create_dir_all(&repo).unwrap();
+                    repo
+                }
+            };
+            let stdout = run_subagent_start(
+                &tmp.path().join(format!("data-{name}")),
+                claude_args("subagent-start", &base),
+                subagent_start_payload(&repo),
+            )
+            .await;
+            assert_eq!(stdout, "{}\n", "{name}");
+        }
+        let recorded = recorded_requests(&mut requests).await;
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+
+    /// An empty `/brief` body (nothing to brief) and a 404 (a server that
+    /// predates the route) both leave the subagent with the `{}` it got
+    /// before, and neither falls back to `/handoff`.
+    #[tokio::test]
+    async fn subagent_start_with_no_brief_prints_an_empty_reply() {
+        for status in ["200 OK", "404 Not Found"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = repo_with_marker(
+                tmp.path(),
+                "repo",
+                "[briefing]\ninject_on_subagent_start = true\n",
+            );
+            let (base, mut requests) = serve_requests(status, "").await;
+
+            let stdout = run_subagent_start(
+                &tmp.path().join("data"),
+                claude_args("subagent-start", &base),
+                subagent_start_payload(&repo),
+            )
+            .await;
+
+            assert_eq!(stdout, "{}\n", "{status}");
+            let recorded = recorded_requests(&mut requests).await;
+            assert!(
+                recorded
+                    .iter()
+                    .any(|request| request.starts_with("GET /brief?")),
+                "{status}: {recorded:?}"
+            );
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|request| request.starts_with("GET /handoff")),
+                "{status}: {recorded:?}"
+            );
+        }
+    }
+
+    /// Only the `claude-code` agent documents `SubagentStart` context. Another
+    /// agent with the same marker asks for nothing and replies as before, and
+    /// so does a Cursor payload arriving through the same hook settings, whose
+    /// handling of the envelope is unverified.
+    #[tokio::test]
+    async fn subagent_brief_skips_agents_without_subagent_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo_with_marker(
+            tmp.path(),
+            "repo",
+            "[briefing]\ninject_on_subagent_start = true\n",
+        );
+        let (base, mut requests) = serve_requests("200 OK", "SUBAGENT-BRIEF").await;
+
+        let stdout = run_subagent_start(
+            &tmp.path().join("data-codex"),
+            codex_args("subagent-start", &base),
+            subagent_start_payload(&repo),
+        )
+        .await;
+        assert_eq!(stdout.trim(), "{}");
+
+        let mut cursor = subagent_start_payload(&repo);
+        cursor["cursor_version"] = "2.0.0".into();
+        let stdout = run_subagent_start(
+            &tmp.path().join("data-cursor"),
+            claude_args("subagent-start", &base),
+            cursor,
+        )
+        .await;
+        assert_eq!(stdout.trim(), "{}");
+
+        let recorded = recorded_requests(&mut requests).await;
+        assert!(
+            !recorded
+                .iter()
+                .any(|request| request.starts_with("GET /brief")),
+            "{recorded:?}"
+        );
+    }
+
     // ── #992: per-repository server profiles ─────────────────────────────
 
     /// Register `name` in `data_dir` with a token and the given roots.
@@ -8748,6 +9448,184 @@ mod tests {
             if let Some(entry) = entries.first() {
                 assert_eq!(query_param(&entry.url, "project"), Some("default-repo"));
             }
+        }
+    }
+
+    /// A Hermes home with one named profile carrying its own marker.
+    fn hermes_root_with_profile_marker(parent: &Path, profile: &str, marker: &str) -> PathBuf {
+        let root = parent.join("hermes-root");
+        repo_with_marker(&root.join("profiles"), profile, marker);
+        root
+    }
+
+    #[test]
+    fn hermes_profile_marker_cwd_takes_only_a_marked_named_profile_in_a_gateway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hermes_root_with_profile_marker(tmp.path(), "sc-seo", "project = \"p\"\n");
+        std::fs::create_dir_all(root.join("profiles").join("unmarked")).unwrap();
+        let profile_dir = root.join("profiles").join("sc-seo");
+        let root_str = root.to_str().unwrap();
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("HERMES_HOME", root_str),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        assert_eq!(
+            hermes_profile_marker_cwd(&gateway, Some("sc-seo")).as_deref(),
+            profile_dir.to_str()
+        );
+        assert_eq!(hermes_profile_marker_cwd(&gateway, Some("unmarked")), None);
+        assert_eq!(hermes_profile_marker_cwd(&gateway, Some("missing")), None);
+        assert_eq!(hermes_profile_marker_cwd(&gateway, None), None);
+        // The default profile's directory is the root; its route is `TERMINAL_CWD`.
+        std::fs::write(root.join(".ai-memory.toml"), "project = \"root\"\n").unwrap();
+        assert_eq!(hermes_profile_marker_cwd(&gateway, Some("default")), None);
+        // Outside a gateway the process cwd and `TERMINAL_CWD` are the session's own.
+        let standalone_cli = RuntimeEnv::with_process_env_for_tests(&[("HERMES_HOME", root_str)]);
+        assert_eq!(
+            hermes_profile_marker_cwd(&standalone_cli, Some("sc-seo")),
+            None
+        );
+        // A standalone gateway of the profile runs with its directory as HERMES_HOME.
+        let own_gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("HERMES_HOME", profile_dir.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        assert_eq!(
+            hermes_profile_marker_cwd(&own_gateway, Some("sc-seo")).as_deref(),
+            profile_dir.to_str()
+        );
+    }
+
+    /// Adversarial: the profile name arrives in the payload, so a name that is
+    /// not a Hermes profile id never becomes a path, even when a marker waits
+    /// where it would lead.
+    #[test]
+    fn hermes_profile_marker_cwd_refuses_a_name_that_is_not_a_profile_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hermes_root_with_profile_marker(tmp.path(), "sc-seo", "project = \"p\"\n");
+        repo_with_marker(&root, "escape", "project = \"escape\"\n");
+        repo_with_marker(&root.join("profiles"), "Upper", "project = \"upper\"\n");
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("HERMES_HOME", root.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        for name in ["../escape", "sc-seo/..", "Upper", "", "-lead", "a/b"] {
+            assert_eq!(
+                hermes_profile_marker_cwd(&gateway, Some(name)),
+                None,
+                "{name}"
+            );
+        }
+        assert!(crate::commands::path_util::is_hermes_profile_id(
+            &"a".repeat(64)
+        ));
+        assert!(!crate::commands::path_util::is_hermes_profile_id(
+            &"a".repeat(65)
+        ));
+        // Control: the valid id still routes.
+        assert!(hermes_profile_marker_cwd(&gateway, Some("sc-seo")).is_some());
+    }
+
+    /// A multiplexing gateway reports its own cwd (here an unmarked home) for
+    /// every profile. A named profile whose Hermes home carries a marker is
+    /// routed there under allowlist mode; an unmarked profile keeps the
+    /// gateway cwd, which allowlist mode drops.
+    #[tokio::test]
+    async fn hermes_gateway_profile_routes_by_its_own_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let root = hermes_root_with_profile_marker(
+            tmp.path(),
+            "sc-seo",
+            "workspace = \"w\"\nproject = \"smart-compost\"\n",
+        );
+        std::fs::create_dir_all(root.join("profiles").join("sc-unmarked")).unwrap();
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("HERMES_HOME", root.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        let payload = |profile: &str| {
+            let mut payload: serde_json::Value = serde_json::from_str(&hermes_payload(
+                "pre_llm_call",
+                &home,
+                pre_llm_call_extra(false),
+            ))
+            .unwrap();
+            payload["profile"] = profile.into();
+            payload.to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+        for (profile, spooled) in [("sc-seo", 1), ("sc-unmarked", 0)] {
+            let data_dir = tmp.path().join(format!("data-{profile}"));
+            run_hermes(&data_dir, args(), payload(profile), gateway.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{profile}");
+            if let Some(entry) = entries.first() {
+                assert_eq!(query_param(&entry.url, "project"), Some("smart-compost"));
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                assert_eq!(
+                    body["cwd"],
+                    root.join("profiles").join(profile).to_str().unwrap()
+                );
+            }
+        }
+    }
+
+    /// Adversarial: a profile marker selects where the event lands, so its
+    /// exclusions and server profile govern it, as a checkout's do. An
+    /// excluded relative read is never spooled and an unregistered server
+    /// profile drops the event; a public read is the control.
+    #[tokio::test]
+    async fn hermes_gateway_profile_marker_applies_its_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let root = hermes_root_with_profile_marker(
+            tmp.path(),
+            "guarded",
+            "project = \"guarded\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        );
+        repo_with_marker(&root.join("profiles"), "routed", "server = \"nobody\"\n");
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("HERMES_HOME", root.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        let read = |profile: &str, path: &str| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": "read_file",
+                "tool_input": {"path": path},
+                "session_id": "hermes-session",
+                "cwd": home,
+                "profile": profile,
+                "extra": {"tool_call_id": "call-1", "status": "ok", "result": "SENTINEL_CONTENT"}
+            })
+            .to_string()
+        };
+        for (name, profile, path, spooled) in [
+            ("excluded read", "guarded", "secret/token.txt", 0),
+            ("public read", "guarded", "README.md", 1),
+            ("refused profile", "routed", "README.md", 0),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            run_hermes(
+                &data_dir,
+                hermes_args("post-tool-use", &dead_server_url()),
+                read(profile, path),
+                gateway.clone(),
+            )
+            .await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{name}");
+            assert!(
+                entries.iter().all(|e| !e.body.contains("secret/token")),
+                "{name}"
+            );
         }
     }
 

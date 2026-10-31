@@ -67,12 +67,12 @@ fn resolve_generic_with_timeout(
     })?;
     let mut command = Command::new(&resolved);
     env.apply_to_std(&mut command);
-    let mut child = command
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = spawn_retrying_busy(&mut command)
         .with_context(|| format!("probing OpenCode executable {}", resolved.display()))?;
     let stdout = read_bounded(child.stdout.take());
     let stderr = read_bounded(child.stderr.take());
@@ -129,6 +129,24 @@ fn resolve_generic_with_timeout(
         dialect,
         executable: resolved,
     })
+}
+
+/// Retry a probe while an updater or a just-finished write still owns the
+/// executable. The total 80 ms retry window stays inside the probe timeout.
+fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn timeout_error(program: &std::path::Path, timeout: Duration) -> anyhow::Error {
@@ -257,6 +275,30 @@ mod tests {
         let resolved = resolve_generic(None, &env).unwrap();
         assert_eq!(resolved.dialect, OpenCodeDialect::V2);
         assert_eq!(resolved.executable, executable);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_probe_retries_a_briefly_busy_executable() {
+        use std::fs::OpenOptions;
+
+        let temp = fake_version("opencode v2.0.23");
+        let executable = temp.path().join("opencode");
+        let writer = OpenOptions::new().write(true).open(&executable).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(writer);
+        });
+
+        let resolved = resolve_generic_with_timeout(
+            Some(executable.as_os_str()),
+            &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        release.join().unwrap();
+
+        assert_eq!(resolved.dialect, OpenCodeDialect::V2);
     }
 
     #[cfg(unix)]

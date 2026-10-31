@@ -403,7 +403,7 @@ pub(crate) fn add(
             table.set_implicit(true);
             toml_edit::Item::Table(table)
         })
-        .as_table_mut()
+        .as_table_like_mut()
         .with_context(|| format!("`servers` in {REGISTRY_FILE} must be a table"))?;
     let mut entry = toml_edit::Table::new();
     entry.insert("url", toml_edit::value(url));
@@ -769,6 +769,82 @@ mod tests {
         assert!(read_token(dd.path(), &name("b")).is_none());
         assert_eq!(load(dd.path()).unwrap().profiles.len(), 1);
         assert!(!remove(dd.path(), &name("b")).unwrap());
+    }
+
+    #[test]
+    fn add_to_an_inline_registry_preserves_the_other_profile() {
+        let dd = tempfile::tempdir().unwrap();
+        let root_a = under(dd.path(), "a");
+        let root_b = under(dd.path(), "b");
+        let encoded_root = toml_edit::Value::from(root_a.clone());
+        std::fs::write(
+            registry_path(dd.path()),
+            format!(
+                "# managed by hand\nservers = {{ a = {{ url = \"https://a.example\", roots = [{encoded_root}] }} }}\n"
+            ),
+        )
+        .unwrap();
+        store_token(dd.path(), &name("a"), "tok-a").unwrap();
+        let before = load(dd.path()).unwrap();
+
+        add(
+            dd.path(),
+            &name("b"),
+            "https://b.example",
+            &[root_b],
+            Some("tok-b"),
+        )
+        .unwrap();
+
+        let after = load(dd.path()).unwrap();
+        assert_eq!(after.profiles.len(), 2);
+        assert_eq!(after.profiles[&name("a")], before.profiles[&name("a")]);
+        assert_eq!(read_token(dd.path(), &name("a")).as_deref(), Some("tok-a"));
+        assert_eq!(read_token(dd.path(), &name("b")).as_deref(), Some("tok-b"));
+        let text = std::fs::read_to_string(registry_path(dd.path())).unwrap();
+        assert!(text.contains("# managed by hand"), "{text}");
+        assert!(!text.contains("tok-a") && !text.contains("tok-b"), "{text}");
+        assert!(remove(dd.path(), &name("b")).unwrap());
+        assert_eq!(load(dd.path()).unwrap(), before);
+        assert!(read_token(dd.path(), &name("b")).is_none());
+    }
+
+    #[test]
+    fn inline_profile_updates_keep_roots_and_retire_only_replaced_url_tokens() {
+        for changed_url in [false, true] {
+            for replacement in [None, Some("tok-new")] {
+                let dd = tempfile::tempdir().unwrap();
+                let root = under(dd.path(), "a");
+                let encoded_root = toml_edit::Value::from(root.clone());
+                std::fs::write(
+                    registry_path(dd.path()),
+                    format!(
+                        "servers = {{ a = {{ url = \"https://old.example\", roots = [{encoded_root}] }} }}\n"
+                    ),
+                )
+                .unwrap();
+                store_token(dd.path(), &name("a"), "tok-old").unwrap();
+                assert_eq!(load(dd.path()).unwrap().profiles.len(), 1);
+                let url = if changed_url {
+                    "https://new.example"
+                } else {
+                    "https://old.example"
+                };
+
+                let outcome = add(dd.path(), &name("a"), url, &[], replacement).unwrap();
+
+                let profile = &load(dd.path()).unwrap().profiles[&name("a")];
+                assert_eq!(profile.url, url);
+                assert_eq!(profile.roots, [root]);
+                assert!(outcome.roots_kept);
+                assert_eq!(
+                    outcome.token_discarded,
+                    changed_url && replacement.is_none()
+                );
+                let expected = replacement.or_else(|| (!changed_url).then_some("tok-old"));
+                assert_eq!(read_token(dd.path(), &name("a")).as_deref(), expected);
+            }
+        }
     }
 
     /// Moving a profile to a new URL without a new token must not pair the

@@ -1,26 +1,30 @@
 //! `GET /w/:workspace/:project` — page tree + recent activity.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use jiff::Timestamp;
 
 use ai_memory_store::ResolvedScope;
 
+use ai_memory_store::lookup_existing_scope;
+
 use crate::state::WebState;
 use crate::templates::{
-    Folder, MailboxRow, PageRow, ProjectView, SessionRow, humanize, page_href, project_href,
-    session_href,
+    AgentBadge, Folder, MailboxRow, PageRow, ProjectMemoryStats, ProjectView, SessionRow,
+    agent_label, duration_between, fmt_tokens, humanize, page_href, project_href, session_href,
 };
 
 /// Pending messages listed on the project page before it says there are more.
 const MAILBOX_LIMIT: usize = 5;
 
 /// Recent sessions listed on the project page.
-const SESSION_LIMIT: usize = 10;
+const SESSION_LIMIT: usize = 20;
 
 /// Sidebar bucket for pages directly under the wiki root.
 const ROOT_FOLDER: &str = "(root)";
@@ -30,23 +34,37 @@ const FOLDER_PREVIEW: usize = 5;
 
 /// Leading body characters shown per message.
 const SNIPPET_CHARS: usize = 160;
+fn fmt_session_tokens(usage: Option<&ai_memory_store::SessionUsageView>) -> String {
+    match usage {
+        Some(u) => format!(
+            "{} in / {} out",
+            fmt_tokens(u.input_tokens),
+            fmt_tokens(u.output_tokens)
+        ),
+        None => "—".to_owned(),
+    }
+}
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<crate::operations::UsageQuery>,
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
     let authorized = match super::authorize_read(&state, viewer, &workspace, &project).await {
         Ok(authorized) => authorized,
         Err(refusal) => return super::page::refusal_response(&refusal),
     };
-    let owner = super::api::owner_filter_for(actor);
-    render(&state, workspace, project, viewer_id, authorized, owner)
-        .await
-        .into_response()
+    let owner = super::api::session_owner_filter_for(actor, auth);
+    render(
+        &state, workspace, project, viewer_id, authorized, owner, query,
+    )
+    .await
+    .into_response()
 }
 
 async fn render(
@@ -56,7 +74,9 @@ async fn render(
     viewer: Option<ai_memory_core::UserId>,
     authorized: Option<ResolvedScope>,
     owner: ai_memory_core::OwnerFilter,
+    query: crate::operations::UsageQuery,
 ) -> Result<Html<String>, StatusCode> {
+    let calls_query = query.store_query()?;
     let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
         async {
             state
@@ -66,8 +86,99 @@ async fn render(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
         mailbox(state, &workspace, &project, viewer, authorized),
-        sessions(state, &workspace, &project, authorized, owner),
+        sessions(state, &workspace, &project, authorized, owner.clone()),
     )?;
+
+    // The page tree alone is a poor explanation for projects where hooks are
+    // working but compilation has not produced a page yet. Reuse the same
+    // metadata-only aggregate behind the dashboard; raw observations remain
+    // accessible only through scoped API detail routes.
+    let summary = state
+        .reader
+        .list_projects_with_stats(viewer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find(|item| item.workspace_name == workspace && item.project_name == project);
+    // Resolved once, reused for every scope-keyed lookup below (agent
+    // breakdown, token total, session list). A project with no resolvable
+    // scope yet (no sessions recorded) just shows none of those rather than
+    // failing the whole page.
+    let scope = lookup_existing_scope(&state.reader, &workspace, &project)
+        .await
+        .ok();
+
+    let tokens_total = match &scope {
+        Some(scope) => state
+            .reader
+            .total_session_usage(scope.workspace_id, scope.project_id, owner.clone())
+            .await
+            .ok()
+            .flatten()
+            .map(|u| {
+                format!(
+                    "{} / {}",
+                    fmt_tokens(u.input_tokens),
+                    fmt_tokens(u.output_tokens)
+                )
+            })
+            .unwrap_or_else(|| "—".to_owned()),
+        None => "—".to_owned(),
+    };
+
+    let stats = match summary {
+        Some(item) => ProjectMemoryStats {
+            page_count: item.page_count,
+            session_count: item.session_count,
+            observation_count: item.observation_count,
+            open_session_count: item.open_session_count,
+            last_activity_relative: item
+                .last_activity
+                .as_deref()
+                .map(humanize)
+                .unwrap_or_default(),
+            tokens_total,
+        },
+        // A page listing may still be visible while aggregate metadata is
+        // being refreshed. Preserve a truthful compiled-page count.
+        None => ProjectMemoryStats {
+            page_count: pages.len() as u64,
+            session_count: 0,
+            observation_count: 0,
+            open_session_count: 0,
+            last_activity_relative: String::new(),
+            tokens_total,
+        },
+    };
+
+    // Which agent CLIs produced this project's memory. Read-only,
+    // unauthenticated dashboard shared by every operator on the project
+    // (see the multi-session/multi-user invariant), so the count
+    // deliberately covers every owner rather than the (nonexistent) caller
+    // identity — same aggregate posture as `stats` above.
+    let by_agent: Vec<AgentBadge> = match &scope {
+        Some(scope) => state
+            .reader
+            .session_counts_by_agent(scope.workspace_id, scope.project_id, owner.clone(), None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| AgentBadge {
+                label: agent_label(ai_memory_core::AgentKind::from_wire(&row.agent)),
+                count: row.sessions,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // Best-effort per-page attribution: the harness whose session most
+    // recently contributed evidence to each page. Decorative UI metadata,
+    // so a lookup failure just means no badges rather than a broken page.
+    let agent_by_path = state
+        .reader
+        .latest_page_agent_kinds(&workspace, &project)
+        .await
+        .unwrap_or_default();
 
     // Build sidebar folder trees (group by first path segment), split
     // into knowledge and machinery. A store accumulates far more
@@ -75,8 +186,8 @@ async fn render(
     // bundle indexes) than curated knowledge; listing them as peers
     // buried the concepts/decisions/rules a human actually opens this
     // UI for.
-    let mut knowledge_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
-    let mut system_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
+    let mut knowledge_map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>> = BTreeMap::new();
+    let mut system_map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>> = BTreeMap::new();
     for p in &pages {
         let folder = p
             .path
@@ -97,8 +208,9 @@ async fn render(
             &mut knowledge_map
         };
         map.entry(folder).or_default().push((
-            p.updated_at.clone(),
+            p.updated_at.parse::<Timestamp>().ok(),
             PageRow {
+                agent_label: None,
                 path: p.path.clone(),
                 href: page_href(&workspace, &project, &p.path),
                 title: p.title.clone(),
@@ -119,11 +231,17 @@ async fn render(
         .filter(|p| !is_system_page(&p.path))
         .cloned()
         .collect();
-    sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sorted.sort_by_cached_key(|page| {
+        (
+            Reverse(page.updated_at.parse::<Timestamp>().ok()),
+            page.path.clone(),
+        )
+    });
     sorted.truncate(20);
     let recent: Vec<PageRow> = sorted
         .into_iter()
         .map(|p| PageRow {
+            agent_label: agent_by_path.get(&p.path).copied().map(agent_label),
             path: p.path.clone(),
             href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
@@ -134,12 +252,54 @@ async fn render(
 
     let mailbox_capped = mailbox_total > mailbox.len() as u64;
     let graph_href = crate::templates::graph_href(&workspace, &project);
+    let report = match &scope {
+        Some(scope) => state
+            .reader
+            .token_usage_report_page(
+                scope.workspace_id,
+                scope.project_id,
+                owner.clone(),
+                None,
+                calls_query,
+            )
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        None => ai_memory_store::TokenUsageReport::default(),
+    };
+    let token_usage = crate::operations::usage_panel(
+        report,
+        &workspace,
+        &project,
+        &query,
+        &format!("{}?tab=tokens", project_href(&workspace, &project)),
+    );
+    let agents = match &scope {
+        Some(scope) => state
+            .reader
+            .agent_usage(scope.workspace_id, scope.project_id, owner.clone())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .map(|r| crate::operations::agent_card(r, &workspace, &project))
+            .collect(),
+        None => Vec::new(),
+    };
     let html = ProjectView {
+        agents,
+        inbox_href: format!(
+            "inbox?workspace={}&project={}",
+            crate::templates::encode_segment(&workspace),
+            crate::templates::encode_segment(&project)
+        ),
+        project_href: project_href(&workspace, &project),
+        token_usage,
         workspace,
         project,
+        stats,
         folders,
         system,
         recent,
+        by_agent,
         mailbox,
         mailbox_total,
         mailbox_capped,
@@ -154,7 +314,7 @@ async fn render(
 /// Turn grouped pages into sidebar folders: newest first, capped at
 /// `FOLDER_PREVIEW`, each linked to its namespace listing.
 fn to_folders(
-    map: BTreeMap<String, Vec<(String, PageRow)>>,
+    map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>>,
     workspace: &str,
     project: &str,
 ) -> Vec<Folder> {
@@ -226,6 +386,7 @@ async fn mailbox(
                     .subject
                     .filter(|subject| !subject.trim().is_empty())
                     .unwrap_or_else(|| "(no subject)".to_owned()),
+                nature: entry.message.nature.as_str(),
                 sender,
                 sender_href,
                 snippet: snippet(&entry.message.body),
@@ -266,6 +427,9 @@ async fn sessions(
         .map(|s| {
             let id = s.session_id.to_string();
             SessionRow {
+                agent_label: agent_label(ai_memory_core::AgentKind::from_wire(&s.agent_kind)),
+                duration: duration_between(&s.started_at, s.ended_at.as_deref()),
+                tokens: fmt_session_tokens(s.usage.as_ref()),
                 href: session_href(workspace, project, &id),
                 agent_kind: s.agent_kind,
                 short_id: crate::templates::short_id(&id),

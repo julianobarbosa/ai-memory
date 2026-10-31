@@ -29,7 +29,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::{is_safe_tool_title, tool_family_from_title};
+use crate::payload::{
+    is_safe_tool_title, listable_tool_name, tool_family_from_title, tool_title_display,
+};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -325,14 +327,6 @@ fn session_line(obs: &Observation) -> SessionLine {
     }
 }
 
-/// Tool names worth listing: a harness's own tool name. Skip `tool <family>` /
-/// bare-`<family>` labels: a family is a partition of the calls, not a name
-/// for a tool, so "Tools used: tool file, tool non-file" tells the receiver
-/// nothing.
-fn is_listable_tool_title(title: &str) -> bool {
-    !title.is_empty() && tool_family_from_title(title).is_none()
-}
-
 fn build_digest(
     snapshot: &SessionObservationSnapshot<'_>,
     session_id: SessionId,
@@ -394,7 +388,12 @@ fn build_digest(
     };
 
     let tools = snapshot.tool_titles()?;
-    let tool_counts: BTreeMap<String, usize> = tools.completed.into_iter().collect();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (title, count) in tools.completed {
+        *tool_counts
+            .entry(tool_title_display(&title).to_owned())
+            .or_insert(0) += count;
+    }
 
     let handoff = HandoffFacts {
         first_prompt: if summary.prompts > 0 {
@@ -438,8 +437,9 @@ fn build_digest(
         has_session_end: summary.last_session_end_at.is_some(),
         tools: tools
             .titles
-            .into_iter()
-            .filter(|title| is_listable_tool_title(title))
+            .iter()
+            .filter_map(|title| listable_tool_name(title))
+            .map(str::to_owned)
             .collect(),
     };
 
@@ -913,7 +913,9 @@ impl SessionDigest {
         let mut tool_counts = BTreeMap::new();
         for obs in observations {
             if obs.kind == ObservationKind::PostToolUse && !obs.title.is_empty() {
-                *tool_counts.entry(obs.title.clone()).or_insert(0) += 1;
+                *tool_counts
+                    .entry(tool_title_display(&obs.title).to_owned())
+                    .or_insert(0) += 1;
             }
         }
         let prompt_titles_all: Vec<String> = observations
@@ -985,9 +987,10 @@ impl HandoffFacts {
                     matches!(
                         o.kind,
                         ObservationKind::PostToolUse | ObservationKind::PreToolUse
-                    ) && is_listable_tool_title(&o.title)
+                    )
                 })
-                .map(|o| o.title.clone())
+                .filter_map(|o| listable_tool_name(&o.title))
+                .map(str::to_owned)
                 .collect(),
         }
     }
@@ -1561,6 +1564,48 @@ mod tests {
         assert!(page.body.contains("`Edit`: 2"));
         assert!(page.body.contains("`Bash`: 1"));
         assert!(page.body.contains("build the thing"));
+    }
+
+    /// `[ingest] record_tool_names` titles count under their tool name, a bare
+    /// family label still counts under the label, and the file family they
+    /// carry still marks an abrupt ending.
+    #[test]
+    fn recorded_tool_names_count_by_name_and_keep_the_file_signal() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool unknown: Skill"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+            obs(ObservationKind::PostToolUse, "tool file: Edit"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::ClaudeCode,
+            &observations,
+        );
+        assert!(page.body.contains("- `Bash`: 2\n"), "{}", page.body);
+        assert!(page.body.contains("- `Skill`: 1\n"), "{}", page.body);
+        assert!(page.body.contains("- `Edit`: 1\n"), "{}", page.body);
+        assert!(
+            page.body.contains("- `tool non-file`: 1\n"),
+            "{}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("`tool non-file: Bash`"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains("Session ended without a normal stop while working with files"),
+            "{}",
+            page.body
+        );
     }
 
     #[test]

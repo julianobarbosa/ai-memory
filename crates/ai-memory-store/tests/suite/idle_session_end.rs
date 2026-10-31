@@ -1269,6 +1269,7 @@ async fn idle_end_writer_recheck_refuses_runs_linked_after_selection() {
     .await;
 
     let prepare = |name: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
         workspace_id: ws,
         project_id: proj,
         repo_fingerprint: "repo".into(),

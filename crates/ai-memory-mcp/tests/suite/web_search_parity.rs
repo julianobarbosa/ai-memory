@@ -205,6 +205,7 @@ fn web(s: &Seeded, embedder: Option<Arc<dyn Embedder>>) -> Router {
                 embedder,
                 rerank: None,
             },
+            runtime: None,
             health: None,
         },
     )

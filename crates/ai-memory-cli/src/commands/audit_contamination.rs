@@ -24,6 +24,8 @@ struct Report {
 struct Summary {
     #[serde(default)]
     sessions_misbucketed: usize,
+    #[serde(default)]
+    project_name_collisions: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -38,6 +40,16 @@ struct Finding {
     expected_project: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    peer_projects: Option<String>,
+    #[serde(default)]
+    pages: Option<u64>,
+    #[serde(default)]
+    sessions: Option<u64>,
+    #[serde(default)]
+    collision_kind: Option<String>,
+    #[serde(default)]
+    last_activity_us: Option<i64>,
 }
 
 /// Run the `audit-contamination` subcommand.
@@ -56,12 +68,15 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
     }
 
     if report.findings.is_empty() {
-        println!("No structural contamination found (no session mis-bucketed by cwd).");
+        println!(
+            "No structural contamination found (no session mis-bucketed by cwd, no project \
+             name collisions)."
+        );
         return Ok(());
     }
     println!(
-        "Contamination audit: {} session(s) mis-bucketed.",
-        report.summary.sessions_misbucketed
+        "Contamination audit: {} session(s) mis-bucketed, {} project(s) with a colliding name.",
+        report.summary.sessions_misbucketed, report.summary.project_name_collisions
     );
     for f in &report.findings {
         let expected = f.expected_project.as_deref().unwrap_or("?");
@@ -74,6 +89,20 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
                 f.landed_project,
                 f.cwd.as_deref().unwrap_or("?"),
                 expected,
+            ),
+            "project_name_collision" => println!(
+                "  [{}] project {} ({}/{}): {} page(s), {} session(s), last activity {}; \
+                 collides by {} with {}. Add a `.ai-memory.toml` marker or run `merge-project`.",
+                f.confidence,
+                f.entity_id,
+                f.landed_workspace,
+                f.landed_project,
+                f.pages.unwrap_or(0),
+                f.sessions.unwrap_or(0),
+                f.last_activity_us
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                f.collision_kind.as_deref().unwrap_or("spelling"),
+                f.peer_projects.as_deref().unwrap_or("?"),
             ),
             other => println!(
                 "  [{}] {} {} in {}/{}",

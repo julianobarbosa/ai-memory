@@ -63,11 +63,20 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
             scope_label(&link),
             terminal_text(&target.to_string_lossy())
         );
+        let project_id = project_registry::project_binding(
+            config,
+            &endpoint,
+            &link.workspace,
+            &link.project,
+            &target,
+        )?
+        .map(|scope| scope.project_id);
         return crate::commands::run::run_from(
             config,
             RunArgs {
                 workspace: Some(link.workspace),
-                project: Some(link.project),
+                project: project_id.is_none().then_some(link.project),
+                project_id,
                 workstream: None,
                 new_workstream: None,
                 executable: None,
@@ -78,6 +87,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 fresh: args.fresh,
                 force_unlock: false,
                 no_autowire: false,
+                no_exit_prompt: false,
                 require_server: false,
                 profile: None,
                 env: Vec::new(),
@@ -144,6 +154,18 @@ pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<Path
     let path = validate_registered_path(&link.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != link.workspace || project != link.project {
+        let bound = project_registry::project_binding_for_server(
+            config,
+            &link.server,
+            &workspace,
+            &project,
+            &path,
+        )?;
+        if bound
+            .is_some_and(|scope| scope.workspace == link.workspace && scope.project == link.project)
+        {
+            return Ok(path);
+        }
         bail!(
             "checkout now resolves to {}/{}",
             terminal_text(&workspace),

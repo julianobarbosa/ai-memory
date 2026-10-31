@@ -202,3 +202,185 @@ async fn a_handoff_from_the_session_after_its_last_work_covers_it() {
     // 30's baton predates its last work at NOW + 500; 31's follows its work.
     assert_eq!(covered, vec![(30, false), (31, true)]);
 }
+
+/// The legacy end remains the writer's watermark; it must not make the
+/// scoped read disagree with the activity feed after substantive work resumes.
+#[tokio::test]
+async fn resumed_summary_is_open_and_preserves_the_persisted_end() {
+    let (_tmp, store) = open_seeded();
+    let resumed_id = ai_memory_core::SessionId::from_slice(&id(30)).unwrap();
+    let resumed = store
+        .reader
+        .session_summary_scoped(ws(), proj_a(), resumed_id, OwnerFilter::Unattributed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resumed.ended_at.is_none(), "new work reopens the read view");
+    for n in [31, 32] {
+        let closed = store
+            .reader
+            .session_summary_scoped(
+                ws(),
+                proj_a(),
+                ai_memory_core::SessionId::from_slice(&id(n)).unwrap(),
+                OwnerFilter::Unattributed,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.ended_at.is_some(), "closed sessions stay closed");
+    }
+    let conn = Connection::open(store.db_path()).unwrap();
+    let persisted: i64 = conn
+        .query_row(
+            "SELECT ended_at FROM sessions WHERE id = ?1",
+            params![&id(30)[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, NOW + 100, "the writer watermark is untouched");
+}
+
+#[tokio::test]
+async fn completed_listing_excludes_resumed_work_and_keeps_closed_controls() {
+    let (_tmp, store) = open_seeded();
+    let completed = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, false, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = completed
+        .iter()
+        .map(|s| s.session_id.as_bytes()[15])
+        .collect();
+    assert_eq!(listed, vec![32, 31]);
+    let all = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, true, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = all.iter().map(|s| s.session_id.as_bytes()[15]).collect();
+    assert_eq!(listed, vec![32, 31, 30]);
+}
+
+#[tokio::test]
+async fn resumed_summary_keeps_owner_and_scope_guards_with_legitimate_controls() {
+    let (_tmp, store) = open_seeded();
+    let bob = ai_memory_core::SessionId::from_slice(&id(33)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), bob, filter_for("alice"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), bob, filter_for("bob"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let other = ProjectId::from_slice(&id(3)).unwrap();
+    let resumed = ai_memory_core::SessionId::from_slice(&id(30)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), other, resumed, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let foreign = ai_memory_core::SessionId::from_slice(&id(34)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), foreign, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), other, foreign, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn only_scoped_substantive_work_reopens_the_summary() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    for (n, sid, project, kind) in [(70, 31, 3, "user-prompt"), (71, 32, 2, "session-start")] {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 't', 'synthetic', 5, ?6)",
+            params![
+                &id(n)[..],
+                &id(sid)[..],
+                &id(1)[..],
+                &id(project)[..],
+                kind,
+                NOW + 900
+            ],
+        )
+        .unwrap();
+    }
+    for n in [31, 32] {
+        let summary = store
+            .reader
+            .session_summary_scoped(
+                ws(),
+                proj_a(),
+                ai_memory_core::SessionId::from_slice(&id(n)).unwrap(),
+                OwnerFilter::Unattributed,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(summary.ended_at.is_some());
+    }
+    let other = store
+        .reader
+        .session_summary_scoped(
+            ws(),
+            ProjectId::from_slice(&id(3)).unwrap(),
+            ai_memory_core::SessionId::from_slice(&id(31)).unwrap(),
+            OwnerFilter::Unattributed,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        other.ended_at.is_none(),
+        "new work opens only its own scope"
+    );
+}
+
+#[tokio::test]
+async fn a_later_persisted_end_closes_the_resumed_read_view() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
+        params![NOW + 600, &id(30)[..]],
+    )
+    .unwrap();
+    let completed = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, false, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = completed
+        .iter()
+        .map(|s| s.session_id.as_bytes()[15])
+        .collect();
+    assert_eq!(listed, vec![32, 31, 30]);
+    assert!(completed.iter().all(|s| s.ended_at.is_some()));
+}

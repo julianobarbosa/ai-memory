@@ -3,90 +3,70 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f766e">
   <title>{% block title %}ai-memory{% endblock %}</title>
   <link rel="icon" href="static/logo.png" type="image/png">
+  {% include "_theme.html" %}
   <link rel="stylesheet" href="static/tailwind.css">
 </head>
-<body class="min-h-full bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-  <a id="skip-link" href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-2 focus:z-20 focus:rounded-md focus:bg-white focus:px-3 focus:py-1.5 focus:text-sm focus:font-medium focus:text-blue-700 dark:focus:bg-slate-900 dark:focus:text-blue-400">Skip to content</a>
-  <script>
-  // The injected <base href> would send a bare "#main-content" to the web root.
-  // Build from the absolute URL: a pathname starting with "//" would otherwise
-  // become a link to another host.
-  (function () {
-    var a = document.getElementById("skip-link");
-    if (a) a.setAttribute("href", location.href.split("#")[0] + "#main-content");
-  })();
-  </script>
-  <header class="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 sticky top-0 z-10">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-wrap items-center gap-x-4 gap-y-2 min-h-14 py-2">
-      <a href="." class="flex items-center gap-2 shrink-0">
-        <img src="static/logo.png" alt="ai-memory logo" class="h-7 w-auto">
-        <span class="font-semibold text-slate-800 dark:text-slate-100 text-sm hidden sm:inline">ai-memory</span>
-      </a>
-      <div class="flex-1"></div>
+<body class="dashboard-shell">
+  <a id="skip-link" href="#main-content" class="skip-link">Skip to content</a>
+  <aside class="app-sidebar" id="app-navigation" aria-label="Workspace navigation">
+    <a href="." class="app-brand"><img src="static/logo.png" alt="" width="34" height="34"><span>ai-memory<small>AGENT WORKSPACE</small></span></a>
+    <p class="nav-label">WORKSPACE</p>
+    <nav aria-label="Main" class="app-nav">
+      <a href="." data-nav="projects"><span aria-hidden="true">▦</span>Projects</a>
+      <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>Inbox <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
+      <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="Projects with pending messages"></ul></div>
+      <span id="inbox-notification-status" class="sr-only" role="status" aria-live="polite"></span>
+      <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>Workstreams</a>
+      <a href="search" data-nav="search"><span aria-hidden="true">⌕</span>Search memory</a>
+      <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true">⌘</span>Knowledge graph</a>
+      <p class="nav-label">OBSERVE &amp; IMPROVE</p>
+      <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>Learning review</a>
+      <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>Server health</a>
+      <p class="nav-label">RESOURCES</p>
+      <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>Documentation</a>
+      <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>Changelog</a>
+    </nav>
+    <div class="nav-bottom"><span class="nav-orbit" aria-hidden="true">◈</span><strong>Context that stays.<small>Across agents. Across sessions.</small></strong></div>
+  </aside>
+  <button class="nav-backdrop" id="nav-backdrop" aria-label="Close navigation" hidden></button>
+  <header class="app-topbar">
+    <div class="app-topbar-content">
+      <button class="menu-button" id="nav-toggle" aria-controls="app-navigation" aria-expanded="false" aria-label="Open navigation">☰</button>
+      <span class="topbar-caption">Workspace <span aria-hidden="true">/</span> <strong>Agent operations</strong></span>
+      <div class="topbar-spacer"></div>
       {% block header_actions %}
       {% block header_search %}
-      <form action="search" method="get" class="flex items-center gap-2">
-        <label for="header-search" class="sr-only">Search pages</label>
-        <input
-          id="header-search"
-          name="q"
-          type="search"
-          placeholder="Search…"
-          class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-        >
-      </form>
+      <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">Search pages</label><input id="header-search" name="q" type="search" placeholder="Search memory…"><span aria-hidden="true">⌕</span></form>
       {% endblock %}
-      <nav aria-label="Main" class="flex flex-wrap items-center justify-end gap-x-4 gap-y-2">
-        <a href="graph" {% block nav_graph_current %}{% endblock %} class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Graph</a>
-        <a href="workstreams" {% block nav_workstreams_current %}{% endblock %} class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Workstreams</a>
-        <a href="pending" {% block nav_pending_current %}{% endblock %} class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Pending</a>
-        <a href="health" {% block nav_health_current %}{% endblock %} class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Health</a>
-        <button
-          type="button"
-          id="ai-memory-logout"
-          class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400"
-        >Log out</button>
-        <script>
-        (function () {
-          var btn = document.getElementById("ai-memory-logout");
-          if (!btn) return;
-          {% include "_js_cookie.html" %}
-          btn.addEventListener("click", function () {
-            var basePath = document
-              .querySelector('meta[name="ai-memory-base-path"]')
-              ?.getAttribute("content") || "";
-            var loginHref = document
-              .querySelector('meta[name="ai-memory-login-path"]')
-              ?.getAttribute("content") || (basePath + "/web/login");
-            fetch(basePath + "/auth/logout", {
-              method: "POST",
-              credentials: "include",
-              headers: {
-                "Accept": "application/json",
-                "X-CSRF-Token": decodeURIComponent(cookie("ai_memory_csrf") || "")
-              }
-            }).finally(function () {
-              location.assign(loginHref);
-            });
-          });
-        })();
-        </script>
-      </nav>
+      <button type="button" id="ai-memory-logout" class="quiet-button">Log out</button>
       {% endblock %}
+      <div class="theme-switch" role="group" aria-label="Color theme">
+        <button type="button" data-theme-choice="light" aria-pressed="false" title="Light theme">Light</button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false" title="Dark theme">Dark</button>
+        <button type="button" data-theme-choice="system" aria-pressed="false" title="Follow system theme">System</button>
+      </div>
     </div>
   </header>
-
-  <main id="main-content" tabindex="-1" class="focus:outline-none max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-    {% block content %}{% endblock %}
-  </main>
-
-  <footer class="border-t border-slate-200 dark:border-slate-800 mt-16 py-4">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
-      <span>ai-memory · read-only</span>
-      {% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}
-    </div>
-  </footer>
+  <main id="main-content" tabindex="-1" class="app-content">{% block content %}{% endblock %}</main>
+  <footer class="app-footer"><span>ai-memory <span aria-hidden="true">·</span> Project memory &amp; agent operations</span>{% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}</footer>
+  <script>
+  (function(){
+    document.getElementById("skip-link").href=location.href.split("#")[0]+"#main-content";
+    var toggle=document.getElementById("nav-toggle"),backdrop=document.getElementById("nav-backdrop"),nav=document.getElementById("app-navigation");
+    function close(){document.body.classList.remove("nav-open");toggle.setAttribute("aria-expanded","false");backdrop.hidden=true;}
+    toggle.addEventListener("click",function(){var open=toggle.getAttribute("aria-expanded")!=="true";document.body.classList.toggle("nav-open",open);toggle.setAttribute("aria-expanded",String(open));backdrop.hidden=!open;if(open)nav.querySelector("a").focus();});
+    backdrop.addEventListener("click",close);
+    document.addEventListener("keydown",function(e){if(e.key==="Escape"&&document.body.classList.contains("nav-open")){close();toggle.focus();}});
+    nav.querySelectorAll("a[data-nav]").forEach(function(a){var path=new URL(a.href).pathname.replace(/\/$/,"");var current=location.pathname.replace(/\/$/,"");if(path===current||(a.dataset.nav==="projects"&&current.indexOf(path+"/w/")===0))a.setAttribute("aria-current","page");a.addEventListener("click",close);});
+    var btn=document.getElementById("ai-memory-logout");
+    if(btn){ {% include "_js_cookie.html" %}
+      btn.addEventListener("click",function(){var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";var login=document.querySelector('meta[name="ai-memory-login-path"]')?.content||(base+"/web/login");fetch(base+"/auth/logout",{method:"POST",credentials:"include",headers:{"Accept":"application/json","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")}}).finally(function(){location.assign(login);});});
+    }
+  })();
+  </script>
+  {% include "_inbox_notifications.html" %}
 </body>
 </html>

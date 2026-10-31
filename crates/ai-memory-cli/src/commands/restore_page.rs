@@ -1,4 +1,4 @@
-//! `ai-memory restore-page` — restore one wiki page from a git checkpoint.
+//! `ai-memory restore-page` — restore one wiki page from retained history.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,10 @@ struct RestorePageRequest {
     workspace: String,
     project: String,
     path: String,
-    rev: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -29,18 +32,18 @@ struct RestorePageResponse {
 /// Run the `restore-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if an explicit scope flag, `--path`, or `--from` is empty;
-/// the server is unreachable; the checkpoint/path cannot be restored; or the
-/// restored page cannot be reindexed.
+/// Returns an error if an explicit scope flag, `--path`, `--from`, or
+/// `--page-id` is empty; the server is unreachable; the requested checkpoint
+/// or page version cannot be restored; or the restored page cannot be
+/// reindexed.
 pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     if args.path.trim().is_empty() {
         bail!("--path was passed empty; specify the wiki page path to restore");
     }
-    if args.from.trim().is_empty() {
-        bail!("--from was passed empty; specify the git checkpoint to restore from");
-    }
+    super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
+    super::refuse_empty_explicit(args.page_id.as_deref(), "--page-id")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -52,6 +55,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
             project: project.clone(),
             path: args.path.clone(),
             rev: args.from.clone(),
+            page_id: args.page_id.clone(),
         },
     )
     .await
@@ -83,10 +87,11 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn args(path: &str, from: &str) -> RestorePageArgs {
+    fn args(path: &str, from: Option<&str>, page_id: Option<&str>) -> RestorePageArgs {
         RestorePageArgs {
             path: path.into(),
-            from: from.into(),
+            from: from.map(str::to_owned),
+            page_id: page_id.map(str::to_owned),
             workspace: None,
             project: None,
             json: false,
@@ -96,7 +101,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_path_is_refused_before_scope_or_network_work() {
         for empty in ["", " \t "] {
-            let error = run(&Config::default(), args(empty, "HEAD~1"))
+            let error = run(&Config::default(), args(empty, Some("HEAD~1"), None))
                 .await
                 .unwrap_err();
             assert!(
@@ -109,11 +114,30 @@ mod tests {
     #[tokio::test]
     async fn an_empty_revision_is_refused_before_scope_or_network_work() {
         for empty in ["", " \t "] {
-            let error = run(&Config::default(), args("notes/example.md", empty))
-                .await
-                .unwrap_err();
+            let error = run(
+                &Config::default(),
+                args("notes/example.md", Some(empty), None),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 error.to_string().contains("--from was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_page_id_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(
+                &Config::default(),
+                args("notes/example.md", None, Some(empty)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("--page-id was passed empty"),
                 "unexpected error: {error}"
             );
         }

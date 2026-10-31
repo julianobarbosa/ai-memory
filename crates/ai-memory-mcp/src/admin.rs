@@ -24,7 +24,7 @@
 //! - `POST /admin/embed`          — backfill embeddings for latest pages.
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
-//! - `POST /admin/restore-page`   — restore one page from a checkpoint.
+//! - `POST /admin/restore-page`   — restore one page from retained history.
 //! - `POST /admin/purge-project`  — delete a project's rows and wiki files
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
@@ -42,6 +42,7 @@
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
 //!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
+//! - `POST /admin/merge-project`  — losslessly join two projects in one workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
@@ -69,9 +70,12 @@ use ai_memory_consolidate::{
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
-    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    DEFAULT_WORKSPACE_NAME, PageId, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
+use ai_memory_llm::{
+    ChatRequest, Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot,
+    error_status_and_message,
+};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
@@ -79,7 +83,8 @@ use ai_memory_store::{
     StoreError, WriterHandle, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{
-    AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
+    AdmissionContext, AdmissionOp, Markdown, MergeProjectFile, SessionPageFile, Wiki, WikiError,
+    WritePageRequest,
 };
 use axum::Json;
 use axum::Router;
@@ -465,6 +470,8 @@ const MESSAGE_BODY_MAX_CHARS: usize = 8000;
 
 /// Subject cap for `POST /admin/messages/send` (V64).
 const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
+/// Supporting evidence cap for cross-project messages (#1428).
+const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
 
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
@@ -678,6 +685,7 @@ pub fn admin_router_with_sweep_tuning(
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/llm-test", post(handle_llm_test))
         .route("/admin/metrics", get(handle_metrics))
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/project-coordinate", get(handle_project_coordinate))
@@ -703,6 +711,7 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/merge-project", post(handle_merge_project))
         .route("/admin/move-session", post(handle_move_session))
         .route(
             "/admin/repair-session-times",
@@ -1276,7 +1285,48 @@ pub struct StatusReport {
     /// Wiki-format state: whether the OKF migration has run, and the
     /// pre-migration backup archive if its receipt still exists.
     pub wiki_format: WikiFormatStatus,
+    /// SessionEnd consolidation queue: counts plus the sessions that gave up,
+    /// so a watchdog can re-run them once the cause is fixed (#1692).
+    pub consolidation: ConsolidationStatus,
 }
+
+/// Consolidation section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConsolidationStatus {
+    /// Jobs waiting for a worker, including ones backing off to retry.
+    pub pending: u64,
+    /// Jobs a worker holds right now.
+    pub running: u64,
+    /// Jobs that finished.
+    pub completed: u64,
+    /// Jobs that gave up after their attempts.
+    pub failed: u64,
+    /// Most recent failures, newest first, bounded to
+    /// [`CONSOLIDATION_FAILED_SESSIONS_CAP`]. The session id is what a
+    /// re-consolidation needs; the error is the worker's own bounded text,
+    /// scrubbed before it leaves the server.
+    pub failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session in [`ConsolidationStatus::failed_sessions`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FailedConsolidationSession {
+    /// Session whose consolidation gave up.
+    pub session_id: String,
+    /// Provider attempts spent on it.
+    pub attempts: u32,
+    /// Unix microseconds of the final failure.
+    pub failed_at_us: i64,
+    /// Bounded, scrubbed error the worker recorded.
+    pub last_error: String,
+}
+
+/// How many failed sessions one status response carries. The counts above
+/// stay exact; the list is a sample, newest first, so the payload cannot grow
+/// with the backlog.
+pub const CONSOLIDATION_FAILED_SESSIONS_CAP: u32 = 20;
+/// Longest error text one failed session carries, in characters.
+const CONSOLIDATION_ERROR_CHARS: usize = 200;
 
 /// Wiki-format section of [`StatusReport`].
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1308,6 +1358,61 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
     }
 }
 
+/// `POST /admin/llm-test` — probe the server's own configured chat provider.
+///
+/// `ai-memory llm-test` builds a provider from the *caller's* environment,
+/// which is the wrong one when the server runs in a container or on another
+/// host: its keys exist only there, so following the health report's retry
+/// hint failed while the server was healthy (#1639). This runs the provider
+/// the server configured, with a fixed short prompt, and answers with the
+/// same status class and bounded message the health snapshot records — never
+/// the request, the reply text or the provider's full body.
+async fn handle_llm_test(State(state): State<Arc<AdminState>>) -> Response {
+    let Some(llm) = state.llm.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this server has no LLM provider configured; set one in its config and restart it",
+            })),
+        )
+            .into_response();
+    };
+    let mut request = ChatRequest::user_prompt("ping".to_owned());
+    request.temperature = Some(0.2);
+    let started = std::time::Instant::now();
+    let elapsed = |started: std::time::Instant| started.elapsed().as_millis() as u64;
+    match llm.complete(request).await {
+        Ok(response) => Json(serde_json::json!({
+            "ok": true,
+            "provider": llm.name(),
+            "model": response.model,
+            "latency_ms": elapsed(started),
+            "reply_chars": response.text.chars().count(),
+        }))
+        .into_response(),
+        Err(error) => {
+            let (status, message) = error_status_and_message(&error);
+            // A provider body can quote the key it rejected. The health
+            // snapshot's own copy is bounded but not scrubbed; this one is
+            // printed into an operator's terminal, so it goes through the
+            // privacy strip first.
+            let message = state.wiki.sanitizer().scrub(&message);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "provider": llm.name(),
+                    "model": llm.model(),
+                    "latency_ms": elapsed(started),
+                    "error": message,
+                    "status": status,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     // Count "missing" against the configured embedder's stored triple, so
     // a model swap cannot read as a fully covered index; with no embedder
@@ -1335,6 +1440,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     .unwrap_or(false);
                 let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
                     .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
+                let consolidation =
+                    consolidation_status(&state, &state.reader.session_consolidation_queue().await)
+                        .await;
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -1353,6 +1461,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                             .map(|r| r.archive_path.display().to_string()),
                         backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
                     },
+                    consolidation,
                 };
                 (
                     StatusCode::OK,
@@ -1368,6 +1477,50 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+/// The consolidation section of a status report.
+///
+/// A failure to read the queue degrades to zeros, like the storage figures
+/// above: `status` is also the health probe, and a queue query must not take
+/// the whole answer down.
+async fn consolidation_status(
+    state: &AdminState,
+    queue: &Result<ai_memory_store::SessionConsolidationQueue, ai_memory_store::StoreError>,
+) -> ConsolidationStatus {
+    let queue = queue.as_ref().copied().unwrap_or_default();
+    let failed_sessions = match state
+        .reader
+        .failed_consolidation_jobs(CONSOLIDATION_FAILED_SESSIONS_CAP)
+        .await
+    {
+        Ok(jobs) => jobs
+            .into_iter()
+            .map(|job| FailedConsolidationSession {
+                session_id: job.session_id,
+                attempts: job.attempts,
+                failed_at_us: job.failed_at_us,
+                // The worker truncates what it records, but that text comes
+                // from a provider body: scrub it before an operator's terminal
+                // sees it, exactly like `/admin/llm-test`.
+                last_error: state
+                    .wiki
+                    .sanitizer()
+                    .scrub(&job.last_error)
+                    .chars()
+                    .take(CONSOLIDATION_ERROR_CHARS)
+                    .collect(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ConsolidationStatus {
+        pending: queue.pending,
+        running: queue.running,
+        completed: queue.completed,
+        failed: queue.failed,
+        failed_sessions,
     }
 }
 
@@ -3331,6 +3484,10 @@ struct SendMessageRequest {
     to_project: String,
     #[serde(default)]
     subject: Option<String>,
+    #[serde(default)]
+    nature: ai_memory_core::MessageNature,
+    #[serde(default)]
+    evidence: Option<String>,
     body: String,
 }
 
@@ -3383,6 +3540,21 @@ async fn handle_send_message(
             ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
         })
         .filter(|s| !s.is_empty());
+    let evidence = req
+        .evidence
+        .as_deref()
+        .map(|value| {
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS)
+        })
+        .filter(|value| !value.trim().is_empty());
+    if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "evidence_required: measured messages require non-empty evidence"
+            })),
+        );
+    }
 
     let distinguishes = match state
         .reader
@@ -3411,8 +3583,11 @@ async fn handle_send_message(
         from_owner_user,
         to_workspace_id: to_ws,
         to_project_id: to_proj,
+        to_agent: None,
         subject,
         body,
+        nature: req.nature,
+        evidence,
     };
 
     // Match MCP's crossing-point admission and post-commit observer ordering.
@@ -3459,6 +3634,8 @@ async fn handle_send_message(
 /// `POST /admin/messages/pop` request body (V64).
 #[derive(Debug, Deserialize)]
 struct PopMessageRequest {
+    #[serde(default)]
+    agent: Option<AgentKind>,
     workspace: String,
     project: String,
     #[serde(default)]
@@ -3516,7 +3693,15 @@ async fn handle_pop_message(
     let claim = ai_memory_core::MessageClaim {
         workspace_id: ws,
         project_id: proj,
-        claiming_agent: AgentKind::Other,
+        claiming_agent: req
+            .agent
+            .or_else(|| {
+                actor_ext
+                    .as_ref()
+                    .and_then(|a| a.0.agent.as_deref())
+                    .map(AgentKind::from_wire)
+            })
+            .unwrap_or(AgentKind::Other),
         claiming_session: None,
         claiming_user,
     };
@@ -4458,7 +4643,12 @@ struct RestorePageRequest {
     /// Relative wiki path to restore.
     path: String,
     /// Git revision/commit to restore from.
-    rev: String,
+    #[serde(default)]
+    rev: Option<String>,
+    /// Retained SQLite page-version id to restore. Mutually exclusive with
+    /// `rev`; used for histories moved by `merge-project`.
+    #[serde(default)]
+    page_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4488,6 +4678,26 @@ async fn handle_restore_page(
         )
     })?;
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let (restore_source, version_id) = match (&req.rev, &req.page_id) {
+        (Some(rev), None) if !rev.trim().is_empty() => (rev.clone(), None),
+        (None, Some(page_id)) if !page_id.trim().is_empty() => {
+            let version = page_id.parse::<PageId>().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid page_id"})),
+                )
+            })?;
+            (format!("page version {page_id}"), Some(version))
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "exactly one of rev or page_id is required"
+                })),
+            ));
+        }
+    };
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -4499,11 +4709,27 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = state
-        .wiki
-        .restore_page_from_checkpoint(ws, proj, path.clone(), &req.rev)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let page_id = if let Some(rev) = &req.rev {
+        state
+            .wiki
+            .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+    } else {
+        let version = version_id
+            .ok_or_else(|| internal_err("validated page-version restore lost its version id"))?;
+        state
+            .wiki
+            .restore_page_from_version(ws, proj, path.clone(), version)
+            .await
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::NotFound(_)) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
+    };
     let checkpoint = checkpoint_or_warn(
         &state.wiki,
         format!(
@@ -4511,7 +4737,7 @@ async fn handle_restore_page(
             req.workspace,
             req.project,
             path.as_str(),
-            req.rev
+            restore_source
         ),
     );
 
@@ -4521,7 +4747,7 @@ async fn handle_restore_page(
             serde_json::to_value(RestorePageResponse {
                 page_id: page_id.to_string(),
                 path: path.to_string(),
-                restored_from: req.rev,
+                restored_from: restore_source,
                 pre_checkpoint,
                 checkpoint,
             })
@@ -6203,8 +6429,257 @@ async fn handle_rename_project(
 }
 
 // ---------------------------------------------------------------------
-// move-project
+// merge-project / move-project
 // ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MergeProjectRequest {
+    workspace: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    from_project_id: Option<String>,
+    #[serde(default)]
+    into: Option<String>,
+    #[serde(default)]
+    into_project_id: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Serialize)]
+struct MergeProjectReport {
+    from: String,
+    into: String,
+    dry_run: bool,
+    page_versions: u64,
+    sessions: u64,
+    observations: u64,
+    handoffs: u64,
+    workstreams: u64,
+    page_conflicts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_warning: Option<String>,
+}
+
+async fn prepare_project_merge(
+    state: &AdminState,
+    workspace: &str,
+    source_name: &str,
+    source: ProjectId,
+    target_name: &str,
+    target: ProjectId,
+    workspace_id: WorkspaceId,
+) -> Result<Vec<MergeProjectFile>, MoveErr> {
+    let summaries = state
+        .reader
+        .list_pages(workspace, source_name)
+        .await
+        .map_err(|error| internal_err(error.to_string()))?;
+    let mut pages = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let path = PagePath::new(summary.path.clone()).map_err(|error| {
+            internal_err(format!(
+                "invalid indexed page path '{}': {error}",
+                summary.path
+            ))
+        })?;
+        let source_meta = state
+            .reader
+            .page_meta(workspace, source_name, path.as_str())
+            .await
+            .map_err(|error| internal_err(error.to_string()))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "project pages changed while the merge was being prepared"
+                    })),
+                )
+            })?;
+        let target_page_id = state
+            .reader
+            .page_meta(workspace, target_name, path.as_str())
+            .await
+            .map_err(|error| internal_err(error.to_string()))?
+            .map(|meta| meta.id);
+        let source_label = format!("{workspace}/{source_name}");
+        pages.push(
+            state
+                .wiki
+                .prepare_project_merge_file(
+                    workspace_id,
+                    source,
+                    target,
+                    ai_memory_store::MergeProjectPage {
+                        path,
+                        source_page_id: source_meta.id,
+                        target_page_id,
+                        merged_page: None,
+                    },
+                    &source_label,
+                )
+                .map_err(|error| match error {
+                    WikiError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "project pages changed while the merge was being prepared"
+                        })),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?,
+        );
+    }
+    Ok(pages)
+}
+
+async fn handle_merge_project(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<MergeProjectRequest>,
+) -> impl IntoResponse {
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let result: Result<MergeProjectReport, MoveErr> = async {
+        let (source_ws, source, source_name) = resolve_target_for_admin(
+            &state,
+            &req.workspace,
+            req.from.as_deref(),
+            req.from_project_id.as_deref(),
+        )
+        .await?;
+        let (target_ws, target, target_name) = resolve_target_for_admin(
+            &state,
+            &req.workspace,
+            req.into.as_deref(),
+            req.into_project_id.as_deref(),
+        )
+        .await?;
+        if source_ws != target_ws {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "projects must be in the same workspace"})),
+            ));
+        }
+        if source == target {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "source and target project must be different"})),
+            ));
+        }
+        let pages = prepare_project_merge(
+            &state,
+            &req.workspace,
+            &source_name,
+            source,
+            &target_name,
+            target,
+            source_ws,
+        )
+        .await?;
+        let store_pages = pages.iter().map(|page| page.store.clone()).collect();
+        let summary = if req.confirm {
+            let admission = AdmissionContext {
+                workspace: req.workspace.clone(),
+                project: source_name.clone(),
+                destination_workspace: Some(req.workspace.clone()),
+                destination_project: Some(target_name.clone()),
+                op: AdmissionOp::MoveProject,
+                actor,
+                ..Default::default()
+            };
+            state
+                .wiki
+                .merge_project(source_ws, source, target, pages, Some(admission))
+                .await
+                .map_err(|error| match error {
+                    WikiError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "project pages changed while the merge was committing"
+                        })),
+                    ),
+                    WikiError::Store(StoreError::ManagedRunActive { .. })
+                    | WikiError::Store(StoreError::ProjectSessionsOpen { .. })
+                    | WikiError::Store(StoreError::Duplicate(_))
+                    | WikiError::Store(StoreError::PagePathCollides { .. })
+                    | WikiError::Store(StoreError::NotFound(_)) => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?
+        } else {
+            state
+                .writer
+                .merge_project(source_ws, source, target, store_pages, false)
+                .await
+                .map_err(|error| match error {
+                    StoreError::ManagedRunActive { .. }
+                    | StoreError::ProjectSessionsOpen { .. }
+                    | StoreError::Duplicate(_)
+                    | StoreError::PagePathCollides { .. } => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    StoreError::NotFound(_) => (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?
+        };
+        let (checkpoint, manifest_warning) = if req.confirm {
+            state.active_project.clear_project(source);
+            invalidate_scope_cache(&state, ScopeInvalidation::Project(source)).await;
+            let manifest_warning = state
+                .wiki
+                .backfill_scope_manifests()
+                .await
+                .err()
+                .map(|error| {
+                    warn!(%error, "merge-project: scope manifest refresh failed");
+                    error.to_string()
+                });
+            (
+                checkpoint_or_warn(
+                    &state.wiki,
+                    format!(
+                        "merge-project {}/{} -> {}/{}",
+                        req.workspace, source_name, req.workspace, target_name
+                    ),
+                ),
+                manifest_warning,
+            )
+        } else {
+            (None, None)
+        };
+        Ok(MergeProjectReport {
+            from: format!("{}/{}", req.workspace, source_name),
+            into: format!("{}/{}", req.workspace, target_name),
+            dry_run: !req.confirm,
+            page_versions: summary.page_versions,
+            sessions: summary.sessions,
+            observations: summary.observations,
+            handoffs: summary.handoffs,
+            workstreams: summary.workstreams,
+            page_conflicts: summary.page_conflicts,
+            checkpoint,
+            manifest_warning,
+        })
+    }
+    .await;
+    match result {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(error) => error,
+    }
+}
 
 /// JSON request body for `POST /admin/move-project`.
 #[derive(Deserialize)]
@@ -6235,6 +6710,13 @@ struct MoveProjectRequest {
     /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
+    /// Acknowledge that this move is a **copy+purge merge** rather than a
+    /// true-move, and that the source project's history goes with it (#1713).
+    /// The server picks the strategy from the destination; when it resolves to
+    /// the merge path and this is absent, the move is refused with the record
+    /// counts it would discard.
+    #[serde(default)]
+    allow_lossy_merge: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
     /// exists in the destination with DIFFERENT content. Ignored by true-move
     /// (no copy). Default `block` — the safe choice for a destructive op.
@@ -6761,6 +7243,39 @@ async fn move_project_core(
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
+    //
+    // That second half is not a move: the source's sessions, observations,
+    // handoffs and older page versions are deleted, while a true-move keeps
+    // them. A `--confirm` written for "move this project" does not say that,
+    // so the merge path needs its own acknowledgement and shows the counts it
+    // would discard (#1713).
+    if !req.allow_lossy_merge {
+        let counts = state
+            .reader
+            .project_record_counts(src_ws, src_proj)
+            .await
+            .map_err(|error| internal_err(error.to_string()))?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the destination workspace already holds a project named '{project_name}', so \
+                     this move would be a copy+purge merge: it copies its {} latest page(s) into \
+                     that project and deletes the source project with its {} session(s), {} \
+                     observation(s) and {} handoff(s). A true-move keeps all of that; to merge, \
+                     re-run with --allow-lossy-merge (allow_lossy_merge=true)",
+                    counts.pages, counts.sessions, counts.observations, counts.handoffs,
+                ),
+                "strategy": "copy-purge",
+                "discarded": {
+                    "pages_copied": counts.pages,
+                    "sessions": counts.sessions,
+                    "observations": counts.observations,
+                    "handoffs": counts.handoffs,
+                },
+            })),
+        ));
+    }
     let destination = create_ws_proj(state, &req.to_workspace, &project_name).await?;
     let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
@@ -8268,6 +8783,10 @@ async fn handle_merge_workspace(
             confirm: true,
             force: req.force,
             on_conflict: req.on_conflict,
+            // `merge-workspace` is the explicit merge command: the operator
+            // already asked for the two workspaces to be combined, so a
+            // same-named project is merged rather than refused (#1713).
+            allow_lossy_merge: true,
         };
         match move_project_core(&state, &move_req, actor.clone()).await {
             Ok(report) => merged.push(report),
@@ -9552,8 +10071,11 @@ mod tests {
                     from_owner_user: None,
                     to_workspace_id: ws,
                     to_project_id: recipient,
+                    to_agent: None,
                     subject: None,
                     body: "fixture".into(),
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
                 })
                 .await
                 .unwrap();
@@ -12348,6 +12870,7 @@ mod tests {
         state.auto_improve_review_config.eval = ai_memory_consolidate::AutoImproveEvalConfig {
             enabled: true,
             command: String::new(),
+            builtin: String::new(),
             timeout_secs: 1,
             targets: vec!["notes".into()],
             min_delta: 0.0,
@@ -13753,7 +14276,7 @@ mod tests {
                             "from_workspace": "src",
                             "project": "merged",
                             "to_workspace": "dst",
-                            "confirm": true,
+                            "confirm": true, "allow_lossy_merge": true,
                         }))
                         .unwrap(),
                     ))
@@ -13807,7 +14330,7 @@ mod tests {
             "from_workspace": "src",
             "project": "live",
             "to_workspace": "dst",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         });
         let guarded = router
             .clone()
@@ -13827,7 +14350,7 @@ mod tests {
             "from_workspace": "src",
             "project": "live",
             "to_workspace": "dst",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
             "force": true,
         });
         let moved = router
@@ -14211,7 +14734,7 @@ mod tests {
                             "from_workspace": "src",
                             "project": "merged",
                             "to_workspace": "dst",
-                            "confirm": true,
+                            "confirm": true, "allow_lossy_merge": true,
                             "force": true,
                         }))
                         .unwrap(),
@@ -14458,6 +14981,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("POST", "/admin/llm-test", serde_json::Value::Null),
             ("GET", "/admin/metrics", serde_json::Value::Null),
             (
                 "GET",
@@ -14562,7 +15086,7 @@ mod tests {
                     "from_workspace": "default",
                     "to_workspace": "archive",
                     "project": "scratch",
-                    "confirm": true
+                    "confirm": true, "allow_lossy_merge": true
                 }),
             ),
             (
@@ -15934,7 +16458,7 @@ mod tests {
                 "from_workspace": "team-a",
                 "project": "shared",
                 "to_workspace": "team-b",
-                "confirm": true,
+                "confirm": true, "allow_lossy_merge": true,
             })),
         )
         .await;

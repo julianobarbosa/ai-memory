@@ -47,6 +47,7 @@ struct FakeMergeLlm {
     calls: Arc<AtomicUsize>,
     saw_schema_field: Arc<AtomicUsize>,
     cancel_after_first: Option<DreamCancel>,
+    edit_during_merge: Option<(Wiki, WorkspaceId, ProjectId, String)>,
 }
 
 impl FakeMergeLlm {
@@ -55,6 +56,7 @@ impl FakeMergeLlm {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_schema_field: Arc::new(AtomicUsize::new(0)),
             cancel_after_first: None,
+            edit_during_merge: None,
         }
     }
 }
@@ -94,6 +96,7 @@ impl LlmProvider for FakeMergeLlm {
         let calls = self.calls.clone();
         let saw_schema = self.saw_schema_field.clone();
         let cancel = self.cancel_after_first.clone();
+        let edit = self.edit_during_merge.clone();
         Box::pin(async move {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             // Invariant #7: the merge must be a JSON-schema structured call, and
@@ -110,6 +113,26 @@ impl LlmProvider for FakeMergeLlm {
                 && let Some(cancel) = cancel
             {
                 cancel.cancel();
+            }
+            // The merge has read every source before this provider call. A
+            // user correction here must not be replaced by that old snapshot.
+            if let Some((wiki, ws, proj, path)) = edit {
+                wiki.write_page(WritePageRequest {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(&path).unwrap(),
+                    frontmatter: serde_json::json!({"title": "Fresh correction"}),
+                    body: FRESH_CORRECTION.into(),
+                    tier: Tier::Semantic,
+                    pinned: true,
+                    title: None,
+                    admission_ctx: None,
+                    author_id: None,
+                    actor: ActorContext::anonymous(),
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
             }
             let prompt = request
                 .messages
@@ -356,6 +379,117 @@ const K8S_A: &str = "Kubernetes pod scheduling node selector affinity rules for 
      autoscaler deployment on the staging namespace were tuned for the unique setting max-nodes-42.";
 const K8S_B: &str = "Kubernetes pod scheduling node selector affinity rules for the cluster \
      autoscaler deployment on the staging namespace were tuned for the unique setting max-nodes-99.";
+
+const FRESH_CORRECTION: &str =
+    "Fresh user correction: this semantic, pinned page must remain current.";
+
+async fn concurrent_member_write_skips_whole_cluster(edit_survivor: bool) {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for path in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, path, COLD_DAYS);
+    }
+    let cfg = dream_on();
+    let mut llm = FakeMergeLlm::new();
+    let plan = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &cfg,
+        &DreamCancel::new(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    let merge = &plan.merges[0];
+    let (edited, peer) = if edit_survivor {
+        (&merge.survivor, &merge.merged[0])
+    } else {
+        (&merge.merged[0], &merge.survivor)
+    };
+    let peer_body = latest_body(&fx, peer);
+    let peer_id = fx
+        .store
+        .reader
+        .latest_page_id_by_ids(fx.ws, fx.proj, peer.clone())
+        .await
+        .unwrap();
+    llm.edit_during_merge = Some((fx.wiki.clone(), fx.ws, fx.proj, edited.clone()));
+
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &cfg,
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(report.clusters_considered, 1);
+    assert_eq!(
+        report.clusters_merged, 0,
+        "a changed member refuses the whole cluster"
+    );
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.pages_rewritten, 0);
+    assert_eq!(report.pages_superseded, 0);
+    assert!(report.merges.is_empty());
+    assert_eq!(latest_body(&fx, edited), FRESH_CORRECTION);
+    let fm = latest_frontmatter(&fx, edited);
+    assert_eq!(fm.get("tier"), Some(&serde_json::json!("semantic")));
+    assert_eq!(fm.get("pinned"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        fx.wiki
+            .read_page(fx.ws, fx.proj, &PagePath::new(edited).unwrap())
+            .unwrap()
+            .body,
+        FRESH_CORRECTION
+    );
+    assert_eq!(latest_body(&fx, peer), peer_body);
+    assert_eq!(
+        fx.wiki
+            .read_page(fx.ws, fx.proj, &PagePath::new(peer).unwrap())
+            .unwrap()
+            .body,
+        peer_body
+    );
+    assert_eq!(
+        fx.store
+            .reader
+            .latest_page_id_by_ids(fx.ws, fx.proj, peer.clone())
+            .await
+            .unwrap(),
+        peer_id
+    );
+    assert_eq!(
+        superseded_row_count(&fx),
+        1,
+        "only the user correction superseded a page"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_survivor_write_skips_whole_cluster() {
+    concurrent_member_write_skips_whole_cluster(true).await;
+}
+
+#[tokio::test]
+async fn concurrent_loser_write_skips_whole_cluster() {
+    concurrent_member_write_skips_whole_cluster(false).await;
+}
 
 /// B2: flag ON — the near-duplicates collapse to one LLM-rewritten survivor; the
 /// survivor keeps every source fact; the loser is superseded (reachable); the

@@ -13,6 +13,679 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Project search links now use the project's current stored name after
+  resolving a canonical or legacy key. Results, breadcrumbs, and the scope
+  selector stay on that project without renaming it (#1875).
+- The CJK index backfill (V87) now also repairs a page or observation stored at
+  rowid `i64::MIN`. Its exclusive initial cursor skipped that one valid SQLite
+  rowid; the inclusive cursor now covers both rowid extremes (#1873).
+- Bounded the SQLite read pool to four in-flight reads. Bursts of concurrent
+  work now wait for a connection asynchronously instead of creating hundreds
+  of blocking threads and long-lived read transactions that starve the server
+  and hold back WAL checkpoints (#1866).
+- Refreshed existing ai-memory-owned OpenCode, OpenCode 2, OMP, Pi, and
+  OpenClaw generated TypeScript integrations during `ai-memory upgrade` using
+  the newly installed binary's templates, while leaving absent and user-owned
+  installs untouched (#1869).
+- The web UI's root operator now sees every user's sessions in a project's
+  Sessions, Agents and Token usage tabs, on each agent's page and on each
+  session's page, and so do the `/api/v1` session list and observations
+  routes. The dashboard counted every user's sessions while these drilldowns
+  listed only root's own, so on a shared server most counted sessions could
+  not be opened. Other users still see only their own sessions plus shared
+  ones (#1867).
+
+- `backfill --session <id>` now finds an explicitly named native session beyond
+  the newest 200-session listing, instead of reporting a successful empty import.
+  Exact lookups retain the adapter's checkout and top-level-session checks;
+  automatic enumeration remains bounded (#1874).
+- Excluded Codex's generated approval-review transcripts and background
+  suggestion prompts from transcript backfill and profile harvesting, and
+  kept a hand-reworded profile page attached to its ledger topic even when a
+  public page write drops the harvester metadata, preventing `-2` duplicates
+  (#1863).
+- Matched Claude Code's UTF-16 project-folder encoding for astral characters
+  and its hashed 200-character limit, so transcript discovery and token-usage
+  backfill find sessions from emoji and very long checkout paths (#1864).
+- Claude Code backfill-close now finds transcripts for project paths that
+  contain dots, underscores, spaces, or non-ASCII characters, so an abandoned
+  session's token usage is retained when its synthetic `session-end` is
+  captured (#1858).
+- Kept the trailing `#` of `memory_patch_page` headings such as `## C#`
+  unless a space or tab comes before it, as CommonMark does. They were
+  listed and matched without it, so naming one as written failed, `## C`
+  and `## C#` collided, and `add_section` wrote `## F` for `## F#` (#1859).
+- Documented four keys added in 3.3.0 that the shipped `config.default.toml`
+  and `docs/config-properties.md` left out: `rerank_timeout_secs`,
+  `[run] exit_prompt`, `[query_answer] max_context_tokens` and
+  `[auto_improve.eval] builtin` (#1861).
+
+## [3.3.0] - 2026-10-29
+
+### Added
+
+- Added `[ingest] record_tool_names` (`AI_MEMORY_INGEST__RECORD_TOOL_NAMES`),
+  off by default. When it is on, each tool call keeps its own name, so a
+  Claude Code shell call is stored as `tool non-file: Bash` instead of
+  `tool non-file`. A `Skill` call also keeps the skill it ran, and an `Agent`
+  call keeps its subagent type. Session pages count calls by name and
+  handoffs list them by name. Only short identifiers are kept, never a tool's
+  arguments, and a call that a capture policy reduced to metadata stays
+  unnamed (#1851).
+
+- `global_scope_hits` now include their workspace, project, and global scope,
+  and `memory_read_page` accepts `scope: "global"`. Supplemental global search
+  results can therefore be read directly without risking a same-path lookup in
+  the caller's active project (#1802).
+
+- Added `--project-id` to managed launches and checkout-local discovery to
+  recover populated legacy name collisions without moving or merging history.
+  An interactive launch offers authorized project choices and remembers the
+  selection for that server and checkout. Resumes reuse the binding, and
+  ID-selected runs keep startup context and hook capture in the selected scope
+  after checking current access, run ownership and native session identity.
+  Existing name selectors and legacy runs retain their behavior (#1833).
+
+- Added `ai-memory run --no-exit-prompt`, `[run] exit_prompt = false`, and
+  `AI_MEMORY_RUN_EXIT_PROMPT=false` to skip the switch/rerun menu after a
+  successful interactive session. The menu remains enabled by default (#1776).
+
+- `ai-memory merge-project --workspace <w> --from <source> --into <target>`
+  losslessly joins two project identities inside one workspace. Its default is
+  an exact dry run; `--confirm` re-stamps page history, sessions, observations,
+  handoffs, embeddings and managed workstreams in one writer transaction, then
+  removes the source project. Same-path pages get a new target version that
+  appends the source body behind an `ai-memory:merged-from` marker while both
+  prior histories remain restorable. The target frontmatter wins, a one-sided
+  expiry is removed, and the combined page is flagged stale for consolidation.
+  `restore-page --page-id <uuid>` restores either retained history even after
+  the source identity is removed. Open sessions and live managed runs refuse
+  the merge (#1645).
+
+- `audit-contamination` now reports projects in one workspace whose names
+  collide after Unicode compatibility decomposition, case folding, and
+  removal of non-spacing marks. Findings distinguish case from accent
+  differences and include page/session counts plus last activity (#1645).
+
+- Cross-project messages can carry an optional epistemic `nature` (`unknown`,
+  `measured`, `reported`, or `inferred`) and bounded supporting `evidence`.
+  The server refuses a `measured` send without non-empty evidence; existing
+  messages and callers remain `unknown` by default (#1428).
+
+- Added `memory_patch_page` for atomic, heading-anchored edits to an existing
+  Markdown page without re-emitting its body or metadata. It requires the
+  page's current `page_id`; section replacement additionally requires the
+  bounded SHA-256 token returned by `memory_read_page`. Missing, duplicate or
+  fenced-code headings, stale tokens, conflicting edits, failed admission and
+  concurrent writes leave the page unchanged. The typed TypeScript client
+  exposes the same contract as `pages.patch` (#1697).
+
+- Added an offline `ai-memory-eval abstention` benchmark with versioned
+  clean-room answerable, hard-negative, conflicting, partial and
+  missing-channel fixtures; raw lexical/score/density/belief signals;
+  FSR/FAR/coverage threshold sweeps with undefined denominators preserved;
+  optional reuse of pinned LongMemEval `*_abs` cases; and optional structured
+  LLM answerability through the existing QA provider path. Conflicting and
+  partial cases remain separate from binary ground truth, no threshold is
+  presented as calibrated, and production runtime behavior is unchanged.
+  The retrieval evaluator now also parses production's structured
+  `{text,citations}` answer shape instead of a stale string (#1717).
+
+- Added `[briefing] inject_on_subagent_start` to `.ai-memory.toml`. A project
+  that sets it hands each `claude-code` subagent the project brief when the
+  subagent starts: the same pinned, `_rules/` and `_slots/` brief that
+  `inject_on_session_start` adds at session start, kept within `max_chars` and
+  within the 10,000-character limit of that agent's hook context. The hook
+  reads it from a new read-only `GET /brief`, which resolves and authorizes the
+  project as `/handoff` does but never reads or claims a handoff, so a subagent
+  cannot take its parent session's baton. A server without the route answers
+  404 and the subagent starts as before. The native hook and the
+  `hooks/claude-code` shell and PowerShell scripts deliver it, and every marker
+  parser treats the key as a settings boundary. It is off by default (#1715).
+
+- Added an optional `[query_answer] max_context_tokens` admission budget for
+  answer synthesis. It preserves retrieval hits, reports omitted or clipped
+  evidence, prioritizes known newer corrections, prefers whole snippets and
+  clips only complete trailing sentences or statements into leftover space. It
+  skips the model when no meaningful evidence fits. The default
+  remains disabled (#1684).
+
+- `GET /admin/status` and `ai-memory status --json` now carry a
+  `consolidation` block: the queue counts plus up to 20 `failed_sessions`
+  (`session_id`, `attempts`, `failed_at_us`, scrubbed `last_error`), newest
+  first. A consolidation run that gives up after its retries now has a
+  machine-readable record with the session ids needed to re-run it, instead of
+  only a journal line and the `/health` panel's count — which also resets with
+  the process. The web health panel's own view stays counts-only, and an older
+  server's status shape is unchanged (#1692).
+
+- Added the bundled `coding-v1` retrieval-evaluation corpus for offline checks
+  of decision rationale, resolved-error causes, correction evidence, and late
+  session details. It reuses the existing scorer and A/B reports; it measures
+  evidence retrieval, not semantic answer correctness or handoff behavior (#1686).
+
+- `[auto_improve.eval] builtin = "structure"` runs the eval gate's structural
+  checks in process, so the gate needs no interpreter, no scorer script inside
+  the container and no timeout to hit. It checks an H1, an upper-case
+  `TODO`/`TBD` placeholder (a hard failure), a `##` section and a list of steps
+  for `procedures/`, and text beyond the heading within 2,400 characters for
+  `_rules/` — never a section name or a wording, so the wiki's language does
+  not matter. `eval_results` records `checker_name = "builtin:structure"`.
+  `builtin` and `command` are mutually exclusive; `command` is unchanged for
+  project-specific scorers (#1638).
+
+- `ai-memory llm-test --server` probes the server's own configured provider
+  instead of building one from the caller's environment, through a new
+  root-only `POST /admin/llm-test`. The retry hint that `status` and the health
+  panel print now names it: with the server in a container or on another host
+  its keys exist only there, so the old client-side hint failed with "no API
+  key" or a provider `400` while the server was healthy. The probe runs one
+  fixed short prompt, reports provider, model, latency and the error class, and
+  scrubs the provider's message before printing it (#1639).
+
+- Added `[handoff] deliver_on_session_start = false` to `.ai-memory.toml`. A
+  project that sets it no longer gets its handoff, or the continuity notice, at
+  session start; the handoff is still created when the session ends and stays
+  open for `memory_handoff_accept`. The native hook, the shell and PowerShell
+  scripts and the generated TypeScript integrations send `handoff=0` only when
+  the value is explicitly falsy (#1621).
+
+- Added first-party Qoder CLI/IDE lifecycle and MCP support. Both installers
+  merge into `~/.qoder/settings.json`: `install-mcp --client qoder` writes a
+  sessionless stdio bridge, while `install-hooks --agent qoder` registers the
+  eight documented memory-bearing events as native commands. Session start
+  delivers a pending handoff through `hookSpecificOutput.additionalContext`,
+  prompt/tool capture uses Qoder's Claude-shaped payloads, and a missing hook
+  `cwd` falls back only to `QODER_PROJECT_DIR`. Setup detects `~/.qoder`,
+  uninstall removes both entries, and agent backups include its settings and
+  shared AGENTS-compatible skills/instructions (#1611).
+
+- Profile writes now return `digest_warning` when the selected summary,
+  abstract, or prose statement exceeds the 240-byte session-start digest
+  limit. The write still succeeds, but its author can shorten the summary
+  instead of discovering the truncation only in a later session (#1609).
+
+- Added project routing for the named profiles of a multiplexing Hermes
+  gateway. The gateway exports only the default profile's `terminal.cwd`, so
+  every other profile's events used to fall back to the gateway's own working
+  directory and all its bots landed in one project. A gateway event of a named
+  profile now routes by an `.ai-memory.toml` placed in that profile's Hermes
+  home (`~/.hermes/profiles/<name>`, or under the gateway's `HERMES_HOME`), and
+  that marker's capture exclusions and server profile apply. A profile without
+  such a marker keeps the old behavior. The profile name is checked against
+  Hermes' profile-id pattern before it is used as a path (#1597).
+
+- Added Hermes Agent hook consent to `ai-memory doctor`. Hermes runs a shell
+  hook only when that exact command is approved in the home's
+  `shell-hooks-allowlist.json`, and each profile under
+  `~/.hermes/profiles/<name>` keeps its own allowlist. A profile with the
+  ai-memory hooks in `config.yaml` but no approvals captured nothing, and its
+  gateway only logged `not allowlisted — skipped` for each event. `doctor` now
+  reads the root home and every profile, reports which ai-memory hook events
+  each one wires, and warns about every profile whose events are not
+  allowlisted (unless `hooks_auto_accept` is on), with the `hermes -p <name>
+  --accept-hooks` command that approves them. The JSON output gains a `hermes`
+  array. It never writes either file and never prints the hook commands,
+  which can embed a bearer token (#1598).
+
+- Added `AI_MEMORY_RERANK_TIMEOUT_SECS` (`rerank_timeout_secs` in
+  `config.toml`) to set the `memory_query` reranker budget, which was fixed at
+  20 seconds. The default stays 20 and zero is rejected at startup. A hosted
+  provider behind an LLM fallback chain can spend the whole fixed budget on one
+  slow 503 before the next candidate answers, and every such query then keeps
+  its pre-rerank order. ([#1614](https://github.com/akitaonrails/ai-memory/issues/1614))
+
+- `ai-memory status` now shows the client's version next to the server's: a
+  `ai-memory X (client)` line under `ai-memory X (server)`, and `version` in
+  the JSON `client` object. In a split install (native client and hooks, the
+  server in a container or on another host) the two drift apart when only one
+  side is upgraded, and nothing showed it. When they differ in major version,
+  the text report adds a warning to upgrade the older side (#1644).
+
+- Added editing for queued messages in the web inbox. Edit takes a message that
+  is still waiting out of the queue, so no agent can collect it, and opens an
+  inline editor. Saving puts the new text back at the message's original place
+  in the queue, after the usual sanitizer, size caps and `message_send`
+  admission. Discarding returns it unchanged. A held message shows as Editing,
+  with a count above the list and a way back into the editor. Editing needs
+  write access to the mailbox project and to the project the message came from,
+  and a message an agent already collected cannot be edited. Held messages use a
+  new `editing` state (migration V95) that no claim path selects (#1832).
+
+- Added server-side response investigation to the project dashboard. Responses
+  can be filtered by UTC period, exact model, harness, session, turn and tool,
+  with complete pagination, filtered token totals and bounded native turn and
+  tool provenance. The context lives in extra `token_calls` columns and a
+  `token_call_tools` table (migration V94). A response from an older hook keeps
+  its provenance unknown instead of guessed. Filters apply after project
+  authorization and the session-owner check and before counting, ranking and
+  pagination (#1830).
+
+- Added version-specific knowledge evidence to the page and project views:
+  readable source links, declared contradictions, expiration context and an
+  on-page recall recomputation that reuses the original search filters (#1830).
+
+- Added caller-aware installation states and next steps to feature guides and
+  the authenticated `/api/v1/docs/features/status` reference. They
+  separate effective settings from client facts the server cannot know, and
+  administrative settings are masked for callers without admin rights (#1830).
+
+- Replaced the static Inbox label with live, access-filtered pending counts and
+  project links throughout the web navigation. Counts are grouped by workspace
+  and project, hide restricted projects, never consume mail, and link to the
+  pending-only mailbox of the project that has mail. Received inboxes open on
+  pending messages, with older queued requests behind collected history, and the
+  composer shows the current project explicitly (#1830).
+
+- Added bundled product documentation to the web UI and the API. The guides and
+  release notes are compiled into the binary and served at `/web/docs`,
+  `/web/docs/changelog` and `/web/docs/{id}` (a `.md` suffix returns the
+  Markdown). They include searchable feature activation guides, per-release
+  changelogs, and authenticated `/api/v1/docs` JSON and Markdown references for
+  agents. No network access or LLM is needed, and the pages describe shipped
+  capabilities without exposing the running server's configuration or
+  credentials. The source-built Docker image now copies `CHANGELOG.md` for this
+  (#1829).
+
+- Organized project pages into accessible tabs showing one section at a time: Overview,
+  Agents, Token usage, Sessions and Knowledge. The selected tab is kept in the
+  URL (`?tab=agents`), which keeps reload, shared links and browser history in
+  sync, and the tabs support Left, Right, Home and End. Existing
+  `#agents`-style section bookmarks still open the matching tab (#1829).
+
+- Updated the browser inbox composer to default To project to the source
+  project and list only harnesses with captured sessions in the destination
+  workspace and project. It resets a stale recipient when a project changes,
+  and it disables sending, with an explanation, for a project that has no
+  registered agent (#1829).
+
+- Redesigned the responsive web dashboard. It has persistent workspace
+  navigation, searchable project cards, per-agent consumption and coverage, and
+  session drilldowns that show the token totals recorded for each agent (#1828).
+
+- Added a browser inbox at `/web/inbox`. It lists received and sent mail
+  without consuming it. A caller with write access to both the source and the
+  destination project can also queue a message for a registered harness of that
+  project. The text goes through the configured sanitizer and admission before
+  the single writer, and the browser never claims mail or starts an agent.
+  Messages can now be addressed to one harness (`to_agent`, migration V93).
+  `memory_message_pop` and `ai-memory message pop` take an optional `agent`,
+  and only that harness can claim the message, even by id. Existing shared mail
+  (`to_agent = NULL`) behaves as before. A claim from a session-aware client
+  whose routing metadata arrives before its session start was persisted is no
+  longer refused. A browser session opened with the legacy read-only login can
+  send with an explicit write token supplied for that one request and cleared
+  right after, with no browser persistence (#1828).
+
+- Added live, deduplicated response token accounting for Claude Code and Codex.
+  Updated native hooks to send measured response usage on `post-tool-use`,
+  `stop`, `pre-compact` and `session-end`, keeping open-session totals current
+  rather than waiting for session end. Each response is stored once by its
+  native identity in a new `token_calls` ledger (V92). A partial or replayed
+  delivery raises the stored counters column by column and never adds the same
+  response twice. Live extraction reads a bounded 4 MiB transcript tail and
+  reports at most 256 responses per event. Fresh input excludes cache reads, so
+  Codex, whose reports included cached input, is normalized once during the
+  upgrade. The project page has a Token usage panel listing the fifty largest
+  captured responses. It flags contexts of at least 100,000 tokens, outputs of
+  at least 20,000 tokens and responses above three times the project average.
+  Only counters, response identities and model names are kept, and project
+  authorization and session-owner filters apply before ranking or aggregation
+  (#1811).
+
+- Added Light, Dark and System theme controls to the web UI. The choice is
+  stored in the browser and System follows the operating system. Tailwind's
+  dark variant now uses the `dark` class instead of the media query, so a
+  manual choice overrides the system setting (#1811).
+
+- Added a memory dashboard to the read-only web home, using sanitized data:
+  projects, sessions, sanitized capture events, compiled pages, open-session
+  continuity signals and last activity. Project cards separate captured work
+  from compiled pages, so an active hook no longer looks empty just because
+  its sessions have not ended (#1803).
+
+- Added dashboard hook-health counters for accepted, policy-dropped,
+  capacity-shed and rate-limited events. They count events since the process
+  started, and prompt, command, path and payload data is neither persisted nor
+  rendered (#1803).
+
+- Added agent CLI attribution to the project overview to show which harnesses
+  produced a project's memory. The stats card has an "Agents" badge row with session counts per
+  harness, and each Recent Activity entry shows the harness whose session last
+  contributed evidence to that page version. Both are best effort: a page or
+  project with no session evidence shows no badge (#1803).
+
+- Added per-session token accounting. At `session-end` the native hook (Claude Code
+  and Codex) reads the harness's own transcript and reports cumulative input,
+  output, cache-write and cache-read totals. It scans Claude Code's JSONL in
+  full and reads only the tail of Codex's rollout file, since both can reach
+  hundreds of MB. The server stores the totals with a `MAX(existing, reported)`
+  upsert, so a replayed or out-of-order delivery never lowers a total. The
+  project overview page shows a "Tokens" total in the stats card and a Sessions
+  table (agent, start, duration, events, tokens) with the 20 most recent
+  sessions. A session whose harness never reported usage, an unsupported
+  harness or an older client shows no number, never a zero (#1803).
+
+- Added recovery of usage and closure for sessions missing a graceful
+  `session-end`, which previously stayed open without tokens. This usually
+  happens when a paid quota runs out mid-task and the operator switches agents. When a new session
+  starts in the same scope and finds one quiet for at least 15 minutes, the
+  client looks for the old session's own transcript (Claude Code and Codex),
+  reports its usage and closes it with a normal synthetic `session-end`. That
+  is safe if the old session turns out to be live, because a later real
+  `session-end` with more work runs the full end path again. A second, more
+  conservative scheduled sweep closes sessions nobody continues anywhere,
+  after 48 hours without activity in any scope, so `open_session_count` stops
+  growing. It attaches no usage and starts no consolidation, because the
+  server cannot read a client's transcript outside a live hook request (#1803).
+
+- Added optional `max_chars` to `memory_read_page` (default 12000,
+  minimum 500, maximum 64000). It caps the returned body with the same visible
+  truncation marker as `memory_read_session_observations`. The response always
+  includes `truncated` and `total_chars`, which report whether the body was cut
+  and its full size (#1827).
+
+### Changed
+
+- `memory_lint` now reports embedding-band pairs as
+  `similarity_candidate` instead of `contradiction`, and no longer infers that
+  a newer page supersedes an older one from timestamps alone. Explicit
+  `contradicts` edges remain `contradiction` findings (#1685).
+
+- `move-project` now refuses the **copy+purge merge** — the path taken when the
+  destination workspace already holds a project of the same name — unless
+  `--allow-lossy-merge` is passed as well as `--confirm`. That path keeps only
+  the source's latest pages and deletes the project with its sessions,
+  observations, handoffs and older page versions, which `--confirm` written for
+  "move this project" did not say; the refusal answers `409` with the counts it
+  would discard. A true-move (fresh destination, everything preserved) is
+  unchanged, and `merge-workspace`, whose command already says merge, keeps
+  working without the extra flag (#1713).
+
+- `memory_install_self_routing(compact: true)` and `ai-memory
+  install-instructions --compact` now return a block that is actually compact:
+  2.1 KB instead of 5.9 KB, close to the 7.9 KB full block it was supposed to
+  replace. It keeps the rules a session needs without reading anything else
+  (scope selection for session-aware and static clients, managed-run resume,
+  capture, the untrusted-memory trust rule, and where rules belong) and points
+  at the installed `ai-memory-*` Agent Skills for the rest, which it already
+  required to be installed (#1672).
+
+- When the native session linked to a workstream is missing from its store,
+  an interactive `ai-memory run <harness>` now also names the newest session
+  this checkout still holds for that harness and the native selector that
+  resumes it, such as `resume <id>` for Codex. The launch still starts fresh
+  as before; running the same command again with that selector right after
+  the harness name links that session instead (#1654).
+
+- Managed-workstream startup packets now render completed tool calls and
+  results as compact provenance stubs instead of spending the 30,000-character
+  resume budget on raw command output or generated file content. Conversation,
+  checkpoints, compactions, and annotations remain inline; the complete
+  sanitized tool evidence stays searchable in the ledger (#1607).
+
+- The LLM fallback chain now logs its own events. A transient candidate
+  failure logs a warning with that candidate's provider, model, chain
+  position, error class, HTTP status and cooldown, and an info line records
+  each change of the answering candidate. Before, the chain logged nothing,
+  and callers such as the reranker named only the first candidate, so a log
+  could blame the primary for a timeout another candidate caused. Response
+  bodies are never logged (#1628).
+
+- Reduced the default output of `memory_read_session_observations`: `limit`
+  from 50 to 20 and `body_max_chars` from 4000 to 1000. Callers can still raise
+  them to the unchanged ceilings of 200 and 16384. The smaller response reduces
+  token costs for routine "what did this session do" lookups. Updated the
+  retrieval skill with an `order="desc"` recipe using a narrow `kinds` filter
+  and small `limit` and `body_max_chars` values to avoid reading the whole
+  session (#1827).
+
+### Fixed
+
+- Retried an OpenCode version probe briefly when the executable is temporarily
+  busy, covering both an updater replacing the binary and a just-written
+  launcher under parallel load instead of failing the managed launch.
+
+- Fixed live response capture after transcript gaps. Bounded batches now resume
+  from durable enqueue checkpoints, including across hook processes and
+  transcript read windows (#1830).
+
+- Fixed response search, signal filtering and recent ordering so they query all
+  authorized calls before pagination. Response pages are independent, and
+  session detail pages refresh usage live (#1830).
+
+- Updated scoped session reads to treat substantive work after an old end as a
+  resumed session, matching the activity feed while preserving persisted
+  lifecycle watermarks. Completed-only listings exclude those resumed sessions (#1830).
+
+- Moved token model label sanitization before truncation to prevent the size
+  limit from exposing a prefix of private text (#1830).
+
+- Updated release selection on the changelog page to load notes immediately
+  and keep the URL, outline and Markdown reference in sync. The form still submits
+  without JavaScript (#1830).
+
+- Added a read-only recovery snapshot at agent startup when the previous
+  substantive session in the project ended without a `SessionEnd` (quota
+  exhaustion, a killed process, a machine restart). The snapshot is built on
+  demand from at most 64 sanitized observations and capped at 6,000
+  characters, so no rolling copy of the transcript exists. It is scoped to the
+  project and owner, leaves out the receiving session, keeps the
+  untrusted-memory boundary, and never closes or claims the source, which may
+  be a legitimate parallel agent. It skips work a handoff already covers and
+  never mixes another live session's transcript into a delivered handoff.
+  Normal single-use handoffs and managed workstream packets are unchanged
+  (#1803).
+
+- Excluded Claude Code's synthetic cross-session messages and plugin-submitted
+  prompts from cross-project profile harvesting, and removed a leading
+  side-agent quote while retaining the user's words after it. Generated text
+  can no longer become a standing preference attributed to the user (#1855).
+
+- Serialized mutating wikisync runs per destination across their full
+  read/plan/write lifecycle, so overlapping exports no longer race on the
+  shared state temporary file or apply plans from the same baseline (#1847).
+
+- Bounded the wiki append-versus-commit concurrency regression so filesystem
+  scheduling cannot turn its background writers into an unbounded fsync
+  workload on macOS, while every round still contends with a commit (#1850).
+
+- Fixed false command timeouts in the macOS menu app when CLI output or
+  diagnostics exceeded a pipe buffer (#1845).
+
+- Fixed the macOS menu app's LaunchAgent installation and restart checks for
+  app and home-directory paths containing XML characters such as `&` (#1844).
+
+- OpenCode 1.x `task` subagents no longer claim the pending handoff or leave
+  one behind. OpenCode runs each subagent in a child session, which the
+  generated plugin took for a top-level one: the subagent's first model call
+  claimed the newest open handoff in the checkout, and the end the plugin
+  posts for it when OpenCode exits carried no subagent marker, so the user's
+  next session got the subagent's handoff instead of the top-level session's.
+  The plugin now records a child session's parent from OpenCode's session
+  events, skips the claim for it and marks its end on every close path, a
+  subagent the task tool resumes by `task_id` included (#1842).
+
+- Preserved `title:` and `body:` filters inside parenthesized CJK searches,
+  so grouped queries no longer include matches from other columns (#1846).
+
+- Made `auth login --timeout-secs` stop device-authorization polling requests
+  and waits at the deadline for OpenAI OAuth, GitHub Copilot and OIDC device
+  login. Late polling results no longer reach credential storage; provider
+  intervals and `slow_down` backoff are preserved. OpenAI's subsequent exchange
+  of an authorized code keeps its own HTTP request timeout (#1848).
+
+## [3.2.10] - 2026-10-29
+
+### Changed
+
+- Documented the settings that `config.default.toml` had left out, and added
+  `docs/config-properties.md`, a reference table of every key `config.toml`
+  accepts with its default, environment variable and purpose. The template now
+  describes the `llm_*` keys (including `llm_compat_strict` and
+  `[[llm_fallbacks]]`), the embedding endpoint and prefix keys,
+  `tcp_keepalive_secs`, `base_path`, `release_base_url`, `cors_allow_origins`,
+  `consolidate_on_session_end`, `backfill_on_start`, `run_autowire`,
+  `claude_true_yolo`, the `contradiction_band_*` keys, and the `[run]`,
+  `[hook_spool]`, `[handoff]`, `[maintenance]`, `[dream]`, `[retrieval]`,
+  `[search.fts]`, `[profile]` and `[[admission_webhooks]]` sections. It also
+  lists the remaining keys of `[decay]` (including `[decay.half_life_days]`),
+  `[consolidation]`, `[auto_improve]`, `[auto_scope]` and `[auth]`, and the
+  `[auto_improve.scheduler.experience_entropy_filter]` table. The new entries
+  are all commented examples, and keys with a built-in default show that
+  default. `AGENTS.md` now requires a new config key to land in both files.
+
+### Fixed
+
+- Made the per-session auto-improve reviewer, the cross-session experience
+  pass, the dream merge and the lint contradiction pass write their prose in
+  the dominant natural language of their input, as the consolidation prompts
+  already did. Their English-only system prompts gave no language rule, so
+  sessions held in Portuguese could still produce English `gotchas/`,
+  `decisions/` and `concepts/` pages and English lint findings. Code,
+  identifiers, paths, patch anchors, evidence quotes, JSON keys and enum
+  values stay verbatim (#1839).
+- Pinned `zip` 8.6 to upstream's official security-backport commit for
+  GHSA-m665-v7pm-7grj. Candle still requires the yanked 8.x line, so the
+  immutable backport keeps fresh builds resolvable while adding the header
+  consistency hardening shipped in `zip` 9.0.5.
+- Updated `libz-sys` to 1.1.31 so its build probe no longer records the build
+  environment, including possible secrets, in Cargo target artifacts
+  (RUSTSEC-2026-0418).
+- Imported every Claude transcript left behind by `/clear`, oldest first,
+  before finalizing the managed run on the newest session. Pre-clear turns now
+  retain their native-session provenance instead of disappearing from the
+  workstream ledger (#1797).
+- Kept purge-session tombstones out of automatic hollow-project cleanup, so
+  an old otherwise-empty project cannot lose replay protection immediately
+  after its session is purged (GHSA-pphw-hm98-3wh4).
+- Made Crush transcript cursors revision-aware within their one-second native
+  timestamp bucket. Same-second inserts and edits are now imported exactly
+  once, while captured recovery endpoints still exclude later revisions
+  (#1813).
+- Made TypeScript SDK capability initialization client-owned with independently
+  cancellable waits, so one caller cannot abort another caller's shared probe
+  and a later caller observes its own cancellation promptly (#1815).
+- Initialized MCP sessions in the document and agentmemory importer routes,
+  retaining validated session IDs and sending `notifications/initialized`, so
+  conditional imports work with both stateless and `--http-stateful` servers
+  (#1836).
+- Explicit `ai-memory run --fresh claude` launches now expose the previously
+  linked Claude session through `AI_MEMORY_PREVIOUS_SESSION_HISTORY`, including
+  when the two sessions live under different Claude config homes (#1789).
+- Replaced the misleading hook-refresh-only warning after a linked Codex run
+  fails to acknowledge context with a `/new`-specific ownership warning. The
+  wrapper does not adopt the unlinked thread because Codex supplies no trusted
+  parent relationship (#1788).
+
+- Sorted recent page lists by timestamp rather than RFC3339 text, so updates
+  with different fractional-second precision appear in chronological order
+  in the legacy recent API, project activity, folder previews and namespace
+  listings. Kept title-sort and equal-timestamp path tie-breaks (#1247).
+
+- Fixed `restore` replacing live data when a backup without `config.toml`
+  contains API keys that the configured pepper cannot verify. It now refuses
+  before the swap, preserving the live wiki, database and config, and names
+  the original configuration as the remedy (#1495).
+
+- Preserved explicit DOCX/PPTX line breaks and DOCX tabs in document imports
+  when XML uses paired tags, including formatted PowerPoint breaks in slides
+  and speaker notes. DOCX carriage returns now also keep adjacent text runs
+  on separate lines instead of joining their words. Paragraph tab-stop
+  definitions no longer insert spurious tabs into the extracted text (#1786).
+
+- Kept a wiki-sync server page when its repository file was recreated after
+  the sync planned a deletion. `sync --propagate-deletes --apply` now rechecks
+  local absence before sending the delete, preserves the page's baseline and
+  reports the changed file for the next sync, including with `--prefer repo`
+  (#1787).
+- Transcript imports (`backfill`, the `run` ledger, `recover`) now drop Codex
+  memory-writing agent runs by the same signals the live hook uses: the
+  checkout cwd, an event's recorded cwd, or a Codex user prompt that opens
+  with `## Memory Writing Agent`. A custom `CODEX_HOME` whose last path
+  component is not `.codex` previously reimported those sessions (#1790).
+- Admission webhook HTTP requests now follow redirects only within the
+  configured `scheme://host:port` origin (up to 10 hops) and fail on
+  cross-origin redirects without forwarding page payloads or applying foreign
+  response mutations, surfacing the redirect refusal cause in logs and
+  `reject`-policy errors (#1794).
+- `ai-memory project access` and `ai-memory project grants` now refuse empty
+  or whitespace-only `--workspace`, `--project`, and (for access) `--mode`
+  values before sending any request to the server. These commands take
+  required names and never call `resolve_scope`, so the #1774 choke point
+  did not cover them (#1791).
+- `ai-memory user grant` and `ai-memory user revoke` now refuse empty or
+  whitespace-only `--user`, `--workspace`, `--project`, and (for grant)
+  `--level` values before sending any request to the server. These commands
+  take required names and never call `resolve_scope`, so the #1774 choke
+  point did not cover them (#1792).
+- Stopped the lifecycle relay from treating an oversized HTTP response as a
+  transport failure and immediately resending its batch. A response beyond the
+  64 KiB acknowledgement cap now retains its HTTP status, stops the flush, and
+  keeps unacknowledged events pending, including on HTTP 429 backpressure (#1799).
+- Decoded WebVTT cue character references before document-import sanitization,
+  preserving literal escaped tags and applying the existing text-size limit
+  to the decoded text. SRT extraction is unchanged (#1800).
+- Preserved native OIDC hook-spool entries when the POSIX or PowerShell script
+  bundle drained the shared queue. Scripts now leave those entries for native
+  credential resolution instead of posting them anonymously and retiring them
+  on a 2xx or 401 response; static, anonymous and legacy entries still drain
+  normally (#1801).
+- Refused backup restores with a missing or invalid gzip trailer before
+  replacing live data, even when all tar entries were readable (#1805).
+- Kept separate pre-migration archives when installations share a backup
+  destination and start in the same second, instead of overwriting an
+  existing installation's snapshot (#1806).
+- Restored the previous wiki file when `restore-page` could not commit its
+  SQLite update, including a rejected case-colliding historical path. Restores
+  now share the page writer's lock through conformance, file replacement and
+  indexing so a concurrent write to that same path cannot leave disk and
+  SQLite disagreeing (#1807).
+- Kept concurrent page edits current during opt-in cold-cluster dedup and dream
+  merges. Each write batch now skips if a selected source version changed,
+  preserving the newer body, tier and pin along with unchanged peers (#1808).
+- Dropping the final store writer handle now finishes when its command queue
+  is full. Accepted writes still drain before the writer thread exits, including
+  when callers have cancelled their waits (#1809).
+
+- Scheduled empty-project cleanup now preserves projects that have sent or
+  received agent messages, including claimed/cancelled history, so it cannot
+  silently delete their inbox/outbox through a project cascade (#1810).
+
+- Fixed `server add` rejecting valid inline tables in `servers.toml`, including
+  token rotations and URL changes. Updates now accept the same table forms as
+  reads and removal, preserving registered roots and other profiles (#1812).
+- Kept OpenCode V1 failed tool results in the managed workstream ledger,
+  including their visible error text and error status, instead of importing
+  only the call and silently dropping the failure reason (#1814).
+- Initialized the TypeScript SDK's MCP session before the first `callTool`,
+  fixing HTTP 422 responses with `--http-stateful`. Raw calls still skip
+  schema checks, and later wrapped calls reuse the session (#1816).
+- Preserved literal reasoning tags and their contents inside structured JSON
+  strings when parsing OpenAI-compatible tolerant replies and Anthropic text
+  replies. Reasoning blocks outside the JSON are still removed, including
+  when a strict OpenAI-compatible request falls back to tolerant parsing (#1817).
+- Disabled HTTP redirect following on the native hook client (`build_client`)
+  so 3xx responses from SSO gateways, captive portals, or proxies fail closed
+  instead of following to a 200 OK login page, which dropped spooled hook events
+  and injected login HTML into agent handoff context (#1818).
+- Supported singular units (`day`, `week`, `month`) and weeks in
+  `parse_since_to_epoch` for git commit filtering during consolidation
+  bootstrapping, trimmed surrounding whitespace, rejected negative intervals,
+  and used checked arithmetic to prevent integer overflow panics (#1820).
+- Kept OpenCode 2 failed tool results in the managed workstream ledger,
+  including their visible error text and error status, instead of importing
+  only the call and recording a status-error loss (#1823).
+- Imported OpenCode 2 compaction session messages into the managed workstream
+  ledger (`summary`, or `error.message` on a failed compaction) instead of
+  dropping them with no event and no loss (#1824).
+- `memory_query(global=false)` now overrides a project's
+  `[recall] default_global` marker and uses the resolved project's normal
+  search. Previously the explicit opt-out still returned cross-project
+  `global_hits` and disabled project-only query options (#1835).
+- Honored `base_path` from `config.toml` when mounting the HTTP server, so
+  thin clients and the web UI use the same prefix. Explicit flag and environment
+  overrides, including an empty value to serve at the root, kept their precedence (#1837).
 - Refused empty and whitespace-only `--workspace` and `--project` flags at the
   shared CLI scope-resolution choke point (`resolve_scope`,
   `resolve_scope_noting_marker_project`, `resolve_scope_with_marker`, and
@@ -29,6 +702,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `agent_id`, which the router treats like an OpenCode child session.
   `drop_subagent_captures` now covers OMP subagents too, and an advisor's tool
   calls stay with the session they advise (#1779).
+- The openai-compat strict path now treats an engine 501 structured-output
+  rejection as a capability gap and falls back to the tolerant parser. It used
+  to return the 501 as a transient failure, so the bootstrap chunk retry loop
+  repeated a call that failed the same way each time.
 
 ## [3.2.9] - 2026-10-27
 
@@ -2911,7 +3588,9 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.9...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.0...HEAD
+[3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
+[3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10
 [3.2.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.9
 [3.2.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.8
 [3.2.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.7

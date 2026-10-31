@@ -3,21 +3,25 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
+mod agents;
 mod api;
+mod documentation;
 mod graph;
 mod health;
 mod history;
+mod inbox;
 mod index;
 mod login;
+mod notifications;
 mod page;
 mod pending;
 mod project;
-mod search;
+pub(crate) mod search;
 mod session;
 pub(crate) mod statics;
 mod workstreams;
@@ -114,6 +118,18 @@ pub(crate) async fn require_admin(
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index::handler))
+        .route("/docs", get(documentation::index))
+        .route("/docs/{slug}", get(documentation::page))
+        .route("/inbox", get(inbox::handler))
+        .route("/inbox/notifications", get(notifications::handler))
+        .route("/messages", post(inbox::send))
+        .route("/messages/{id}/edit", post(inbox::begin_edit))
+        .route("/messages/{id}/save", post(inbox::save_edit))
+        .route("/messages/{id}/release", post(inbox::release_edit))
+        .route(
+            "/w/{workspace}/{project}/agents/{agent}",
+            get(agents::handler),
+        )
         .route("/graph", get(graph::global_handler))
         .route("/w/{workspace}/{project}", get(project::handler))
         .route(
@@ -143,6 +159,7 @@ pub(crate) fn build_public_auth(cfg: Arc<HtmlAuthRedirectConfig>) -> Router {
         .route("/change-password", get(login::change_password))
         .route("/static/tailwind.css", get(statics::tailwind_css))
         .route("/static/logo.png", get(statics::logo))
+        .route("/static/{font}", get(statics::font))
         .with_state(cfg)
 }
 

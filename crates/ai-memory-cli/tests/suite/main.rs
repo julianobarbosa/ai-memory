@@ -6,6 +6,7 @@
 //! so a new file must be declared here (`scripts/check-test-suites.*` enforces it).
 
 mod auth_default_e2e;
+mod auth_device_timeout;
 mod autoscope_env;
 mod backfill_dry_run;
 mod backfill_e2e;
@@ -26,6 +27,7 @@ mod hook_drain;
 mod hook_payload;
 mod install_script;
 mod jail_toggles_e2e;
+mod live_token_usage_e2e;
 mod marker_scope;
 mod mcp_bridge_stdio;
 mod message_e2e;
@@ -38,6 +40,7 @@ mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
 mod run_offline;
+mod serve_config;
 mod serve_shutdown;
 mod server_profiles;
 mod service_host_windows;

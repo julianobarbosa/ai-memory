@@ -15,6 +15,7 @@ pub mod auth;
 pub mod human_auth;
 pub mod identity;
 pub mod metrics;
+mod page_patch;
 pub mod self_service_keys;
 mod server;
 pub mod session_management;

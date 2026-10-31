@@ -260,6 +260,81 @@ fn external_capture_still_delivers_the_compaction_recap() {
     }
 }
 
+/// The subagent brief is context delivery too: under an external capture
+/// owner, a repository that opted into `[briefing] inject_on_subagent_start`
+/// still hands the subagent its brief, and the event itself is
+/// left to the owner.
+#[test]
+fn external_capture_still_delivers_the_subagent_brief() {
+    const BRIEF: &str = "SUBAGENT_BRIEF_SENTINEL";
+    let guard = tempfile::tempdir().unwrap();
+    let root = guard.path().to_path_buf();
+    std::fs::write(
+        root.join(".ai-memory.toml"),
+        "[briefing]\ninject_on_subagent_start = true\n",
+    )
+    .unwrap();
+    let (server, stop, served) = serve_one_request(BRIEF);
+
+    let mut child = hermetic(BIN)
+        .args(["--data-dir"])
+        .arg(root.join("data"))
+        .args([
+            "hook",
+            "--agent",
+            "claude-code",
+            "--event",
+            "subagent-start",
+            "--server-url",
+            &server,
+        ])
+        .env("AI_MEMORY_HOME", &root)
+        .env("HOME", &root)
+        .env("AI_MEMORY_CAPTURE_OWNER", "example.runtime")
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({
+                "session_id": "external-subagent-test",
+                "cwd": root,
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-1",
+                "agent_type": "Explore"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    stop.store(true, Ordering::SeqCst);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let request = served
+        .join()
+        .unwrap()
+        .unwrap_or_else(|| panic!("the brief GET never reached the server; stdout was {stdout:?}"));
+    assert!(request.starts_with("GET /brief?"), "{request}");
+    let envelope: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        envelope["hookSpecificOutput"]["hookEventName"],
+        "SubagentStart"
+    );
+    assert_eq!(envelope["hookSpecificOutput"]["additionalContext"], BRIEF);
+    let spooled = std::fs::read_dir(root.join("data/hook-spool"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(spooled, 0, "the event must be left to its capture owner");
+}
+
 mod slow {
     use super::*;
     use std::process::Command;

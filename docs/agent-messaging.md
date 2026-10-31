@@ -16,20 +16,29 @@ ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
 
 ## The model
 
-- A message is addressed to a **project**, not a person. Any session working in
-  the recipient project can pop it. (Knowledge is shared; the pop is the
-  claim-once baton, the same rule handoffs follow.)
+- A message is addressed to a **project**, with an optional harness recipient
+  such as `codex` or `claude-code`. Any session in the recipient project can
+  pop a shared message; only the named harness can claim an addressed message.
+  Knowledge is shared, while messages and handoffs are claimed once.
 - **Claim-once queue.** A message is `pending` until a session in the recipient
   project pops it (→ `claimed`, exactly once) or the sender cancels it
   (→ `cancelled`). A second pop of the same message returns nothing.
+  Claimed and cancelled messages remain for audit. Scheduled empty-project
+  cleanup preserves both the sender and recipient while any message remains;
+  an explicit project or workspace purge still removes its messages.
 - **Fail closed on an unknown recipient.** The recipient project must already
   exist (an agent must have run there at least once). A typo is rejected, not
   turned into a dead inbox nobody reads.
 - **Bounded.** Each recipient inbox holds at most 256 pending messages; a full
   inbox rejects new sends.
+- **Epistemic provenance.** A sender may classify a claim as `measured`,
+  `reported`, `inferred`, or `unknown` (the compatibility default). A measured
+  claim is refused unless it includes non-empty supporting `evidence`; both
+  fields are scrubbed, bounded, and shown by inbox list and pop responses.
 
-A wiki page is not a message. `memory_message_send` is the only thing that
-lands in a project's inbox; writing a page into the target project with
+A wiki page is not a message. Agents send through `memory_message_send`, and
+people can use the web composer described below. Writing a page into the target
+project with
 `memory_write_page` stores knowledge there but is never surfaced as mail, so
 a "report" delivered as a page sits unread. When the ask is to send, notify,
 or leave a message for the agent in another project, use
@@ -54,7 +63,10 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 
 Kimi calls `memory_message_send` with `to_workspace: "default"`,
 `to_project: "project-b"`, and a self-contained `body`. Compose the body as a
-complete prompt, because the recipient cannot see project A.
+complete prompt, because the recipient cannot see project A. When the body
+states a direct measurement, also send `nature: "measured"` and evidence such
+as the command, query, `file:line`, or source message id. Relayed claims should
+remain `reported` unless the sender measures them again.
 
 **In Claude (project B), receiving:**
 
@@ -98,7 +110,8 @@ Pass `workspace` + `project` for pop and cancel, and `from_workspace` +
 `memory_briefing`'s `scope` gives, not one derived from the folder or the git
 remote; the server may know the project under a different name. A caller bound
 to its own hook session (`session`) and an explicit scope (`explicit`) proceed
-as before.
+as before. Routing metadata can arrive before the session row exists, and a
+claim records its session only once that row is there.
 
 `memory_message_list` stays read-only and still answers an inferred scope, but
 then always adds `resolved_scope` (workspace and project names), `scope_source`,
@@ -110,6 +123,9 @@ whose mailbox it read.
 ```
 ai-memory message send --to-workspace default --to-project project-b \
     --subject "export endpoint" "Add a /v1/export endpoint that streams NDJSON…"
+ai-memory message send --to-workspace default --to-project project-b \
+    --nature measured --evidence "tests/export.rs:42 (100/100 runs)" \
+    "The export retry test passed 100 times."
 # body may also be piped on stdin:
 echo "…request…" | ai-memory message send --to-workspace default --to-project project-b
 
@@ -257,9 +273,9 @@ comment: Accepting the exception; the flake is already written down.
 `comment` is untrusted input, the same as any popped body. The asker weighs it
 with the user. It does not authorize a command on its own.
 
-A companion could serve a page for this (open questions, options, answer
-buttons, the audit trail) through the public MCP or admin message routes; none
-ships today. The built-in `/web` mailbox stays read-only. See
+The built-in `/web/inbox` can show the text and send an ordinary reply. It does
+not interpret decision options or authorize the action being discussed. A
+structured decision companion is still separate; see
 [companion crates](companion-crates.md).
 
 ### How the asker sees the answer
@@ -297,24 +313,61 @@ orchestrator. Each inbox still holds at most 256 pending messages.
 
 ## In the web UI
 
-The `/web` UI is read-only here too. A project card shows an amber `N inbox`
-badge when messages are pending for that project, and nothing when there are
-none. The home page adds a one-line summary of the total with links to the
-projects holding mail. The project page has a Mailbox section above Recent
-Activity listing up to five pending messages, oldest first, with the subject,
-the sender, a 160-character snippet and the age; when more are pending it says
-"5 of N" and gives the `ai-memory message list --workspace W --project P
---limit 200` command for that project (the CLI lists at most 200 at a time),
-and when none are waiting it says so. A URL that names no project shows an
-empty mailbox, as it shows no pages. The section never pops or cancels: consuming a message stays an agent
-action (`memory_message_pop`), so the claim-once queue is not reachable from a
-browser. Only the inbox is shown; sent mail is still `memory_message_list`
-with `box=outbox`.
+Open Inbox in the workspace sidebar, or Message on a project's agent card.
+Select a project mailbox to see its received or sent history. The list is paged
+at fifty messages, shows queued, collected and cancelled states, and shows each
+body as escaped plain text when you expand the row. Reading never claims or
+cancels a message. "Collected" records the agent's claim; completion of the
+request is not confirmed.
 
-A message is addressed to a project, so anyone who can read that project sees
-it. The sender's name is a separate matter: if the viewer may not read the
-sender's repository the page shows "a project you cannot read" instead of its
-name and does not link it.
+The composer sets To project to the From project by default, and To agent lists
+only harnesses with captured sessions in the destination workspace and project.
+Changing the source resets the destination to that project, so pick another To
+project explicitly to send across projects. Changing either project clears the
+selected agent. A project without registered agents disables sending and
+explains how to register one. Neither coordinate is created if it is missing.
+The sender needs write access to both projects. The configured sanitizer, the
+`message_send` admission webhooks, the audit and the bounded writer queue all
+apply before a send succeeds. Cookie-authenticated browser writes use the
+existing CSRF token. A JSON body, a custom UI header and an origin check stop
+cross-site form sends that ride on cached Basic credentials. The legacy
+GET-only login shows a write-token field, and the operator supplies a token for
+that one message. It goes only in the request header and is cleared whether the
+send succeeds or fails. It is never saved in a cookie, a URL or browser
+storage. Existing human sessions use their normal CSRF authentication and do
+not show the field.
+
+The destination harness is stored as `to_agent`. A matching agent claims the
+message with `memory_message_pop`, passing `agent: "codex"` for example when
+session metadata does not identify the harness, or with
+`ai-memory message pop --agent codex`. Both claim guards enforce the target,
+including a pop by explicit message id. Shared messages from existing MCP and
+CLI senders keep `to_agent: null` and claim as before. The harness selector
+routes a request inside an authorized project. It is not a per-person
+confidentiality boundary.
+
+A queued message can be edited from the Received view. Edit takes it out of the
+queue, so no harness can collect it, and opens its subject and text in an inline
+editor. "Save and requeue" sends the new text through the same sanitizer, size
+caps and `message_send` admission as a new message and puts the message back in
+its original place in the queue. "Discard changes" puts it back unchanged. The
+message keeps its id either way. A message an agent collected in the meantime
+cannot be edited, and the editor says so. Editing needs write access to the
+project that holds the mailbox and to the project the message came from, the
+same access that sending it needed. Held messages show as Editing. A banner above the list counts them and links
+to them; Continue editing and Discard changes work from any tab. Closing an
+editor tab leaves the message held outside the queue until someone saves or
+discards it. The legacy GET-only login cannot
+edit.
+
+Queuing a message does not start or wake an agent, or authorize it to follow
+the request. The recipient checks its inbox independently and evaluates the
+request under the same untrusted-input rules as other cross-project mail. Session-start notices count
+only shared mail and mail addressed to the receiving harness.
+
+A message belongs to its project's mailbox. Readers of that project can read
+it, and a sender or recipient project the viewer cannot read is shown without
+its name. Sending never grants read access to another project's memory.
 
 ## Security — a popped message is untrusted input
 

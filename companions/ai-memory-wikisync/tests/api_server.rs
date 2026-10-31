@@ -1455,6 +1455,75 @@ async fn sync_propagates_deletes_from_an_unchanged_side() {
     );
 }
 
+/// A restored file invalidates the planned repository-side deletion even
+/// though the server's version precondition still holds.
+#[tokio::test]
+async fn sync_keeps_a_server_page_when_its_file_reappears_during_planning() {
+    for prefer in [None, Some(Prefer::Repo)] {
+        let mut page = decision();
+        page.pinned = false;
+        let mut other = page.clone();
+        other.path = "decisions/other.md".to_string();
+        let (addr, fixture) = serve(Fixture::with_pages(vec![page, other])).await;
+        let (_tmp, dest) = temp_dest();
+        sync(addr, &dest).await.expect("first sync");
+        let before = state::load(&dest).unwrap();
+        let original = fixture.page("decisions/db.md").unwrap();
+        let restored = DECISION_FILE
+            .replace("pinned: true\n", "")
+            .replace("Use Postgres.", "Restored with a new repository edit.");
+        fs::remove_file(dest.join("decisions/db.md")).unwrap();
+        fs::remove_file(dest.join("decisions/other.md")).unwrap();
+        // The file is restored after the plan read its absence, while the
+        // server request is in flight, before any delete is sent.
+        *fixture.repository_edit_on_read.lock().unwrap() =
+            Some((dest.join("decisions/db.md"), restored.as_bytes().to_vec()));
+
+        let result = bidi::run(&deleting_args(addr, &dest, prefer), SyncMode::Apply).await;
+        assert!(
+            fixture.page("decisions/db.md").is_some(),
+            "a recreated file must prevent deleting its unchanged server page"
+        );
+        let kept = fixture.page("decisions/db.md").unwrap();
+        assert_eq!(kept.id, original.id);
+        assert_eq!(kept.body, original.body);
+        assert_eq!(
+            fs::read(dest.join("decisions/db.md")).unwrap(),
+            restored.as_bytes()
+        );
+        let after = state::load(&dest).unwrap();
+        assert_eq!(
+            after.pages["decisions/db.md"],
+            before.pages["decisions/db.md"]
+        );
+        let message = result
+            .expect_err("the local race must be reported")
+            .to_string();
+        assert!(message.contains("changed during this run"), "{message}");
+        assert!(message.contains("decisions/db.md"), "{message}");
+
+        // Control: the other file stayed absent, so its deletion proceeds.
+        assert!(fixture.page("decisions/other.md").is_none());
+        assert!(!after.pages.contains_key("decisions/other.md"));
+        assert_eq!(fixture.mcp_deletes.load(Ordering::SeqCst), 1);
+        let calls = fixture.mcp_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0]["arguments"]["path"], "decisions/other.md");
+
+        // Retaining the baseline lets a later sync import the restored edit.
+        sync(addr, &dest)
+            .await
+            .expect("the next sync imports the restored file");
+        assert!(
+            fixture
+                .page("decisions/db.md")
+                .unwrap()
+                .body
+                .contains("Restored with a new repository edit.")
+        );
+    }
+}
+
 #[tokio::test]
 async fn sync_delete_conflicts_follow_prefer() {
     let mut other = decision();

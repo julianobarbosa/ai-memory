@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use super::api::{
     SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS, SESSION_OBSERVATIONS_MAX_LIMIT, cap_body,
-    owner_filter_for,
+    session_owner_filter_for,
 };
 use crate::state::WebState;
 use crate::templates::{SessionObservationRow, SessionView, humanize, project_href, session_href};
@@ -40,6 +40,8 @@ pub(crate) struct SessionQuery {
     /// holds it.
     #[serde(default)]
     pub at: Option<usize>,
+    #[serde(flatten)]
+    pub usage: crate::operations::UsageQuery,
 }
 
 /// Handler for `GET /w/:workspace/:project/s/:session_id`.
@@ -47,9 +49,11 @@ pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project, raw_session)): Path<(String, String, String)>,
     Query(query): Query<SessionQuery>,
 ) -> Response {
+    let owner = session_owner_filter_for(actor, auth);
     let viewer = viewer.map(|axum::Extension(viewer)| viewer.user());
     let scope = match super::resolve_read_scope(&state, viewer, &workspace, &project).await {
         Ok(scope) => scope,
@@ -70,7 +74,7 @@ pub(crate) async fn handler(
             scope.workspace_id,
             scope.project_id,
             session_id,
-            owner_filter_for(actor),
+            owner.clone(),
         )
         .await
     {
@@ -135,7 +139,35 @@ pub(crate) async fn handler(
         .collect();
     let page_href = |offset: usize| format!("{base}?offset={offset}&limit={limit}");
     let last_offset = total_usize.saturating_sub(1) / limit * limit;
+    let calls_query = match query.usage.store_query() {
+        Ok(query) => query,
+        Err(status) => return status.into_response(),
+    };
+    let report = match state
+        .reader
+        .token_usage_report_page(
+            scope.workspace_id,
+            scope.project_id,
+            owner,
+            Some(session_id),
+            calls_query,
+        )
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return internal(error),
+    };
+    let mut token_usage = crate::operations::usage_panel(
+        report,
+        &workspace,
+        &project,
+        &query.usage,
+        &format!("{base}?offset={offset}&limit={limit}"),
+    );
+    token_usage.observation_offset = offset;
+    token_usage.observation_limit = limit;
     let view = SessionView {
+        token_usage,
         workspace: workspace.clone(),
         project: project.clone(),
         project_href: project_href(&workspace, &project),

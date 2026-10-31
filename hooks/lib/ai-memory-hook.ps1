@@ -65,7 +65,7 @@ function Test-AiMemoryMarkerDeclaresSettings {
     }
     if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
     if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
-    foreach ($key in @("default_global", "inject_on_session_start", "max_chars", "contribute", "consume")) {
+    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start")) {
         if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
     }
     return $false
@@ -420,17 +420,18 @@ function Test-AiMemoryTruthy {
 }
 
 # Build `&briefing=<v>[&briefing_budget=<v>]` from the `[briefing]` section
-# of the marker walked up from $Cwd. Returns "" when the repo did not opt
-# in. Used by agents that deliver the compiled project brief once per
-# session (kimi-code, via the first user prompt — kimi discards
-# SessionStart hook stdout) so the server does not recompose the brief on
-# every request. The char-budget clamp is server-side.
+# of the marker walked up from $Cwd, for the opt-in $Key (by default
+# inject_on_session_start; a subagent start passes inject_on_subagent_start).
+# Returns "" when the repo did not opt in. Used by agents that deliver the
+# compiled project brief once per session (kimi-code, via the first user
+# prompt — kimi discards SessionStart hook stdout) so the server does not
+# recompose the brief on every request. The char-budget clamp is server-side.
 function Get-AiMemoryBriefingQuery {
-    param([string] $Cwd)
+    param([string] $Cwd, [string] $Key = "inject_on_session_start")
     if (-not $Cwd) { return "" }
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if (-not $marker) { return "" }
-    $briefing = Get-AiMemoryTomlFlag -File $marker -Key "inject_on_session_start"
+    $briefing = Get-AiMemoryTomlFlag -File $marker -Key $Key
     if (-not (Test-AiMemoryTruthy -Value $briefing)) { return "" }
     $budget = Get-AiMemoryTomlFlag -File $marker -Key "max_chars"
     $qs = "&briefing=$([uri]::EscapeDataString($briefing))"
@@ -589,6 +590,7 @@ function Get-AiMemoryMarkerQuery {
     $identityStyle = $null
     $profileContribute = $null
     $profileConsume = $null
+    $handoffOff = $false
     $aliases = $null
     $identityQuery = ""
     $homeRouted = $false
@@ -629,6 +631,8 @@ function Get-AiMemoryMarkerQuery {
         # what it stored.
         $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
         $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
+        # `[handoff] deliver_on_session_start = false`: sent only when explicitly falsy.
+        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "deliver_on_session_start")) -eq "0"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -662,6 +666,7 @@ function Get-AiMemoryMarkerQuery {
     if ($defaultGlobal) { $qs += "&default_global=$([uri]::EscapeDataString($defaultGlobal))" }
     if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
     if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
+    if ($handoffOff) { $qs += "&handoff=0" }
     return $qs
 }
 
@@ -753,7 +758,8 @@ function Write-AiMemorySpoolEvent {
 # the pass and keeps the remainder for the next one. The per-entry timeout
 # is this bundle's own POST budget. ConvertFrom-Json reads every escape
 # either serializer emits, so entries written by the shell bundle or the
-# native binary drain here too.
+# native binary drain here too, except OIDC entries that need native auth.json
+# credential resolution.
 function Invoke-AiMemoryDrainSpool {
     param([int] $Max = 64)
     try {
@@ -778,6 +784,9 @@ function Invoke-AiMemoryDrainSpool {
         } catch {
             continue
         }
+        # OIDC entries have no inline bearer. The native drain resolves/refreshes
+        # auth.json; an anonymous POST here can retire the event without it.
+        if ($entry.auth_mode -eq "oidc") { continue }
         if (-not $entry.url) { continue }
         $headers = @{}
         $headers["X-AI-Memory-Client"] = "hook-ps"
@@ -1007,7 +1016,10 @@ function Invoke-AiMemoryHook {
         [switch] $BriefingOncePerSession,
         # Grok PostToolUse: wrap a fetched handoff as additionalContext and
         # only fetch once per session. Other events must not set this.
-        [switch] $GrokPostTool
+        [switch] $GrokPostTool,
+        # `claude-code` SubagentStart: hand the subagent the `[briefing]
+        # inject_on_subagent_start` brief from the read-only `/brief`.
+        [switch] $SubagentStartBrief
     )
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
@@ -1103,6 +1115,38 @@ function Invoke-AiMemoryHook {
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
         Clear-AiMemorySessionId -Agent $Agent
+    }
+
+    # A subagent runs inside its parent's session, so its brief comes from the
+    # read-only `/brief`, never `/handoff`, whose fetch would claim the
+    # parent's baton (parity with the native hook and subagent-start.sh). A
+    # Cursor payload gets none: its handling of the envelope is unverified.
+    # No brief prints nothing, as this hook always did.
+    if ($SubagentStartBrief) {
+        if ($Cwd -and -not $Payload.Contains('"cursor_version"')) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd -Key "inject_on_subagent_start"
+            if ($BriefQS) {
+                $NoProxy = Get-AiMemoryNoProxy
+                try {
+                    $Response = Invoke-WebRequest @NoProxy `
+                        -UseBasicParsing `
+                        -TimeoutSec 2 `
+                        -Uri "$Server/brief?agent=$Agent$QS$BriefQS" `
+                        -Headers $Headers
+                    if ($null -ne $Response -and $Response.Content) {
+                        $Wrapped = @{
+                            hookSpecificOutput = @{
+                                hookEventName = "SubagentStart"
+                                additionalContext = [string]$Response.Content
+                            }
+                        }
+                        [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                    }
+                } catch {
+                }
+            }
+        }
+        return
     }
 
     # `GET /handoff` claims the newest open baton in whatever project the

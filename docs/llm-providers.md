@@ -275,6 +275,31 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > startup for that provider; the dynamic value must not be shadowed or
 > duplicated.
 
+### Probing the server's own provider
+
+`ai-memory llm-test` builds a provider from the shell it runs in. That is the
+right check before a key goes into the config, and it works with the server
+down — but it is the wrong check when the server runs in a container or on
+another host, because the keys exist there and not in your shell. A failure
+like `building LLM provider` (no key) or a provider `400 Please pass a valid
+API key` says nothing about the server in that case.
+
+`ai-memory llm-test --server` asks the server to run the probe itself, with its
+own configured provider, fallback chain and keys, and prints the provider,
+model, latency and the error class:
+
+```bash
+ai-memory llm-test --server
+```
+
+It is the same probe `status` and the health panel name when a provider call
+fails, it runs one fixed short prompt, and it takes no `--provider`, `--model`,
+`--prompt`, `--base-url` or `--api-key`: a client cannot hand the server a key
+nor point it at another URL. On a multi-user server the route is root-only, and
+a provider's error body is scrubbed before it is printed, so a key the provider
+quoted back never reaches your terminal. Without a configured provider the
+server answers `503` and says so.
+
 ### Security and gotchas
 
 - **Bind address vs. port publish.** When running inside a container, the
@@ -381,6 +406,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+The tolerant parser removes `<think>`, `<thinking>`, `<analysis>` and
+`<reasoning>` wrappers outside the JSON answer and unwraps Markdown fences.
+Literal tags inside JSON strings remain intact, so summaries can quote prompt
+templates or other tagged text. Anthropic's structured text replies use the
+same parsing rules when the provider uses automatic tool choice.
+
 > [!TIP]
 > **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
 > models).** Such engines spend the output budget on a reasoning pass before
@@ -434,7 +465,9 @@ RRF ranked below the requested cut, at the cost of LLM latency and usage. The
 request sends the query plus at most 30 bounded page titles and search snippets
 to the configured provider; all values are JSON-encoded and treated as
 untrusted data. A timeout, provider error, or incomplete/invalid score set
-preserves the normal order. `global=true` and supplemental global-preference
+preserves the normal order. The timeout is 20 seconds per query; raise it with
+`AI_MEMORY_RERANK_TIMEOUT_SECS` (or `rerank_timeout_secs` in `config.toml`)
+when a slow provider or a fallback chain needs longer to answer. `global=true` and supplemental global-preference
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 

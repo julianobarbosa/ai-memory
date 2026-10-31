@@ -3,10 +3,29 @@
 {% block title %}Projects — ai-memory{% endblock %}
 
 {% block content %}
-<div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Projects</h1>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki. <a href="graph" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">Link graph</a></p>
-</div>
+<div class="page-heading"><div><p class="eyebrow">WORKSPACE OVERVIEW</p><h1>Memory dashboard</h1><p>Track activity, investigate token usage, and coordinate your agents.</p></div><a href="inbox" class="primary-button">✉ Open inbox</a></div>
+<section aria-label="Memory health overview"><div class="metric-grid">
+  <article class="metric-card"><span>Projects</span><span class="metric-marker" aria-hidden="true">▦</span><strong>{{ dashboard.project_count }}</strong><small>Visible in your workspace</small></article>
+  <article class="metric-card"><span>Sessions</span><span class="metric-marker" aria-hidden="true">◈</span><strong>{{ dashboard.session_count }}</strong><small>Across registered agents</small></article>
+  <article class="metric-card"><span>Captured events</span><span class="metric-marker" aria-hidden="true">⌁</span><strong>{{ dashboard.observation_count }}</strong><small>Sanitized activity records</small></article>
+  <article class="metric-card"><span>Compiled pages</span><span class="metric-marker" aria-hidden="true">☷</span><strong>{{ dashboard.page_count }}</strong><small>Knowledge ready for recall</small></article>
+  <article class="metric-card metric-attention"><span>Open sessions</span><span class="metric-marker" aria-hidden="true">◷</span><strong>{{ dashboard.open_session_count }}</strong><small>No session-end event received</small></article>
+</div><p class="section-note">{% if dashboard.last_activity_relative != "" %}Last capture {{ dashboard.last_activity_relative }}. {% endif %}Open means no SessionEnd was received; it can be an active agent or an interruption. Counts are metadata only; raw prompts and commands remain in scoped detail views.</p></section>
+
+{% if let Some(ingest) = dashboard.ingest %}
+<section aria-label="Hook capture health" class="capture-health">
+  <div class="flex flex-wrap items-baseline justify-between gap-2">
+    <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">Hook capture health</h2>
+    <p class="text-xs text-slate-500">Since this server started; counters contain no prompt or command content.</p>
+  </div>
+  <div class="memory-hook-health-grid mt-4 text-sm">
+    <div><div class="text-slate-500">Accepted</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
+    <div><div class="text-slate-500">Policy-dropped</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
+    <div><div class="text-slate-500">Capacity-shed</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
+    <div><div class="text-slate-500">Rate-limited</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
+  </div>
+</section>
+{% endif %}
 
 {% if mail_total > 0 %}
 <div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
@@ -15,39 +34,6 @@
   {% for item in mail_projects %}<a href="{{ item.href }}" class="font-medium underline hover:text-amber-950 dark:hover:text-amber-100">{{ item.label }}</a> ({{ item.pending }}){% if !loop.last %}, {% endif %}{% endfor %}{% if mail_hidden > 0 %} and {{ mail_hidden }} more project{% if mail_hidden != 1 %}s{% endif %}{% endif %}.</span>
 </div>
 {% endif %}
-
-<div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
-  <button id="llm-notice-close" type="button" aria-label="Dismiss permanently" title="Don't show this again"
-          class="absolute top-2 right-2 rounded p-1 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40">
-    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z"/></svg>
-  </button>
-  <p class="font-medium mb-1">This is LLM-optimised memory, not hand-curated documentation.</p>
-  <p class="text-amber-800 dark:text-amber-300/90 leading-relaxed">
-    Pages are compiled from session observations by an LLM and revised as you work — they're shaped
-    for an agent's retrieval needs, not for human readability. The primary interface is the MCP
-    tools (<code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_query</code>,
-    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_recent</code>,
-    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_explore</code>,
-    …) your coding agent calls automatically. This browser is for spelunking — auditing what
-    landed, browsing your own history, sharing a page with a teammate — not for serving as project
-    documentation.
-  </p>
-</div>
-<script>
-  (function () {
-    var notice = document.getElementById("llm-notice");
-    if (!notice) return;
-    var key = "ai-memory-llm-notice-dismissed";
-    try {
-      if (localStorage.getItem(key) === "1") return;
-    } catch (e) { /* storage blocked: still show the notice */ }
-    notice.classList.remove("hidden");
-    document.getElementById("llm-notice-close").addEventListener("click", function () {
-      try { localStorage.setItem(key, "1"); } catch (e) { /* best effort */ }
-      notice.classList.add("hidden");
-    });
-  })();
-</script>
 
 {% if let Some(dialog) = okf_dialog %}
 <div id="okf-dialog-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" data-dismiss-key="ai-memory-okf-dialog-{{ dialog.created_at }}">
@@ -146,31 +132,21 @@
 {% endif %}
 
 
-{% if projects.is_empty() %}
-<div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-12 text-center">
-  <p class="text-slate-500 dark:text-slate-400 text-sm">
-    No projects yet — wire up a hook and start a session.
-  </p>
+<div class="project-toolbar"><h2>Your projects <span class="subtle-pill">{{ projects.len() }}</span></h2><label class="sr-only" for="project-filter">Filter projects</label><input id="project-filter" type="search" placeholder="Filter projects…" autocomplete="off"><label class="sr-only" for="project-state">Project activity filter</label><select id="project-state"><option value="all">All projects</option><option value="open">With open sessions</option><option value="inbox">With queued messages</option></select></div>
+{% if projects.is_empty() %}<div class="empty-state"><span aria-hidden="true">▦</span><h2>Your workspace starts here</h2><p>No projects yet — wire up a hook and start a session.</p></div>{% else %}
+<div class="project-cards-grid" id="project-cards">
+{% for card in projects %}
+<article class="project-card" data-project-search="{{ card.workspace }} {{ card.project }} {{ card.agent_summary }}" data-open="{{ card.open_session_count }}" data-inbox="{{ card.pending_inbox }}">
+  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="Open {{ card.workspace }}/{{ card.project }}" href="{{ card.href }}">{{ card.project }}</a></h3></div>{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="Messages waiting for an agent">{{ card.pending_inbox }} inbox</a>{% endif %}</div>
+  <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}No agent sessions yet{% endif %}</p>
+  <div class="project-card-metrics"><div class="project-card-metric"><span>Sessions</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>Captured events</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>Compiled pages</span><strong>{{ card.page_count }} <small>page{% if card.page_count != 1 %}s{% endif %}</small></strong></div><div class="project-card-metric"><span>Open sessions</span><strong>{{ card.open_session_count }}</strong></div></div>
+  <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}Last capture {{ card.last_updated_relative }}{% else %}No capture yet{% endif %}</span><a href="{{ card.href }}?tab=agents">Explore agents ↗</a></div>
+</article>
+{% endfor %}
 </div>
-{% else %}
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-  {% for card in projects %}
-  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
-    <div class="flex items-center justify-between gap-2 h-5 mb-1">
-      <div class="min-w-0 truncate text-xs font-medium text-slate-500 dark:text-slate-400">{{ card.workspace }}</div>
-      {% if card.pending_inbox > 0 %}
-      <span class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300" title="Messages from other projects waiting for an agent here">{{ card.pending_inbox }} inbox</span>
-      {% endif %}
-    </div>
-    <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
-    <div class="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-      <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>
-      {% if card.last_updated_relative != "" %}
-      <span>{{ card.last_updated_relative }}</span>
-      {% endif %}
-    </div>
-  </a>
-  {% endfor %}
-</div>
-{% endif %}
+<p class="project-result-count" id="project-result-count" role="status" aria-live="polite"></p><div id="project-filter-empty" class="empty-state" hidden><h3>No projects match these filters</h3><p>Try another name or switch back to all projects.</p></div>
+<script>
+(function(){var input=document.getElementById("project-filter"),state=document.getElementById("project-state"),cards=Array.from(document.querySelectorAll("article[data-project-search]"));function filter(){var term=input.value.trim().toLocaleLowerCase(),count=0;cards.forEach(function(card){var match=card.dataset.projectSearch.toLocaleLowerCase().includes(term)&&(state.value==="all"||(state.value==="open"&&Number(card.dataset.open)>0)||(state.value==="inbox"&&Number(card.dataset.inbox)>0));card.hidden=!match;if(match)count++;});document.getElementById("project-filter-empty").hidden=count!==0;document.getElementById("project-result-count").textContent=term||state.value!=="all"?count+" of "+cards.length+" projects":"";}input.addEventListener("input",filter);state.addEventListener("change",filter);})();
+</script>{% endif %}
+<details class="section-note section-block"><summary>About compiled memory</summary><p>Pages are compiled from captured observations for agent retrieval. Use project details to audit sessions and inspect the underlying events.</p></details>
 {% endblock %}

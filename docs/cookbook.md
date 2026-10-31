@@ -276,11 +276,12 @@ compacted or merged stays in git and the supersession chain, recoverable with
 - **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
-- **Surface likely contradictions:** run `memory_lint` (through your agent or the
-  CLI); with embeddings configured it flags pairs of same-topic pages that look
-  like they conflict, advisory only. Similarity reads shared vocabulary as much
-  as disagreement, so a single-domain or single-language store yields mostly
-  candidate pairs: read each finding as a pair to check, not as a defect. If
+- **Review similar knowledge:** run `memory_lint` (through your agent or the
+  CLI); with embeddings configured it emits `similarity_candidate` findings
+  for same-topic page pairs, advisory only. Similarity reads shared vocabulary
+  as much as disagreement, so read each candidate as a pair to check, not as a
+  contradiction or a supersession instruction. Explicit `contradicts` edges
+  remain `contradiction` findings. If
   that noise is too high, raise `contradiction_band_min` (`config.toml` or
   `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`). On such a store the
   band measures domain proximity more than conflict, so a higher floor trims

@@ -1,0 +1,16 @@
+<section id="agents" class="section-block" aria-labelledby="agents-title">
+  <div class="section-heading"><div><p class="eyebrow">YOUR AGENT FLEET</p><h2 id="agents-title">One project. Every agent.</h2><p>See who has worked here, where tokens went, and what needs attention.</p></div><span class="subtle-pill">{{ agents.len() }} registered</span></div>
+  {% if agents.is_empty() %}<div class="empty-state"><span aria-hidden="true">◈</span><h3>Your agents will appear here</h3><p>A captured session registers its agent in this project.</p></div>{% else %}
+  <div class="agent-grid">
+    {% for agent in agents %}
+    <article class="agent-card" data-agent="{{ agent.kind }}">
+      <div class="agent-card-top"><span class="agent-avatar" aria-hidden="true">{% if agent.kind == "codex" %}Cx{% else if agent.kind == "claude-code" %}Cl{% else %}Ai{% endif %}</span><div><a href="{{ agent.href }}" class="agent-name">{{ agent.label }}</a><p>{{ agent.sessions }} session{% if agent.sessions != 1 %}s{% endif %} recorded</p></div><span class="status-pill {% if agent.open > 0 %}status-open{% endif %}">{% if agent.open > 0 %}{{ agent.open }} open{% else %}No open sessions{% endif %}</span></div>
+      <div class="agent-card-usage"><div><span>Reported tokens</span><strong>{{ agent.tokens }}</strong></div><div><span>Measured calls</span><strong>{{ agent.calls }}</strong></div></div>
+      <div class="coverage-label"><span>Usage coverage</span><strong>{{ agent.measured }}/{{ agent.sessions }} sessions</strong></div><progress class="coverage-bar" value="{{ agent.coverage }}" max="100" aria-label="Sessions reporting token usage">{{ agent.coverage }}%</progress>
+      {% if agent.measured == 0 %}<p class="card-hint hint-warning">Usage not reported yet. Check the agent's capture setup.</p>{% else %}<p class="card-hint">{{ agent.input }} input <span>·</span> {{ agent.output }} output <span>·</span> {{ agent.cache }} cache</p>{% endif %}
+      <div class="card-actions"><a href="{{ agent.href }}">Explore sessions <span aria-hidden="true">↗</span></a><a href="{{ agent.compose_href }}" class="quiet-button">Message <span aria-hidden="true">↗</span></a></div>
+    </article>
+    {% endfor %}
+  </div>{% endif %}
+  <p class="section-note">Open means no session-end event was received. It does not confirm that an agent is currently running. Missing token usage is unknown, never zero.</p>
+</section>

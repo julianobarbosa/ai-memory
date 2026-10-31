@@ -364,6 +364,10 @@ fn docker_source_build_uses_vendored_tailwind() {
         "the source builder must copy files embedded by ai-memory-cli"
     );
     assert!(
+        dockerfile.contains("COPY CHANGELOG.md ./"),
+        "the source builder must include bundled release notes"
+    );
+    assert!(
         !dockerfile.contains("TAILWIND"),
         "the vendored stylesheet is the default; the image build must not opt into a regeneration"
     );
@@ -1857,8 +1861,13 @@ impl PrePushFixture {
             fixture_toplevel: String::new(),
             _guard: guard,
         };
-        fixture.git(&fixture.hook_repo, &["init", "-q"]);
-        fixture.git(&fixture.fixture_repo, &["init", "-q"]);
+        // Do not depend on installed Git templates: relocatable Git binaries
+        // can lose their template path through the fixture's tool symlink.
+        // Tests that seed a user hook need its directory before installation.
+        // https://git-scm.com/docs/git-init#_template_directory
+        fixture.git(&fixture.hook_repo, &["init", "-q", "--template="]);
+        fixture.git(&fixture.fixture_repo, &["init", "-q", "--template="]);
+        std::fs::create_dir_all(fixture.hook.parent().unwrap()).unwrap();
         // Compare Git's own answers rather than Rust path strings: Git Bash
         // reports `C:/...` where Rust reports `C:\...`.
         fixture.hook_toplevel = fixture.git(&fixture.hook_repo, &["rev-parse", "--show-toplevel"]);

@@ -136,8 +136,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Codex | Supported |
 | Command Code | Supported |
 | Devin CLI | Supported |
-| OpenCode (V1/V2 auto-detected) | Supported |
-| OpenCode V2 compatibility aliases (`opencode2`, `opencode-v2`, `open-code2`) | Supported |
+| OpenCode (V1/V2 auto-detected; legacy force-V2 aliases retained) | Supported |
 | Cursor | Supported |
 | Gemini CLI | Supported |
 | Oh My Pi / OMP | Supported |
@@ -160,6 +159,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | CodeBuddy Code | Hooks-only |
 | IBM Bob | Supported |
 | Qwen Code | Supported |
+| Qoder | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | Hooks + MCP |
@@ -393,7 +393,7 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent cline`, `--agent qwen-code`, `--agent omp`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent cline`, `--agent qwen-code`, `--agent qoder`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`,
 #    `--client cline`, `--client freebuff`, etc.
@@ -435,9 +435,10 @@ Wiring another agent is the same two commands with a different name:
 matrix. OpenCode is version-detected by host-side commands; when generating its
 artifacts inside a container, use `setup-agent --agent opencode
 --opencode-dialect v1|v2 --to /tmp/unused` because the container cannot inspect
-the host executable. The `opencode2` aliases remain force-V2 compatibility
-spellings. The full per-agent guide, including Windows and remote servers, is
-[`docs/install.md`](docs/install.md).
+the host executable. The legacy `opencode2`, `opencode-v2`, and `open-code2`
+aliases remain force-V2 compatibility spellings for old scripts; use
+`opencode` for new commands. The full per-agent guide, including Windows and
+remote servers, is [`docs/install.md`](docs/install.md).
 
 Two agents in the same project at once, or teammates on one server, work
 out of the box: the "current project" pointer is isolated per caller
@@ -623,6 +624,17 @@ readable wiki pages; the next session starts with a handoff.
   and no user accounts (every fresh install), the browser asks for a username
   and password: any username, and the contents of
   `<data_dir>/auth-tokens/default` as the password.
+- Investigate Claude Code and Codex response-token usage in the project
+  dashboard, and pick a Light, Dark or System theme. See
+  [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
+  for capture coverage, cache accounting and the investigation flags. You can
+  drill down from a project to an agent, its sessions and individual responses.
+  The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
+  queue requests for registered agents and read the received and sent history.
+  Token filters run on the full authorized ledger, with native turn and tool
+  context when reported. Pages show their sources, declared contradictions and
+  recall explanations, and the [feature guide](docs/features.md) shows the
+  effective installation states in the web UI.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
@@ -686,6 +698,13 @@ for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in
 [`docs/llm-providers.md`](docs/llm-providers.md).
 
+For optional synthesized query answers, operators can set
+`[query_answer] max_context_tokens` to limit admitted evidence while retaining
+all retrieval hits. Known newer corrections take priority, and whole snippets
+are preferred over sentence-bounded fragments. It is disabled by default. See the
+[configuration reference](docs/ARCHITECTURE.md#configuration-configtoml) for the
+conservative counting rule and omission receipt.
+
 ## Architecture
 
 One Rust binary runs an MCP/HTTP server and owns one data directory:
@@ -715,6 +734,7 @@ diagram, crate breakdown, schema notes, and invariants.
 
 | File | What it is |
 |---|---|
+| [`docs/testing-dashboard.md`](docs/testing-dashboard.md) | Dashboard behavior tests, real-browser CI and mutation probes that prove regression guards fail. |
 | [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a project rule, import an existing knowledge base, get two agents/repos working together. Start here. |
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine walkthrough. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and the rules, memory and profile precedence. |
@@ -731,7 +751,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
 | [`docs/management-ui.md`](docs/management-ui.md) | Optional server-rendered console: feature gates, user and session management, MCP keys, public deployment, and frontend checks. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
-| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
+| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / merge / backup / restore / reset / reindex / restore-page.** Safety matrix, lossless project-identity merge, per-project disk layout, retained-version recovery, and operator workflows. |
 | [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
 | [`docs/design-backup-agent-assets.md`](docs/design-backup-agent-assets.md) | Host agent-asset backup/restore: supported paths, filtering, redaction limits, archive bounds, active-content warning, and rollback behavior. |
 | [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
@@ -770,6 +790,11 @@ Written by users; not maintained here, so check them against the version you run
 
 - [Installing and configuring ai-memory on Linux](https://www.linuxpro.com.br/2026/09/ai-memory-instalar-configurar-agentes-linux/) (pt-BR, LinuxPro, covers v2.6.3)
 - [ai-memory from v2.4 to v2.6.3](https://www.linuxpro.com.br/2026/10/ai-memory-a-evolucao-da-2-4-a-2-6-3/) (pt-BR, LinuxPro)
+
+The built-in web UI also has Documentation at `/web/docs` and a Changelog at
+`/web/docs/changelog`. The [feature activation guide](docs/features.md) covers
+prerequisites and verification. Agents can read the same bundled guides through
+authenticated `/api/v1/docs` JSON or each guide's Markdown link.
 
 ## License
 

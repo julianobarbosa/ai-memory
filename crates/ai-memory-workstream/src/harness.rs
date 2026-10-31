@@ -131,9 +131,9 @@ pub enum ManagedHarness {
     Codex,
     /// OpenCode.
     OpenCode,
-    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
-    /// Shares v1's config dir, session store, and agent kind; only the
-    /// launched executable differs.
+    /// Legacy force-V2 compatibility spelling (`opencode2` executable).
+    /// Shares the generic OpenCode config dir, session store, and agent kind;
+    /// only the executable selection and skipped version probe differ.
     OpenCode2,
     /// Pi coding agent.
     Pi,
@@ -645,6 +645,27 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
     }
 }
 
+/// Keep OpenCode's server and tool processes inside an ai-jail lifecycle.
+///
+/// OpenCode V2 normally delegates to a shared per-user service. That service
+/// can outlive the jailed client and create tool processes outside the jail's
+/// PID namespace. A private `--standalone` server stays inside the namespace,
+/// so Linux tears down its remaining descendants when the jail exits. An
+/// explicit `--server` remains authoritative: it deliberately selects an
+/// external service and must not be silently overridden.
+///
+/// Returns whether `--standalone` was added.
+pub fn apply_jail_process_isolation(harness: ManagedHarness, args: &mut Vec<OsString>) -> bool {
+    if harness != ManagedHarness::OpenCode2
+        || launch_mode(harness, args) != LaunchMode::Session
+        || has_flag(args, &["--standalone", "--server"])
+    {
+        return false;
+    }
+    args.push(OsString::from("--standalone"));
+    true
+}
+
 /// Opt-in Claude-only "true yolo": on top of [`apply_yolo`]'s
 /// `--dangerously-skip-permissions`, force `bypassPermissions` through
 /// `--settings`, whose CLI-flag precedence beats a `defaultMode` in the user's
@@ -822,10 +843,10 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "db",
         ]
         .as_slice(),
-        // Beta subcommands, verified on `opencode2 v0.0.0-beta-18999`
-        // (`opencode2 --help`). `run` stays session-bearing (see
-        // `noninteractive_invocation`); `mini` is the minimal interactive
-        // UI and also stays session-bearing.
+        // V2 subcommands, originally verified on the side-by-side
+        // `opencode2 v0.0.0-beta-18999` binary and retained for the legacy
+        // force-V2 spelling. `run` stays session-bearing (see
+        // `noninteractive_invocation`); `mini` is the minimal interactive UI.
         ManagedHarness::OpenCode2 => [
             "upgrade", "acp", "api", "debug", "console", "auth", "mcp", "plugin", "models",
             "stats", "export", "import", "service", "pair", "serve",
@@ -1726,8 +1747,8 @@ fn environment_session_dir_with(
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
-        // The beta channel keeps v1's `opencode.db` filename (other channels
-        // get `opencode-<channel>.db`), so both harnesses share one store.
+        // V2 keeps v1's `opencode.db` filename (other channels get
+        // `opencode-<channel>.db`), so both adapters share one store.
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             value("XDG_DATA_HOME").map(|dir| dir.join("opencode"))
         }
@@ -2047,16 +2068,16 @@ mod tests {
                 Some(ManagedHarness::OpenCode2)
             );
         }
-        let beta = ManagedHarness::OpenCode2;
+        let compatibility = ManagedHarness::OpenCode2;
         // Same store, same kind, same flags — only the executable differs,
         // so `run opencode2` resumes v1 sessions and vice versa.
-        assert_eq!(beta.executable(), "opencode2");
-        assert_eq!(beta.as_str(), "opencode2");
-        assert_eq!(beta.agent_kind(), AgentKind::OpenCode);
+        assert_eq!(compatibility.executable(), "opencode2");
+        assert_eq!(compatibility.as_str(), "opencode2");
+        assert_eq!(compatibility.agent_kind(), AgentKind::OpenCode);
         assert_eq!(ManagedHarness::OpenCode.agent_kind(), AgentKind::OpenCode);
 
         let plan = build_launch_plan(
-            beta,
+            compatibility,
             None,
             vec![OsString::from("run"), OsString::from("continue here")],
             Some("shared-id"),
@@ -2069,29 +2090,38 @@ mod tests {
         assert_eq!(plan.expected_session_id.as_deref(), Some("shared-id"));
 
         let mut yolo = Vec::new();
-        apply_yolo(beta, &mut yolo);
-        apply_yolo(beta, &mut yolo);
+        apply_yolo(compatibility, &mut yolo);
+        apply_yolo(compatibility, &mut yolo);
         assert_eq!(strings(&yolo), ["--auto"]);
 
         assert!(allows_native_session_adoption(
-            beta,
+            compatibility,
             &[OsString::from("--auto")]
         ));
         assert!(!allows_native_session_adoption(
-            beta,
+            compatibility,
             &[OsString::from("run"), OsString::from("continue here")]
         ));
 
         for utility in ["service", "api", "auth"] {
-            let plan =
-                build_launch_plan(beta, None, vec![OsString::from(utility)], Some("shared-id"))
-                    .unwrap();
+            let plan = build_launch_plan(
+                compatibility,
+                None,
+                vec![OsString::from(utility)],
+                Some("shared-id"),
+            )
+            .unwrap();
             assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
         }
         // `mini` is the interactive UI, not a utility: it stays
         // session-bearing.
-        let mini =
-            build_launch_plan(beta, None, vec![OsString::from("mini")], Some("shared-id")).unwrap();
+        let mini = build_launch_plan(
+            compatibility,
+            None,
+            vec![OsString::from("mini")],
+            Some("shared-id"),
+        )
+        .unwrap();
         assert_eq!(mini.mode, LaunchMode::Session);
     }
 
@@ -2196,6 +2226,68 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[test]
+    fn jailed_opencode_uses_a_private_server_by_default() {
+        let mut interactive = Vec::new();
+        assert!(apply_jail_process_isolation(
+            ManagedHarness::OpenCode2,
+            &mut interactive
+        ));
+        assert_eq!(strings(&interactive), ["--standalone"]);
+
+        let mut run = ["run", "inspect this checkout"]
+            .map(OsString::from)
+            .to_vec();
+        assert!(apply_jail_process_isolation(
+            ManagedHarness::OpenCode2,
+            &mut run
+        ));
+        assert_eq!(
+            strings(&run),
+            ["run", "inspect this checkout", "--standalone"]
+        );
+    }
+
+    #[test]
+    fn jailed_opencode_preserves_explicit_server_selection() {
+        for original in [
+            vec!["--standalone"],
+            vec!["--server", "http://127.0.0.1:4096"],
+            vec!["run", "--server=http://127.0.0.1:4096", "inspect"],
+        ] {
+            let mut args = original.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(!apply_jail_process_isolation(
+                ManagedHarness::OpenCode2,
+                &mut args
+            ));
+            assert_eq!(strings(&args), original);
+        }
+    }
+
+    #[test]
+    fn jail_process_isolation_ignores_utilities_and_other_harnesses() {
+        let mut service = ["service", "status"].map(OsString::from).to_vec();
+        assert!(!apply_jail_process_isolation(
+            ManagedHarness::OpenCode2,
+            &mut service
+        ));
+        assert_eq!(strings(&service), ["service", "status"]);
+
+        let mut codex = Vec::new();
+        assert!(!apply_jail_process_isolation(
+            ManagedHarness::Codex,
+            &mut codex
+        ));
+        assert!(codex.is_empty());
+
+        let mut opencode_v1 = Vec::new();
+        assert!(!apply_jail_process_isolation(
+            ManagedHarness::OpenCode,
+            &mut opencode_v1
+        ));
+        assert!(opencode_v1.is_empty());
     }
 
     #[test]

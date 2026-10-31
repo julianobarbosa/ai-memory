@@ -23,6 +23,7 @@
 //! or a guideline block in a rules file) with the line to fix by hand; see
 //! [`super::agentmemory_residue`]. That check only reads.
 
+mod hermes;
 mod presentation;
 
 use std::collections::BTreeMap;
@@ -197,6 +198,10 @@ struct DoctorReport {
     /// Meta Muse Code's settings file, when there is one: whether ai-memory's
     /// hooks and MCP entry are in it, and the two shapes that break Muse.
     muse: Option<MuseReport>,
+    /// Every Hermes Agent home (the root and each profile) with a
+    /// `config.yaml`: which ai-memory hook events it wires and which of
+    /// those its own allowlist does not approve.
+    hermes: Vec<hermes::HermesProfileReport>,
     /// Set when the Windows logon entry `setup` wrote for this data dir names
     /// an `ai-memory.exe` that is no longer on disk (#1280). Omitted
     /// otherwise, so the JSON shape is unchanged when there is nothing to say.
@@ -695,6 +700,9 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     let muse = super::install_hooks::muse_settings_path(&config.runtime_env)
         .ok()
         .and_then(|path| muse_report(&path));
+    let hermes = hermes::hermes_root(config.runtime_env.var_os("HERMES_HOME"), Some(&home))
+        .map(|root| hermes::reports(&root))
+        .unwrap_or_default();
 
     // Local, like the spool: a quarantined binary leaves no server to ask.
     let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
@@ -722,6 +730,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         agentmemory_residue,
         plugins,
         muse,
+        hermes,
         windows_logon,
     };
 
@@ -1156,6 +1165,7 @@ mod tests {
             agentmemory_residue: Vec::new(),
             plugins: Vec::new(),
             muse: None,
+            hermes: Vec::new(),
             windows_logon: None,
         }
     }

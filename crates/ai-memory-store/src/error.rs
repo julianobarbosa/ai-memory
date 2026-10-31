@@ -200,6 +200,14 @@ pub enum StoreError {
         workstreams: String,
     },
 
+    /// A project merge was refused because sessions can still receive hook
+    /// observations under the source coordinate.
+    #[error("project has {count} open session(s); finish them before merging the project")]
+    ProjectSessionsOpen {
+        /// Number of source sessions whose `ended_at` is still NULL.
+        count: u64,
+    },
+
     /// A workspace rename was rejected because the destination name is already
     /// in use by another workspace (`workspaces.name` is UNIQUE).
     #[error("workspace name '{0}' is already taken")]

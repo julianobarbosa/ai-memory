@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
@@ -18,14 +19,53 @@ pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let summaries = list_for_checkout(
+    let fingerprints = inspect_repository_fingerprints(&cwd)?;
+    let project_id = if args.project_id.is_some() || args.project.is_some() {
+        args.project_id
+    } else {
+        super::project_registry::project_binding(config, &endpoint, &workspace, &project, &cwd)?
+            .map(|scope| scope.project_id)
+    };
+    let summaries = match list_for_checkout(
         &endpoint,
         &workspace,
         &project,
         &cwd,
         usize::from(args.limit),
+        project_id,
     )
-    .await?;
+    .await
+    {
+        Err(error) if super::managed_project::is_ambiguous(&error) && project_id.is_none() => {
+            let scope = super::managed_project::choose(
+                &endpoint,
+                &workspace,
+                &project,
+                !args.json && std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+            let summaries = list_for_checkout(
+                &endpoint,
+                &workspace,
+                &project,
+                &cwd,
+                usize::from(args.limit),
+                Some(scope.project_id),
+            )
+            .await?;
+            super::project_registry::record_project_binding(
+                config,
+                &endpoint,
+                &project,
+                &cwd,
+                &scope,
+                &fingerprints,
+            )?;
+            summaries
+        }
+        result => result?,
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
         return Ok(());
@@ -45,6 +85,7 @@ pub(super) async fn list_for_checkout(
     project: &str,
     checkout: &Path,
     limit: usize,
+    project_id: Option<ai_memory_core::ProjectId>,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
     let repository = inspect_repository_fingerprints(checkout)
         .context("inspecting managed workstream checkout")?;
@@ -52,8 +93,13 @@ pub(super) async fn list_for_checkout(
         endpoint,
         "/workstream/recent",
         &ListManagedWorkstreamsRequest {
+            project_id,
             workspace: workspace.to_owned(),
-            project: project.to_owned(),
+            project: if project_id.is_some() {
+                String::new()
+            } else {
+                project.to_owned()
+            },
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
             limit,
@@ -65,6 +111,7 @@ pub(super) async fn list_for_checkout(
 
 /// Fetch every checkout-local page without changing the server's per-page cap.
 pub(super) async fn list_all_for_checkout(
+    config: &Config,
     endpoint: &ServerEndpoint,
     workspace: &str,
     project: &str,
@@ -72,11 +119,19 @@ pub(super) async fn list_all_for_checkout(
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
     let repository = inspect_repository_fingerprints(checkout)
         .context("inspecting managed workstream checkout")?;
+    let project_id =
+        super::project_registry::project_binding(config, endpoint, workspace, project, checkout)?
+            .map(|scope| scope.project_id);
     let mut request = ListManagedWorkstreamsRequest {
+        project_id,
         workspace: workspace.to_owned(),
-        project: project.to_owned(),
-        repo_fingerprint: repository.repo_fingerprint,
-        worktree_fingerprint: repository.worktree_fingerprint,
+        project: if project_id.is_some() {
+            String::new()
+        } else {
+            project.to_owned()
+        },
+        repo_fingerprint: repository.repo_fingerprint.clone(),
+        worktree_fingerprint: repository.worktree_fingerprint.clone(),
         limit: 100,
         offset: 0,
     };
@@ -84,7 +139,34 @@ pub(super) async fn list_all_for_checkout(
     let mut seen = HashSet::new();
     loop {
         let page: Vec<ManagedWorkstreamSummary> =
-            post_json(endpoint, "/workstream/recent", &request).await?;
+            match post_json(endpoint, "/workstream/recent", &request).await {
+                Err(error)
+                    if request.project_id.is_none()
+                        && super::managed_project::is_ambiguous(&error) =>
+                {
+                    let scope = super::managed_project::choose(
+                        endpoint,
+                        workspace,
+                        project,
+                        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await?;
+                    request.project_id = Some(scope.project_id);
+                    request.project.clear();
+                    let page = post_json(endpoint, "/workstream/recent", &request).await?;
+                    super::project_registry::record_project_binding(
+                        config,
+                        endpoint,
+                        project,
+                        checkout,
+                        &scope,
+                        &repository,
+                    )?;
+                    page
+                }
+                result => result?,
+            };
         let count = page.len();
         let before = summaries.len();
         summaries.extend(

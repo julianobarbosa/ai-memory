@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use ai_memory_client::sanitize_external_text;
@@ -1290,6 +1292,8 @@ struct ImportClient {
     origin: String,
     base_path: String,
     token: Option<String>,
+    mcp_session: Mutex<Option<Option<String>>>,
+    mcp_request_id: AtomicU64,
 }
 
 impl ImportClient {
@@ -1321,6 +1325,8 @@ impl ImportClient {
             token: std::env::var("AI_MEMORY_AUTH_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            mcp_session: Mutex::new(None),
+            mcp_request_id: AtomicU64::new(0),
         })
     }
     fn url(&self, path: &str) -> String {

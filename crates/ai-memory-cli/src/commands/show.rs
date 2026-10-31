@@ -229,6 +229,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
     crate::commands::run::run_from(
         config,
         RunArgs {
+            project_id: None,
             workspace: Some(workspace),
             project: Some(project),
             workstream: None,
@@ -241,6 +242,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             fresh: args.fresh,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),

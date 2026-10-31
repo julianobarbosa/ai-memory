@@ -11,6 +11,7 @@ publish = false
 ai-memory-client = { version = "0.1.0", path = "../ai-memory-client" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+htmlize = { version = "1.1", features = ["unescape"] }
 # Pure-Rust text-layer extraction. It does not OCR scanned/image-only PDFs.
 lopdf = { version = "0.45", default-features = false }
 quick-xml = "0.42"

@@ -317,6 +317,8 @@ pub struct WebMountSpec<'a> {
     /// The server's configured embedder and reranker, so project search in
     /// `/web` and `/api/v1` ranks like `memory_query`.
     pub recall: crate::Recall,
+    /// Safe configuration switches read once by the host.
+    pub runtime: Option<crate::features::RuntimeFeatures>,
     /// Process-side sources for the root-only health page.
     pub health: Option<Arc<crate::health::HealthSources>>,
 }
@@ -362,7 +364,19 @@ pub fn split_web_routers(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
-    let split = split_web_routers_unframed(enable_web, reader, wiki, spec)?;
+    split_web_routers_with_metrics(enable_web, reader, wiki, None, spec)
+}
+
+/// Metric-aware variant of [`split_web_routers`]. The optional input keeps
+/// the web crate embeddable without coupling custom frontends to hook state.
+pub fn split_web_routers_with_metrics(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    let split = split_web_routers_unframed(enable_web, reader, wiki, ingest_metrics, spec)?;
     let layer = || axum::middleware::map_response(deny_framing);
     Ok(SplitWebRouters {
         public: split.public.layer(layer()),
@@ -375,6 +389,7 @@ fn split_web_routers_unframed(
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
     if !enable_web && !spec.enable_api {
@@ -386,9 +401,13 @@ fn split_web_routers_unframed(
     }
     let mut state = crate::WebState::new(reader, wiki)
         .with_trusted_proxy_identity(spec.trusted_proxy_identity)
-        .with_recall(spec.recall);
+        .with_recall(spec.recall)
+        .with_runtime(spec.runtime);
     if let Some(health) = spec.health {
         state = state.with_health(health);
+    }
+    if let Some(metrics) = ingest_metrics {
+        state = state.with_ingest_metrics(metrics);
     }
     let api = build_api_router(state.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
@@ -727,6 +746,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1142,6 +1162,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1222,6 +1243,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1310,6 +1332,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1384,6 +1407,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1446,6 +1470,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1537,6 +1562,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1596,6 +1622,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1644,6 +1671,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )

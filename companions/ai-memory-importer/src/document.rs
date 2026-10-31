@@ -1061,7 +1061,7 @@ fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
             if line.is_empty() {
                 continue;
             }
-            push_bounded(&mut output, clean_transcript_markup(line).trim())?;
+            push_bounded(&mut output, clean_transcript_markup(line, webvtt).trim())?;
             push_bounded(&mut output, "\n")?;
         }
         if !output.is_empty() && !output.ends_with("\n\n") {
@@ -1086,14 +1086,25 @@ fn is_timing_line(line: &str) -> bool {
     looks_like_timestamp(start) && looks_like_timestamp(end)
 }
 
-fn clean_transcript_markup(line: &str) -> String {
+fn clean_transcript_markup(line: &str, webvtt: bool) -> String {
+    // WebVTT uses HTML character references in text (not attribute) context:
+    // https://www.w3.org/TR/webvtt1/#webvtt-cue-text-parsing-rules
+    // Decode original text segments once: escaped tags remain literal, and
+    // removing markup cannot join fragments into a new character reference.
+    let push_text = |output: &mut String, text: &str| {
+        if webvtt {
+            output.push_str(&htmlize::unescape(text));
+        } else {
+            output.push_str(text);
+        }
+    };
     let mut output = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(start) = rest.find('<') {
-        output.push_str(&rest[..start]);
+        push_text(&mut output, &rest[..start]);
         let after_start = &rest[start + 1..];
         let Some(end) = after_start.find('>') else {
-            output.push_str(&rest[start..]);
+            push_text(&mut output, &rest[start..]);
             return output;
         };
         let candidate = &after_start[..end];
@@ -1104,7 +1115,7 @@ fn clean_transcript_markup(line: &str) -> String {
         }
         rest = &after_start[end + 1..];
     }
-    output.push_str(rest);
+    push_text(&mut output, rest);
     output
 }
 
@@ -1198,8 +1209,14 @@ fn xml_text(xml: &str) -> Result<String> {
     loop {
         match reader.read_event().context("parse Office XML")? {
             Event::Start(_) if skipped_depth > 0 => skipped_depth += 1,
+            // These tab lists define paragraph layout, not tab characters:
+            // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.tabs
+            // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.drawing.tabstoplist
             Event::Start(tag)
-                if matches!(tag.local_name().as_ref(), "del" | "delText" | "instrText") =>
+                if matches!(
+                    tag.local_name().as_ref(),
+                    "del" | "delText" | "instrText" | "tabs" | "tabLst"
+                ) =>
             {
                 skipped_depth = 1;
             }
@@ -1217,11 +1234,18 @@ fn xml_text(xml: &str) -> Result<String> {
             Event::GeneralRef(reference) if text_depth > 0 => {
                 push_bounded(&mut output, &xml_reference(&reference)?)?;
             }
-            Event::Empty(tag) if skipped_depth == 0 => match tag.local_name().as_ref() {
-                "br" => push_bounded(&mut output, "\n")?,
-                "tab" => push_bounded(&mut output, "\t")?,
-                _ => {}
-            },
+            // DrawingML breaks can contain run properties; empty WordprocessingML
+            // breaks and tabs may also use paired start/end tags. A `w:cr` is a
+            // line break, like `w:br`, rather than a new paragraph.
+            // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.drawing.break
+            // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.carriagereturn
+            Event::Start(tag) | Event::Empty(tag) if skipped_depth == 0 => {
+                match tag.local_name().as_ref() {
+                    "br" | "cr" => push_bounded(&mut output, "\n")?,
+                    "tab" => push_bounded(&mut output, "\t")?,
+                    _ => {}
+                }
+            }
             Event::End(tag) if skipped_depth == 0 => match tag.local_name().as_ref() {
                 "p" | "tr" => push_bounded(&mut output, "\n")?,
                 "tc" => push_bounded(&mut output, "\t")?,
@@ -1582,6 +1606,30 @@ mod tests {
     }
 
     #[test]
+    fn docx_run_separators_are_preserved_and_sanitized() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("separators.docx");
+        for line_break in ["<w:br/>", "<w:br></w:br>", "<w:cr/>", "<w:cr></w:cr>"] {
+            for tab in ["<w:tab/>", "<w:tab></w:tab>"] {
+                let document = format!(
+                    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First line</w:t>{line_break}<w:t>Host</w:t>{tab}<w:t>8443 token=abcdefghijklmnop</w:t></w:r></w:p><w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="left" w:pos="1440"></w:tab></w:tabs></w:pPr><w:r><w:t>Kept</w:t></w:r><w:del><w:r><w:delText>DELETED_SENTINEL</w:delText>{line_break}{tab}</w:r></w:del><w:r><w:instrText>FIELD_SENTINEL</w:instrText><w:t> together</w:t></w:r></w:p></w:body></w:document>"#
+                );
+                write_zip(&file, &[("word/document.xml", &document)]);
+                let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+                assert!(
+                    plan.body
+                        .contains("First line\nHost\t8443 token=[REDACTED]\nKept together"),
+                    "break {line_break}, tab {tab}: {}",
+                    plan.body
+                );
+                assert!(!plan.body.contains("abcdefghijklmnop"));
+                assert!(!plan.body.contains("DELETED_SENTINEL"));
+                assert!(!plan.body.contains("FIELD_SENTINEL"));
+            }
+        }
+    }
+
+    #[test]
     fn pdf_extracts_text_by_page() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("brief.pdf");
@@ -1724,6 +1772,64 @@ mod tests {
     }
 
     #[test]
+    fn pptx_run_separators_are_preserved_and_sanitized() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("separators.pptx");
+        let tab_stops = r#"<a:tab pos="914400" algn="l"/><a:tab pos="1828800" algn="l"></a:tab>"#;
+        let list_style = format!(
+            "<a:lstStyle><a:defPPr><a:tabLst>{tab_stops}</a:tabLst></a:defPPr><a:lvl1pPr><a:tabLst>{tab_stops}</a:tabLst></a:lvl1pPr></a:lstStyle>"
+        );
+        // The first shape makes any injected tab in the next shape's paragraph
+        // properties visible instead of letting normalize_text trim it away.
+        let first_shape = "<p:sp><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Heading</a:t></a:r></a:p></p:txBody></p:sp>";
+        for line_break in [
+            "<a:br/>",
+            "<a:br></a:br>",
+            r#"<a:br><a:rPr lang="en-US"/></a:br>"#,
+        ] {
+            let slide = format!(
+                r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{first_shape}<p:sp><p:txBody><a:bodyPr/>{list_style}<a:p><a:pPr><a:tabLst>{tab_stops}</a:tabLst></a:pPr><a:r><a:t>Use</a:t></a:r>{line_break}<a:r><a:t>TLS token=abcdefghijklmnop</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            );
+            let notes = format!(
+                r#"<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{first_shape}<p:sp><p:txBody><a:bodyPr/>{list_style}<a:p><a:pPr><a:tabLst>{tab_stops}</a:tabLst></a:pPr><a:r><a:t>Say</a:t></a:r>{line_break}<a:r><a:t>this token=abcdefghijklmnop</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#
+            );
+            write_zip(
+                &file,
+                &[
+                    (
+                        "ppt/presentation.xml",
+                        r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                    ),
+                    (
+                        "ppt/_rels/presentation.xml.rels",
+                        r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+                    ),
+                    ("ppt/slides/slide1.xml", &slide),
+                    (
+                        "ppt/slides/_rels/slide1.xml.rels",
+                        r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#,
+                    ),
+                    ("ppt/notesSlides/notesSlide1.xml", &notes),
+                ],
+            );
+            let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+            assert!(
+                plan.body
+                    .contains("## Slide 1\n\nHeading\nUse\nTLS token=[REDACTED]"),
+                "break {line_break}: {}",
+                plan.body
+            );
+            assert!(
+                plan.body
+                    .contains("### Speaker notes\n\nHeading\nSay\nthis token=[REDACTED]"),
+                "break {line_break}: {}",
+                plan.body
+            );
+            assert!(!plan.body.contains("abcdefghijklmnop"));
+        }
+    }
+
+    #[test]
     fn transcripts_drop_timing_metadata_and_markup() {
         let vtt = b"WEBVTT\n\nNOTE private cue note\nskip me\n\nintro-id\n00:00:01.000 --> 00:00:02.000\n<v Alice>Hello</v> world\n\n00:00:03.000 --> 00:00:04.000\n1 < 2 and literal --> arrow\n";
         let text = extract_transcript(vtt, true).unwrap();
@@ -1732,6 +1838,98 @@ mod tests {
         let srt = b"1\n00:00:01,000 --> 00:00:02,000\n12345\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond line\n";
         let text = extract_transcript(srt, false).unwrap();
         assert_eq!(text.trim(), "12345\n\nSecond line");
+    }
+
+    #[test]
+    fn webvtt_decodes_character_references_in_cue_text() {
+        for (payload, expected) in [
+            (
+                "AT&amp;T: 1 &lt; 2 &gt; 0, a&nbsp;b &lrm;left &rlm;right",
+                "AT&T: 1 < 2 > 0, a\u{a0}b \u{200e}left \u{200f}right",
+            ),
+            (
+                "&#39;caf&#233;&#39; &#x1F642; &trade; &NotEqualTilde;",
+                "'café' 🙂 ™ ≂\u{338}",
+            ),
+            ("&notit; &copy 2026 &#65 &#x41 &#X41", "¬it; © 2026 A A A"),
+            (
+                "&#0; &#xD800; &#1114112; &#128; &#999999999999999999999;",
+                "� � � € �",
+            ),
+            (
+                "&unknown; &#; &#x; bare & ampersand &amp;",
+                "&unknown; &#; &#x; bare & ampersand &",
+            ),
+        ] {
+            let input = format!("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{payload}\n");
+            assert_eq!(
+                extract_transcript(input.as_bytes(), true).unwrap().trim(),
+                expected,
+                "cue payload {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webvtt_decodes_once_without_reparsing_or_joining_markup() {
+        for (payload, expected) in [
+            (
+                "<v Alice><b>AT&amp;T</b> &lt;b&gt;literal&lt;/b&gt;</v>",
+                "AT&T <b>literal</b>",
+            ),
+            ("&amp;lt; &amp;amp;", "&lt; &amp;"),
+            ("&am<b></b>p; &#x<i></i>41;", "&amp; &#x41;"),
+            ("<unknown>&amp;</unknown>", "<unknown>&</unknown>"),
+            ("1 < 2 &amp;", "1 < 2 &"),
+            (
+                "<v Alice><b>First &amp;\nSecond &lt;third&gt;</b></v>",
+                "First &\nSecond <third>",
+            ),
+            ("&am\np;", "&am\np;"),
+        ] {
+            let input = format!("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{payload}\n");
+            assert_eq!(
+                extract_transcript(input.as_bytes(), true).unwrap().trim(),
+                expected,
+                "cue payload {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn srt_keeps_character_references_literal() {
+        let input =
+            b"1\n00:00:01,000 --> 00:00:02,000\n<b>AT&amp;T</b> &lt;b&gt;literal&lt;/b&gt; &#65;\n";
+        assert_eq!(
+            extract_transcript(input, false).unwrap().trim(),
+            "AT&amp;T &lt;b&gt;literal&lt;/b&gt; &#65;"
+        );
+    }
+
+    #[test]
+    fn webvtt_decoded_text_is_sanitized_before_the_document_plan() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("captions.vtt");
+        fs::write(
+            &file,
+            "WEBVTT\n\nNOTE annotation\nCOMMENT_SENTINEL\n\n00:00:01.000 --> 00:00:02.000\nKnown fact AT&amp;T token&#61;abcdefghijklmnop\nLiteral &lt;b&gt;sample&lt;/b&gt; &amp;lt;\n",
+        )
+        .unwrap();
+        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+        assert!(plan.body.contains("Known fact AT&T"));
+        assert!(plan.body.contains("token=[REDACTED]"));
+        assert!(plan.body.contains("Literal <b>sample</b> &lt;"));
+        assert!(!plan.body.contains("abcdefghijklmnop"));
+        assert!(!plan.body.contains("COMMENT_SENTINEL"));
+    }
+
+    #[test]
+    fn webvtt_entity_expansion_respects_the_working_text_limit() {
+        // &nGt; has five input bytes and expands to six UTF-8 bytes.
+        let payload = "&nGt;".repeat(MAX_WORKING_TEXT_BYTES / 6 + 1);
+        assert!(payload.len() < MAX_WORKING_TEXT_BYTES);
+        let input = format!("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{payload}\n");
+        assert!(extract_transcript(input.as_bytes(), true).is_err());
     }
 
     #[test]

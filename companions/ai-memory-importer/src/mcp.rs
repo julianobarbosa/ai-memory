@@ -8,8 +8,9 @@
 //! That closes the check-then-write race the `/admin/write-page` routes carry.
 
 use std::fmt;
+use std::sync::atomic::Ordering;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::ImportClient;
@@ -18,6 +19,8 @@ use crate::ImportClient;
 const ERROR_PREVIEW: usize = 300;
 /// JSON-RPC `invalid_request`, the code a failed precondition carries.
 const INVALID_REQUEST: i64 = -32600;
+const MCP_SESSION_ID: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 /// The server release that added conditional page writes.
 pub(crate) const MIN_SERVER: &str = "3.0";
 
@@ -189,8 +192,10 @@ impl ImportClient {
 
     /// One JSON-RPC request; its `result`, or the error it answered with.
     async fn mcp_request(&self, method: &str, params: Value) -> Result<Value> {
-        let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let response = self
+        let session = self.mcp_session().await?;
+        let id = self.mcp_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let mut builder = self
             .request(reqwest::Method::POST, "/mcp")
             // The streamable HTTP transport refuses a request that does not
             // accept both; it answers plain JSON in its default stateless
@@ -199,7 +204,11 @@ impl ImportClient {
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
             )
-            .json(&request)
+            .json(&request);
+        if let Some(session) = session.as_deref() {
+            builder = builder.header(MCP_SESSION_ID, session);
+        }
+        let response = builder
             .send()
             .await
             .map_err(|e| anyhow!("MCP {method} request failed: {e}"))?;
@@ -223,6 +232,107 @@ impl ImportClient {
             .get_mut("result")
             .map(Value::take)
             .ok_or_else(|| anyhow!("MCP {method} answered with no result"))
+    }
+
+    async fn mcp_session(&self) -> Result<Option<String>> {
+        if let Some(session) = self
+            .mcp_session
+            .lock()
+            .map_err(|_| anyhow!("MCP session state is unavailable"))?
+            .clone()
+        {
+            return Ok(session);
+        }
+
+        let id = self.mcp_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "ai-memory-importer", "version": env!("CARGO_PKG_VERSION")}
+            }
+        });
+        let response = self
+            .request(reqwest::Method::POST, "/mcp")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .json(&request)
+            .send()
+            .await
+            .context("MCP initialize request failed")?;
+        let status = response.status();
+        let session = response
+            .headers()
+            .get(MCP_SESSION_ID)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 256
+                            && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                    })
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("MCP initialize returned an invalid session id"))
+            })
+            .transpose()?;
+        let text = response
+            .text()
+            .await
+            .context("reading the MCP initialize response failed")?;
+        if !status.is_success() {
+            bail!("MCP initialize returned HTTP {status}: {}", preview(&text));
+        }
+        let message = json_rpc_message(&text)
+            .ok_or_else(|| anyhow!("MCP initialize answered with no JSON-RPC message"))?;
+        if let Some(error) = message.get("error") {
+            bail!("MCP initialize failed: {}", preview(&error.to_string()));
+        }
+        if message
+            .pointer("/result/protocolVersion")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            bail!("MCP initialize answered without a protocol version");
+        }
+
+        if let Some(session_id) = session.as_deref() {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            });
+            let response = self
+                .request(reqwest::Method::POST, "/mcp")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(MCP_SESSION_ID, session_id)
+                .json(&notification)
+                .send()
+                .await
+                .context("MCP initialized notification failed")?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                bail!(
+                    "MCP initialized notification returned HTTP {status}: {}",
+                    preview(&text)
+                );
+            }
+        }
+
+        *self
+            .mcp_session
+            .lock()
+            .map_err(|_| anyhow!("MCP session state is unavailable"))? = Some(session.clone());
+        Ok(session)
     }
 }
 

@@ -13,6 +13,25 @@ static TAILWIND_CSS: &str = include_str!(env!("AI_MEMORY_WEB_TAILWIND_CSS"));
 /// Logo (PNG), embedded at compile time from `docs/logo.png`.
 static LOGO: &[u8] = include_bytes!("../../../../docs/logo.png");
 
+/// Self-hosted fonts shared with the management surface.
+pub(crate) async fn font(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let bytes: &[u8] = match name.as_str() {
+        "instrument-sans-latin-wdth-normal.woff2" => {
+            include_bytes!("../../static/management/instrument-sans-latin-wdth-normal.woff2")
+        }
+        "bricolage-grotesque-latin-standard-normal.woff2" => include_bytes!(
+            "../../static/management/bricolage-grotesque-latin-standard-normal.woff2"
+        ),
+        "commit-mono-latin-400-normal.woff2" => {
+            include_bytes!("../../static/management/commit-mono-latin-400-normal.woff2")
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, "font/woff2")], bytes).into_response()
+}
+
 /// `GET /static/tailwind.css`
 pub(crate) async fn tailwind_css() -> impl IntoResponse {
     let mut headers = HeaderMap::new();

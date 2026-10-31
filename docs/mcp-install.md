@@ -145,7 +145,8 @@ the next primary-session turn, including after a native resume),
 it after every turn) and `on_session_finalize` (the session end). Hermes gates
 user hooks behind its own acceptance prompt (`hooks_auto_accept`), so paste the
 block and let Hermes accept it. [install.md](install.md#hermes-agent-nous-research)
-has the event table, the `TERMINAL_CWD` routing and the
+has the event table, the `TERMINAL_CWD` routing, the per-profile marker for a
+multiplexing gateway's bots and the
 `finalize-session --agent hermes` step for idle gateway sessions.
 
 `install-mcp --client hermes` (alias `hermes-agent`) prints an entry for the
@@ -973,6 +974,49 @@ no Qwen-specific instruction file. Restart the CLI session after changing
 Sources: [Qwen Code MCP](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
 [Qwen Code hooks](https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/),
 and [Qwen Code settings](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/).
+
+---
+
+## Qoder
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file:** `~/.qoder/settings.json` (user), or a project
+`.qoder/settings.json` supplied with `--config-file`. MCP servers live under
+`mcpServers`; hooks live under `hooks` in the same document.
+
+```bash
+ai-memory install-mcp --client qoder --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent qoder --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+```
+
+Qoder's MCP configuration accepts stdio `command`, `args`, and `env`. ai-memory
+always writes a sessionless `mcp-bridge` entry, so it can use the configured
+remote server without a second server process contending for the data-dir lock.
+The bridge has no lifecycle identity; pass explicit `workspace` and `project`
+on every project-scoped MCP call. Applied token installs use ai-memory's
+owner-only token file when possible; printed configuration carries the token in
+the entry's `AI_MEMORY_AUTH_TOKEN` environment.
+
+The hook installer registers the eight documented events that carry useful
+memory state: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `PreCompact`, `Stop`, and `SessionEnd`. Qoder sends
+Claude-shaped fields such as `session_id`, `cwd`, `tool_name`, `tool_input`, and
+`tool_use_id`, so capture exclusions are enforced by the same closed parser.
+SessionStart delivers a pending handoff through
+`hookSpecificOutput.additionalContext`; a missing payload `cwd` falls back to
+`QODER_PROJECT_DIR`. Qoder requires a restart after hook changes.
+
+Qoder reads `AGENTS.md` and shared `~/.agents/skills`, so the normal routing
+snippet and installed Agent Skills need no Qoder-specific copy. There is no
+`ai-memory run qoder` adapter or native transcript backfill because no stable
+native transcript-store contract is documented.
+
+Sources: [Qoder hooks](https://docs.qoder.com/cli/hooks) and
+[Qoder MCP](https://docs.qoder.com/cli/mcp-reference).
 
 ---
 
@@ -1944,11 +1988,11 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
-delivery. The OpenCode 2 beta plugin subscribes to the same event name on the
+delivery. The OpenCode V2 plugin subscribes to the same event name on the
 V2 event stream and injects handoffs through the `context` hook instead of
 v1's removed `experimental.chat.system.transform`. Its generated plugin also sends a deduped best-effort close for any
 still-active sessions from `dispose` during normal plugin teardown; abrupt

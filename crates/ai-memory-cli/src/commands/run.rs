@@ -16,17 +16,17 @@ use ai_memory_workstream::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, FORWARDED_ENV_NAMES,
     JailChecklistItem, JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode,
     LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env_lookup, claude_continued_session,
-    claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
-    crush_global_config_path, discover_native_session, export_transcript,
-    has_native_session_selector, inside_ai_jail_here, inspect_repository,
-    is_interactive_session_invocation, jail_checklist, jail_toggle, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
-    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
-    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
+    allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
+    apply_yolo, build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
+    claude_continued_session, claude_continued_sessions, claude_live_background_attach_id,
+    claude_session_ran_in_background, clean_path, crush_global_config_path,
+    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
+    inspect_repository, is_interactive_session_invocation, jail_checklist, jail_toggle,
+    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
+    list_native_sessions, marked_choices, native_session_exists, native_session_in_checkout,
+    native_store_root, omp_profile_flag, omp_profile_flag_env, parse_jail_toggles,
+    store_override_vars, transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
     wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -336,7 +336,6 @@ enum AfterRunAction {
 async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
     let interactive_terminal =
         io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
-    let custom_executable = args.executable.is_some();
     let mut next_args = args;
     preserve_trailing_run_options(&mut next_args);
 
@@ -348,7 +347,7 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
             &super::run_autowire::WireOverrides::default(),
         )
         .await?;
-        if !should_offer_after_run(&outcome, interactive_terminal, custom_executable) {
+        if !should_offer_after_run(config, &next_args, &outcome, interactive_terminal) {
             return Ok(outcome.exit_code);
         }
 
@@ -379,22 +378,26 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
 }
 
 fn should_offer_after_run(
+    config: &Config,
+    args: &RunArgs,
     outcome: &RunOutcome,
     interactive_terminal: bool,
-    custom_executable: bool,
 ) -> bool {
-    outcome.exit_code == 0
+    config.run.exit_prompt
+        && !args.no_exit_prompt
+        && outcome.exit_code == 0
         && outcome.mode == LaunchMode::Session
         && outcome.interactive_session
         && !outcome.degraded
         && interactive_terminal
-        && !custom_executable
+        && args.executable.is_none()
 }
 
 fn preserve_trailing_run_options(args: &mut RunArgs) {
     args.yolo |= remove_wrapper_yolo(&mut args.native_args);
     args.true_yolo |= remove_wrapper_true_yolo(&mut args.native_args);
     args.no_autowire |= remove_wrapper_no_autowire(&mut args.native_args);
+    args.no_exit_prompt |= remove_wrapper_no_exit_prompt(&mut args.native_args);
     let trailing_jail = remove_wrapper_jail(&mut args.native_args);
     if trailing_jail.jail.is_some() {
         args.jail = trailing_jail.jail;
@@ -526,6 +529,7 @@ async fn run_once_with_wiring(
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
+    remove_wrapper_no_exit_prompt(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
     let yolo_modes = yolo_modes(
@@ -676,11 +680,25 @@ async fn run_once_with_wiring(
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let project_id = if let Some(id) = args.project_id {
+        Some(id)
+    } else if args.project.is_none() {
+        super::project_registry::project_binding(
+            config,
+            &endpoint,
+            &workspace,
+            &project,
+            &repository.cwd,
+        )?
+        .map(|scope| scope.project_id)
+    } else {
+        None
+    };
     // Probe before any server work: a homelab down for maintenance must
     // downgrade (or, with --require-server, fail) in ~2s, not after a
     // TCP-level timeout on the prepare POST. Any HTTP answer counts as
     // reachable — including 404/405 from a server older than /healthz.
-    let require_server = args.require_server || config.run.require_server;
+    let require_server = args.require_server || config.run.require_server || project_id.is_some();
     if let ServerProbe::Unreachable(probe_error) = probe_server(&endpoint).await {
         if require_server {
             // Fail closed exactly like the prepare below would: same
@@ -688,6 +706,11 @@ async fn run_once_with_wiring(
             let url = endpoint.build_url("/workstream/runs");
             return Err(augment_connect_error(probe_error, &endpoint, &url)
                 .context("opening managed workstream; the agent was not started"));
+        }
+        if jailed && apply_jail_process_isolation(provisional_harness, &mut native_args) {
+            eprintln!(
+                "ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"
+            );
         }
         return run_degraded_offline(
             config,
@@ -714,9 +737,14 @@ async fn run_once_with_wiring(
         )
         .await;
     }
-    let prepare = PrepareManagedRunRequest {
+    let mut prepare = PrepareManagedRunRequest {
+        project_id,
         workspace: workspace.clone(),
-        project: project.clone(),
+        project: if project_id.is_some() {
+            String::new()
+        } else {
+            project.clone()
+        },
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
@@ -727,13 +755,42 @@ async fn run_once_with_wiring(
         new_workstream: args.new_workstream,
         force_unlock,
         lease_owner: lease_owner(),
-        repository_identity: remote_identity_naming(&repository.cwd, &project, marker_project),
+        repository_identity: project_id
+            .is_none()
+            .then(|| remote_identity_naming(&repository.cwd, &project, marker_project))
+            .flatten(),
     };
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
-    let prepared = prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn)
-        .await
-        .context("opening managed workstream; the agent was not started");
+    let prepared = async {
+        match prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn).await
+        {
+            Err(error)
+                if (super::managed_project::is_ambiguous(&error)
+                    && prepare.project_id.is_none())
+                    || (args.project_id.is_none()
+                        && prepare.project_id.is_some()
+                        && super::managed_project::is_missing(&error)) =>
+            {
+                let scope = super::managed_project::choose(
+                    &endpoint,
+                    &workspace,
+                    &project,
+                    interactive,
+                    &interrupted_before_spawn,
+                )
+                .await?;
+                prepare.project_id = Some(scope.project_id);
+                prepare.project.clear();
+                prepare.repository_identity = None;
+                prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn)
+                    .await
+            }
+            result => result,
+        }
+    }
+    .await
+    .context("opening managed workstream; the agent was not started");
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -743,17 +800,6 @@ async fn run_once_with_wiring(
     };
     if let Some(warning) = prepared.manifest_warning.as_deref() {
         eprintln!("ai-memory: warning: {warning}");
-    }
-    if let Err(error) = super::project_registry::record_prepared_checkout(
-        config,
-        &endpoint,
-        &workspace,
-        &project,
-        &repository.cwd,
-    ) {
-        eprintln!(
-            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
-        );
     }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
     macro_rules! acquired_try {
@@ -772,6 +818,42 @@ async fn run_once_with_wiring(
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
+    }
+    acquired_try!(super::managed_project::validate_prepared_scope(
+        &prepare, &prepared
+    ));
+    if let Some(scope) = &prepared.resolved_project
+        && let Err(error) = super::project_registry::record_project_binding(
+            config,
+            &endpoint,
+            &project,
+            &repository.cwd,
+            scope,
+            &ai_memory_workstream::RepositoryFingerprints {
+                repo_fingerprint: prepare.repo_fingerprint.clone(),
+                worktree_fingerprint: prepare.worktree_fingerprint.clone(),
+            },
+        )
+    {
+        eprintln!(
+            "ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
+            scope.project_id
+        );
+    }
+    let resolved_name = prepared
+        .resolved_project
+        .as_ref()
+        .map_or(project.as_str(), |scope| scope.project.as_str());
+    if let Err(error) = super::project_registry::record_prepared_checkout(
+        config,
+        &endpoint,
+        &workspace,
+        resolved_name,
+        &repository.cwd,
+    ) {
+        eprintln!(
+            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+        );
     }
     let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
     if let Some(id) = prepared.native_session_id.as_deref() {
@@ -820,6 +902,11 @@ async fn run_once_with_wiring(
     } else {
         resolved_harness
     };
+    if jailed && apply_jail_process_isolation(harness, &mut native_args) {
+        eprintln!(
+            "ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"
+        );
+    }
     if automatic_harness
         && matches!(
             harness,
@@ -890,6 +977,25 @@ async fn run_once_with_wiring(
             display_session_id(&orphaned_session),
             prepared.workstream_name
         );
+        // The hint tells the user to repeat their own command with a selector
+        // right after the harness name, which only works when they typed one
+        // and launched an interactive session (`codex exec` and `opencode run`
+        // take their selector after the subcommand).
+        if interactive_session && !automatic_harness {
+            let sessions = list_native_sessions(
+                harness,
+                &home,
+                &repository.cwd,
+                plan.session_dir.as_deref(),
+                1,
+            )
+            .await;
+            if let Some(hint) =
+                orphan_resume_hint(harness, &orphaned_session, sessions, SystemTime::now())
+            {
+                eprintln!("{hint}");
+            }
+        }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
             "ai-memory: starting a fresh {} session in workstream '{}'",
@@ -901,6 +1007,7 @@ async fn run_once_with_wiring(
         && prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
         && may_adopt_native_session
+        && prepare.project_id.is_none()
     {
         let candidate = acquired_try!(
             auto_candidates
@@ -927,6 +1034,7 @@ async fn run_once_with_wiring(
     } else if prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
         && may_adopt_native_session
+        && prepare.project_id.is_none()
         && allows_native_session_adoption(harness, &native_args)
         && io::stdin().is_terminal()
         && io::stderr().is_terminal()
@@ -1123,7 +1231,14 @@ async fn run_once_with_wiring(
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
-    let previous_history = match prepared.previous_native_session.as_ref() {
+    let previous_session = previous_session_for_history(
+        prepared.previous_native_session.as_ref(),
+        prepared.native_session_id.as_deref(),
+        force_fresh,
+        plan.mode,
+        harness,
+    );
+    let previous_history = match previous_session.as_ref() {
         Some(previous) => match prepare_previous_session_history(
             config,
             &endpoint,
@@ -1336,7 +1451,55 @@ async fn run_once_with_wiring(
         } else {
             None
         };
-    let (transcript, exact_export_available) = if plan.mode == LaunchMode::Session
+    let left_behind_session_ids = if let (Some(own), Some(followed)) =
+        (own_session_id.as_deref(), native_session_id.as_deref())
+    {
+        match claude_left_behind_session_ids(
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            own,
+            followed,
+            started_at,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!(
+                    "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut left_behind_transcripts = Vec::new();
+    let mut left_behind_losses = Vec::new();
+    for session_id in &left_behind_session_ids {
+        let source_cursor = (prepared.native_session_id.as_deref() == Some(session_id.as_str()))
+            .then_some(prepared.source_cursor.as_deref())
+            .flatten();
+        let mut exported = export_after_flush(
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            Some(session_id),
+            source_cursor,
+        )
+        .await;
+        left_behind_losses.extend(exported.losses.drain(..).map(|loss| {
+            format!(
+                "Claude session {} was left behind before continuation: {loss}",
+                display_session_id(session_id)
+            )
+        }));
+        if !exported.events.is_empty() {
+            left_behind_transcripts.push(exported);
+        }
+    }
+    let (mut transcript, exact_export_available) = if plan.mode == LaunchMode::Session
         && harness.transcript_capability() == ai_memory_workstream::TranscriptCapability::Export
     {
         let exported = export_after_flush(
@@ -1362,6 +1525,7 @@ async fn run_once_with_wiring(
             false,
         )
     };
+    transcript.losses.extend(left_behind_losses);
     let recovery_event_digests =
         exact_export_available.then(|| transcript_interval_digests(&transcript.events));
     let recovery_cursor = exact_export_available
@@ -1370,17 +1534,42 @@ async fn run_once_with_wiring(
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
-    let imported = match import_batches(
-        &endpoint,
-        &run_path,
-        transcript,
-        checkpoint,
-        Some(exit_code),
-        &privacy,
-        &TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd),
-    )
-    .await
-    {
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd);
+    let mut preliminary_imported = 0;
+    let mut preliminary_error = None;
+    for abandoned in left_behind_transcripts {
+        match import_incomplete_batches(
+            &endpoint,
+            &run_path,
+            abandoned,
+            checkpoint.clone(),
+            &privacy,
+            &capture,
+        )
+        .await
+        {
+            Ok(imported) => preliminary_imported += imported,
+            Err(error) => {
+                preliminary_error = Some(error);
+                break;
+            }
+        }
+    }
+    let import_result = match preliminary_error {
+        Some(error) => Err(error),
+        None => import_batches(
+            &endpoint,
+            &run_path,
+            transcript,
+            checkpoint,
+            Some(exit_code),
+            &privacy,
+            &capture,
+        )
+        .await
+        .map(|imported| preliminary_imported + imported),
+    };
+    let imported = match import_result {
         Ok(imported) => imported,
         // The child has already exited; an unreachable server must not turn
         // its exit code into an error. The transcript is not recorded, so say
@@ -1398,6 +1587,16 @@ async fn run_once_with_wiring(
                     &error,
                 )
             );
+            if !left_behind_session_ids.is_empty() {
+                eprintln!(
+                    "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                    left_behind_session_ids
+                        .iter()
+                        .map(|id| display_session_id(id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             journal_finish_failed_run(
                 config,
                 &endpoint,
@@ -1442,7 +1641,8 @@ async fn run_once_with_wiring(
         && attached_background.is_none()
     {
         eprintln!(
-            "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+            "{}",
+            missing_context_warning(harness, resumes_linked_session)
         );
     }
     eprintln!(
@@ -2665,7 +2865,7 @@ fn exec_under_ai_jail(
                 .context("resolving the current executable for the ai-jail re-exec");
         }
     };
-    let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let forwarded = jail_forwarded_args(config, std::env::args_os().skip(1));
     let resolved = jail_resolved_env(config);
     let present = jail_forwarded_names(config, &resolved);
     // `--agent-state` is a bare toggle: enable it so the harness's own login
@@ -2683,6 +2883,28 @@ fn exec_under_ai_jail(
     );
     eprintln!("{}", jail_summary(toggles, project_config));
     reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+fn jail_forwarded_args(
+    config: &Config,
+    original: impl IntoIterator<Item = OsString>,
+) -> Vec<OsString> {
+    let mut args: Vec<_> = original.into_iter().collect();
+    // The jail's private home cannot reload the host config, and its env
+    // allowlist does not forward this setting. Carry the resolved opt-out
+    // as a wrapper flag instead.
+    // `resume`, `continue`, and `show` also reach this re-exec through
+    // `run_from`, but have no menu and do not accept this run-only flag.
+    let is_run = || {
+        crate::cli::try_parse_from(
+            std::iter::once(OsString::from("ai-memory")).chain(args.iter().cloned()),
+        )
+        .is_ok_and(|cli| matches!(cli.command, crate::cli::Command::Run(_)))
+    };
+    if !config.run.exit_prompt && !args.iter().any(|arg| arg == "--no-exit-prompt") && is_run() {
+        args.push(OsString::from("--no-exit-prompt"));
+    }
+    args
 }
 
 /// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
@@ -2844,6 +3066,37 @@ fn follow_claude_continued_session(
             own
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claude_left_behind_session_ids(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    own_session_id: &str,
+    followed_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Vec<String>> {
+    if harness != ManagedHarness::Claude || own_session_id == followed_session_id {
+        return Ok(Vec::new());
+    }
+    let continuations =
+        claude_continued_sessions(home, cwd, session_dir, own_session_id, started_at)?;
+    let mut sessions = vec![own_session_id.to_owned()];
+    for continuation in continuations {
+        let id = continuation.session_id();
+        if id == followed_session_id {
+            return Ok(sessions);
+        }
+        if !sessions.iter().any(|known| known == id) {
+            sessions.push(id.to_owned());
+        }
+    }
+    Err(anyhow!(
+        "followed Claude session {} was absent from its continuation chain",
+        display_session_id(followed_session_id)
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3166,6 +3419,12 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+fn remove_wrapper_no_exit_prompt(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--no-exit-prompt"));
+    args.len() != before
+}
+
 /// The error for a `--profile` name `config.toml` does not define: it names
 /// the profiles that do exist, or, with none defined, prints a table to paste.
 fn unknown_run_profile(run: &crate::config::RunSettings, name: &str) -> anyhow::Error {
@@ -3291,6 +3550,33 @@ fn blank_home_overrides(
             value.is_some() && ai_memory_workstream::env_dir_override(value).is_none()
         })
         .collect()
+}
+
+fn previous_session_for_history(
+    previous: Option<&ManagedNativeSessionReference>,
+    linked_session_id: Option<&str>,
+    force_fresh: bool,
+    launch_mode: LaunchMode,
+    harness: ManagedHarness,
+) -> Option<ManagedNativeSessionReference> {
+    previous.cloned().or_else(|| {
+        (force_fresh && launch_mode == LaunchMode::Session)
+            .then(|| {
+                linked_session_id.map(|native_session_id| ManagedNativeSessionReference {
+                    agent: harness.agent_kind(),
+                    native_session_id: native_session_id.to_owned(),
+                })
+            })
+            .flatten()
+    })
+}
+
+fn missing_context_warning(harness: ManagedHarness, resumes_linked_session: bool) -> &'static str {
+    if harness == ManagedHarness::Codex && resumes_linked_session {
+        "ai-memory: Codex did not acknowledge the managed context in the linked thread; if you used `/new`, that new thread was not adopted because Codex exposes no trustworthy parent link. Resume the intended thread explicitly on the next managed run; otherwise refresh the ai-memory hooks"
+    } else {
+        "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4110,6 +4396,89 @@ fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
     super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
+/// What to tell the user about the rest of the checkout once the linked
+/// session is known to be missing: the newest other session of the harness and
+/// the native selector that resumes it, or why the checkout could not be
+/// listed. The launch itself still starts fresh, because picking another
+/// session for an established workstream stays the user's explicit choice.
+/// The caller only asks for an interactive launch that named its harness.
+fn orphan_resume_hint(
+    harness: ManagedHarness,
+    orphaned_session: &str,
+    sessions: Result<Vec<NativeSessionCandidate>>,
+    now: SystemTime,
+) -> Option<String> {
+    let sessions = match sessions {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            return Some(format!(
+                "ai-memory: could not list this checkout's other {} sessions ({error:#})",
+                harness.as_str()
+            ));
+        }
+    };
+    let newest = sessions
+        .into_iter()
+        .next()
+        .filter(|candidate| candidate.native_session_id != orphaned_session)?;
+    let found = format!(
+        "ai-memory: this checkout's newest {} session is {} (updated {})",
+        harness.as_str(),
+        display_session_id(&newest.native_session_id),
+        session_age(newest.updated_at, now)
+    );
+    Some(match resume_selector(harness, &newest.native_session_id) {
+        Some(selector) => format!(
+            "{found}; to continue it instead, stop this fresh session and run the same command again with `{selector}` right after `{}`",
+            run_harness_name(harness)
+        ),
+        None => format!(
+            "{found}; to continue it instead, stop this fresh session and resume that one by its id"
+        ),
+    })
+}
+
+/// The harness name as `ai-memory run` takes it. Kiro's v3 engine is chosen
+/// with `kiro --v3`, not by a harness name of its own.
+fn run_harness_name(harness: ManagedHarness) -> &'static str {
+    match harness {
+        ManagedHarness::KiroV3 => ManagedHarness::Kiro.as_str(),
+        other => other.as_str(),
+    }
+}
+
+/// The native arguments that resume `id`, rendered from the launch plan so
+/// each harness gets its own form (`resume <id>`, `--resume <id>`,
+/// `--resume=<id>`). The `--v3` the plan adds for Kiro's v3 engine is left
+/// out: the user's own command already selects the engine. `None` when the id
+/// would not print whole or a word would need shell quoting, since the line is
+/// meant to be typed as shown.
+fn resume_selector(harness: ManagedHarness, id: &str) -> Option<String> {
+    if display_session_id(id) != id {
+        return None;
+    }
+    build_launch_plan(harness, None, Vec::new(), Some(id))
+        .ok()?
+        .args
+        .iter()
+        .filter(|arg| !(harness == ManagedHarness::KiroV3 && *arg == "--v3"))
+        .map(|arg| {
+            let arg = arg.to_str()?;
+            let shown = match arg.strip_suffix(id) {
+                Some(flag) if flag.is_empty() || flag.ends_with('=') => {
+                    format!("{flag}{}", display_session_id(id))
+                }
+                _ => arg.to_owned(),
+            };
+            shown
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.=:/@+,".contains(c))
+                .then_some(shown)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|words| words.join(" "))
+}
+
 async fn export_exact_after_run(
     harness: ManagedHarness,
     home: &std::path::Path,
@@ -4207,6 +4576,40 @@ pub(crate) async fn import_batches(
                 Vec::new()
             },
             exit_code: complete.then_some(exit_code).flatten(),
+        };
+        imported += finish_with_retry(endpoint, run_path, &request)
+            .await?
+            .imported_events;
+    }
+    Ok(imported)
+}
+
+async fn import_incomplete_batches(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    transcript: ExportedTranscript,
+    checkpoint: ai_memory_core::WorkstreamCheckpoint,
+    sanitizer: &Sanitizer,
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let native_identity = NativeSessionIdentity::parse(&transcript.native_session_id, sanitizer)?;
+    for event in &transcript.events {
+        NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
+    }
+    let events = capture.filter_ledger_events(transcript.events);
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut imported = 0;
+    for batch in event_batches(events) {
+        let request = FinishManagedRunRequest {
+            native_session_id: Some(native_identity.as_str().to_owned()),
+            source_cursor: None,
+            events: batch,
+            complete: false,
+            checkpoint: checkpoint.clone(),
+            losses: Vec::new(),
+            exit_code: None,
         };
         imported += finish_with_retry(endpoint, run_path, &request)
             .await?
@@ -5109,6 +5512,30 @@ mod tests {
     }
 
     #[test]
+    fn jail_reexec_preserves_the_resolved_exit_prompt_opt_out() {
+        let mut config = Config::default();
+        let original = ["run", "codex", "--model", "model"].map(OsString::from);
+        assert_eq!(jail_forwarded_args(&config, original.clone()), original);
+
+        config.run.exit_prompt = false;
+        let forwarded = jail_forwarded_args(&config, original);
+        let mut argv = vec![OsString::from("ai-memory")];
+        argv.extend(forwarded.clone());
+        let CliCommand::Run(mut args) = crate::cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected run command");
+        };
+        preserve_trailing_run_options(&mut args);
+        assert!(args.no_exit_prompt);
+        assert_eq!(args.native_args, ["--model", "model"].map(OsString::from));
+        assert_eq!(jail_forwarded_args(&config, forwarded.clone()), forwarded);
+
+        for command in ["resume", "continue", "show"] {
+            let original = ["--config", "/tmp/run", command].map(OsString::from);
+            assert_eq!(jail_forwarded_args(&config, original.clone()), original);
+        }
+    }
+
+    #[test]
     fn jail_forwarded_names_come_from_the_captured_env_and_resolved_values() {
         let mut config = Config {
             runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[
@@ -5288,6 +5715,7 @@ mod tests {
 
     fn run_args_for_after_run_test() -> RunArgs {
         RunArgs {
+            project_id: None,
             workspace: Some("work".into()),
             project: Some("repo".into()),
             workstream: None,
@@ -5300,6 +5728,7 @@ mod tests {
             fresh: true,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("work".into()),
             env: vec![("MODEL_HOME".into(), "custom".into())],
@@ -5436,16 +5865,64 @@ mod tests {
             workstream_name: "research".into(),
             degraded: false,
         };
-        assert!(should_offer_after_run(&outcome, true, false));
-        assert!(!should_offer_after_run(&outcome, false, false));
-        assert!(!should_offer_after_run(&outcome, true, true));
+        let config = Config::default();
+        let mut args = run_args_for_after_run_test();
+        assert!(should_offer_after_run(&config, &args, &outcome, true));
+        assert!(!should_offer_after_run(&config, &args, &outcome, false));
+        args.executable = Some(PathBuf::from("custom-harness"));
+        assert!(!should_offer_after_run(&config, &args, &outcome, true));
+        args.executable = None;
 
         let mut failed = outcome;
         failed.exit_code = 1;
-        assert!(!should_offer_after_run(&failed, true, false));
+        assert!(!should_offer_after_run(&config, &args, &failed, true));
         failed.exit_code = 0;
         failed.mode = LaunchMode::Passthrough;
-        assert!(!should_offer_after_run(&failed, true, false));
+        assert!(!should_offer_after_run(&config, &args, &failed, true));
+    }
+
+    #[test]
+    fn post_run_prompt_respects_config_env_and_flag_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+            degraded: false,
+        };
+        for (file, env, enabled) in [
+            ("", None, true),
+            ("[run]\nrequire_server = false\n", None, true),
+            ("[run]\nexit_prompt = false\n", None, false),
+            ("[run]\nexit_prompt = true\n", None, true),
+            ("", Some("false"), false),
+            ("[run]\nexit_prompt = true\n", Some("false"), false),
+            ("[run]\nexit_prompt = false\n", Some("true"), true),
+        ] {
+            std::fs::write(&config_path, file).unwrap();
+            let pairs: Vec<_> = env
+                .map(|value| ("AI_MEMORY_RUN_EXIT_PROMPT", value))
+                .into_iter()
+                .collect();
+            let config = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(dir.path().to_path_buf()),
+                crate::config::RuntimeEnv::with_process_env_for_tests(&pairs),
+            )
+            .unwrap();
+            for no_exit_prompt in [false, true] {
+                let mut args = run_args_for_after_run_test();
+                args.no_exit_prompt = no_exit_prompt;
+                assert_eq!(
+                    should_offer_after_run(&config, &args, &outcome, true),
+                    enabled && !no_exit_prompt,
+                    "file={file:?}, env={env:?}, flag={no_exit_prompt}",
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6119,6 +6596,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6140,6 +6618,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
         let request = PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "project".into(),
             cwd: "/tmp/project".into(),
@@ -6274,6 +6753,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6393,6 +6873,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6414,6 +6895,7 @@ mod tests {
 
     fn held_lease_request() -> PrepareManagedRunRequest {
         PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "project".into(),
             cwd: "/tmp/project".into(),
@@ -6679,6 +7161,87 @@ mod tests {
         assert!(rendered.contains("no codex session is linked"));
         assert!(rendered.contains("updated 1 hour ago"));
         assert!(rendered.contains("Start a new codex session"));
+    }
+
+    /// The hint names the newest checkout session and the native selector to
+    /// put right after the harness, in that harness's own form. It falls back
+    /// to plain advice when the id would not print whole or would need shell
+    /// quoting, reports a listing error, and says nothing when there is no
+    /// other session to offer.
+    #[test]
+    fn orphan_resume_hint_names_the_newest_session_and_its_selector() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(7_200);
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let newest = |id: &str| {
+            Ok(vec![NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
+            }])
+        };
+        let hint = |harness, sessions| orphan_resume_hint(harness, "gone", sessions, now);
+
+        let codex = hint(ManagedHarness::Codex, newest(id)).unwrap();
+        assert!(
+            codex.starts_with(&format!(
+                "ai-memory: this checkout's newest codex session is {id} (updated 1 hour ago)"
+            )),
+            "{codex}"
+        );
+        assert!(
+            codex.ends_with(&format!("with `resume {id}` right after `codex`")),
+            "{codex}"
+        );
+        let claude = hint(ManagedHarness::Claude, newest(id)).unwrap();
+        assert!(
+            claude.ends_with(&format!("with `--resume {id}` right after `claude`")),
+            "{claude}"
+        );
+        let kiro_id = "sess_01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let kiro = hint(ManagedHarness::KiroV3, newest(kiro_id)).unwrap();
+        assert!(
+            kiro.ends_with(&format!("with `--resume-id {kiro_id}` right after `kiro`")),
+            "{kiro}"
+        );
+        let omp = hint(ManagedHarness::Omp, newest(id)).unwrap();
+        assert!(
+            omp.ends_with(&format!("with `--resume={id}` right after `omp`")),
+            "{omp}"
+        );
+
+        let long = "a".repeat(80);
+        let unprintable = hint(ManagedHarness::Codex, newest(&long)).unwrap();
+        assert!(
+            unprintable.ends_with("stop this fresh session and resume that one by its id"),
+            "{unprintable}"
+        );
+        assert!(!unprintable.contains('`'), "{unprintable}");
+        let quoted = hint(ManagedHarness::Pi, newest("odd session;id")).unwrap();
+        assert!(!quoted.contains('`'), "{quoted}");
+
+        let error = hint(ManagedHarness::Codex, Err(anyhow!("store unreadable"))).unwrap();
+        assert_eq!(
+            error,
+            "ai-memory: could not list this checkout's other codex sessions (store unreadable)"
+        );
+        assert!(hint(ManagedHarness::Codex, newest("gone")).is_none());
+        assert!(hint(ManagedHarness::Codex, Ok(Vec::new())).is_none());
+
+        // The launch asks for the hint only for an interactive session: in
+        // `codex exec` or `opencode run` the selector belongs after the
+        // subcommand, not right after the harness name.
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&[])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&["exec", "fix it"])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::OpenCode,
+            &args(&["run", "fix it"])
+        ));
     }
 
     #[test]
@@ -7185,6 +7748,59 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_no_exit_prompt_parses_before_or_after_the_harness() {
+        for argv in [
+            vec![
+                "ai-memory",
+                "run",
+                "--no-exit-prompt",
+                "codex",
+                "--model",
+                "model",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "codex",
+                "--no-exit-prompt",
+                "--model",
+                "model",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "codex",
+                "--model",
+                "model",
+                "--no-exit-prompt",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "--no-exit-prompt",
+                "codex",
+                "--model",
+                "model",
+                "--no-exit-prompt",
+            ],
+        ] {
+            let mut args = parse_run(&argv);
+            preserve_trailing_run_options(&mut args);
+            assert!(args.no_exit_prompt, "{argv:?}");
+            assert_eq!(args.native_args, ["--model", "model"].map(OsString::from));
+        }
+        let mut native = [
+            "--no-exit-prompt=literal",
+            "prompt with --no-exit-prompt inside",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let original = native.clone();
+        assert!(!remove_wrapper_no_exit_prompt(&mut native));
+        assert_eq!(native, original);
+    }
+
+    #[test]
     fn resolve_run_env_merges_profile_file_then_cli_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vars.env");
@@ -7241,6 +7857,7 @@ mod tests {
         let mut config = Config::load(None, Some(tmp.path().join("data"))).unwrap();
         config.server_url = "http://127.0.0.1:1".into();
         let args = RunArgs {
+            project_id: None,
             workspace: None,
             project: None,
             workstream: None,
@@ -7253,6 +7870,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("missing".into()),
             env: Vec::new(),
@@ -7520,6 +8138,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -7588,6 +8207,7 @@ mod tests {
         );
 
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -7600,6 +8220,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
@@ -7695,6 +8316,7 @@ mod tests {
         config.run_autowire = false;
 
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -7707,6 +8329,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -8042,6 +8665,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8123,6 +8747,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8188,6 +8813,7 @@ mod tests {
 
         let default_home = home.path().join(".claude");
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -8200,6 +8826,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             // Pinned so a contributor's own CLAUDE_CONFIG_DIR cannot leak in.
@@ -8531,6 +9158,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
+    }
+
+    #[test]
+    fn fresh_session_uses_the_linked_session_as_local_history_fallback() {
+        let linked = previous_session_for_history(
+            None,
+            Some("linked-claude-session"),
+            true,
+            LaunchMode::Session,
+            ManagedHarness::Claude,
+        )
+        .unwrap();
+        assert_eq!(linked.agent, AgentKind::ClaudeCode);
+        assert_eq!(linked.native_session_id, "linked-claude-session");
+
+        assert!(
+            previous_session_for_history(
+                None,
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Passthrough,
+                ManagedHarness::Claude,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_harness_history_precedes_the_fresh_session_fallback() {
+        let previous = ManagedNativeSessionReference {
+            agent: AgentKind::OpenCode,
+            native_session_id: "previous-opencode-session".into(),
+        };
+        assert_eq!(
+            previous_session_for_history(
+                Some(&previous),
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Session,
+                ManagedHarness::Claude,
+            ),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn linked_codex_context_warning_explains_unowned_new_threads() {
+        let warning = missing_context_warning(ManagedHarness::Codex, true);
+        assert!(warning.contains("if you used `/new`"));
+        assert!(warning.contains("no trustworthy parent link"));
+
+        assert!(!missing_context_warning(ManagedHarness::Codex, false).contains("`/new`"));
+        assert!(!missing_context_warning(ManagedHarness::Claude, true).contains("`/new`"));
     }
 
     #[tokio::test]
@@ -8934,6 +9614,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8993,6 +9674,7 @@ mod tests {
             ..WireOverrides::default()
         };
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9006,6 +9688,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             env: vec![
                 ("PATH".into(), executable_dir.display().to_string()),
@@ -9066,6 +9749,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -9123,6 +9807,7 @@ mod tests {
             ..WireOverrides::default()
         };
         let args = || RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9135,6 +9820,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -9215,6 +9901,7 @@ mod tests {
                 "/workstream/runs",
                 post(move || async move {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -9267,6 +9954,7 @@ mod tests {
                     "/workstream/runs",
                     post(|| async {
                         axum::Json(PrepareManagedRunResponse {
+                            resolved_project: None,
                             workstream_id: WorkstreamId::new(),
                             workstream_name: "default".into(),
                             run_id: ManagedRunId::new(),
@@ -9391,6 +10079,133 @@ mod tests {
         (script, captured)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_project_id_launch_reuses_binding_honors_override_and_refuses_old_server() {
+        use ai_memory_core::ManagedProjectScope;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: ai_memory_core::ProjectId::new(),
+            workspace: "ws".into(),
+            project: "selected".into(),
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<PrepareManagedRunRequest>::new()));
+        let confirms = Arc::new(AtomicBool::new(true));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post({
+                    let scope = scope.clone();
+                    let requests = requests.clone();
+                    let confirms = confirms.clone();
+                    move |axum::Json(request): axum::Json<PrepareManagedRunRequest>| {
+                        let mut scope = scope.clone();
+                        let requests = requests.clone();
+                        let confirms = confirms.clone();
+                        async move {
+                            if request.project_id.is_none() {
+                                scope.project = request.project.clone();
+                            }
+                            requests.lock().unwrap().push(request);
+                            axum::Json(PrepareManagedRunResponse {
+                                resolved_project: confirms.load(Ordering::SeqCst).then_some(scope),
+                                workstream_id: WorkstreamId::new(),
+                                workstream_name: "default".into(),
+                                run_id: ManagedRunId::new(),
+                                resolved_agent: None,
+                                native_session_id: None,
+                                source_cursor: None,
+                                previous_native_session: None,
+                                sync_after: 0,
+                                sync_through: 0,
+                                may_adopt_existing_session: false,
+                                manifest_warning: None,
+                            })
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/cancel",
+                post({
+                    let cancelled = cancelled.clone();
+                    move || {
+                        let cancelled = cancelled.clone();
+                        async move {
+                            cancelled.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_RUN_ID");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        let mut args = run_args(RunHarnessChoice::Claude, script, Vec::new(), &["--version"]);
+        args.project = None;
+        args.project_id = Some(scope.project_id);
+        args.no_autowire = true;
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        args.project_id = None;
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        args.project = Some("override".into());
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        let before = std::fs::read_to_string(&captured).unwrap();
+        confirms.store(false, Ordering::SeqCst);
+        args.project = None;
+        args.project_id = Some(scope.project_id);
+        let error = run_from(&config, args, repo.path()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("did not confirm project-ID"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            before,
+            "old-server response must not start the child"
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for index in [0, 1, 3] {
+            assert_eq!(requests[index].project_id, Some(scope.project_id));
+            assert!(
+                requests[index].project.is_empty(),
+                "old servers must reject the selector before creation"
+            );
+            assert!(requests[index].repository_identity.is_none());
+        }
+        assert_eq!(requests[2].project, "override");
+        assert!(requests[2].project_id.is_none());
+        server.abort();
+    }
+
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
@@ -9408,6 +10223,7 @@ mod tests {
         native_args: &[&str],
     ) -> RunArgs {
         RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9420,6 +10236,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env,
@@ -10297,6 +11114,71 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn abandoned_session_batches_do_not_finalize_the_followed_run() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let transcript = ExportedTranscript {
+            native_session_id: "abandoned".into(),
+            source_cursor: Some("must-not-advance".into()),
+            events: vec![ai_memory_core::NewWorkstreamEvent {
+                event_id: "abandoned-event".into(),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "abandoned".into(),
+                source_record_id: None,
+                kind: ai_memory_core::WorkstreamEventKind::Message,
+                role: Some("user".into()),
+                content: "before clear".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+            losses: vec!["reported on the final transcript".into()],
+        };
+
+        assert_eq!(
+            import_incomplete_batches(
+                &endpoint,
+                "/workstream/runs/test",
+                transcript,
+                Default::default(),
+                &Sanitizer::builtin(),
+                &TranscriptCapture::for_checkout(home.path(), home.path()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.native_session_id.as_deref(), Some("abandoned"));
+        assert!(!request.complete);
+        assert!(request.source_cursor.is_none());
+        assert!(request.losses.is_empty());
+        assert!(request.exit_code.is_none());
+        server.abort();
+    }
+
     /// GHSA-gcpc-88hm-3xqr: the ledger upload applies the checkout's
     /// `[capture] ignore_paths`. An excluded read's call and output never reach
     /// the finish request (and so never a raw segment); a public read in the
@@ -10723,6 +11605,7 @@ mod tests {
                     "/workstream/runs",
                     post(|| async {
                         axum::Json(PrepareManagedRunResponse {
+                            resolved_project: None,
                             workstream_id: WorkstreamId::new(),
                             workstream_name: "default".into(),
                             run_id: ManagedRunId::new(),

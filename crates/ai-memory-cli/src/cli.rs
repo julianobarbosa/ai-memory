@@ -359,6 +359,9 @@ pub enum Command {
     /// copy+purge (only durable pages migrate, source purged). Either way the
     /// operation is irreversible — requires `--confirm`.
     MoveProject(MoveProjectArgs),
+    /// Losslessly merge one project into another inside the same workspace.
+    /// Without `--confirm`, prints an exact server-side dry run.
+    MergeProject(MergeProjectArgs),
     /// Move one session (or every session of a project) to another project,
     /// re-stamping its observations, handoffs, consolidation jobs and its
     /// `sessions/<id>.md` page in one transaction. Without `--confirm` it
@@ -374,6 +377,9 @@ pub enum Command {
     /// installs keep using the shell wrapper's `upgrade` (image pull);
     /// package-managed installs (Homebrew, AUR, …) are refused.
     Upgrade(UpgradeArgs),
+    /// Re-render installed hooks from the replacement binary during upgrade.
+    #[command(hide = true, name = "upgrade-refresh-hooks")]
+    UpgradeRefreshHooks,
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
     /// Manage human users and their project grants. All subcommands
@@ -411,8 +417,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub workspace: Option<String>,
     /// Project override. Defaults to the current repository project.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Select an existing project by ID and remember it for this checkout.
+    /// Requires a server supporting managed project-ID selection.
+    #[arg(long, conflicts_with = "project")]
+    pub project_id: Option<ai_memory_core::ProjectId>,
     /// Select an existing named workstream instead of the current one.
     #[arg(long, conflicts_with = "new_workstream")]
     pub workstream: Option<String>,
@@ -476,6 +486,11 @@ pub struct RunArgs {
     /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
     #[arg(long)]
     pub no_autowire: bool,
+    /// Return to the shell after the harness exits without offering the
+    /// switch/rerun menu. Also set with `[run] exit_prompt = false` in
+    /// config.toml or `AI_MEMORY_RUN_EXIT_PROMPT=false`.
+    #[arg(long)]
+    pub no_exit_prompt: bool,
     /// Refuse to launch when the ai-memory server is unreachable, restoring
     /// the pre-degraded-launch fail-closed behavior. Without this flag an
     /// unreachable server downgrades the launch: the harness still starts
@@ -796,6 +811,12 @@ pub struct MessageSendArgs {
     /// Optional one-line subject.
     #[arg(long)]
     pub subject: Option<String>,
+    /// How the sender knows the claim.
+    #[arg(long, default_value = "unknown", value_parser = ["unknown", "measured", "reported", "inferred"])]
+    pub nature: String,
+    /// Supporting evidence. Required by the server for `--nature measured`.
+    #[arg(long)]
+    pub evidence: Option<String>,
     /// Message body. Omitted reads the full body from stdin.
     pub body: Option<String>,
     /// Sender workspace (defaults to the resolved scope).
@@ -832,6 +853,9 @@ pub struct MessageListArgs {
 /// Arguments for `message pop`.
 #[derive(Debug, Args)]
 pub struct MessagePopArgs {
+    /// Receive mail addressed to this harness (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: Option<String>,
     /// Workspace to pop from (defaults to the resolved scope).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -874,8 +898,11 @@ pub struct WorkstreamsArgs {
     #[arg(long)]
     pub workspace: Option<String>,
     /// Project override. Defaults to the current repository project.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Select an existing project by ID instead of a name or cached binding.
+    #[arg(long, conflicts_with = "project")]
+    pub project_id: Option<ai_memory_core::ProjectId>,
     /// Maximum workstreams to return, current first then newest activity.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub limit: u8,
@@ -1703,6 +1730,39 @@ pub struct MoveProjectArgs {
     /// lands under a de-duplicated path).
     #[arg(long, value_parser = ["block", "overwrite", "duplicate"], default_value = "block")]
     pub on_conflict: String,
+    /// Allow the copy+purge merge when the destination workspace already holds
+    /// a project of the same name.
+    ///
+    /// That path is not a move: it copies the source's latest pages and
+    /// deletes the project with its sessions, observations, handoffs and older
+    /// page versions. Without this flag the server refuses and reports the
+    /// counts it would discard (#1713).
+    #[arg(long)]
+    pub allow_lossy_merge: bool,
+}
+
+/// Arguments for `merge-project`.
+#[derive(Debug, Args)]
+pub struct MergeProjectArgs {
+    /// Workspace containing both projects. Defaults to the nearest marker's
+    /// workspace, then `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Source project name. Mutually exclusive with `--from-project-id`.
+    #[arg(long, conflicts_with = "from_project_id")]
+    pub from: Option<String>,
+    /// Source project UUID, for an ambiguous legacy name.
+    #[arg(long)]
+    pub from_project_id: Option<String>,
+    /// Target project name. Mutually exclusive with `--into-project-id`.
+    #[arg(long, conflicts_with = "into_project_id")]
+    pub into: Option<String>,
+    /// Target project UUID, for an ambiguous legacy name.
+    #[arg(long)]
+    pub into_project_id: Option<String>,
+    /// Apply the merge. Omit for an exact dry-run preview.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `move-session`.
@@ -2398,8 +2458,12 @@ pub struct RestorePageArgs {
     #[arg(long)]
     pub path: String,
     /// Git checkpoint/revision to restore from.
-    #[arg(long)]
-    pub from: String,
+    #[arg(long, conflicts_with = "page_id", required_unless_present = "page_id")]
+    pub from: Option<String>,
+    /// Retained page-version UUID to restore, including a version preserved by
+    /// `merge-project`. Mutually exclusive with `--from`.
+    #[arg(long, conflicts_with = "from", required_unless_present = "from")]
+    pub page_id: Option<String>,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
     /// `workspace`, else `default`.
     #[arg(long)]
@@ -2598,6 +2662,10 @@ pub enum AgentChoice {
     /// Qwen's own `SessionEnd` closes the session.
     #[value(name = "qwen-code", alias = "qwen", alias = "qwencode")]
     QwenCode,
+    /// Qoder CLI and IDE — lifecycle hooks merged into the `hooks` key of
+    /// `~/.qoder/settings.json`. Qoder sends Claude Code-shaped JSON on stdin
+    /// and consumes `SessionStart` additional context.
+    Qoder,
 }
 
 impl AgentChoice {
@@ -2636,6 +2704,7 @@ impl AgentChoice {
             Self::Dsh => AgentKind::Dsh,
             Self::Cline => AgentKind::Cline,
             Self::QwenCode => AgentKind::QwenCode,
+            Self::Qoder => AgentKind::Qoder,
         }
     }
 
@@ -2661,6 +2730,7 @@ impl AgentChoice {
             | Self::IbmBob
             | Self::Cline
             | Self::QwenCode => None,
+            Self::Qoder => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2862,6 +2932,9 @@ pub enum McpClient {
     /// capture and `SessionStart` handoff delivery.
     #[value(name = "qwen-code", alias = "qwen", alias = "qwencode")]
     QwenCode,
+    /// Qoder CLI and IDE — user-level `~/.qoder/settings.json`, with a
+    /// stdio `ai-memory mcp-bridge --no-session-id` entry under `mcpServers`.
+    Qoder,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -3188,15 +3261,29 @@ pub struct PendingWriteRejectArgs {
 /// Arguments for `llm-test`.
 #[derive(Debug, Args)]
 pub struct LlmTestArgs {
+    /// Probe the server's own configured provider instead of building one
+    /// from this shell's environment.
+    ///
+    /// The retry hint the server and `/web` print uses this form: a server in
+    /// a container or on another host holds the keys, so a client-side
+    /// `llm-test` fails while the server is healthy (#1639). Takes no
+    /// `--provider`/`--model`/`--prompt`/`--base-url`/`--api-key`: the probe
+    /// runs what the server is configured with, and a client cannot point it
+    /// at another URL or hand it a key.
+    #[arg(
+        long,
+        conflicts_with_all = ["provider", "model", "prompt", "structured", "base_url", "api_key"]
+    )]
+    pub server: bool,
     /// Provider to test.
-    #[arg(long, value_enum)]
-    pub provider: LlmProviderChoice,
+    #[arg(long, value_enum, required_unless_present = "server")]
+    pub provider: Option<LlmProviderChoice>,
     /// Model identifier (e.g. `claude-haiku-4-5`, `gpt-5.4-mini`, `llama3.1:8b`).
-    #[arg(long)]
-    pub model: String,
+    #[arg(long, required_unless_present = "server")]
+    pub model: Option<String>,
     /// Prompt to send.
-    #[arg(long)]
-    pub prompt: String,
+    #[arg(long, required_unless_present = "server")]
+    pub prompt: Option<String>,
     /// Request a small JSON-schema response instead of plain text.
     #[arg(long)]
     pub structured: bool,
@@ -3623,15 +3710,15 @@ pub struct ServeArgs {
     /// --enable-web is set.
     #[arg(long, env = "AI_MEMORY_WEB_UI_DIR")]
     pub web_ui_dir: Option<PathBuf>,
-    /// Base path the whole HTTP surface is served under. Empty (default)
-    /// keeps every route at the host root — byte-identical to previous
-    /// behaviour. Set e.g. `/wiki` to host ai-memory under a URL subpath
+    /// Base path the whole HTTP surface is served under (default: from config).
+    /// Empty (the configuration default) keeps every route at the host root.
+    /// Set e.g. `/wiki` to host ai-memory under a URL subpath
     /// behind a reverse proxy that preserves the prefix; then `/mcp`,
     /// `/api/v1`, `/hook` and the web UI all live under it (`/wiki/mcp`,
     /// `/wiki/api/v1`, …). The value is normalised to `/<core>` (leading
     /// slash, no trailing); `/` and `` both mean root.
-    #[arg(long, env = "AI_MEMORY_BASE_PATH", default_value = "")]
-    pub base_path: String,
+    #[arg(long, env = "AI_MEMORY_BASE_PATH")]
+    pub base_path: Option<String>,
     /// Slug the web UI is mounted at, WITHIN `--base-path`. Default `/web`
     /// (the read-only `/api/v1` API always stays at `<base>/api/v1`). Set
     /// `/` to serve the UI at the base root itself (e.g. `/wiki` instead of
@@ -4654,7 +4741,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode2_aliases_parse_to_the_beta_variants() {
+    fn opencode2_aliases_parse_to_the_v2_compatibility_variants() {
         for alias in ["opencode2", "opencode-v2", "open-code2"] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
@@ -5088,6 +5175,24 @@ mod tests {
             };
             assert_eq!(args.client, McpClient::QwenCode);
         }
+    }
+
+    #[test]
+    fn qoder_install_hooks_and_mcp_parse() {
+        let hooks =
+            Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "qoder"]).unwrap();
+        let Command::InstallHooks(args) = hooks.command else {
+            panic!("expected install-hooks");
+        };
+        assert_eq!(args.agent, AgentChoice::Qoder);
+        assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Qoder);
+        assert_eq!(args.agent.script_hook_subdir(), None);
+
+        let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", "qoder"]).unwrap();
+        let Command::InstallMcp(args) = mcp.command else {
+            panic!("expected install-mcp");
+        };
+        assert_eq!(args.client, McpClient::Qoder);
     }
 
     #[test]
@@ -5539,9 +5644,13 @@ mod tests {
         let Command::LlmTest(args) = cli.command else {
             panic!("expected llm-test command");
         };
-        assert!(matches!(args.provider, LlmProviderChoice::AnthropicOauth));
-        assert_eq!(args.model, "claude-sonnet-4-6");
-        assert_eq!(args.prompt, "ping");
+        assert!(matches!(
+            args.provider,
+            Some(LlmProviderChoice::AnthropicOauth)
+        ));
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(args.prompt.as_deref(), Some("ping"));
+        assert!(!args.server);
     }
 
     #[test]
@@ -5562,8 +5671,41 @@ mod tests {
         let Command::LlmTest(args) = cli.command else {
             panic!("expected llm-test command");
         };
-        assert!(matches!(args.provider, LlmProviderChoice::Codex));
+        assert!(matches!(args.provider, Some(LlmProviderChoice::Codex)));
         assert!(args.structured);
+    }
+
+    /// `--server` runs the probe on the server, so none of the client-side
+    /// provider flags apply and passing one is a parse error rather than a
+    /// silently ignored key (#1639).
+    #[test]
+    fn llm_test_server_takes_no_client_side_provider_flags() {
+        let cli = Cli::try_parse_from(["ai-memory", "llm-test", "--server"]).unwrap();
+        let Command::LlmTest(args) = cli.command else {
+            panic!("expected llm-test command");
+        };
+        assert!(args.server);
+        assert!(args.provider.is_none() && args.model.is_none() && args.prompt.is_none());
+
+        for flag in [
+            "--provider",
+            "--model",
+            "--prompt",
+            "--api-key",
+            "--base-url",
+        ] {
+            let mut argv = vec!["ai-memory", "llm-test", "--server", flag];
+            let value = match flag {
+                "--provider" => "anthropic",
+                "--api-key" => "sk-x",
+                _ => "x",
+            };
+            argv.push(value);
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "`{flag}` must conflict with --server"
+            );
+        }
     }
 
     #[test]
@@ -5609,6 +5751,36 @@ mod tests {
     /// ambiguous request never reaches the server to be guessed at.
     #[test]
     fn project_id_flags_parse_and_conflict_with_their_name_flags() {
+        let managed_id = ai_memory_core::ProjectId::new();
+        let id_text = managed_id.to_string();
+        let cli =
+            Cli::try_parse_from(["ai-memory", "run", "--project-id", &id_text, "claude"]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.project_id, Some(managed_id));
+        let cli =
+            Cli::try_parse_from(["ai-memory", "workstreams", "--project-id", &id_text]).unwrap();
+        let Command::Workstreams(workstreams) = cli.command else {
+            panic!("expected workstreams");
+        };
+        assert_eq!(workstreams.project_id, Some(managed_id));
+        for command in ["run", "workstreams"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ai-memory",
+                    command,
+                    "--project",
+                    "api",
+                    "--project-id",
+                    &id_text
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from(["ai-memory", command, "--project-id", "not-a-uuid"]).is_err()
+            );
+        }
         let id = "11111111-2222-3333-4444-555555555555";
 
         let cli = Cli::try_parse_from(["ai-memory", "purge-project", "--project-id", id]).unwrap();
@@ -5686,6 +5858,66 @@ mod tests {
             ])
             .is_err(),
             "--project and --project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "merge-project",
+            "--workspace",
+            "default",
+            "--from-project-id",
+            id,
+            "--into",
+            "canonical",
+        ])
+        .unwrap();
+        let Command::MergeProject(args) = cli.command else {
+            panic!("expected merge-project");
+        };
+        assert_eq!(args.from_project_id.as_deref(), Some(id));
+        assert_eq!(args.into.as_deref(), Some("canonical"));
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "merge-project",
+                "--from",
+                "old",
+                "--from-project-id",
+                id,
+                "--into",
+                "new",
+            ])
+            .is_err(),
+            "--from and --from-project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "restore-page",
+            "--path",
+            "notes/example.md",
+            "--page-id",
+            id,
+        ])
+        .unwrap();
+        let Command::RestorePage(args) = cli.command else {
+            panic!("expected restore-page");
+        };
+        assert_eq!(args.page_id.as_deref(), Some(id));
+        assert!(args.from.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "restore-page",
+                "--path",
+                "notes/example.md",
+                "--from",
+                "HEAD",
+                "--page-id",
+                id,
+            ])
+            .is_err(),
+            "--from and --page-id must not both be accepted"
         );
     }
 }

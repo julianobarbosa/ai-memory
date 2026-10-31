@@ -8,6 +8,7 @@ mod access_reinforcement;
 mod admin_audit_log;
 mod admin_backup;
 mod admin_bootstrap;
+mod admin_llm_test;
 mod admin_metrics;
 mod admin_move;
 mod admin_move_session;

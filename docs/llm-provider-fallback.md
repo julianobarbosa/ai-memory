@@ -146,6 +146,16 @@ provider/model fields for compatibility. Per-candidate state contains:
 Status records only calls the server already made. It does not probe fallbacks
 or trigger background recovery traffic.
 
+The server log carries the same events as they happen, with the same redacted
+fields and never a response body. A transient failure logs a warning naming
+the failing candidate's provider, model, chain position, error class, HTTP
+status and cooldown; that is the only place the failing model shows up,
+because callers such as the reranker label the chain with its first
+candidate. A deterministic failure logs at debug level, since the caller
+reports the returned error itself. An info line records each change of the
+candidate that answers, so a primary that stays down yields one line, not one
+per call.
+
 ## Tests
 
 1. Unit-test chain order with fake `LlmProvider` instances.

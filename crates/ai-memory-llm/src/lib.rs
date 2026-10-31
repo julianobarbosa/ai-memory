@@ -133,7 +133,7 @@ pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     CandidateHealth, LlmWorkloadHealthSnapshot, ProviderHealth, ProviderHealthSnapshot,
-    ProviderHealthStatus, ProviderRoleHealthSnapshot,
+    ProviderHealthStatus, ProviderRoleHealthSnapshot, error_status_and_message,
 };
 #[cfg(feature = "local-embeddings")]
 pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};

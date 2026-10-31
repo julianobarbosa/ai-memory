@@ -129,6 +129,52 @@ describe("pages against a real server", () => {
     assert.equal((await memory.pages.read({ path: "notes/meta.md" })).body, "# Meta\nother writer");
   });
 
+  it("patch replaces one section and preserves frontmatter", async () => {
+    await memory.pages.write({
+      path: "notes/patch.md",
+      body: "# Status\n## Log\nold\n## Open\none\n",
+      tags: ["living"],
+      abstract: "preserved",
+    });
+    const base = await memory.pages.read({ path: "notes/patch.md" });
+    const log = base.sections.find((section) => section.anchor === "Log");
+    assert.ok(log !== undefined);
+    const patched = await memory.pages.patch({
+      path: "notes/patch.md",
+      expectedPageId: base.pageId,
+      edits: [
+        {
+          op: "replace_section",
+          anchor: "Log",
+          sectionSha256: log.sha256,
+          content: "new",
+        },
+        { op: "append", target: "end_of_page", content: "tail" },
+      ],
+    });
+    const page = await memory.pages.read({ path: "notes/patch.md" });
+    assert.equal(page.pageId, patched.pageId);
+    assert.equal(page.body, "# Status\n## Log\nnew\n## Open\none\ntail\n");
+    assert.deepEqual(page.frontmatter["tags"], ["living"]);
+    assert.equal(page.frontmatter["abstract"], "preserved");
+    await assert.rejects(
+      memory.pages.patch({
+        path: "notes/patch.md",
+        expectedPageId: patched.pageId,
+        edits: [
+          {
+            op: "replace_section",
+            anchor: "Log",
+            sectionSha256: log.sha256,
+            content: "stale",
+          },
+        ],
+      }),
+      InvalidParamsError,
+    );
+    assert.doesNotMatch((await memory.pages.read({ path: "notes/patch.md" })).body, /stale/);
+  });
+
   it("superseded versions come back only when asked", async () => {
     await memory.pages.write({ path: "notes/versions.md", body: "# Versions\nzebra one" });
     await memory.pages.write({ path: "notes/versions.md", body: "# Versions\nzebra two" });

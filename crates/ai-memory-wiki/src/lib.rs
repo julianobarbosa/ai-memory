@@ -36,7 +36,7 @@ pub use migrations::run_pending as run_wiki_migrations;
 pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MoveSessionOutcome,
+    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MergeProjectFile, MoveSessionOutcome,
     PAGE_CHECKPOINT_WALK_LIMIT, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 

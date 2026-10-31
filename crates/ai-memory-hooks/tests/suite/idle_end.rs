@@ -85,6 +85,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
         profile: ai_memory_core::profile::ProfileSettings::default(),
         ingest_drop_list: crate::drop_list::IngestDropList::default(),
+        record_tool_names: false,
         skip_wiki_checkpoints: false,
     };
     (tmp, store, wiki, state)
@@ -534,6 +535,7 @@ async fn idle_tick_excludes_active_managed_run_sessions() {
     let run = store
         .writer
         .prepare_workstream_run(ai_memory_store::PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: proj,
             repo_fingerprint: "repo".into(),
@@ -622,6 +624,7 @@ async fn idle_tick_excluded_backlog_cannot_starve_the_batch() {
         let run = store
             .writer
             .prepare_workstream_run(ai_memory_store::PrepareWorkstreamRun {
+                scope_by_id: false,
                 workspace_id: ws,
                 project_id: proj,
                 repo_fingerprint: format!("repo-{i}"),

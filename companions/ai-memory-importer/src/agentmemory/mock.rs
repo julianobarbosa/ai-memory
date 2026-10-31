@@ -109,6 +109,14 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
         return ("200 OK", json!({"accepted": accepted}));
     }
     match request["method"].as_str() {
+        Some("initialize") => (
+            "200 OK",
+            rpc(json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "mock", "version": "3.2.10"}
+            })),
+        ),
         Some("tools/list") => {
             let mut properties = json!({"path": {}, "body": {}});
             if state.conditional {

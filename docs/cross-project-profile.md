@@ -185,7 +185,8 @@ is new since the last one.
   brief each other through the prompt channel, that text is a lead agent's
   task brief or a pasted review, not you. Text you did not write is skipped
   as well: a harness turn stored as a prompt (Claude Code's
-  `<task-notification>` blocks), the instruction files Codex injects as a user
+  `<task-notification>` blocks), Claude Code cross-session/plugin turns and
+  side-agent quote blocks, the instruction files Codex injects as a user
   message, and ai-memory's own routing snippet or recalled-history digest
   pasted into a prompt (only that block; your sentences around it still
   count). A prompt written by a program driving the agent through its SDK is
@@ -271,7 +272,9 @@ the same way, with the word lists and the newest statement.
 - **Reword it:** edit the page (by hand, or with `memory_write_page` and
   `scope: "profile"`). An entry you edited becomes yours: the harvester never
   rewrites a page it did not write, or one whose body changed since it wrote
-  it, and `profile review` lists it as edited by hand.
+  it, and `profile review` lists it as edited by hand. The entry ledger keeps
+  the page attached to its original topic even when the edit replaces its
+  frontmatter, so the old wording is not recreated at a `-2` path.
 - **Start over:** `ai-memory profile rebuild` re-reads every project from the
   beginning. It does not touch entries you edited or removed, and it never
   removes an entry: a candidate already recorded keeps the classification it

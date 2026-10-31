@@ -454,6 +454,78 @@ fn qwen_backup_round_trips_every_documented_asset() {
 }
 
 #[test]
+fn qoder_backup_round_trips_shared_assets() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let fixtures = [
+        (
+            home.path().join(".qoder/settings.json"),
+            r#"{"mcpServers":{"ai-memory":{"command":"ai-memory"}}}"#,
+        ),
+        (
+            home.path().join(".agents/skills/shared/SKILL.md"),
+            "# Shared skill",
+        ),
+        (project.path().join("AGENTS.md"), "# Shared instructions"),
+    ];
+    for (path, body) in &fixtures {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("qoder.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qoder",
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qoder",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    for (path, body) in [
+        (
+            restored_home.path().join(".qoder/settings.json"),
+            fixtures[0].1,
+        ),
+        (
+            restored_home.path().join(".agents/skills/shared/SKILL.md"),
+            fixtures[1].1,
+        ),
+        (restored_project.path().join("AGENTS.md"), fixtures[2].1),
+    ] {
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
+    }
+}
+
+#[test]
 fn backup_agents_sanitizes_secrets_by_default() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();

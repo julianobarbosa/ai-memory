@@ -687,6 +687,9 @@ pub(crate) fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
 pub async fn run(args: &RunArgs, mode: Mode) -> Result<()> {
     let families = validate_allowlist(&args.include)?;
     let dest_root = resolve_dest(&args.dest, mode)?;
+    let _write_lock = (mode == Mode::Apply)
+        .then(|| state::acquire_write_lock(&dest_root))
+        .transpose()?;
     let scope = state::SyncScope::of(&args.server, &args.workspace, &args.project);
     let old_state = baseline_for(state::load(&dest_root)?, &scope, args.adopt_scope)?;
     let client = ApiClient::new(&args.server, args.token.clone())?;
