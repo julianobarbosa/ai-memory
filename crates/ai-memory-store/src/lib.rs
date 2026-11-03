@@ -78,7 +78,7 @@ pub use ops::{
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
-    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
+    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,
     ProfileCandidateRow, ProfileDigestInputs, ProfileHarvestMark, ProfileHarvestProject,
     ProfileLedgerEntry, ProfileOptOut, ProfilePageRow, ProfilePromptRow, ProfileScopePage,
     ProjectProfileFlags,
@@ -126,11 +126,12 @@ pub use session_consolidation::{
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunHookIdentity,
-    ManagedRunSessionLink, OperationalWorkstreamSummary, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus,
-    StoredWorkstreamSummary, WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
+    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
+    WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -2839,6 +2840,89 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "hyphen.md");
+    }
+
+    const DIRECTORY_PATH_BODY: &str =
+        "edited crates/ai-memory-store/src/reader.rs for the writer_actor in ai-memory";
+    const DIRECTORY_PATH_QUERIES: [&str; 5] = [
+        "reader.rs",
+        "reader",
+        "src/reader.rs",
+        // Control: identifiers must still match as whole tokens.
+        "ai-memory",
+        "writer_actor",
+    ];
+
+    #[tokio::test]
+    async fn search_finds_a_page_naming_a_file_with_its_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/edit.md", DIRECTORY_PATH_BODY))
+            .await
+            .unwrap();
+
+        for query in DIRECTORY_PATH_QUERIES {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].path.as_str(), "notes/edit.md", "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_finds_an_observation_naming_a_file_with_its_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "tool file".into(),
+                    body: DIRECTORY_PATH_BODY.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        for query in DIRECTORY_PATH_QUERIES {
+            let hits = store
+                .reader
+                .search_observations_for_project(ws, proj, query.into(), 5)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].session_id, session_id, "query {query:?}");
+        }
     }
 
     #[tokio::test]
@@ -6730,6 +6814,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
+            claude_boundary: ClaudeSessionBoundary::Other,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -6757,6 +6842,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
+                    claude_boundary: ClaudeSessionBoundary::Other,
                 })
                 .await
                 .unwrap(),

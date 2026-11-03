@@ -37,6 +37,7 @@
 //! `AI_MEMORY_AUTH_TOKEN`, which wins.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -328,6 +329,75 @@ fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// How long the bridge waits for a server that refuses connections before it
+/// gives up. A stdio MCP client does not relaunch a bridge that exited, so a
+/// client opened while the service restarts (an upgrade, a reboot, a crash
+/// the supervisor recovers from) lost its memory tools for the whole session.
+/// The bound stays well under the five seconds a client such as OpenCode
+/// allows a local MCP server to answer, so a server that never comes up still
+/// fails inside the client's own window (#1947).
+const SERVER_WAIT: Duration = Duration::from_secs(3);
+/// The pause between connection attempts while waiting.
+const SERVER_WAIT_POLL: Duration = Duration::from_millis(200);
+
+/// `server_url` as an error message may print it: without the `user:pass@`
+/// userinfo a URL can carry, and never the raw text of one that does not
+/// parse (it could hold that userinfo in a form the parser rejects).
+fn display_server_url(server_url: &str) -> String {
+    let Ok(mut url) = reqwest_mcp::Url::parse(server_url) else {
+        return "the configured server URL".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
+/// Wait, at most `budget`, until something accepts TCP connections at
+/// `server_url`'s host and port, retrying only while the port refuses
+/// (the window a restarting service leaves). Any other failure, and a port
+/// still refusing at the deadline, ends with a diagnosis that names the URL
+/// and says the server did not answer, instead of rmcp's
+/// `error sending request ... when send initialize request` under a bearer
+/// hint that has nothing to do with it. A URL with no host is left to the
+/// transport to reject.
+async fn wait_for_server(server_url: &str, budget: Duration, poll: Duration) -> Result<()> {
+    let Ok(url) = reqwest_mcp::Url::parse(server_url) else {
+        return Ok(());
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return Ok(());
+    };
+    // `host_str` keeps an IPv6 literal's brackets; the resolver wants it bare.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let attempt =
+            tokio::time::timeout(remaining, tokio::net::TcpStream::connect((host, port))).await;
+        let cause = match attempt {
+            Ok(Ok(_stream)) => return Ok(()),
+            Ok(Err(error))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && tokio::time::Instant::now() + poll < deadline =>
+            {
+                tokio::time::sleep(poll).await;
+                continue;
+            }
+            Ok(Err(error)) => error.to_string(),
+            Err(_elapsed) => "the connection attempt timed out".to_owned(),
+        };
+        anyhow::bail!(
+            "could not reach the ai-memory server at {}: {cause} (gave up after \
+             waiting {}s). Check the server is running (`ai-memory status`; on a service \
+             install, `systemctl --user status ai-memory` or the launchd agent) and that this \
+             entry points at it: the bridge connects to `--server-url`, else the configured \
+             server (AI_MEMORY_SERVER_URL).",
+            display_server_url(server_url),
+            budget.as_secs_f32()
+        );
+    }
+}
+
 /// Run the stdio bridge, session-aware or session-less (see the module docs).
 ///
 /// # Errors
@@ -347,6 +417,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
     // Connecting before serving stdio means a refused credential (401) or an
     // unreachable server ends the process with this error at once; the client
     // sees the MCP server exit instead of a session that never answers.
+    wait_for_server(&server_url, SERVER_WAIT, SERVER_WAIT_POLL).await?;
     let mut upstream = match ().serve(transport).await {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -355,7 +426,8 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
             let refused = format!("{error:#}").contains("Auth required");
             return Err(error).with_context(|| {
                 format!(
-                    "connecting the MCP bridge to {server_url}{}{}",
+                    "connecting the MCP bridge to {}{}{}",
+                    display_server_url(&server_url),
                     if refused {
                         ": the server answered 401 Unauthorized"
                     } else {
@@ -501,6 +573,119 @@ mod tests {
                 request.name
             ))]))
         }
+    }
+
+    /// A port nothing listens on, reserved by binding and then dropping it.
+    async fn refusing_address() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// #1947: a server that is not listening ends the bridge within the bound,
+    /// after retrying, with a diagnosis that names the URL and the server, not
+    /// rmcp's initialize error under an unrelated bearer hint.
+    #[tokio::test]
+    async fn an_unreachable_server_fails_within_the_bound_with_a_named_diagnosis() {
+        let address = refusing_address().await;
+        let url = format!("http://{address}/mcp");
+        let started = std::time::Instant::now();
+        let error = wait_for_server(&url, Duration::from_millis(400), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("could not reach the ai-memory server at {url}")),
+            "{message}"
+        );
+        assert!(!message.contains("bearer"), "{message}");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "it must retry a refusing port, gave up after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "unbounded wait: {elapsed:?}"
+        );
+    }
+
+    /// The unreachable-server diagnosis never prints the `user:pass@`
+    /// userinfo a configured URL may carry, nor the raw text of a URL that
+    /// does not parse.
+    #[tokio::test]
+    async fn the_unreachable_diagnosis_strips_userinfo_from_the_url() {
+        let address = refusing_address().await;
+        let url = format!("http://alice:hunter2@{address}/mcp");
+        let error = wait_for_server(&url, Duration::from_millis(100), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "could not reach the ai-memory server at http://{address}/mcp"
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+        assert_eq!(
+            display_server_url("http://user:secret@[::1]:9/mcp"),
+            "http://[::1]:9/mcp"
+        );
+        assert!(!display_server_url("not a url user:secret@").contains("secret"));
+    }
+
+    /// #1947: a server that comes up inside the bound (a service restart) is
+    /// reached, and the bridge completes its upstream handshake.
+    #[tokio::test]
+    async fn a_server_that_starts_within_the_bound_is_reached() {
+        let address = refusing_address().await;
+        let echo = EchoServer {
+            seen_session: Arc::new(Mutex::new(None)),
+        };
+        let http_server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let service: StreamableHttpService<EchoServer, LocalSessionManager> =
+                StreamableHttpService::new(
+                    move || Ok(echo.clone()),
+                    LocalSessionManager::default().into(),
+                    StreamableHttpServerConfig::default()
+                        .with_stateful_mode(false)
+                        .with_json_response(true),
+                );
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            axum::serve(listener, Router::new().nest_service("/mcp", service))
+                .await
+                .unwrap();
+        });
+
+        let url = format!("http://{address}/mcp");
+        wait_for_server(&url, Duration::from_secs(5), Duration::from_millis(50))
+            .await
+            .unwrap();
+        let upstream = ().serve(upstream_transport(&url, None, None).unwrap()).await.unwrap();
+        assert!(upstream.peer_info().is_some());
+        upstream.cancel().await.unwrap();
+        http_server.abort();
+    }
+
+    /// The wait covers only a refusing port: a name that does not resolve is
+    /// reported at once rather than retried until the deadline.
+    #[tokio::test]
+    async fn a_non_refusal_failure_is_reported_without_waiting() {
+        let started = std::time::Instant::now();
+        let error = wait_for_server(
+            "http://ai-memory-bridge-test.invalid:49374/mcp",
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not reach the ai-memory server"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]
