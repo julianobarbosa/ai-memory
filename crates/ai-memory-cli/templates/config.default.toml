@@ -1,10 +1,14 @@
 # ai-memory configuration.
 #
-# All values can also be overridden via environment variables prefixed
+# Scalar values can also be overridden via environment variables prefixed
 # `AI_MEMORY_` (e.g. `AI_MEMORY_BIND=0.0.0.0:49374`).
 #
 # `data_dir` is intentionally absent here: it's set by `--data-dir`
 # or `AI_MEMORY_DATA_DIR`, and the config file lives inside it.
+
+# Human-facing terminal language: "en" or "pt-BR". --language overrides this.
+# JSON, MCP, stored content and technical diagnostics keep their original format.
+language = "en"
 
 # HTTP bind address used by `ai-memory serve`.
 bind = "127.0.0.1:49374"
@@ -108,9 +112,9 @@ log_level = "info"
 # rerank_timeout_secs = 20
 
 # --- LLM provider (consolidation, auto-improve, reranker) -----------------
-# Unset = zero-LLM: session pages are written heuristically and search needs no
-# provider. Setting a provider turns on the LLM features that need one. Each key
-# has an `AI_MEMORY_` environment equivalent (`AI_MEMORY_LLM_PROVIDER`, ...).
+# With no global or per-task provider, session pages are written heuristically
+# and search needs no provider. A task profile can enable its own LLM features
+# independently. Top-level keys have `AI_MEMORY_` environment equivalents.
 #   llm_provider = "anthropic"   # or openai | gemini | openai-compat |
 #                                # openai-oauth | anthropic-oauth | codex |
 #                                # copilot | opencode | cursor
@@ -130,12 +134,26 @@ log_level = "info"
 # it. Off by default. Env equivalent: `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING`.
 # llm_compat_disable_thinking = false
 
+# openai-compat only: explicitly set the `stream` field on Chat Completions
+# requests. Set to false to prevent gateways defaulting to SSE. Setting true
+# is rejected because this transport cannot decode SSE responses.
+# Unset by default (omits the field). Env equivalent:
+# `AI_MEMORY_LLM_COMPAT_STREAM`.
+#   llm_compat_stream = false
+
 # Per-request timeout in seconds for every chat completion and for the Copilot
 # token exchange. The openai-oauth token refresh keeps its own built-in ceiling.
 # The default tolerates a local engine cold-loading a large model. Raise it for
 # a hosted gateway whose long completions run past it (seen on free aggregator
 # tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
 # llm_timeout_secs = 300
+
+# How many live `bootstrap` runs may call the LLM at once, across projects. A
+# second run for the same project always waits for the first. The default runs
+# one at a time; raise it when the provider batches concurrent requests (a local
+# vLLM or llama.cpp server) to keep it busy while many repositories bootstrap.
+# Env equivalent: `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`.
+# bootstrap_max_concurrent = 1
 
 # Reasoning effort sent to the provider. Unset leaves the model default. Values:
 # none, minimal, low, medium, high, xhigh, max, ultra, persistent. Each provider
@@ -333,6 +351,34 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 #   [decay.half_life_days]
 #   episodic = 180.0
 
+# Per-task LLM profiles are optional. Tasks: consolidation, bootstrap,
+# auto_improve, experience, dream, lint, profile, rerank and query_answer.
+# query_answer covers memory_query(answer=true) and memory_explore.
+# An unset task shares the default provider and its fallback chain. A task
+# profile can also work without a global llm_provider; unrelated tasks remain
+# without a provider. Each task chain uses only its own fallbacks.
+#
+# provider is required and nonblank. model defaults to the selected provider's
+# model; openai-compat requires both model and base_url. A task does not inherit
+# the global endpoint. api_key_env names an environment variable, never a key
+# value; when omitted, the provider uses its normal credential source. OpenAI
+# OAuth, Codex and Cursor reject api_key_env and keep their native login.
+# A named variable that is missing fails serve startup. Timeout, compatibility
+# options, headers and reasoning effort remain global.
+#
+# Nested scalar environment overrides use double underscores, for example
+# AI_MEMORY_LLM__BOOTSTRAP__PROVIDER. Fallback lists are config-only.
+#   [llm.bootstrap]
+#   provider = "openai-compat"
+#   model = "local-model"
+#   base_url = "http://127.0.0.1:49375/v1"
+#   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+#
+#   [[llm.bootstrap.fallbacks]]
+#   provider = "gemini"
+#   model = "gemini-3.5-flash"
+#   api_key_env = "GEMINI_API_KEY"
+#
 # NOTE: commented example tables stay below the first real table, where the
 # top-level keys have ended. A `[table]` header owns every key after it, so an
 # example table uncommented above a top-level key would silently capture it.
@@ -392,6 +438,15 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # reduced to metadata stays unnamed. Off by default.
 # Env equivalent: AI_MEMORY_INGEST__RECORD_TOOL_NAMES=true
 # record_tool_names = true
+#
+# Store the checkout-relative path of the one file a kept file-tool call named
+# (native hook client and generated TypeScript integrations), so the store can
+# answer which sessions touched a file. A path an `ignore_paths` entry excludes
+# never leaves the machine. The `file_path_*` counters in `/admin/status` and
+# `/admin/metrics` say why the other file-tool events got no path. Off by
+# default.
+# Env equivalent: AI_MEMORY_INGEST__INDEX_FILE_PATHS=true
+# index_file_paths = true
 
 # Privacy strip.
 #
@@ -702,12 +757,31 @@ mid_session = "follow-cwd"
 # observation_stream lets matching observation bodies vote, once per session,
 # for that session's latest `sessions/<id>.md` page in the same project. It
 # reads observations and writes nothing. False restores the previous ranking.
+#
+# feedback_demotion subtracts its weight from the authority factor of a page
+# whose current version carries open `stale`/`wrong` feedback, until a rewrite
+# supersedes that version and clears the flag with it. helpful and not_helpful
+# never demote. 0.0 (the default) is inert and negative values are clamped to 0.
+#
+# query_signal_weight is the query-scoped implicit-signal boost: when a
+# memory_query hit is followed in the same agent session by a memory_read_page
+# of that path (or a `helpful` feedback signal), the pair is stored as a
+# (normalized query -> page) association — sanitized, scoped to the project and
+# purged with it or with the session that wrote it. Only callers with write
+# access to the project record one, only session-aware MCP clients (those that
+# send a session id) produce them, and `not_helpful` right after the query
+# withdraws it. A later query lexically similar to a stored query gives that
+# page up to `weight * similarity` in authority, similarity-capped, so an
+# unrelated query gains nothing. 0.0 (the default) also stops the capture: no
+# queries are stored while the boost is off.
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
 # abstract_vectors = false
 # belief_authority_weight = 0.0
 # observation_stream = true
+# feedback_demotion = 0.0
+# query_signal_weight = 0.0
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A
@@ -757,6 +831,7 @@ mid_session = "follow-cwd"
 # digest_max_bytes = 3000
 # baseline_max_bytes = 6000
 # apply_max_lines = 40
+# max_output_tokens = 2000
 # llm = true
 
 # Admission webhooks: synchronous HTTP hooks the server calls just before it

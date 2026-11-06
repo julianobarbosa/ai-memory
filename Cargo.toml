@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "3.3.2"
+version = "3.4.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -45,18 +45,24 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "3.3.2" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "3.3.2" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.3.2" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.3.2" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.3.2" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.3.2" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.3.2" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "3.3.2" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.3.2" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.3.2" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.4.2" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.4.2" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.4.2" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.4.2" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.4.2" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.4.2" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.4.2" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.4.2" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.4.2" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.4.2" }
 
 # (Workspace shared deps follow below)
+
+# Localization. Catalogs are embedded; no runtime files or JavaScript tooling.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+fluent-syntax = "0.12"
+askama = { version = "0.12", default-features = false, features = ["humansize", "num-traits", "urlencode"] }
 
 # Error handling.
 anyhow = "1"
@@ -91,7 +97,7 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 # Config & CLI.
 figment = { version = "0.10", features = ["toml", "env"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 # Shell-completion generator for `ai-memory completions <shell>`. Reads the
 # same derived `Command` the parser uses, so completions can never drift
 # from the actual CLI surface.
@@ -142,7 +148,10 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+# rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
+# per-request `_meta` negotiation) while keeping the legacy `initialize`
+# handshake, so both-era clients connect without a shim (#1924).
+rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

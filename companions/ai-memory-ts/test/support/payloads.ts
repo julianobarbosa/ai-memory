@@ -12,6 +12,18 @@ export const SESSION_ID = "b2f3725b-265c-5da4-9866-35db4765d1b9";
 
 export const write = { page_id: NEXT_PAGE_ID, path: "notes/retries.md", checkpoint: "b04977fb" };
 export const patch = write;
+export const resolvedWriteTarget = {
+  workspace: "demo",
+  project: "app",
+  project_id: "01a135ce-c831-75e5-937e-1df03537fc28",
+};
+export const batchWrite = {
+  pages: [
+    { index: 0, path: "notes/a.md", page_id: PAGE_ID },
+    { index: 1, path: "notes/b.md", page_id: NEXT_PAGE_ID },
+  ],
+  checkpoint: "c04d2f91",
+};
 
 export const read = {
   path: "notes/retries.md",
@@ -28,6 +40,8 @@ export const read = {
     abstract: "short",
     relations: { fixes: ["notes/a.md"], bogus: ["x"] },
     expires_at: "2099-01-01",
+    source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
+    sources: [{ resource: "ai-memory://session/x", author: "process:claude-code" }],
     type: "Note",
     generated: { by: "process:ai-memory/3.0.0", at: "2026-10-13T15:10:47Z" },
   },

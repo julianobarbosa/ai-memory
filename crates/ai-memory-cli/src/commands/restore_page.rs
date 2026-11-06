@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::RestorePageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -37,10 +38,16 @@ struct RestorePageResponse {
 /// or page version cannot be restored; or the restored page cannot be
 /// reindexed.
 pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     if args.path.trim().is_empty() {
-        bail!("--path was passed empty; specify the wiki page path to restore");
+        bail!(
+            "{}",
+            i18n.text(
+                "cli-restore-page-path-was-passed-empty-specify-the-wiki-page-path-to-restore"
+            )
+        );
     }
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     super::refuse_empty_explicit(args.page_id.as_deref(), "--page-id")?;
@@ -59,7 +66,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
         },
     )
     .await
-    .context("restoring page via server")?;
+    .context(i18n.text("cli-restore-page-restoring-page-via-server"))?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -67,18 +74,38 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
     }
 
     println!(
-        "restored {} under {}/{} from {} (page_id={})",
-        resp.path,
-        workspace,
-        project,
-        resp.restored_from,
-        super::write_page::short_page_id(&resp.page_id)
+        "{}",
+        i18n.format(
+            "cli-restore-page-restored-under-from-page-id",
+            &[
+                ("value0", terminal_text(&resp.path)),
+                ("value1", workspace.to_string()),
+                ("value2", project.to_string()),
+                ("value3", terminal_text(&resp.restored_from)),
+                (
+                    "value4",
+                    terminal_text(super::write_page::short_page_id(&resp.page_id))
+                )
+            ]
+        )
     );
     if let Some(pre) = resp.pre_checkpoint {
-        println!("pre-restore checkpoint: {pre}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-restore-page-pre-restore-checkpoint-pre",
+                &[("value0", terminal_text(&pre))]
+            )
+        );
     }
     if let Some(cp) = resp.checkpoint {
-        println!("restore checkpoint: {cp}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-restore-page-restore-checkpoint-cp",
+                &[("value0", terminal_text(&cp))]
+            )
+        );
     }
     Ok(())
 }

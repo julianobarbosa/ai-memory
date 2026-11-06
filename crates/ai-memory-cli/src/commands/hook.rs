@@ -20,9 +20,10 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, GlobStep,
-    GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths, capture_lookup_locations,
-    glob_segment_matches, glob_walk, repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, FILE_FIELD_KEY,
+    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, LookupLocation, PolicyState,
+    absolute_tool_location_paths, capture_lookup_locations, file_field, file_target,
+    glob_segment_matches, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -34,9 +35,10 @@ use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
     HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_for_subagent_brief,
-    marker_query_suffix_without_briefing, marker_requests_briefing,
-    marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
+    hook_scope, inbox_notice_query_suffix, marker_capture_policy, marker_query_suffix,
+    marker_query_suffix_for_subagent_brief, marker_query_suffix_without_briefing,
+    marker_requests_briefing, marker_requests_inbox_notice, marker_requests_subagent_briefing,
+    resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -60,6 +62,9 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+/// Per-execution opt-out of the automatic handoff (#1951): a falsy value
+/// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
+const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
 const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
@@ -345,7 +350,12 @@ fn dispatch_backfill_close(
         });
     }
     let Ok(payload) = serde_json::to_string(&body) else {
-        eprintln!("ai-memory hook warning: could not serialize backfill-close body; skipped");
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook warning: could not serialize backfill-close body; skipped"
+            )
+        );
         return;
     };
     let cwd_qs = candidate
@@ -362,7 +372,12 @@ fn dispatch_backfill_close(
     let spool = hook_spool::spool_dir(dd);
     let entry = hook_spool::entry_for(event_url, payload, auth_token, oidc_present);
     if let Err(e) = hook_spool::enqueue_with_config(&spool, &entry, None) {
-        eprintln!("ai-memory hook warning: failed to spool backfill-close event: {e}");
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: failed to spool backfill-close event: {e}"
+            ))
+        );
     }
 }
 
@@ -434,7 +449,17 @@ fn briefed_marker_path(
     session_id: Option<&str>,
     cwd: Option<&str>,
 ) -> PathBuf {
-    let key = session_id.map_or_else(
+    data_dir
+        .join("briefed")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+/// The per-session key the `briefed`, `inbox-notice` and sibling state files
+/// share: the payload's canonical session id when the harness supplies one,
+/// else a stable hash of agent+cwd so a session-less agent still gets
+/// once-per-checkout behavior. Sanitized to a safe file name.
+fn briefed_session_key(agent: &str, session_id: Option<&str>, cwd: Option<&str>) -> String {
+    session_id.map_or_else(
         || {
             format!(
                 "{:x}",
@@ -442,8 +467,7 @@ fn briefed_marker_path(
             )
         },
         sanitize_briefed_key,
-    );
-    data_dir.join("briefed").join(key)
+    )
 }
 
 /// The once-per-session profile-digest marker beside a brief marker: same
@@ -469,17 +493,53 @@ fn sanitize_briefed_key(raw: &str) -> String {
         .collect()
 }
 
-/// Best-effort marker write with bounded retention: on failure the worst case
-/// is a re-brief on the next prompt, which is acceptable.
-fn mark_briefed(path: &Path) {
+/// `<data_dir>/inbox-notice/<key>` — the last mid-session inbox notice this
+/// session was shown (#1942), keyed like the briefed markers (native session
+/// id when the payload carries one, else a stable hash of agent+cwd, so a
+/// session-less checkout still deduplicates per checkout). Holds the notice
+/// text itself, bounded by [`INBOX_NOTICE_STATE_MAX_BYTES`]: text equality is
+/// count equality plus the inbox's own names, so a change in either re-notifies.
+fn inbox_notice_state_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    data_dir
+        .join("inbox-notice")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+/// The storage bound for a dedup state file. The notice is a fixed scaffold
+/// around a count and two names, always far below this; the cap only stops a
+/// hostile server from parking unbounded text on disk through this path.
+const INBOX_NOTICE_STATE_MAX_BYTES: usize = 1024;
+
+fn inbox_notice_already_shown(path: &Path, notice: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|shown| shown == notice)
+}
+
+/// Best-effort dedup write with bounded retention: on failure the worst case
+/// is the same notice re-delivered on the next prompt, which is acceptable.
+fn mark_inbox_notice_shown(path: &Path, notice: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() || fs::write(path, b"").is_err() {
+    if fs::create_dir_all(parent).is_err() {
         return;
     }
+    let bounded = &notice.as_bytes()[..notice.len().min(INBOX_NOTICE_STATE_MAX_BYTES)];
+    if fs::write(path, bounded).is_err() {
+        return;
+    }
+    prune_to_newest_files(parent, path, MAX_BRIEFED_MARKERS);
+}
 
-    let Ok(entries) = fs::read_dir(parent) else {
+/// Keep only the `keep` newest files in `dir` (plus `except`, always kept):
+/// per-session state directories are bounded so a long-lived install does
+/// not accumulate one small file per session it has ever run.
+fn prune_to_newest_files(dir: &Path, except: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut stale_candidates = entries
@@ -492,13 +552,25 @@ fn mark_briefed(path: &Path) {
                 entry.path(),
             ))
         })
-        .filter(|(_, _, candidate)| candidate != path)
+        .filter(|(_, _, candidate)| candidate != except)
         .collect::<Vec<_>>();
     stale_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let keep_others = MAX_BRIEFED_MARKERS.saturating_sub(1);
+    let keep_others = keep.saturating_sub(1);
     for (_, _, stale) in stale_candidates.into_iter().skip(keep_others) {
         let _ = fs::remove_file(stale);
     }
+}
+
+/// Best-effort marker write with bounded retention: on failure the worst case
+/// is a re-brief on the next prompt, which is acceptable.
+fn mark_briefed(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() || fs::write(path, b"").is_err() {
+        return;
+    }
+    prune_to_newest_files(parent, path, MAX_BRIEFED_MARKERS);
 }
 
 fn fresh_session_id(data_dir: &Path, agent: AgentKind) -> String {
@@ -651,7 +723,12 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         Ok(outcome) => {
             let _ = write_drain_report(&mut std::io::stderr(), &outcome);
         }
-        Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
+        Err(err) => eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain warning: failed to acquire drain lock: {err}"
+            ))
+        ),
     }
     Ok(())
 }
@@ -678,8 +755,11 @@ fn write_drain_report<W: std::io::Write>(
         // the fix, the confusion the fix is for.
         hook_spool::LockedDrainResult::LockBusy => writeln!(
             w,
-            "ai-memory hook-drain warning: another drainer holds the spool lock; \
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook-drain warning: another drainer holds the spool lock; \
              this pass attempted no delivery and left the spool untouched"
+            )
         ),
         hook_spool::LockedDrainResult::Drained(result) => {
             if result.remaining == 0 && result.dropped == 0 {
@@ -692,10 +772,13 @@ fn write_drain_report<W: std::io::Write>(
             // drain cannot observe — the precise confusion #493 was written in.
             writeln!(
                 w,
-                "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
                  {} still queued, {} DROPPED undelivered (past the retry cap or \
                  older than the spool TTL)",
-                result.sent, result.remaining, result.dropped
+                    result.sent, result.remaining, result.dropped
+                ))
             )
         }
     }
@@ -715,6 +798,18 @@ fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<Stri
 
 fn managed_run_query_suffix() -> String {
     managed_run_query_suffix_with(env_lookup)
+}
+
+/// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
+/// handoff off for this execution. Inherited execution context, like
+/// `AI_MEMORY_RUN_ID`; anything but an explicit falsy value sends nothing, so
+/// the server's `[handoff] create_on_session_end` decides.
+fn auto_handoff_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    if env_lookup(AUTO_HANDOFF_ENV).is_some_and(|value| crate::marker::is_falsy(&value)) {
+        "&auto_handoff=0".to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// Read a positive-integer minute override from `name`, falling back to the
@@ -1204,11 +1299,63 @@ fn recap_url(base: &str, agent: &str, session_id: &str, budget: Option<usize>) -
     )
 }
 
-fn user_prompt_recap_envelope(recap: &str) -> serde_json::Value {
+/// The post-compaction anchor's size. A compaction already left the context
+/// tight, so it asks for the server's default rather than a recap's room. One
+/// budget serves every agent because it already fits Codex's limit.
+const ANCHOR_BUDGET: usize = 2_000;
+const _: () = assert!(ANCHOR_BUDGET <= CODEX_RECAP_BUDGET);
+/// The first line of a real anchor. A server that predates `mode=anchor`
+/// ignores it and answers with the full recap (up to 8,000 chars), and an
+/// unknown or refused session gets a "no session is recorded" notice; neither
+/// starts with this, so neither is injected automatically. A session with no
+/// prompts yet still gets its short anchor, which names where the record is.
+pub(crate) const ANCHOR_HEADER: &str = ai_memory_core::compaction_recap::ANCHOR_HEADER_PREFIX;
+
+/// Whether a `SessionStart` is the one an agent fires right after a context
+/// compaction (`source: "compact"`). Any agent that says so is mid-session,
+/// so none of them claims the startup packet; only
+/// [`injects_compaction_anchor`] agents get the anchor in its place.
+fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
+    raw.get("source").and_then(serde_json::Value::as_str) == Some("compact")
+}
+
+/// Whether a compaction `SessionStart` should carry the session anchor: the
+/// agents documented to add its `additionalContext` to the compacted context:
+/// - Claude Code: <https://code.claude.com/docs/en/hooks> ("Re-inject
+///   context after compaction", `source: "compact"`);
+/// - Codex: <https://learn.chatgpt.com/docs/hooks> (`source: "compact"`,
+///   queued after a compaction and run before the next model request);
+/// - Factory Droid: <https://docs.factory.com/reference/hooks-reference>
+///   (`source: "compact"`, appended to the new session context).
+///
+/// Muse reports a `compact` source but publishes no output contract for it,
+/// and Cursor runs Claude Code's settings with unverified handling of the
+/// envelope, so neither gets an anchor.
+fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
+    matches!(
+        agent,
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
+    ) && is_compaction_session_start(raw)
+        && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+}
+
+/// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
+/// re-grounding the agent after the summary dropped them.
+fn anchor_url(base: &str, agent: &str, session_id: &str) -> String {
+    format!(
+        "{}&mode=anchor",
+        recap_url(base, agent, session_id, Some(ANCHOR_BUDGET))
+    )
+}
+
+/// A `UserPromptSubmit` hook's `hookSpecificOutput.additionalContext`:
+/// Claude Code places it alongside the submitted prompt (used for both the
+/// compaction recap and the mid-session inbox notice, #1942).
+fn user_prompt_context_envelope(context: &str) -> serde_json::Value {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": recap,
+            "additionalContext": context,
         }
     })
 }
@@ -1461,7 +1608,10 @@ where
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!(
-                "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
+                "{}",
+                crate::localization::process_diagnostic(
+                    "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
+                )
             );
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
@@ -1702,11 +1852,14 @@ where
         HookRoute::Profile(resolved) => Some(resolved),
         HookRoute::Rejected { name, reason } => {
             eprintln!(
-                "ai-memory hook warning: this repository's marker selects server profile {}, \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: this repository's marker selects server profile {}, \
                  which was refused ({}); the event was dropped",
-                name.as_ref()
-                    .map_or_else(|| "<invalid>".to_owned(), |n| format!("`{n}`")),
-                reason.as_str()
+                    name.as_ref()
+                        .map_or_else(|| "<invalid>".to_owned(), |n| format!("`{n}`")),
+                    reason.as_str()
+                ))
             );
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
@@ -1737,18 +1890,30 @@ where
                 );
                 payload = serde_json::to_string(&json)?;
             }
-            CaptureDisposition::Keep
-                if decision.protocol().policy_state() != PolicyState::Inactive =>
-            {
-                if let Some(object) = json.as_object_mut() {
-                    object.insert(
-                        "_ai_memory_capture".into(),
-                        serde_json::to_value(decision.protocol())?,
-                    );
+            CaptureDisposition::Keep => {
+                let claim = decision.protocol().policy_state() != PolicyState::Inactive;
+                let file = (hook_event == HookEvent::PostToolUse)
+                    .then(|| {
+                        inspection_cwd
+                            .as_deref()
+                            .and_then(|cwd| file_path_field(agent_kind, &json, cwd))
+                    })
+                    .flatten();
+                if (claim || file.is_some())
+                    && let Some(object) = json.as_object_mut()
+                {
+                    if claim {
+                        object.insert(
+                            "_ai_memory_capture".into(),
+                            serde_json::to_value(decision.protocol())?,
+                        );
+                    }
+                    if let Some(file) = file {
+                        object.insert(FILE_FIELD_KEY.into(), file);
+                    }
                     payload = serde_json::to_string(&json)?;
                 }
             }
-            CaptureDisposition::Keep => {}
         }
     }
 
@@ -1829,7 +1994,8 @@ where
     let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}");
+    let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -1899,7 +2065,10 @@ where
                 store_antigravity_transcript_cursor(&prompts.cursor_path, &prompts.cursor);
             } else {
                 eprintln!(
-                    "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                    "{}",
+                    crate::localization::process_diagnostic(
+                        "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                    )
                 );
             }
         };
@@ -1919,7 +2088,10 @@ where
                     .routed_to(profile_name);
             if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
                 eprintln!(
-                    "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                    "{}",
+                    crate::localization::process_diagnostic(
+                        "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                    )
                 );
             } else if let Some(batch) = live_batch.take() {
                 batch.commit();
@@ -2002,13 +2174,38 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if agent_kind.session_start_injects_handoff() && !handoff_scoped {
+        // A compaction's SessionStart is not a new session: claiming a
+        // handoff, a recovery snapshot or the brief again would spend the
+        // tight room the compaction left on the startup packet, and would
+        // consume a baton mid-session. A verified agent gets the session
+        // anchor instead; every other one, and an unavailable anchor, gets
+        // the normal empty reply.
+        if is_compaction_session_start(&json) {
+            if injects_compaction_anchor(agent_kind, &json)
+                && let Some(session_id) = canonical_session_id.as_deref()
+            {
+                let client = build_client();
+                let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+                let url = anchor_url(base, &args.agent, session_id);
+                if let Some(anchor) =
+                    get_handoff(&client, &url, bearer.as_deref(), handoff_timeout())
+                        .await
+                        .filter(|body| body.starts_with(ANCHOR_HEADER))
+                {
+                    let envelope = session_start_handoff_envelope(agent_kind, anchor);
+                    writeln!(stdout, "{envelope}")?;
+                    return Ok(());
+                }
+            }
+        } else if agent_kind.session_start_injects_handoff() && !handoff_scoped {
             eprintln!(
-                "ai-memory hook warning: the event named no project directory, so no handoff \
+                "{}",
+                crate::localization::process_diagnostic(
+                    "ai-memory hook warning: the event named no project directory, so no handoff \
                  was fetched; recover a pending one with memory_handoff_accept"
+                )
             );
-        }
-        if agent_kind.session_start_injects_handoff() && handoff_scoped {
+        } else if agent_kind.session_start_injects_handoff() && handoff_scoped {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -2104,7 +2301,7 @@ where
         let url = recap_url(base, &args.agent, session_id, budget);
         if let Some(recap) = get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
         {
-            writeln!(stdout, "{}", user_prompt_recap_envelope(&recap))?;
+            writeln!(stdout, "{}", user_prompt_context_envelope(&recap))?;
             return Ok(());
         }
     }
@@ -2215,6 +2412,63 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt, Claude Code only: a repository that opted into
+    // `[messaging] inbox_notice_on_prompt` (#1942) gets the same count-only
+    // inbox notice a session start appends, on every prompt, deduplicated on
+    // count change. `inbox_only=1` makes the server return only that notice
+    // and skip every claim, write and active-project publish; `handoff=0`,
+    // `recovery=0`, `profile_digest=0` (each sent once: a repeated key is a
+    // 400, see `inbox_notice_query_suffix`) and no `briefing` keep an older server
+    // that ignores the flag to the same body (the baton stays unclaimed,
+    // unlike the kimi path above, which is Claude's baton-delivery
+    // substitute). The response is a count and the inbox's own names, never
+    // message text. Cursor runs these hook settings too; its handling of the
+    // envelope is unverified, so a Cursor payload gets nothing (same guard
+    // as the recap above).
+    if hook_event == HookEvent::UserPrompt
+        && agent_kind == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && marker_requests_inbox_notice(cwd)
+    {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let native_session_qs = canonical_session_id
+            .as_deref()
+            .map_or_else(String::new, |session_id| {
+                format!("&session_id={}", url_encode(session_id))
+            });
+        let notice_url = format!(
+            "{base}/handoff?agent={}{qs}{native_session_qs}",
+            args.agent,
+            qs = inbox_notice_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
+        );
+        let notice = get_handoff(&client, &notice_url, bearer.as_deref(), handoff_timeout()).await;
+        let shown = inbox_notice_state_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        match notice.as_deref() {
+            // Zero agent-visible mail (or a failed fetch — indistinguishable
+            // here, which only ever costs one re-notice after an outage):
+            // clear the dedup state so the next rise notifies again, and say
+            // nothing.
+            None => {
+                let _ = fs::remove_file(&shown);
+            }
+            // Same notice as last time: the count (and the inbox's own
+            // names) have not changed, so the prompt stays quiet.
+            Some(notice) if inbox_notice_already_shown(&shown, notice) => {}
+            Some(notice) => {
+                mark_inbox_notice_shown(&shown, notice);
+                writeln!(stdout, "{}", user_prompt_context_envelope(notice))?;
+                return Ok(());
+            }
+        }
     }
 
     // user-prompt: Hermes ignores `on_session_start` stdout, but adds a
@@ -2359,7 +2613,10 @@ where
         )
     {
         eprintln!(
-            "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
+            ))
         );
     }
 
@@ -2572,13 +2829,13 @@ fn foreign_decision_within(
     // long list inside the checkout must not spend it first. Inside it the
     // own policy governs, as for a glob rooted there; a marker nested in it
     // is found while the budget lasts, the shallowest locations first.
-    let (outside, mut inside): (Vec<String>, Vec<String>) =
+    let (outside, mut inside): (Vec<LookupLocation>, Vec<LookupLocation>) =
         locations.into_iter().partition(|location| {
             checkout
                 .as_deref()
-                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+                .is_none_or(|checkout| !Path::new(&location.path).starts_with(checkout))
         });
-    inside.sort_by_key(|location| Path::new(location).components().count());
+    inside.sort_by_key(|location| Path::new(&location.path).components().count());
     let inside_from = outside.len();
     for (index, location) in outside.into_iter().chain(inside).enumerate() {
         // Past a bound, a location inside the own checkout ends the lookup;
@@ -2590,8 +2847,8 @@ fn foreign_decision_within(
                 Some(unprovable())
             }
         };
-        let (lookup, steps) = match glob_walk(&location) {
-            GlobWalk::Literal => (location, None),
+        let (lookup, steps) = match location.walk() {
+            GlobWalk::Literal => (location.path, None),
             GlobWalk::Unprovable => return unprovable(),
             GlobWalk::Walk { root, steps } => (root, Some(steps)),
         };
@@ -2959,6 +3216,37 @@ pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
         .unwrap_or_else(|_| cwd.to_owned())
 }
 
+/// The `_ai_memory_file` field for a kept file-tool PostToolUse (#1843): the
+/// one file the call names, relative to the checkout root of `cwd` (the
+/// lexical inspection cwd) and `/`-separated, or why the client has none.
+/// `None` when the call names no single file. Lexical like the capture
+/// policy, so a symlinked cwd is not resolved; relative to the checkout root
+/// rather than the marker, so two worktrees produce the same key.
+fn file_path_field(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    cwd: &str,
+) -> Option<serde_json::Value> {
+    let FileTarget::One(path) = file_target(agent, raw)? else {
+        return None;
+    };
+    let cwd = Path::new(cwd);
+    let Some(root) = crate::marker::checkout_root(cwd) else {
+        return Some(file_field(Err(FileSkip::NoCheckout)));
+    };
+    let absolute = crate::marker::absolute_normalized(&cwd.join(path));
+    let Ok(relative) = absolute.strip_prefix(&root) else {
+        return Some(file_field(Err(FileSkip::OutsideCheckout)));
+    };
+    let key = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|segments| segments.join("/"))
+        .filter(|key| ai_memory_core::valid_file_path_key(key));
+    Some(file_field(key.as_deref().ok_or(FileSkip::Refused)))
+}
+
 /// File under the data dir holding the per-install capture mode (#446).
 ///
 /// Deliberately a standalone file rather than a flag baked into each agent's
@@ -3027,11 +3315,7 @@ fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> P
     let dir = data_dir
         .map(Path::to_path_buf)
         .or_else(|| runtime_env.data_dir().map(Path::to_path_buf))
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("ai-memory")
-        });
+        .unwrap_or_else(crate::config::default_data_dir);
     // Recover already-installed hooks that baked a safe verbatim data-dir form.
     match dir.to_str() {
         Some(s) if s.starts_with(r"\\?\") => {
@@ -3044,6 +3328,28 @@ fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_handoff_env_forwards_only_an_explicit_opt_out() {
+        let lookup = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == AUTO_HANDOFF_ENV)
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            }
+        };
+        for off in ["off", "0", "false", "NO", " Off "] {
+            assert_eq!(
+                auto_handoff_query_suffix_with(lookup(Some(off))),
+                "&auto_handoff=0",
+                "{off}"
+            );
+        }
+        for keep in [None, Some(""), Some("on"), Some("1"), Some("maybe")] {
+            assert_eq!(auto_handoff_query_suffix_with(lookup(keep)), "", "{keep:?}");
+        }
+    }
 
     /// The regression this whole change exists for. `inspect` runs only for
     /// tool events, so a gate expressed through `CaptureDisposition` would
@@ -5490,6 +5796,62 @@ mod tests {
         .map(|decision| decision.protocol().disposition())
     }
 
+    /// Regression (#1977): a shell does not expand a `(` or `{` inside
+    /// quotes, so a quoted one next to a `/` (an awk block, a jq group) is
+    /// text and the call keeps its output with no marker anywhere.
+    /// Adversarial: an unquoted brace expansion or zsh group that spans a
+    /// separator still proves nothing, and quoted braces that list
+    /// alternatives, which a program that globs its own argument expands,
+    /// are followed into the sibling checkout they name.
+    #[test]
+    fn a_quoted_group_or_brace_next_to_a_separator_is_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let plain = work.join("plain");
+        let a = work.join("a");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "echo '(a/b)'",
+            "echo 'a/(b'",
+            "echo 'a/{b'",
+            "echo \"(a/b)\"",
+            "echo a/\\(b",
+            "awk '{print $1/2}' f.txt",
+            "jq '(.a // \"x\")' f.json",
+            "jq '{a: .x, b: (.y/2)}' f.json",
+            "bash -c \"awk '{print \\$1/2}' f.txt\"",
+        ] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                None,
+                "{command}"
+            );
+        }
+        for command in ["cat {x/y,z}", "cat x/{y", "bash -c 'cat {x/y,z}'"] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                Some(CaptureDisposition::MetadataOnly),
+                "{command}"
+            );
+        }
+        assert!(
+            foreign_disposition(&plain, "rg -g '{../a/secrets.env,x}' key", None, None, fast)
+                .is_some(),
+            "the sibling checkout's marker governs a quoted alternative naming it"
+        );
+        assert_eq!(
+            foreign_disposition(&plain, "rg -g '{../plain/x,y}' key", None, None, fast),
+            None
+        );
+    }
+
     /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that
     /// starts above the event's checkout skips the checkout's own subtree, so
     /// a checkout with more directories than the walk's bound keeps
@@ -6760,7 +7122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_preserves_bytes_and_active_keep_adds_protocol() {
+    async fn inactive_appends_only_the_file_field_and_active_keep_adds_protocol() {
         let tmp = tempfile::tempdir().unwrap();
         let inactive_data = tmp.path().join("inactive-data");
         let inactive_payload =
@@ -6776,9 +7138,16 @@ mod tests {
         )
         .await
         .unwrap();
+        // A file-tool PostToolUse now carries the file path field (#1843),
+        // appended; no claim is attached under an inactive policy and every
+        // other byte is as the harness sent it.
+        let expected = format!(
+            r#"{},"_ai_memory_file":{{"version":1,"skipped":"no_checkout"}}}}"#,
+            inactive_payload.strip_suffix('}').unwrap()
+        );
         assert_eq!(
             read_spooled_entries(&hook_spool::spool_dir(&inactive_data))[0].body,
-            inactive_payload
+            expected
         );
 
         std::fs::write(
@@ -6803,6 +7172,202 @@ mod tests {
         .unwrap();
         assert_eq!(body["_ai_memory_capture"]["disposition"], "keep");
         assert_eq!(body["_ai_memory_capture"]["policy_state"], "active");
+    }
+
+    /// Run one native hook event into its own data dir and return the spooled
+    /// body, or `None` when nothing was spooled.
+    async fn spooled_body(
+        data: PathBuf,
+        event: &str,
+        agent: &str,
+        payload: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut args = devin_hook_args(event);
+        args.agent = agent.into();
+        run_with_payload(
+            Some(data.clone()),
+            args,
+            payload.to_string(),
+            &mut Vec::new(),
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data);
+        if !spool.exists() {
+            return None;
+        }
+        read_spooled_entries(&spool)
+            .first()
+            .map(|entry| serde_json::from_str(&entry.body).unwrap())
+    }
+
+    /// #1843: a kept file-tool PostToolUse carries `_ai_memory_file` with the
+    /// one file's checkout-relative path, under an inactive or an active
+    /// policy, or why it has none. A PreToolUse, a two-file patch and a
+    /// metadata-only event carry no field, and an ignored path is not sent.
+    #[tokio::test]
+    async fn post_tool_use_carries_the_file_field_or_its_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("crates")).unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/w\n").unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(active.join(".git")).unwrap();
+        std::fs::write(
+            active.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let read = |cwd: &Path, path: &str| {
+            serde_json::json!({
+                "session_id": "file-field", "cwd": cwd, "tool_name": "Read",
+                "tool_input": { "file_path": path }, "tool_response": { "content": "x" },
+            })
+        };
+        let patch = |cwd: &Path, headers: &str| {
+            let mut body = ai_memory_hooks::tool_call_payload(
+                AgentKind::Codex,
+                "apply_patch",
+                Some(&serde_json::json!({
+                    "input": format!("*** Begin Patch\n{headers}*** End Patch")
+                })),
+                None,
+            );
+            body["session_id"] = "file-field".into();
+            body["cwd"] = cwd.to_string_lossy().as_ref().into();
+            body
+        };
+        let path = |p: &str| Some(serde_json::json!({ "version": 1, "path": p }));
+        let skipped = |r: &str| Some(serde_json::json!({ "version": 1, "skipped": r }));
+        let absolute = repo.join("src/a.rs").to_string_lossy().into_owned();
+        let long = "a".repeat(ai_memory_core::FILE_PATH_MAX_CHARS + 1);
+        let cases = [
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, "src/lib.rs"),
+                path("src/lib.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo.join("crates"), "../README.md"),
+                path("README.md"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, &absolute),
+                path("src/a.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&worktree, "x.rs"),
+                path("x.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, "/etc/hosts"),
+                skipped("outside_checkout"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&plain, "x.rs"),
+                skipped("no_checkout"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, &long),
+                skipped("refused"),
+            ),
+            (
+                "pre-tool-use",
+                "claude-code",
+                read(&repo, "src/lib.rs"),
+                None,
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&repo, "*** Update File: a.rs\n*** Delete File: b.rs\n"),
+                None,
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&repo, "*** Update File: one.rs\n"),
+                path("one.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&active, "src/lib.rs"),
+                path("src/lib.rs"),
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&active, "*** Update File: one.rs\n"),
+                None,
+            ),
+        ];
+        for (index, (event, agent, payload, expected)) in cases.into_iter().enumerate() {
+            let body = spooled_body(
+                tmp.path().join(format!("data-{index}")),
+                event,
+                agent,
+                payload,
+            )
+            .await
+            .unwrap_or_else(|| panic!("case {index}: nothing spooled"));
+            assert_eq!(body.get(FILE_FIELD_KEY).cloned(), expected, "case {index}");
+        }
+
+        // A symlinked cwd is not resolved: a path under the link keys from the
+        // link, and the target's own absolute path is outside the checkout
+        // the lexical cwd names.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&repo, &link).unwrap();
+            for (name, payload, expected) in [
+                ("under", read(&link, "src/lib.rs"), path("src/lib.rs")),
+                (
+                    "target",
+                    read(&link, &absolute),
+                    skipped("outside_checkout"),
+                ),
+            ] {
+                let body = spooled_body(
+                    tmp.path().join(format!("data-link-{name}")),
+                    "post-tool-use",
+                    "claude-code",
+                    payload,
+                )
+                .await
+                .unwrap();
+                assert_eq!(body.get(FILE_FIELD_KEY).cloned(), expected, "{name}");
+            }
+        }
+
+        let ignored = spooled_body(
+            tmp.path().join("data-ignored"),
+            "post-tool-use",
+            "claude-code",
+            read(&active, "secret/key.pem"),
+        )
+        .await;
+        assert_eq!(ignored, None, "an ignored path never leaves the machine");
     }
 
     #[tokio::test]
@@ -9018,6 +9583,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn claude_user_prompt_injects_a_deduplicated_inbox_notice_after_opt_in() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n",
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let notice = "1 cross-project message waiting in default/app";
+        let (base, mut requests) = serve_requests("200 OK", notice).await;
+        let make_args = |server: &str| {
+            let mut args = kimi_hook_args("user-prompt-submit", server);
+            args.agent = "claude-code".into();
+            args
+        };
+        let payload = serde_json::json!({
+            "session_id": "claude-session",
+            "cwd": repo.path(),
+            "prompt": "check the inbox"
+        })
+        .to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            make_args(&base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8_lossy(&stdout);
+        let envelope: serde_json::Value =
+            serde_json::from_str(output.trim_end()).expect("the notice is one JSON envelope");
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"], notice,
+            "{envelope}"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(
+            request.contains("agent=claude-code")
+                && request.contains("inbox_only=1")
+                && request.contains("handoff=0")
+                && request.contains("recovery=0")
+                && request.contains("profile_digest=0"),
+            "{request}"
+        );
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            make_args(&base),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stdout, b"{}\n",
+            "an unchanged count must stay quiet; got {stdout:?}"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    /// A repository that turned handoff and recovery delivery off still gets
+    /// the prompt inbox notice: the request carries each suppression flag
+    /// once, so the server's `HandoffQuery` extractor accepts it instead of
+    /// answering 400 (which the hook swallows as "no notice").
+    #[tokio::test]
+    async fn claude_user_prompt_inbox_notice_survives_delivery_opt_outs() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n\
+             [handoff]\ndeliver_on_session_start = false\n\
+             [recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "1 message waiting").await;
+        let mut args = kimi_hook_args("user-prompt-submit", &base);
+        args.agent = "claude-code".into();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            args,
+            serde_json::json!({"session_id": "claude-session", "cwd": repo.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let request = first_request(&mut requests).await.unwrap();
+        let target = request.split_whitespace().nth(1).unwrap();
+        let uri: axum::http::Uri = target.parse().unwrap();
+        let Query(query) = Query::<HandoffQuery>::try_from_uri(&uri)
+            .unwrap_or_else(|e| panic!("the server would reject {target}: {e}"));
+        assert_eq!(query.inbox_only.as_deref(), Some("1"), "{target}");
+        assert_eq!(query.handoff.as_deref(), Some("0"), "{target}");
+        assert_eq!(query.recovery.as_deref(), Some("0"), "{target}");
+    }
+
     fn hermes_args(event: &str, server_url: &str) -> HookArgs {
         let mut args = kimi_hook_args(event, server_url);
         args.agent = "hermes".into();
@@ -10183,6 +10859,26 @@ mod tests {
                 .is_file()
         );
     }
+    #[test]
+    fn inbox_notice_state_is_per_session_and_deduplicates_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-a"), Some("/repo"));
+        let same =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-a"), Some("/repo"));
+        let second =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-b"), Some("/repo"));
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+
+        assert!(!inbox_notice_already_shown(&first, "1 message"));
+        mark_inbox_notice_shown(&first, "1 message");
+        assert!(inbox_notice_already_shown(&first, "1 message"));
+        assert!(!inbox_notice_already_shown(&first, "2 messages"));
+        mark_inbox_notice_shown(&first, "2 messages");
+        assert!(inbox_notice_already_shown(&first, "2 messages"));
+    }
+
     fn codex_args(event: &str, server_url: &str) -> HookArgs {
         let mut args = claude_args(event, server_url);
         args.agent = "codex".into();
@@ -10581,5 +11277,210 @@ mod tests {
         )
         .await;
         assert!(!data_dir.join("recap-pending").join("grok-session").exists());
+    }
+
+    fn droid_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = claude_args(event, server_url);
+        args.agent = "droid".into();
+        args
+    }
+
+    fn session_start_payload(cwd: &Path, session_id: &str, source: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id,
+            "cwd": cwd,
+            "source": source,
+        })
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_injects_the_anchor_and_never_claims_a_handoff() {
+        type Args = fn(&str, &str) -> HookArgs;
+        let agents: [(&str, Args); 3] = [
+            ("claude-code", claude_args),
+            ("codex", codex_args),
+            ("droid", droid_args),
+        ];
+        for (agent, args) in agents {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                args("session-start", &base),
+                session_start_payload(tmp.path(), "compacted-session", "compact"),
+            )
+            .await;
+            let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+            assert_eq!(
+                envelope,
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": ANCHOR_SAMPLE,
+                    }
+                }),
+                "{agent}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{agent}: a compaction must not claim a handoff: {seen:?}"
+            );
+            let recap = recap_requests(&seen);
+            assert_eq!(recap.len(), 1, "{agent}: {seen:?}");
+            for part in [
+                "mode=anchor",
+                "budget=2000",
+                "session_id=compacted-session",
+                &format!("agent={agent}"),
+            ] {
+                assert!(recap[0].contains(part), "{agent}: {part}: {}", recap[0]);
+            }
+            // The session-start drain still runs first, so the compaction's
+            // own boundary reaches the server before the anchor reads it.
+            let drain = seen.iter().position(|r| r.starts_with("POST /hook"));
+            let anchor = seen.iter().position(|r| r.starts_with("GET /recap"));
+            assert!(drain.is_some() && drain < anchor, "{agent}: {seen:?}");
+        }
+    }
+
+    const ANCHOR_SAMPLE: &str = "> 🧭 ai-memory: post-compaction anchor for this session (compacted-session)\n> The summary may have lost detail.";
+
+    /// An older server ignores `mode=anchor` and answers with the full recap
+    /// or its "no compaction" notice; an unknown or refused session gets the
+    /// anchor's own notice. None of them is injected.
+    #[tokio::test]
+    async fn compact_session_start_injects_only_a_real_anchor() {
+        for body in [
+            "> 🧭 ai-memory: compaction recap for this session\n<!-- ai-memory:untrusted-history:start -->\nold recap",
+            "> 🧭 ai-memory: no compaction is recorded for this session yet.",
+            ai_memory_core::compaction_recap::NO_ANCHOR_SESSION_NOTICE,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", body).await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                claude_args("session-start", &base),
+                session_start_payload(tmp.path(), "compacted-session", "compact"),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{body}");
+            let seen = all_requests(&mut requests).await;
+            assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{seen:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_with_the_server_down_prints_the_empty_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &dead_server_url()),
+            session_start_payload(tmp.path(), "compacted-session", "compact"),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_with_no_anchor_never_falls_back_to_a_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            codex_args("session-start", &base),
+            session_start_payload(tmp.path(), "compacted-session", "compact"),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let seen = all_requests(&mut requests).await;
+        assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_session_start_sources_still_fetch_the_handoff() {
+        for source in ["startup", "resume", "clear"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", "HANDOFF-BODY").await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                claude_args("session-start", &base),
+                session_start_payload(tmp.path(), "fresh-session", source),
+            )
+            .await;
+            let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+            assert_eq!(
+                envelope["hookSpecificOutput"]["additionalContext"], "HANDOFF-BODY",
+                "{source}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                seen.iter().any(|r| r.starts_with("GET /handoff?")),
+                "{source}: {seen:?}"
+            );
+            assert!(recap_requests(&seen).is_empty(), "{source}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_documented_agents_inject_a_compaction_anchor() {
+        let compact = serde_json::json!({ "source": "compact" });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(injects_compaction_anchor(agent, &compact), "{agent:?}");
+            assert!(!injects_compaction_anchor(
+                agent,
+                &serde_json::json!({ "source": "resume" })
+            ));
+        }
+        // Muse reports a `compact` source but publishes no output contract
+        // for it; Cursor running Claude Code's settings is unverified. Both
+        // still count as a compaction, so neither claims the startup packet.
+        let cursor = serde_json::json!({ "source": "compact", "cursor_version": "2.0.0" });
+        assert!(!injects_compaction_anchor(AgentKind::Muse, &compact));
+        assert!(!injects_compaction_anchor(AgentKind::ClaudeCode, &cursor));
+        assert!(is_compaction_session_start(&compact));
+        assert!(is_compaction_session_start(&cursor));
+        assert!(!is_compaction_session_start(
+            &serde_json::json!({ "source": "startup" })
+        ));
+    }
+
+    /// A compaction `SessionStart` from an agent without a verified anchor
+    /// contract (Muse, or Cursor running Claude Code's settings) is still
+    /// mid-session: it must not claim a pending handoff, recovery snapshot or
+    /// brief, and gets no anchor either.
+    #[tokio::test]
+    async fn unverified_compact_session_start_claims_nothing_and_gets_no_anchor() {
+        for (name, agent, cursor) in [("muse", "muse", false), ("cursor", "claude-code", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+            let mut args = claude_args("session-start", &base);
+            args.agent = agent.into();
+            let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+            if cursor {
+                payload["cursor_version"] = "2.0.0".into();
+            }
+            let stdout = run_hook(&tmp.path().join("data"), args, payload).await;
+            let stdout = String::from_utf8_lossy(&stdout);
+            assert!(
+                !stdout.contains("post-compaction anchor"),
+                "{name}: {stdout}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{name}: a compaction must not claim a handoff: {seen:?}"
+            );
+            assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
+        }
     }
 }

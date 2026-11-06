@@ -36,6 +36,18 @@ const SCOPE = ["workspace", "project"] as const;
 
 /** Every MCP tool the server lists, keyed by tool name. */
 export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
+  memory_resolve_write_target: {
+    status: "wrapped",
+    methods: ["pages.resolveWriteTarget"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id"],
+  },
+  memory_write_pages_batch: {
+    status: "wrapped",
+    methods: ["pages.writeBatch"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id", "pages"],
+  },
   memory_write_page: {
     status: "wrapped",
     methods: ["pages.write", "pages.update"],
@@ -53,6 +65,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
       "abstract",
       "relations",
       "expires_at",
+      "source_files",
       "expected_page_id",
       "create_only",
     ],
@@ -131,8 +144,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     sends: [
       "to_workspace",
       "to_project",
+      "to_agent",
       "from_workspace",
       "from_project",
+      "from_agent",
       "body",
       "subject",
       "nature",
@@ -161,7 +176,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["briefing"],
     phase: 2,
-    sends: [...SCOPE, "recent_pages_limit", "settled_first"],
+    sends: [...SCOPE, "recent_pages_limit", "recent_sessions_limit", "settled_first"],
   },
   memory_explore: {
     status: "wrapped",

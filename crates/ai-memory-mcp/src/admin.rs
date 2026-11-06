@@ -33,6 +33,8 @@
 //!   computes them from local transcripts; see `ai-memory
 //!   repair-backfill-timestamps`).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/adopt-project-identity` — move an empty project's repository
+//!   identity onto the project holding the checkout's sessions (#1993).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
 //! - `POST /admin/reclaim-ledger-versions` — drop the superseded ledger
@@ -73,7 +75,7 @@ use ai_memory_core::{
     DEFAULT_WORKSPACE_NAME, PageId, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{
-    ChatRequest, Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot,
+    ChatRequest, Embedder, LlmProviders, LlmWorkload, ProviderHealth, ProviderHealthSnapshot,
     error_status_and_message,
 };
 use ai_memory_store::{
@@ -114,6 +116,111 @@ struct SweepTuning {
     compact_cold_episodic: bool,
 }
 
+/// Admission control for live `/admin/bootstrap` runs.
+///
+/// A run spends minutes in LLM calls and milliseconds writing pages, so
+/// one server-wide mutex leaves a local provider idle while callers for
+/// other projects queue behind it. The wiki's own commit lock already
+/// serialises `commit_all`, which is what the original mutex protected
+/// before that lock existed. Two guards remain:
+///
+/// - `slots` bounds how many runs call the LLM at once
+///   (`bootstrap_max_concurrent`, default 1: the previous behaviour).
+/// - one run per project at a time, so a second run for the same project
+///   waits and then reads the first run's manifest (`AlreadyBootstrapped`)
+///   instead of racing it and spending the LLM calls twice.
+#[derive(Clone)]
+pub struct BootstrapGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+type BootstrapProjectLocks =
+    std::collections::HashMap<(WorkspaceId, ProjectId), Arc<tokio::sync::Mutex<()>>>;
+
+impl BootstrapGate {
+    /// Gate allowing up to `max_concurrent` live runs; zero is treated as one.
+    #[must_use]
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            projects: Arc::new(std::sync::Mutex::new(BootstrapProjectLocks::new())),
+        }
+    }
+
+    /// Wait for this project's turn, then for a free slot. The project lock
+    /// is taken first so a caller queued behind its own project never holds
+    /// a slot another project could use.
+    async fn acquire(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> Result<BootstrapPermit, tokio::sync::AcquireError> {
+        let project_lock = {
+            let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(projects.entry((ws, proj)).or_default())
+        };
+        let project = match Arc::clone(&project_lock).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                info!(
+                    "another bootstrap of this project is in progress; queueing — \
+                     this request waits for it to finish"
+                );
+                project_lock.lock_owned().await
+            }
+        };
+        let slot = match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                info!(
+                    "bootstrap_max_concurrent runs are in progress; queueing — \
+                     this request waits for a free slot"
+                );
+                Arc::clone(&self.slots).acquire_owned().await?
+            }
+        };
+        Ok(BootstrapPermit {
+            _slot: slot,
+            project: Some(project),
+            key: (ws, proj),
+            projects: Arc::clone(&self.projects),
+        })
+    }
+}
+
+impl Default for BootstrapGate {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+/// Held for the whole live run. Dropping it frees the slot and the project
+/// lock, and forgets the project's entry once nobody else waits on it, so
+/// the map stays as small as the set of projects currently bootstrapping.
+struct BootstrapPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    project: Option<tokio::sync::OwnedMutexGuard<()>>,
+    key: (WorkspaceId, ProjectId),
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+impl Drop for BootstrapPermit {
+    fn drop(&mut self) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        // Release under the map lock: a new caller clones the entry under
+        // that same lock, so a count of one (the map's own) means no caller
+        // holds or awaits it and the entry can go.
+        self.project = None;
+        if projects
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            projects.remove(&self.key);
+        }
+    }
+}
+
 /// Shared state for the admin router.
 #[derive(Clone)]
 pub struct AdminState {
@@ -123,8 +230,8 @@ pub struct AdminState {
     pub reader: ReaderPool,
     /// Wiki handle — pages are written here.
     pub wiki: Wiki,
-    /// Optional LLM provider. When `None`, bootstrap returns 503.
-    pub llm: Option<Arc<dyn LlmProvider>>,
+    /// LLM providers selected by workload, with a default provider.
+    pub llm_providers: LlmProviders,
     /// If true, auto-improve leaves staged proposals pending for manual
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
@@ -163,13 +270,10 @@ pub struct AdminState {
     /// Server home directory resolved once at config load. Used to keep admin
     /// audits consistent with the hook router's cwd-prefix guard.
     pub home_dir: Option<String>,
-    /// Serialises concurrent bootstrap requests. Bootstrap fans out
-    /// into an LLM call + a multi-page wiki write + a git commit;
-    /// running two in parallel would race the `commit_all` git ops and
-    /// stack LLM cost unnecessarily. The mutex is held for the entire
-    /// handler so a second caller waits its turn (request stays open
-    /// until the lock is acquired, then proceeds normally).
-    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Admission control for live bootstrap runs: a bounded number at
+    /// once, one per project. A queued caller's request stays open until
+    /// its turn, then proceeds normally. See [`BootstrapGate`].
+    pub bootstrap_gate: BootstrapGate,
     /// Per-server token pepper, used by `/admin/api-credentials` to hash
     /// freshly-issued `aim_` secrets before they land in
     /// `api_credentials.token_hash`. `None` when the operator hasn't set
@@ -710,6 +814,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
+        .route(
+            "/admin/adopt-project-identity",
+            post(handle_adopt_project_identity),
+        )
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/merge-project", post(handle_merge_project))
         .route("/admin/move-session", post(handle_move_session))
@@ -1368,11 +1476,11 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
 /// same status class and bounded message the health snapshot records — never
 /// the request, the reply text or the provider's full body.
 async fn handle_llm_test(State(state): State<Arc<AdminState>>) -> Response {
-    let Some(llm) = state.llm.clone() else {
+    let Some(llm) = state.llm_providers.default.as_ref().cloned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "this server has no LLM provider configured; set one in its config and restart it",
+                "error": "this server has no default LLM provider configured; set one in its config and restart it",
             })),
         )
             .into_response();
@@ -2518,36 +2626,26 @@ async fn handle_bootstrap(
     }
 
     // Live runs from here on need LLM + workspace/project resolution.
-    if state.llm.is_none() {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::Bootstrap).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "LLM provider not configured on server"
             })),
         ));
-    }
+    };
     let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
     let (ws, proj) = target.scope.as_tuple();
 
-    // Serialise live bootstrap runs. Two parallel `process_sources`
-    // calls would race the wiki's `commit_all` (libgit2 ops on the
-    // same repo) and stack LLM cost unnecessarily. The wait is
-    // operator-visible only in log lines; the request stays open
-    // until the lock is acquired, then proceeds normally.
-    if state.bootstrap_lock.try_lock().is_err() {
-        info!(
-            "another bootstrap is in progress; queueing — \
-             this request waits for the active one to finish"
-        );
-    }
-    let _bootstrap_guard = state.bootstrap_lock.lock().await;
-
-    let llm = Arc::clone(
-        state
-            .llm
-            .as_ref()
-            .expect("llm is Some: checked above (non-dry-run without LLM returns 503)"),
-    );
+    // Bounded, one run per project; see `BootstrapGate`. The wait is
+    // operator-visible only in log lines.
+    let _bootstrap_permit = state.bootstrap_gate.acquire(ws, proj).await.map_err(|e| {
+        log_server_error(StatusCode::INTERNAL_SERVER_ERROR, "bootstrap", &e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
 
     let cfg = BootstrapConfig {
         // repo_path is unused by process_sources — the path field is
@@ -2709,7 +2807,7 @@ async fn handle_auto_improve(
         ));
     }
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
-    let Some(llm) = state.llm.as_ref().cloned() else {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::AutoImprove).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -4268,7 +4366,7 @@ async fn handle_lint(
     run_lint(
         &state.reader,
         &state.wiki,
-        state.llm.as_ref(),
+        state.llm_providers.get(LlmWorkload::Lint),
         ws,
         proj,
         ai_memory_consolidate::LintOptions {
@@ -4714,7 +4812,13 @@ async fn handle_restore_page(
             .wiki
             .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
             .await
-            .map_err(|e| internal_err(e.to_string()))?
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
     } else {
         let version = version_id
             .ok_or_else(|| internal_err("validated page-version restore lost its version id"))?;
@@ -4723,6 +4827,10 @@ async fn handle_restore_page(
             .restore_page_from_version(ws, proj, path.clone(), version)
             .await
             .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
                 WikiError::Store(StoreError::NotFound(_)) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": error.to_string()})),
@@ -6420,6 +6528,105 @@ async fn handle_rename_project(
         to: req.to.clone(),
         pages,
         checkpoint,
+        manifest_warning,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+#[derive(Deserialize)]
+struct AdoptProjectIdentityRequest {
+    workspace: String,
+    /// The project that holds the checkout's sessions.
+    project_id: String,
+    /// The empty project that holds the repository identity.
+    from_project_id: String,
+    /// The emptied project's name when it held the remote-derived name;
+    /// defaults to `<name>-split-<YYYYMMDD>`.
+    #[serde(default)]
+    archive_name: Option<String>,
+}
+
+/// Wire-format summary returned by `POST /admin/adopt-project-identity`.
+#[derive(Debug, Serialize)]
+pub struct AdoptProjectIdentitySummary {
+    /// Workspace name.
+    pub workspace: String,
+    /// The project that now carries the identity, under its final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+    /// Non-fatal manifest/checkpoint failure after the database change committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+}
+
+async fn handle_adopt_project_identity(
+    State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<AdoptProjectIdentityRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    let (ws_id, into) =
+        match resolve_target_ids_for_admin(&state, &req.workspace, None, Some(&req.project_id))
+            .await
+        {
+            Ok(target) => target,
+            Err(e) => return e,
+        };
+    let (_, from) = match resolve_target_ids_for_admin(
+        &state,
+        &req.workspace,
+        None,
+        Some(&req.from_project_id),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    let adopted = match state
+        .writer
+        .adopt_project_identity(ws_id, into, from, req.archive_name.clone(), author_id)
+        .await
+    {
+        Ok(adopted) => adopted,
+        Err(e) => {
+            let status = match &e {
+                StoreError::InvalidState(_) => StatusCode::CONFLICT,
+                StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+    let mut manifest_warning = None;
+    for project_id in [into, from] {
+        if let Err(error) = state.wiki.refresh_renamed_scope(ws_id, project_id).await {
+            warn!(
+                error = %error,
+                workspace_id = %ws_id,
+                project_id = %project_id,
+                "adopt-project-identity committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            manifest_warning = Some(error.to_string());
+        }
+    }
+    let summary = AdoptProjectIdentitySummary {
+        workspace: req.workspace,
+        project: adopted.project,
+        previous: adopted.previous,
+        archived: adopted.archived,
+        identity: adopted.identity,
         manifest_warning,
     };
     (
@@ -9895,12 +10102,60 @@ mod tests {
         ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
     };
     use ai_memory_core::{Sanitized, Sanitizer};
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmResult, LlmWorkload};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmProvider, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    fn bootstrap_gate_entries(gate: &BootstrapGate) -> usize {
+        gate.projects.lock().unwrap().len()
+    }
+
+    /// The per-project map only holds projects with a run in progress or
+    /// queued: a released permit forgets its entry, and a waiter keeps it
+    /// alive until it too is done.
+    #[tokio::test]
+    async fn bootstrap_gate_forgets_a_project_once_nobody_waits_on_it() {
+        let gate = BootstrapGate::new(4);
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+
+        let first = gate.acquire(ws, proj).await.unwrap();
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.acquire(ws, proj).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a second run for the same project must wait"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter gets its turn once the first run ends")
+            .unwrap();
+        assert_eq!(
+            bootstrap_gate_entries(&gate),
+            1,
+            "the waiter still holds it"
+        );
+
+        drop(second);
+        assert_eq!(bootstrap_gate_entries(&gate), 0);
+    }
+
+    /// A zero limit would admit nothing and hang every caller; it is
+    /// clamped to one run at a time instead.
+    #[tokio::test]
+    async fn bootstrap_gate_treats_a_zero_limit_as_one() {
+        let gate = BootstrapGate::new(0);
+        let permit = gate.acquire(WorkspaceId::new(), ProjectId::new()).await;
+        assert!(permit.is_ok());
+        assert_eq!(gate.slots.available_permits(), 0);
+    }
 
     async fn message_send_fixture(
         reject: bool,
@@ -10157,7 +10412,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10169,7 +10424,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10191,6 +10446,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["llm_workloads"], serde_json::json!([]));
+        assert!(json["providers"]["llm_workloads_started_ms"].is_null());
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
         // 2.0 item 7: the report carries the wedged-writer gauge and the
         // wiki-format state — a fresh store is natively conformant (no
@@ -10226,7 +10482,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: Some(llm),
+            llm_providers: LlmProviders {
+                default: Some(llm),
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10238,7 +10497,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10260,6 +10519,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let workloads = json["providers"]["llm_workloads"].as_array().unwrap();
         assert_eq!(workloads.len(), LlmWorkload::ALL.len());
+        // #1981: the counters say since when they count.
+        assert!(
+            json["providers"]["llm_workloads_started_ms"]
+                .as_u64()
+                .is_some_and(|started| started > 0),
+            "{json}"
+        );
         let query_answer = workloads
             .iter()
             .find(|entry| entry["workload"] == "query-answer")
@@ -10301,7 +10567,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10313,7 +10579,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49376".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10429,7 +10695,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10441,7 +10707,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49375".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10668,7 +10934,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10680,7 +10946,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10866,7 +11132,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10878,7 +11144,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -11091,7 +11357,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -11103,7 +11369,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -11989,7 +12255,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm,
+            llm_providers: LlmProviders {
+                default: llm,
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -12001,7 +12270,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -12337,18 +12606,19 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
             .await
             .unwrap();
 
-        let router = admin_router(admin_state_for_store_with_llm(
-            &tmp,
-            &store,
-            wiki,
-            Some(Arc::new(FakeAutoImproveLlm)),
-        ));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state
+            .llm_providers
+            .overrides
+            .insert(LlmWorkload::AutoImprove, Arc::new(FakeAutoImproveLlm));
+        let router = admin_router(state);
         let resp = router
             .oneshot(
                 Request::builder()
@@ -12495,6 +12765,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12637,6 +12908,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12757,6 +13029,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12860,6 +13133,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13016,6 +13290,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13889,7 +14164,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -13901,7 +14176,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14002,7 +14277,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14014,7 +14289,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14108,7 +14383,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14120,7 +14395,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14220,7 +14495,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14232,7 +14507,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14771,7 +15046,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14783,7 +15058,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14840,7 +15115,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14852,7 +15127,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper.clone()),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15078,6 +15353,15 @@ mod tests {
                 "POST",
                 "/admin/rename-project",
                 serde_json::json!({"workspace": "default", "from": "scratch", "to": "renamed"}),
+            ),
+            (
+                "POST",
+                "/admin/adopt-project-identity",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project_id": "01a19c51-63d5-7dc2-8dc1-90201095ba96",
+                    "from_project_id": "01a19da2-094f-7830-9807-1d32f2fdb464"
+                }),
             ),
             (
                 "POST",
@@ -15534,7 +15818,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15546,7 +15830,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15669,7 +15953,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15681,7 +15965,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -16642,7 +16926,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -16654,7 +16938,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,

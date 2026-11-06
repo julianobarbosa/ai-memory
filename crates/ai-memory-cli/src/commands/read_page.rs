@@ -13,6 +13,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::ReadPageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -41,24 +42,36 @@ struct PageContent {
 /// the server is unreachable; returns non-2xx; or neither `--path` nor a query
 /// is supplied.
 pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let path = match args.path.as_deref() {
         Some(p) if p.trim().is_empty() => {
-            bail!("--path was passed empty; specify the wiki page path to read");
+            bail!(
+                "{}",
+                i18n.text("cli-read-page-path-was-passed-empty-specify-the-wiki-page-path-to-read")
+            );
         }
         Some(p) => Some(p),
         None => None,
     };
     let query = match args.query.as_deref() {
         Some(q) if q.trim().is_empty() => {
-            bail!("search query was passed empty; specify a query or --path <wiki-path>");
+            bail!(
+                "{}",
+                i18n.text(
+                    "cli-read-page-search-query-was-passed-empty-specify-a-query-or-path-wiki-path"
+                )
+            );
         }
         Some(q) => Some(q),
         None => None,
     };
     if path.is_none() && query.is_none() {
-        bail!("provide a query (positional) or --path <wiki-path>");
+        bail!(
+            "{}",
+            i18n.text("cli-read-page-provide-a-query-positional-or-path-wiki-path")
+        );
     }
 
     let (workspace, project) =
@@ -94,22 +107,25 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&page)?);
     } else {
-        print!("{}", render_text(&page));
+        print!("{}", render_text(&config.i18n, &page));
     }
     Ok(())
 }
 
-fn render_text(page: &PageContent) -> String {
+fn render_text(i18n: &ai_memory_core::i18n::Localizer, page: &PageContent) -> String {
     let mut out = String::new();
     if let Some(title) = &page.title {
-        out.push_str(&format!("# {title}\n"));
+        out.push_str(&format!("# {}\n", terminal_text(title)));
     }
-    out.push_str(&format!("path: {}\n", page.path));
+    out.push_str(&i18n.format(
+        "cli-read-page-path",
+        &[("value0", terminal_text(&page.path))],
+    ));
     if page.expired {
-        out.push_str("expired: true\n");
+        out.push_str(&i18n.text("cli-read-page-expired-true"));
     }
     out.push('\n');
-    out.push_str(&page.body);
+    out.push_str(&terminal_body(&page.body));
     if !page.body.ends_with('\n') {
         out.push('\n');
     }
@@ -135,11 +151,11 @@ mod tests {
     #[test]
     fn text_output_marks_only_expired_pages() {
         assert_eq!(
-            render_text(&page(false)),
+            render_text(&ai_memory_core::i18n::Localizer::default(), &page(false)),
             "# Example\npath: notes/example.md\n\nbody\n"
         );
         assert_eq!(
-            render_text(&page(true)),
+            render_text(&ai_memory_core::i18n::Localizer::default(), &page(true)),
             "# Example\npath: notes/example.md\nexpired: true\n\nbody\n"
         );
     }

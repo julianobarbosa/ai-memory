@@ -25,8 +25,9 @@ python3 scripts/check-dashboard-core-mutations.py --case expose-restricted-mailb
 Use `AI_MEMORY_BIN` for another built executable and `AI_MEMORY_BROWSER` for an
 existing Chromium executable. On Linux, the runner also finds Chromium in the
 Playwright cache. An absent executable, a missing browser, a failed setup or a
-JavaScript exception fails the command. The Linux CI job installs the pinned
-browser and runs both mutation gates, without `continue-on-error` or retries.
+JavaScript exception fails the command. The Linux CI test job installs the
+pinned browser and runs the browser mutation gate; the Rust mutation gate is
+its own CI job. Neither uses `continue-on-error` or retries.
 The [browser installation reference](https://playwright.dev/docs/browsers)
 describes the test browser's system dependencies and headless shell.
 
@@ -40,8 +41,9 @@ screenshot.
 Run the Rust mutation command alone, with no other build running and no editor
 writing the selected source files. It temporarily changes clean tracked source
 files, stores the exact originals and restores them in `finally`. A concurrent
-edit is refused instead of overwritten. Each probe needs a passing baseline and
-a specific failed test assertion, so compiler errors and timeouts do not count.
+edit is refused instead of overwritten. Each distinct test command runs once as
+a passing baseline before any probe, and each probe needs a specific failed test
+assertion, so compiler errors and timeouts do not count.
 Logs and originals stay under `target/dashboard-core-mutations-*`.
 
 ## Behaviors protected
@@ -66,6 +68,7 @@ guessed coordinates.
 | Behavior | Automated regression guard |
 | --- | --- |
 | Only the selected tab is visible/accessibility-exposed; keyboard, history, reload and old section links work | `web_dashboard_browser.mjs`: `tabs`; Rust `operations_project_tabs_have_one_default_panel_and_matching_controls` |
+| Metric cards lead to the project ordering/filter or scoped detail view that explains the count | Rust `dashboard_metric_links_sort_filter_and_reject_unknown_views`, project-page smoke assertions, and `operations_agent_totals_and_session_drilldown_do_not_multiply_tokens` |
 | Recipient filtering includes workspace and project, clears stale selection, disables empty projects and recovers | Browser `recipients`; Rust `operations_inbox_filters_initial_agents_by_both_project_coordinates` |
 | Inbox queue counts name each workspace/project, links and selectors open the matching mailbox, empty states do not claim new mail, reading leaves messages queued, collection reduces counts | Browser `mailbox-context`; Rust `operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail` also refuses foreign/partial scopes and hides restricted project names with legitimate read/root controls |
 | Sidebar notifications appear for actual queued mail, refresh without reload, link to the right workspace/project, disappear after collection and clear on authorization loss | Browser `notifications`; Rust `operations_notifications_are_read_only_and_hide_restricted_projects` covers access-filtered totals, bounded links, zero state, no caching and non-consumption |

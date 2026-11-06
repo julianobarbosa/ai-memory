@@ -88,6 +88,48 @@ ai_memory_parse_toml_flag() {
         | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# Section-scoped counterpart for the same-named [handoff] and [recovery]
+# delivery keys. The exclusion mode preserves legacy handoff parsing elsewhere.
+ai_memory_parse_toml_scoped_flag() {
+    file="$1"; section="$2"; key="$3"; exclude="$4"
+    [ -f "$file" ] || return 0
+    ai_memory_strip_utf8_bom <"$file" | LC_ALL=C awk \
+        -v section="$section" -v key="$key" -v exclude="$exclude" '
+        function trim(value) {
+            gsub(/^[ \t\r]+|[ \t\r]+$/, "", value)
+            return value
+        }
+        {
+            header = $0
+            sub(/#.*/, "", header)
+            header = trim(header)
+            if (header ~ /^\[.*\]$/) {
+                in_section = trim(substr(header, 2, length(header) - 2)) == section
+                next
+            }
+            if ((exclude == "1" && in_section) || (exclude != "1" && !in_section)) next
+            pattern = "^[ \t]*" key "[ \t]*="
+            if ($0 !~ pattern) next
+            value = $0
+            sub(pattern, "", value)
+            sub(/#.*/, "", value)
+            value = trim(value)
+            gsub(/^"|"$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }'
+}
+
+ai_memory_parse_toml_section_flag() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 0
+}
+
+ai_memory_parse_toml_flag_outside_section() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 1
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # 0 for a falsy value (0/false/no/off, any case), 1 for anything else, an
 # absent key included. Parity with `profile_flag_value` in hook_capture.rs.
@@ -339,9 +381,16 @@ ai_memory_antigravity_is_initial_invocation() {
     [ "$value" = "0" ]
 }
 
+# Invocation-scoped context: the managed run, and the per-execution
+# `AI_MEMORY_AUTO_HANDOFF=off` opt-out of the automatic handoff (#1951), which
+# is forwarded only for an explicit falsy value, as the native hook does.
 ai_memory_managed_qs() {
-    [ -n "${AI_MEMORY_RUN_ID:-}" ] || return 0
-    printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    if [ -n "${AI_MEMORY_RUN_ID:-}" ]; then
+        printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    fi
+    case "$(printf '%s' "${AI_MEMORY_AUTO_HANDOFF:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off) printf '&auto_handoff=0' ;;
+    esac
 }
 
 # Resolve cwd for agents whose native hook payload omits it. Payload wins,
@@ -720,6 +769,7 @@ ai_memory_marker_qs() {
     pcon=""
     pcons=""
     hoff=""
+    roff=""
     aliases=""
     routed=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
@@ -763,9 +813,9 @@ ai_memory_marker_qs() {
         # what it stored.
         pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
         pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
-        # `[handoff] deliver_on_session_start = false` is sent only when
-        # explicitly falsy; an absent key leaves the request unchanged.
-        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" deliver_on_session_start)")" = 0 ] && hoff=0
+        # The delivery key is independent in [handoff] and [recovery].
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag_outside_section "$marker" recovery deliver_on_session_start)")" = 0 ] && hoff=0
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_section_flag "$marker" recovery deliver_on_session_start)")" = 0 ] && roff=0
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -812,6 +862,7 @@ ai_memory_marker_qs() {
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
     [ -n "$hoff" ] && qs="${qs}&handoff=0"
+    [ -n "$roff" ] && qs="${qs}&recovery=0"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }
@@ -1043,13 +1094,40 @@ ai_memory_get_handoff() {
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
-            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" -H @"$_amhdr") || return $?
     else
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1") || return $?
     fi
+    # Appending the status preserves the body's final newlines in the command
+    # substitution. Redirect and error bodies must never become agent context.
+    _amhandoff_code=${_amhandoff##*'
+'}
+    case "$_amhandoff_code" in
+        2??) printf '%s' "${_amhandoff%'
+'*}" ;;
+    esac
+    return 0
+}
+
+# True when SessionStart payload "$1" is the one an agent fires right after a
+# context compaction (`"source": "compact"`). That start is mid-session, so it
+# must not claim a handoff baton, recovery snapshot or brief.
+ai_memory_is_compaction_start() {
+    _amsrc=$(printf '%s' "$1" | ai_memory_after_key source \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n 1) || return 1
+    [ "$_amsrc" = "compact" ]
+}
+
+# The session-start handoff GET: `ai_memory_get_handoff "$2"`, except for a
+# compaction start (payload "$1"), which fetches nothing and so prints the
+# same empty reply as "no pending handoff" (parity with the native hook; the
+# post-compaction anchor is native-only).
+ai_memory_get_start_handoff() {
+    ai_memory_is_compaction_start "$1" && return 0
+    ai_memory_get_handoff "$2"
 }
 
 # GET the read-only subagent brief at URL "$1", with ai_memory_get_handoff's

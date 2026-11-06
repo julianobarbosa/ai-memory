@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -46,6 +46,8 @@ dependencies = [
  "ai-memory-wiki",
  "ai-memory-workstream",
  "anyhow",
+ "askama",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -60,6 +62,7 @@ dependencies = [
  "jsonc-parser",
  "libc",
  "parking_lot",
+ "regex",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rmcp",
@@ -92,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -119,8 +122,10 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
+ "fluent-bundle",
+ "fluent-syntax",
  "icu_normalizer",
  "jiff",
  "regex",
@@ -130,12 +135,13 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "unic-langid",
  "uuid",
 ]
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -159,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -189,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -219,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -256,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -284,11 +290,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.3.2"
+version = "3.4.2"
 
 [[package]]
 name = "ai-memory-web"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -315,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -347,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.3.2"
+version = "3.4.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -610,6 +616,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -1038,12 +1050,12 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
+checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
 dependencies = [
- "darling_core 0.23.0",
- "darling_macro 0.23.0",
+ "darling_core 0.24.1",
+ "darling_macro 0.24.1",
 ]
 
 [[package]]
@@ -1062,15 +1074,15 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
+checksum = "6837e2cf7485aaae18f86181d2f0e9a7ed297a025e220aeabf63fdebd3a2ddff"
 dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
  "strsim",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1086,13 +1098,13 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
+checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
- "darling_core 0.23.0",
+ "darling_core 0.24.1",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1421,6 +1433,41 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr",
+]
+
+[[package]]
+name = "fluent-bundle"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01203cb8918f5711e73891b347816d932046f95f54207710bda99beaeb423bf4"
+dependencies = [
+ "fluent-langneg",
+ "fluent-syntax",
+ "intl-memoizer",
+ "intl_pluralrules",
+ "rustc-hash",
+ "self_cell",
+ "smallvec",
+ "unic-langid",
+]
+
+[[package]]
+name = "fluent-langneg"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eebbe59450baee8282d71676f3bfed5689aeab00b27545e83e5f14b1195e8b0"
+dependencies = [
+ "unic-langid",
+]
+
+[[package]]
+name = "fluent-syntax"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54f0d287c53ffd184d04d8677f590f4ac5379785529e5e08b1c8083acdd5c198"
+dependencies = [
+ "memchr",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2152,6 +2199,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "intl-memoizer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "310da2e345f5eb861e7a07ee182262e94975051db9e4223e909ba90f392f163f"
+dependencies = [
+ "type-map",
+ "unic-langid",
+]
+
+[[package]]
+name = "intl_pluralrules"
+version = "7.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "078ea7b7c29a2b4df841a7f6ac8775ff6074020c6776d48491ce2268e068f972"
+dependencies = [
+ "unic-langid",
 ]
 
 [[package]]
@@ -3324,18 +3390,20 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "2.2.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14db48ee17a9ba61810ab1a9c1beb7d06d8136ae39ac25a1137f10d357af01af"
+checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "futures",
  "http",
  "http-body",
  "http-body-util",
+ "indexmap",
+ "libc",
  "pastey",
  "pin-project-lite",
  "rand 0.10.1",
@@ -3356,15 +3424,15 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "2.2.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "783d787bf21813b285f13019adc49e11af501c658890c1e519f31f937c68b7e3"
+checksum = "8b0748e054a5f5598b3213cf72099ae6b2745ba4d996c59ccf455150a7dbb839"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.24.1",
  "proc-macro2",
  "quote",
  "serde_json",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3626,6 +3694,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "self_cell"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "semver"
@@ -4101,6 +4175,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
+ "serde_core",
  "zerovec",
 ]
 
@@ -4437,6 +4512,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "type-map"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "typed-path"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4455,6 +4539,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
 dependencies = [
  "version_check",
+]
+
+[[package]]
+name = "unic-langid"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ba52c9b05311f4f6e62d5d9d46f094bd6e84cb8df7b3ef952748d752a7d05"
+dependencies = [
+ "unic-langid-impl",
+]
+
+[[package]]
+name = "unic-langid-impl"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce1bf08044d4b7a94028c93786f8566047edc11110595914de93362559bc658"
+dependencies = [
+ "tinystr",
 ]
 
 [[package]]
@@ -5353,6 +5455,7 @@ version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239"
 dependencies = [
+ "serde",
  "yoke",
  "zerofrom",
  "zerovec-derive",

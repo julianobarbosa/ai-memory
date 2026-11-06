@@ -14,10 +14,11 @@ use std::sync::{Arc, Weak};
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
-    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
-    NewSession, NewSessionUsage, ObservationKind, PageId, PagePath, ProjectId, Sanitized,
-    Sanitizer, SessionId, WorkspaceId, WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, FilePathOutcome, Handoff,
+    IdentityKey, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff,
+    NewObservation, NewSession, NewSessionUsage, ObservationKind, PageId, PagePath, ProjectId,
+    Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, InterruptedSessionCandidate, ObservationOrder,
@@ -648,6 +649,10 @@ pub struct HookState {
     /// subagent it ran) instead of only its family. Never its arguments.
     /// Held here because the hooks crate makes no config reads.
     pub record_tool_names: bool,
+    /// `[ingest] index_file_paths` (default `false`): store the
+    /// checkout-relative path of the one file a kept file-tool PostToolUse
+    /// named, and count why the others got none (#1843).
+    pub index_file_paths: bool,
     /// Benchmark escape hatch (`AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`, set
     /// only by the retrieval-benchmark harness in `evals/`): skip the
     /// SessionEnd auto-commits of the wiki git tree. The LongMemEval replay
@@ -828,6 +833,7 @@ async fn admit_hook(
     // `Value` before it becomes a `HookEnvelope`, so the field can never reach
     // `body_excerpt`, tracing, or the store — regardless of client version.
     crate::assistant_capture::strip_assistant_message_raw(&mut body);
+    let file_claim = crate::file_field::take_file_claim(&mut body);
     let mut env = HookEnvelope::from_query_and_body(query, body);
     // Consume the opt-in `_ai_memory_assistant` marker and, when both opt-ins are
     // on for a supported Stop, populate the Stop body with the sanitized excerpt.
@@ -845,6 +851,7 @@ async fn admit_hook(
     if state.record_tool_names {
         env.record_tool_name();
     }
+    env.classify_file_path(state.index_file_paths, file_claim, &state.sanitizer);
     if is_cursor_draft_placeholder(&env) {
         HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
@@ -966,6 +973,18 @@ impl HookProcessingOutcome {
             Self::DroppedUnauthorized => metrics.record_dropped_unauthorized(),
             Self::DroppedInvalid => metrics.record_dropped_invalid(),
             Self::DroppedCollision => metrics.record_dropped_collision(),
+        }
+    }
+
+    /// Count the delivery's file path outcome (#1843) only when it stored a
+    /// new observation: a replay, a shed retry or a drop moves nothing.
+    fn record_file_path(
+        self,
+        metrics: &ai_memory_core::IngestMetrics,
+        file_path: Option<FilePathOutcome>,
+    ) {
+        if let (Self::Stored, Some(file_path)) = (self, file_path) {
+            metrics.record_file_path(file_path);
         }
     }
 }
@@ -1099,6 +1118,7 @@ async fn handle_hook_batch(
         // Same unconditional assistant-message backstop as `handle_hook`, applied
         // per item before the envelope is built (#196).
         crate::assistant_capture::strip_assistant_message_raw(&mut item.body);
+        let file_claim = crate::file_field::take_file_claim(&mut item.body);
         let query = parse_hook_query(&item.url);
         let mut env = HookEnvelope::from_query_and_body(query, item.body);
         crate::assistant_capture::apply_assistant_backstop(
@@ -1129,6 +1149,7 @@ async fn handle_hook_batch(
         if state.record_tool_names {
             env.record_tool_name();
         }
+        env.classify_file_path(state.index_file_paths, file_claim, &state.sanitizer);
         if is_cursor_draft_placeholder(&env) {
             HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
             results.push(HookBatchResult {
@@ -1223,6 +1244,7 @@ async fn handle_hook_batch(
         let _permit = permit;
         state.ingest_metrics.record_accepted();
         let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
+        let file_path = env.file_path_outcome;
         let outcome = match process_authorized(
             &state,
             env,
@@ -1275,6 +1297,7 @@ async fn handle_hook_batch(
             }
         };
         outcome.record(&state.ingest_metrics);
+        outcome.record_file_path(&state.ingest_metrics, file_path);
         results.push(HookBatchResult {
             index: idx,
             outcome,
@@ -1305,7 +1328,12 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
         // fallback.
         let decision = direct(PolicyState::Invalid);
         if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
-            return Some(metadata_envelope(env, &decision, None));
+            let file = decision.protocol().tool_family() == ToolFamily::File;
+            let mut env = metadata_envelope(env, &decision, None);
+            if file {
+                env.file_path_outcome = Some(FilePathOutcome::InvalidClaim);
+            }
+            return Some(env);
         }
         return Some(env);
     };
@@ -1317,7 +1345,14 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
     }
 
     if protocol.disposition() == CaptureDisposition::MetadataOnly {
-        return metadata_only_protocol_envelope(env, &protocol);
+        // The client already stripped the arguments, so the family comes from
+        // the claim, which `metadata_protocol_is_legal` checks.
+        return metadata_only_protocol_envelope(env, &protocol).map(|mut env| {
+            if protocol.tool_family() == ToolFamily::File {
+                env.file_path_outcome = Some(FilePathOutcome::MetadataOnly);
+            }
+            env
+        });
     }
 
     let decision = direct(protocol.policy_state());
@@ -1329,8 +1364,13 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
         // invalid/metadata-only protocol rather than echoing the bad claim.
         if protocol.tool_family() == ToolFamily::File || inspected.tool_family() == ToolFamily::File
         {
+            let file = inspected.tool_family() == ToolFamily::File;
             let fallback = direct(PolicyState::Invalid);
-            return Some(metadata_envelope(env, &fallback, None));
+            let mut env = metadata_envelope(env, &fallback, None);
+            if file {
+                env.file_path_outcome = Some(FilePathOutcome::InvalidClaim);
+            }
+            return Some(env);
         }
         return match inspected.disposition() {
             CaptureDisposition::Drop => None,
@@ -1707,6 +1747,21 @@ pub struct HandoffQuery {
     /// handoff stays open and unclaimed, and the rest of the on-start context
     /// is delivered as usual. Absent or anything else delivers as before.
     pub handoff: Option<String>,
+    /// The marker's `[recovery] deliver_on_session_start`, sent as `0` only
+    /// when the project opted out. An explicit falsy value suppresses only the
+    /// unfinished-session recovery snapshot and its backfill marker. Absent or
+    /// anything else delivers recovery as before.
+    pub recovery: Option<String>,
+    /// Truthy from the mid-session inbox notice clients (the Claude Code
+    /// `UserPromptSubmit` notice and `mcp-bridge --channel inbox`, #1942).
+    /// The response is then only the count-only inbox notice, whatever the
+    /// other flags say: no handoff read or claim, no recovery packet, no
+    /// brief, no profile digest or `[profile]` write, no managed ledger, and
+    /// no active-project publish, so a background poll cannot move the
+    /// caller's "current project" pointer. A server that predates the flag
+    /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
+    /// so that server still returns only the notice.
+    pub inbox_only: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1803,6 +1858,12 @@ async fn fetch_and_accept_handoff_at(
     // repository does not become the caller's default for later calls.
     let (ws, proj) =
         resolve_authorized_startup_scope(state, &query, actor.as_ref(), viewer).await?;
+    // Mid-session notice poll (#1942): authorized like a session start, then
+    // read-only. Returning here skips every claim, write and pointer publish
+    // below.
+    if crate::payload::query_flag_truthy(query.inbox_only.as_deref()) {
+        return Ok(pending_inbox_notice(state, ws, proj, agent).await);
+    }
     // A managed run's ledger is additive, not a replacement. Resolve and
     // authorize the request's repository before interpreting the run id: a
     // shared Codex daemon may carry a terminal id from another checkout, and
@@ -1862,14 +1923,13 @@ async fn fetch_and_accept_handoff_at(
     // demand instead of continuously duplicating an in-flight transcript.
     // The source row stays open because it may belong to a legitimate parallel
     // agent; the packet says so explicitly and is never claimed/consumed.
-    let interrupted_md = render_interrupted_session_context(
-        state,
-        ws,
-        proj,
-        owner_filter.clone(),
-        accepting_session,
-    )
-    .await?;
+    // `[recovery] deliver_on_session_start = false` skips only this packet.
+    let interrupted_md = if crate::payload::query_flag_falsy(query.recovery.as_deref()) {
+        None
+    } else {
+        render_interrupted_session_context(state, ws, proj, owner_filter.clone(), accepting_session)
+            .await?
+    };
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
@@ -2063,25 +2123,7 @@ async fn fetch_and_accept_handoff_at(
     // text (no subject, no sender string) — so a hostile message cannot inject
     // text into the on-start context. Nothing is popped here; the agent pops
     // deliberately via memory_message_pop.
-    let inbox_notice = match state
-        .reader
-        .pending_messages_for_agent(ws, proj, agent)
-        .await
-    {
-        Ok(0) => None,
-        Ok(count) => {
-            let names = inbox_scope_names(state, ws, proj).await;
-            render_inbox_notice(
-                count,
-                names
-                    .as_ref()
-                    .map(|(ws_name, proj_name)| (ws_name.as_str(), proj_name.as_str())),
-            )
-        }
-        // A notice is a convenience; never fail the whole SessionStart fetch
-        // because the count could not be read.
-        Err(_) => None,
-    };
+    let inbox_notice = pending_inbox_notice(state, ws, proj, agent).await;
     // A delivered baton supplies the recovery body. Keep another session's
     // uncovered work as a metadata-only pointer instead of mixing its live
     // transcript into the baton the receiver actually claimed.
@@ -2437,6 +2479,36 @@ fn humanize_handoff_age_secs(seconds: i64) -> String {
         v => (v / 2_592_000, "month"),
     };
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
+/// The count-only inbox notice for mail `agent` could claim in `(ws, proj)`,
+/// or `None` for an empty inbox. Shared by the session-start fetch and the
+/// `inbox_only` mid-session poll (#1942), so both render the same text.
+async fn pending_inbox_notice(
+    state: &HookState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    agent: AgentKind,
+) -> Option<String> {
+    match state
+        .reader
+        .pending_messages_for_agent(ws, proj, agent)
+        .await
+    {
+        Ok(0) => None,
+        Ok(count) => {
+            let names = inbox_scope_names(state, ws, proj).await;
+            render_inbox_notice(
+                count,
+                names
+                    .as_ref()
+                    .map(|(ws_name, proj_name)| (ws_name.as_str(), proj_name.as_str())),
+            )
+        }
+        // A notice is a convenience; never fail the whole fetch because the
+        // count could not be read.
+        Err(_) => None,
+    }
 }
 
 /// Workspace and project names of the inbox the notice counts, or `None` when
@@ -4460,6 +4532,7 @@ async fn process_envelope(
     viewer: Option<ai_memory_core::UserId>,
 ) -> Option<HookProcessingOutcome> {
     let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
+    let file_path = env.file_path_outcome;
     let outcome = match process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
         Ok(outcome) => outcome,
         Err(e) if e.downcast_ref::<CaptureNotAuthorized>().is_some() => {
@@ -4516,6 +4589,7 @@ async fn process_envelope(
         }
     };
     outcome.record(&state.ingest_metrics);
+    outcome.record_file_path(&state.ingest_metrics, file_path);
     Some(outcome)
 }
 
@@ -4936,6 +5010,7 @@ async fn process_authorized(
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
+            file_path: env.file_path.clone(),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -5449,9 +5524,13 @@ async fn process_authorized(
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
-        // no end event. The checkpoint still refreshes the summary page.
-        let should_create_handoff =
-            !managed && !child_session && state.create_handoff_on_session_end;
+        // no end event. The checkpoint still refreshes the summary page. The
+        // per-execution `auto_handoff=0` flag (#1951) narrows it to this one
+        // session's events; it never creates a baton the server would not.
+        let should_create_handoff = !managed
+            && !child_session
+            && !env.auto_handoff_off
+            && state.create_handoff_on_session_end;
         let handoff = should_create_handoff.then(|| {
             build_auto_handoff(
                 page_ws,
@@ -5600,6 +5679,12 @@ async fn process_authorized(
                     session = %session_id,
                     page = %new_page.path,
                     "session ended; summary page written without a handoff (create_on_session_end disabled)",
+                );
+            } else if env.auto_handoff_off {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    "session ended; summary page written without a handoff (auto_handoff=0 for this execution)",
                 );
             } else {
                 // Only reachable through the admission refusal above, which
@@ -6346,6 +6431,13 @@ pub(crate) mod tests {
     /// project, so it needs a distinct sender coordinate). Returns nothing; the
     /// point is only that the recipient now has pending mail.
     async fn seed_inbox(state: &HookState, count: usize) {
+        seed_inbox_addressed(state, count, None).await;
+    }
+
+    /// [`seed_inbox`] with the harness-addressing column set: `to_agent`
+    /// `None` is shared project mail, `Some(kind)` is addressed to that
+    /// harness alone.
+    async fn seed_inbox_addressed(state: &HookState, count: usize, to_agent: Option<AgentKind>) {
         let sender = state
             .writer
             .get_or_create_project(state.workspace_id, "sender-proj".to_string(), None)
@@ -6362,7 +6454,7 @@ pub(crate) mod tests {
                     from_owner_user: None,
                     to_workspace_id: state.workspace_id,
                     to_project_id: state.project_id,
-                    to_agent: None,
+                    to_agent,
                     subject: Some(format!("subject {i}")),
                     body: format!("please do task {i}"),
                     nature: ai_memory_core::MessageNature::Unknown,
@@ -6379,6 +6471,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -6487,6 +6581,313 @@ pub(crate) mod tests {
             popped.is_some(),
             "a message the notice reported must still be poppable afterwards",
         );
+    }
+
+    /// The mid-session inbox notice (#1942) rides `GET /handoff` with every
+    /// other section suppressed (`handoff=0&recovery=0&profile_digest=0`, no
+    /// `briefing`): the Claude Code `UserPromptSubmit` hook re-fetches the
+    /// same count-only notice a session start got, without claiming a baton,
+    /// recomposing a brief, or touching recovery. The response must then be
+    /// exactly the inbox notice — and, like the pop it advertises, it must
+    /// respect `to_agent`: mail addressed to another harness does not count.
+    #[tokio::test]
+    async fn suppressed_handoff_fetch_returns_only_the_agent_scoped_inbox_notice() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Shared mail counts for every harness; the codex-addressed copy
+        // never reaches a claude-code notice.
+        seed_inbox(&state, 1).await;
+        seed_inbox_addressed(&state, 2, Some(AgentKind::Codex)).await;
+        // An open baton and an open recovery window must both survive the
+        // fetch untouched.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "MUST-STAY-OPEN".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+
+        let query = HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            handoff: Some("0".into()),
+            recovery: Some("0".into()),
+            profile_digest: Some("0".into()),
+            ..session_start_query("")
+        };
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Count-only and agent-scoped: the one shared message, not three.
+        assert!(
+            body.contains("1 cross-project message waiting"),
+            "the notice must count only shared plus claude-code-addressed mail: {body}",
+        );
+        // Nothing but the notice: no handoff markdown, no summary text, no
+        // recovery scaffold, no brief header.
+        for forbidden in [
+            "MUST-STAY-OPEN",
+            "recovery snapshot",
+            "## ",
+            "subject 0",
+            "please do task",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "a suppressed fetch must not carry {forbidden:?}: {body}",
+            );
+        }
+
+        // Non-claiming on every axis: the baton is still open, the mail is
+        // still pending, and a deliberate pop still finds the shared message.
+        let handoffs = state
+            .reader
+            .list_handoffs(
+                state.workspace_id,
+                state.project_id,
+                Some(ai_memory_core::HandoffState::Open),
+                ai_memory_core::OwnerFilter::Any,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(handoffs.len(), 1, "the suppressed fetch must claim nothing");
+        let popped = state
+            .writer
+            .pop_message(
+                ai_memory_core::MessageClaim {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    claiming_agent: AgentKind::ClaudeCode,
+                    claiming_session: None,
+                    claiming_user: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(popped.is_some(), "the mail must stay claimable");
+    }
+
+    /// The same suppressed fetch on an empty inbox returns an empty body, the
+    /// client's signal that the count is zero (and its cue to reset its
+    /// dedup state so a later arrival notifies again).
+    #[tokio::test]
+    async fn suppressed_handoff_fetch_is_empty_when_no_mail_is_agent_visible() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Only harness-addressed mail for another agent: invisible here.
+        seed_inbox_addressed(&state, 3, Some(AgentKind::Codex)).await;
+        let state = Arc::new(state);
+
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(HandoffQuery {
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    handoff: Some("0".into()),
+                    recovery: Some("0".into()),
+                    profile_digest: Some("0".into()),
+                    ..session_start_query("")
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "", "an invisible inbox must render no notice");
+    }
+
+    /// `inbox_only=1` (#1942) is the background-poll form of the notice
+    /// fetch: it must stay read-only even when the caller leaves every other
+    /// section on. No baton claim, and no active-project publish, so a bridge
+    /// polling repository A every few seconds cannot keep steering an
+    /// operator's unscoped calls in repository B back to A. The control is a
+    /// plain session start on the same state, which does publish and claim.
+    #[tokio::test]
+    async fn inbox_only_fetch_claims_nothing_and_publishes_no_active_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_inbox(&state, 2).await;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "INBOX-ONLY-BATON".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let fetch = |inbox_only: Option<&'static str>| {
+            let state = state.clone();
+            let query = HandoffQuery {
+                inbox_only: inbox_only.map(Into::into),
+                ..session_start_query(&cwd)
+            };
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        None,
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = fetch(Some("1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("2 cross-project messages waiting"), "{body}");
+        assert!(!body.contains("INBOX-ONLY-BATON"), "{body}");
+        assert!(
+            open_handoff_exists(&state).await,
+            "inbox_only claimed the baton"
+        );
+        assert_eq!(
+            state.active_project.get(),
+            None,
+            "inbox_only published the caller's active project"
+        );
+
+        // Control: the same query without the flag is a real session start.
+        let (status, body) = fetch(None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("INBOX-ONLY-BATON"), "{body}");
+        assert_eq!(
+            state.active_project.get(),
+            Some((state.workspace_id, state.project_id))
+        );
+    }
+
+    /// The notice poll is authorized like a session start: a viewer with no
+    /// grant on a restricted project gets a 403 and no count, so the poll
+    /// cannot be used to watch another team's inbox. A granted reader is the
+    /// control and sees the count.
+    #[tokio::test]
+    async fn inbox_only_fetch_refuses_a_viewer_without_read_access() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        seed_inbox(&state, 1).await;
+        let human = |name: &'static str| {
+            let writer = state.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader = human("reader").await;
+        let outsider = human("outsider").await;
+        state
+            .writer
+            .grant_memory(
+                reader,
+                state.project_id,
+                ai_memory_store::GrantLevel::Read,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let poll = |viewer: ai_memory_core::UserId| {
+            let state = state.clone();
+            let query = HandoffQuery {
+                inbox_only: Some("1".into()),
+                handoff: Some("0".into()),
+                recovery: Some("0".into()),
+                profile_digest: Some("0".into()),
+                ..session_start_query(&cwd)
+            };
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        Some(axum::Extension(AuthorizedViewer(viewer))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = poll(outsider).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            !body.contains("message waiting"),
+            "leaked the count: {body}"
+        );
+
+        let (status, body) = poll(reader).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("1 cross-project message waiting"), "{body}");
     }
 
     /// A resumed session that had already ended may not take a baton
@@ -7193,6 +7594,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -8160,6 +8563,7 @@ pub(crate) mod tests {
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
             record_tool_names: false,
             skip_wiki_checkpoints: false,
+            index_file_paths: false,
         }
     }
 
@@ -10313,6 +10717,7 @@ pub(crate) mod tests {
                     title: "pending replay".into(),
                     body: "hello".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -11068,7 +11473,7 @@ pub(crate) mod tests {
     /// creates a handoff (a wiki write + git checkpoint), which is slower than
     /// a plain observation store, so the deadline is generous and the poll
     /// waits for the specific kinds rather than a bare count.
-    async fn wait_for_kinds(
+    pub(crate) async fn wait_for_kinds(
         state: &HookState,
         sid: &str,
         expected: &[ObservationKind],
@@ -15324,6 +15729,7 @@ pub(crate) mod tests {
                                 title: "probe".into(),
                                 body: String::new(),
                                 importance: 1,
+                                file_path: None,
                             },
                             &state.sanitizer
                         ),
@@ -16975,6 +17381,8 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
+                inbox_only: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -17054,6 +17462,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -17288,6 +17698,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -17479,6 +17891,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -17798,6 +18212,208 @@ pub(crate) mod tests {
             !open_handoff_exists(&state).await,
             "on-demand recovery must not create an accumulating handoff row"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_opt_out_keeps_other_start_context_and_is_project_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let capture_old = |project: Option<&str>, cwd: &str, session_id: &str, prompt: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.into()),
+                    workspace: Some("default".into()),
+                    project: project.map(Into::into),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": cwd,
+                    "prompt": prompt,
+                    "occurred_at": "2020-01-01T00:00:00Z"
+                }),
+            )
+        };
+        process(
+            &state,
+            capture_old(
+                Some("scratch"),
+                "/tmp/project-a",
+                "12121212-1212-1212-1212-121212121212",
+                "RECOVERY-SOURCE-A",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                    ai_memory_core::OwnerFilter::Any,
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the old source fixture must begin open"
+        );
+        process(
+            &state,
+            capture_old(
+                Some("project-b"),
+                "/tmp/project-b",
+                "34343434-3434-3434-3434-343434343434",
+                "RECOVERY-SOURCE-B",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_rules/recovery.md",
+                "RECOVERY-OPT-OUT-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        seed_global_profile(&state).await;
+        seed_inbox(&state, 1).await;
+
+        for falsy in ["0", "false", "no", "OFF"] {
+            let body = fetch_and_accept_handoff(
+                &state,
+                HandoffQuery {
+                    agent: Some("codex".into()),
+                    cwd: Some("/tmp/project-a".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    briefing: Some("true".into()),
+                    recovery: Some(falsy.into()),
+                    ..Default::default()
+                },
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the other startup context must survive recovery opt-out");
+            for unwanted in [
+                "unfinished-session recovery snapshot",
+                BACKFILL_MARKER_PREFIX,
+                "RECOVERY-SOURCE-A",
+            ] {
+                assert!(!body.contains(unwanted), "{falsy}: {unwanted}: {body}");
+            }
+            for retained in [
+                "RECOVERY-OPT-OUT-BRIEF",
+                "Use pnpm, not npm.",
+                "1 cross-project message waiting",
+            ] {
+                assert!(
+                    body.contains(retained),
+                    "{falsy}: missing {retained}: {body}"
+                );
+            }
+            assert_eq!(
+                state
+                    .reader
+                    .pending_message_count(state.workspace_id, state.project_id)
+                    .await
+                    .unwrap(),
+                1,
+                "the inbox notice must remain non-consuming"
+            );
+        }
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                    ai_memory_core::OwnerFilter::Any,
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an opted-out start must leave its source session untouched"
+        );
+
+        // Recovery opt-out is independent of the ordinary handoff baton.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "RECOVERY-OPT-OUT-HANDOFF".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let handed_off = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/project-a".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                recovery: Some("0".into()),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("recovery opt-out must not suppress a handoff");
+        assert!(handed_off.contains("RECOVERY-OPT-OUT-HANDOFF"));
+        assert!(!handed_off.contains("unfinished-session recovery snapshot"));
+
+        // A second project keeps the default and receives only its own source.
+        let project_b = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/project-b".into()),
+                workspace: Some("default".into()),
+                project: Some("project-b".into()),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a project without the opt-out still receives recovery");
+        assert!(project_b.contains("unfinished-session recovery snapshot"));
+        assert!(project_b.contains(BACKFILL_MARKER_PREFIX));
+        assert!(project_b.contains("RECOVERY-SOURCE-B"));
+        assert!(!project_b.contains("RECOVERY-SOURCE-A"));
     }
 
     #[tokio::test]
@@ -18570,6 +19186,106 @@ pub(crate) mod tests {
         );
     }
 
+    async fn end_claude_session(state: &HookState, tmp: &TempDir, auto_handoff: Option<&str>) {
+        let session = SessionId::new();
+        for event in ["session-start", "user-prompt", "session-end"] {
+            let envelope = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    auto_handoff: auto_handoff.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "cwd": tmp.path(),
+                    "prompt": "Review the parser change",
+                }),
+            );
+            process(state, envelope, None, Vec::new()).await.unwrap();
+        }
+    }
+
+    /// #1951: a headless helper turn opts out of its own automatic baton with
+    /// `auto_handoff=0`, while the server keeps `create_on_session_end` on for
+    /// every other session, in the same project and at the same time.
+    #[tokio::test]
+    async fn auto_handoff_off_skips_only_that_sessions_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert!(state.create_handoff_on_session_end);
+        for off in ["0", "false", "OFF", " no "] {
+            end_claude_session(&state, &tmp, Some(off)).await;
+            assert!(
+                !open_handoff_exists(&state).await,
+                "auto_handoff={off} must not create an automatic handoff"
+            );
+        }
+        assert!(
+            !session_pages(&state).await.is_empty(),
+            "the opted-out session still gets its summary page"
+        );
+        // Not a falsy value: the server default applies.
+        end_claude_session(&state, &tmp, Some("1")).await;
+        assert!(
+            open_handoff_exists(&state).await,
+            "auto_handoff=1 keeps the baton"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_handoff_off_leaves_a_concurrent_session_its_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        end_claude_session(&state, &tmp, Some("0")).await;
+        end_claude_session(&state, &tmp, None).await;
+        assert!(
+            open_handoff_exists(&state).await,
+            "an attended session without the flag keeps its automatic baton"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_honours_auto_handoff_off() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new();
+        let text = "Implemented the helper turn";
+        process(
+            &state,
+            opencode_turn_event(&session.to_string(), "user-prompt", text),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut stop = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("opencode2".into()),
+                capture_assistant: Some("1".into()),
+                auto_handoff: Some("0".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": text,
+                "turn_checkpoint": true,
+                "_ai_memory_assistant": { "version": 1, "excerpt": text },
+            }),
+        );
+        crate::assistant_capture::apply_assistant_backstop(&mut stop, true);
+        process(&state, stop, None, Vec::new()).await.unwrap();
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(
+            !open_handoff_exists(&state).await,
+            "auto_handoff=0 must not write a checkpoint baton"
+        );
+    }
+
     #[tokio::test]
     async fn session_end_with_create_on_session_end_enabled_creates_handoff() {
         let tmp = TempDir::new().unwrap();
@@ -18655,6 +19371,8 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: None,
+                    recovery: None,
+                    inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -19276,6 +19994,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -19366,6 +20086,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -19475,6 +20197,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -19671,6 +20395,8 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
+                    recovery: None,
+                    inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -20295,6 +21021,7 @@ pub(crate) mod tests {
                     title: "session-end".into(),
                     body: "finish".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -20766,6 +21493,8 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -20850,6 +21579,8 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -20926,6 +21657,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -21083,6 +21816,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -21206,6 +21941,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21291,6 +22028,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21722,6 +22461,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21889,6 +22630,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -22745,6 +23488,8 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -25122,6 +25867,372 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// One batch of `(url query, body)` items after a session start; returns the
+    /// stored PostToolUse observations.
+    async fn file_path_batch(
+        state: &Arc<HookState>,
+        agent: &str,
+        session: &str,
+        items: Vec<(&str, serde_json::Value)>,
+    ) -> Vec<ai_memory_core::Observation> {
+        let mut batch = vec![HookBatchItem {
+            url: format!("http://h/hook?event=session-start&agent={agent}"),
+            body: serde_json::json!({ "session_id": session }),
+        }];
+        batch.extend(items.into_iter().map(|(query, mut body)| {
+            body["session_id"] = session.into();
+            HookBatchItem {
+                url: format!("http://h/hook?{query}"),
+                body,
+            }
+        }));
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+            .reader
+            .observations_for_session(SessionId::from_native(session))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == ObservationKind::PostToolUse)
+            .collect()
+    }
+
+    fn read_call(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "Read", "tool_use_id": "toolu_f",
+            "tool_input": { "file_path": path }, "tool_response": { "content": "x" },
+        })
+    }
+
+    fn with_file_field(mut body: serde_json::Value, field: serde_json::Value) -> serde_json::Value {
+        body[crate::file_field::FILE_FIELD_KEY] = field;
+        body
+    }
+
+    /// #1843: with `[ingest] index_file_paths` on, each stored file-tool
+    /// PostToolUse moves exactly its own `file_path_*` counter and no other,
+    /// only a valid path for a single file is stored, and the observation is
+    /// kept whatever the field says. A PreToolUse, a non-file call (even with a
+    /// valid field) and a backfill import move none. Each case is delivered on
+    /// its own and checked against the counter delta it caused.
+    #[tokio::test]
+    async fn file_path_index_counts_each_reason_and_stores_only_a_valid_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let post = "event=post-tool-use&agent=claude-code";
+        let codex = "event=post-tool-use&agent=codex";
+        let field = |path: &str| crate::file_field::file_field(Ok(path));
+        let skipped = |reason: &str| serde_json::json!({ "version": 1, "skipped": reason });
+        let patch = |headers: &str| {
+            let mut body = crate::capture_policy::tool_call_payload(
+                AgentKind::Codex,
+                "apply_patch",
+                Some(&serde_json::json!({
+                    "input": format!("*** Begin Patch\n{headers}*** End Patch")
+                })),
+                None,
+            );
+            body["tool_response"] = "done".into();
+            body
+        };
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                post,
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                Some("indexed"),
+            ),
+            (
+                codex,
+                with_file_field(patch("*** Update File: one.rs\n"), field("one.rs")),
+                Some("indexed"),
+            ),
+            (post, read_call("src/a.rs"), Some("field_absent")),
+            (
+                post,
+                with_file_field(read_call("src/a.rs"), serde_json::json!({"version": 2})),
+                Some("unknown_version"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("outside_checkout")),
+                Some("skipped_outside_checkout"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("no_checkout")),
+                Some("skipped_no_checkout"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("refused")),
+                Some("skipped_refused"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("symlinked_cwd")),
+                Some("skipped_other"),
+            ),
+            (
+                post,
+                with_file_field(read_call("/etc/passwd"), field("/etc/passwd")),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                with_file_field(read_call(".ssh/config"), field(".ssh/config")),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), serde_json::json!({"version": 1})),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                serde_json::json!({
+                    "tool_name": "Read", "tool_input": { "file_path": "secret/x" },
+                    "_ai_memory_capture": "not a protocol",
+                    "_ai_memory_file": field("secret/x"),
+                }),
+                Some("invalid_claim"),
+            ),
+            (
+                post,
+                serde_json::json!({
+                    "tool_family": "file", "tool_name": "file",
+                    "_ai_memory_capture": capture_protocol("metadata-only", "active", "file", 1, "extracted"),
+                }),
+                Some("metadata_only"),
+            ),
+            (
+                codex,
+                with_file_field(
+                    patch("*** Update File: a.rs\n*** Delete File: b.rs\n"),
+                    field("a.rs"),
+                ),
+                Some("multi_file"),
+            ),
+            (
+                codex,
+                with_file_field(patch(""), field("x.rs")),
+                Some("no_file"),
+            ),
+            (
+                "event=pre-tool-use&agent=claude-code",
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                None,
+            ),
+            (
+                post,
+                with_file_field(
+                    serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+                    field("src/lib.rs"),
+                ),
+                None,
+            ),
+            (
+                "event=post-tool-use&agent=claude-code&extension=ai-memory-backfill&source_event=backfill.tool_call",
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                None,
+            ),
+        ];
+        let mut first = None;
+        for (index, (query, body, expected)) in cases.into_iter().enumerate() {
+            let agent = if query.contains("agent=codex") {
+                "codex"
+            } else {
+                "claude-code"
+            };
+            let before = metrics.snapshot().file_paths();
+            let session = format!("file-index-{index}");
+            let stored = file_path_batch(&state, agent, &session, vec![(query, body)]).await;
+            let moved: Vec<(&str, u64)> = metrics
+                .snapshot()
+                .file_paths()
+                .iter()
+                .zip(before)
+                .filter(|((_, after), (_, before))| after != before)
+                .map(|((label, after), (_, before))| (*label, after - before))
+                .collect();
+            assert_eq!(
+                moved,
+                expected
+                    .map(|label| (label, 1))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "case {index}"
+            );
+            if !query.contains("pre-tool-use") {
+                assert_eq!(stored.len(), 1, "case {index}: the observation is kept");
+            }
+            first = first.or(stored.into_iter().next());
+        }
+
+        let first = first.unwrap();
+        for (path, sessions) in [
+            ("src/lib.rs", 1),
+            ("one.rs", 1),
+            ("/etc/passwd", 0),
+            ("a.rs", 0),
+        ] {
+            let hits = state
+                .reader
+                .observations_for_file(
+                    first.workspace_id,
+                    first.project_id,
+                    ai_memory_core::OwnerFilter::Any,
+                    path.into(),
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), sessions, "{path}");
+        }
+    }
+
+    /// Control for the above: with the key off (the default) a valid field is
+    /// still stripped, but nothing is stored and no counter moves.
+    #[tokio::test]
+    async fn file_path_index_off_means_off() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert!(!state.index_file_paths);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let field = crate::file_field::file_field(Ok("src/lib.rs"));
+        let stored = file_path_batch(
+            &state,
+            "claude-code",
+            "file-index-off",
+            vec![(
+                "event=post-tool-use&agent=claude-code",
+                with_file_field(read_call("src/lib.rs"), field),
+            )],
+        )
+        .await;
+        assert_eq!(stored.len(), 1);
+        assert!(metrics.snapshot().file_paths().iter().all(|(_, n)| *n == 0));
+        let hits = state
+            .reader
+            .observations_for_file(
+                stored[0].workspace_id,
+                stored[0].project_id,
+                ai_memory_core::OwnerFilter::Any,
+                "src/lib.rs".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// The single route counts only a stored delivery: a 429 the client
+    /// retries counts nothing until it is stored, and a keyed replay of the
+    /// same event counts nothing more.
+    #[tokio::test]
+    async fn file_path_counters_move_once_per_stored_delivery_on_the_single_route() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let semaphore = state.ingest_semaphore.clone();
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut state = Arc::new(state);
+        let body = with_file_field(
+            serde_json::json!({ "session_id": "single-file", "tool_name": "Read", "tool_input": { "file_path": "src/lib.rs" } }),
+            crate::file_field::file_field(Ok("src/lib.rs")),
+        );
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ingest_key: Some("file-key-1".into()),
+            ..Default::default()
+        };
+        let post = |state: Arc<HookState>| {
+            admit_hook(
+                state,
+                query(),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                body.clone(),
+            )
+        };
+        assert_eq!(post(state.clone()).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            0,
+            "a shed event counts nothing"
+        );
+
+        Arc::get_mut(&mut state).unwrap().ingest_semaphore = semaphore;
+        assert_eq!(post(state.clone()).await.0, StatusCode::ACCEPTED);
+        wait_for_kinds(&state, "single-file", &[ObservationKind::PostToolUse]).await;
+        for _ in 0..300 {
+            if metrics.snapshot().file_path_indexed == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.snapshot().file_path_indexed, 1);
+
+        assert_eq!(post(state.clone()).await.0, StatusCode::ACCEPTED);
+        for _ in 0..300 {
+            if metrics.snapshot().replayed == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.snapshot().replayed, 1);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            1,
+            "a replay counts nothing more"
+        );
+    }
+
+    /// The batch route counts the same way: a keyed item delivered in a second
+    /// batch is a replay and counts nothing more.
+    #[tokio::test]
+    async fn file_path_counters_move_once_per_stored_delivery_on_the_batch_route() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let item = (
+            "event=post-tool-use&agent=claude-code&ingest_key=file-key-2",
+            with_file_field(
+                read_call("src/lib.rs"),
+                crate::file_field::file_field(Ok("src/lib.rs")),
+            ),
+        );
+        file_path_batch(&state, "claude-code", "batch-file", vec![item.clone()]).await;
+        assert_eq!(metrics.snapshot().file_path_indexed, 1);
+
+        file_path_batch(&state, "claude-code", "batch-file", vec![item]).await;
+        assert_eq!(metrics.snapshot().replayed, 1);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            1,
+            "a replay counts nothing more"
+        );
+    }
+
     /// `[ingest] record_tool_names` names a kept call, and never a call a
     /// capture policy reduced to metadata: not one the client stripped, and
     /// not a shell call the server strips itself because its marker is
@@ -26489,6 +27600,8 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: None,
+                    recovery: None,
+                    inbox_only: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -26560,6 +27673,8 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
+            inbox_only: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -26976,6 +28091,7 @@ pub(crate) mod tests {
                         title: "prompt".into(),
                         body: habit.into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

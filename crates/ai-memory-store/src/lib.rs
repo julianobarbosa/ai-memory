@@ -31,6 +31,7 @@ mod provenance;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
+pub mod query_signals;
 mod reader;
 mod retrieval_tuning;
 mod scope;
@@ -65,16 +66,16 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalBatchUpsert,
-    ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
-    EntityBackfillSummary, HookSessionAdmission, IdentityResolution, IdleEndAction,
-    IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary, MoveSessionSummary,
-    MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH,
-    PagePrecondition, PageWindowBackfillSummary, PagesMode, ProjectAliasWriteResolution, PurgeMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
-    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
-    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
+    ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary,
+    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
+    IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
@@ -87,16 +88,20 @@ pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
 };
+pub use query_signals::{
+    QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
+    query_hash, query_signal_boost,
+};
 pub use reader::{
     ActivityWindow, AgentSessionCount, AnswerEvidenceMeta, AuditEvent, AuditLogFilter,
     AutoImproveCandidateSession, AutoImproveParkedClaim, BriefPageBody, BriefingPage,
     BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
     ContaminationSummary, ContradictionEdge, CrossProjectEdge, DecayCandidate, DecayTombstone,
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, HybridSearch, HybridSearchOutcome,
-    IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate, LinkGraph, LinkGraphEdge,
-    LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult,
-    ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
+    HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
+    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
     PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
     PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
     PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
@@ -128,10 +133,10 @@ pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
-    WorkstreamSelection, WorkstreamSelector,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -2908,6 +2913,7 @@ mod tests {
                     title: "tool file".into(),
                     body: DIRECTORY_PATH_BODY.into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3770,6 +3776,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "the raw-only zebra detail lives here".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3833,6 +3840,7 @@ mod tests {
                     body: "leaked Authorization: Bearer abcdef0123456789ABCDEF0123456789 in transcript"
                         .into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3855,6 +3863,92 @@ mod tests {
                 "secret reached disk unscrubbed: {col}"
             );
         }
+    }
+
+    /// #1843: a keyed insert that fails leaves no `file_path` behind and frees
+    /// its key, so the redelivery stores the path (AGENTS.md: new disk+SQL
+    /// mutations need recovery tests).
+    #[tokio::test]
+    async fn a_failed_observation_insert_leaves_no_file_path_and_can_be_retried() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let obs = || {
+            Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "tool file".into(),
+                    body: "tool_family: file".into(),
+                    importance: 5,
+                    file_path: Some("src/lib.rs".into()),
+                },
+                &Sanitizer::builtin(),
+            )
+        };
+        let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        let rows_with_path = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE file_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute_batch(
+            "CREATE TRIGGER reject_file_path BEFORE INSERT ON observations \
+             WHEN NEW.file_path IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        assert!(
+            store
+                .writer
+                .insert_observation_ingest(obs(), "entry-file".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(rows_with_path(), 0, "the failed insert left a path behind");
+
+        conn.execute_batch("DROP TRIGGER reject_file_path;")
+            .unwrap();
+        let retried = store
+            .writer
+            .insert_observation_ingest(obs(), "entry-file".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(retried, IngestObservationOutcome::Inserted(_)),
+            "the rolled-back key is free for the redelivery"
+        );
+        assert_eq!(rows_with_path(), 1);
     }
 
     /// Ingest idempotency distinguishes pending and completed replays, scopes
@@ -3911,6 +4005,7 @@ mod tests {
             title: "prompt".into(),
             body: "hello".into(),
             importance: 5,
+            file_path: None,
         };
 
         let first = store
@@ -4275,6 +4370,7 @@ mod tests {
                     title: "first".into(),
                     body: "initial work".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4319,6 +4415,7 @@ mod tests {
                     title: "resumed".into(),
                     body: "new work".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4987,6 +5084,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "upgrade observation survives".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();

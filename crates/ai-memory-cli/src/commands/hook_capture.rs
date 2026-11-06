@@ -337,6 +337,45 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
     marker_query_suffix_impl(cwd, default_strategy, None)
 }
 
+/// The fixed `/handoff` flags of a count-only inbox notice fetch (#1942).
+/// `inbox_only=1` makes the server return only the notice and skip every
+/// claim, write and active-project publish; the suppression flags keep a
+/// server that predates `inbox_only` to the same body.
+const INBOX_NOTICE_FLAGS: &str = "&inbox_only=1&handoff=0&recovery=0&profile_digest=0";
+
+/// The query suffix of a count-only inbox notice fetch: the routing pairs of
+/// [`marker_query_suffix_without_briefing`] followed by
+/// [`INBOX_NOTICE_FLAGS`]. The marker's own `&handoff=0` / `&recovery=0`
+/// delivery opt-outs are left out because the fixed flags already carry
+/// them: `GET /handoff` deserializes its query into a struct, and a repeated
+/// key is a 400, which would hide the notice for exactly the repositories
+/// that turned delivery off. Both the Claude Code prompt notice and the
+/// `mcp-bridge --channel inbox` poll build their query here.
+pub fn inbox_notice_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+    match routing_selection(cwd) {
+        Ok(selection) => inbox_notice_query_suffix_from_selection(cwd, default_strategy, selection),
+        // Like `marker_query_suffix_impl`: an unreadable routing marker sends
+        // no routing pairs at all.
+        Err(_) => INBOX_NOTICE_FLAGS.to_owned(),
+    }
+}
+
+fn inbox_notice_query_suffix_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    selection: Option<RoutingSelection>,
+) -> String {
+    let mut qs = build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        None,
+        selection,
+        DeliveryOptOuts::Omit,
+    );
+    qs.push_str(INBOX_NOTICE_FLAGS);
+    qs
+}
+
 /// Whether the marker that routes `cwd` explicitly enables the compiled
 /// project brief. It is the selection [`marker_query_suffix`] reads its
 /// `&briefing` params from, so the Kimi gate agrees with the query it gates:
@@ -356,6 +395,32 @@ pub fn marker_requests_briefing(cwd: &str) -> bool {
 /// `/brief` only when its query would carry the opt-in.
 pub fn marker_requests_subagent_briefing(cwd: &str) -> bool {
     marker_requests_briefing_with_home(cwd, home_dir().as_deref(), BriefingKey::SubagentStart)
+}
+
+/// Whether the marker that routes `cwd` opts this repository into the
+/// mid-session inbox notice (#1942): `[messaging] inbox_notice_on_prompt`.
+/// Same selection rule as [`marker_requests_briefing`] — the nearest
+/// settings-declaring marker, so a nested capture-only marker cannot shadow
+/// an outer opt-in and a marker declaring only this key still counts as a
+/// settings boundary. Truthy-only: absent or falsy leaves the notice off.
+pub fn marker_requests_inbox_notice(cwd: &str) -> bool {
+    marker_requests_inbox_notice_with_home(cwd, home_dir().as_deref())
+}
+
+/// [`marker_requests_inbox_notice`] resolved against `home` instead of the
+/// operator's home directory, so tests are hermetic.
+fn marker_requests_inbox_notice_with_home(cwd: &str, home: Option<&Path>) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| {
+            crate::marker::parse_toml_section_flag(
+                &selection.path,
+                "messaging",
+                "inbox_notice_on_prompt",
+            )
+        })
+        .is_some_and(|value| is_truthy(&value))
 }
 
 /// [`marker_requests_briefing`] for the opt-in `key`, resolved against `home`
@@ -679,6 +744,31 @@ fn marker_query_suffix_impl_from_selection(
     briefing_key: Option<BriefingKey>,
     selection: Option<RoutingSelection>,
 ) -> String {
+    build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        briefing_key,
+        selection,
+        DeliveryOptOuts::Forward,
+    )
+}
+
+/// Whether a marker suffix carries the `[handoff]` / `[recovery]`
+/// `deliver_on_session_start` opt-outs as `&handoff=0` / `&recovery=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOptOuts {
+    Forward,
+    /// The caller appends both flags itself ([`INBOX_NOTICE_FLAGS`]).
+    Omit,
+}
+
+fn build_marker_query_suffix(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    briefing_key: Option<BriefingKey>,
+    selection: Option<RoutingSelection>,
+    delivery_opt_outs: DeliveryOptOuts,
+) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
     let marker = selection.as_ref().map(|selection| selection.path.clone());
     let scope = hook_scope_from_selection(cwd, default_strategy, selection);
@@ -686,6 +776,7 @@ fn marker_query_suffix_impl_from_selection(
     let (mut briefing, mut briefing_budget) = (None, None);
     let (mut profile_contribute, mut profile_consume) = (None, None);
     let mut handoff_off = false;
+    let mut recovery_off = false;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -708,12 +799,19 @@ fn marker_query_suffix_impl_from_selection(
         // marker sends nothing, so the server keeps what it stored.
         profile_contribute = Some(profile_flag_value(parse_toml_flag(&marker, "contribute")));
         profile_consume = Some(profile_flag_value(parse_toml_flag(&marker, "consume")));
-        // `[handoff] deliver_on_session_start = false` keeps this project's
-        // handoffs out of its session starts. Sent only when explicitly
-        // falsy, so an absent key leaves the request byte-identical.
-        handoff_off = parse_toml_flag(&marker, "deliver_on_session_start")
-            .as_deref()
-            .is_some_and(crate::marker::is_falsy);
+        // The delivery keys share a name but not a table. Keep legacy handoff
+        // parsing outside `[recovery]`; recovery itself is section-scoped.
+        handoff_off = crate::marker::parse_toml_flag_outside_section(
+            &marker,
+            "recovery",
+            "deliver_on_session_start",
+        )
+        .as_deref()
+        .is_some_and(crate::marker::is_falsy);
+        recovery_off =
+            crate::marker::parse_toml_section_flag(&marker, "recovery", "deliver_on_session_start")
+                .as_deref()
+                .is_some_and(crate::marker::is_falsy);
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -761,8 +859,13 @@ fn marker_query_suffix_impl_from_selection(
     if let Some(val) = profile_consume {
         qs.push_str(&format!("&profile_consume={val}"));
     }
-    if handoff_off {
-        qs.push_str("&handoff=0");
+    if delivery_opt_outs == DeliveryOptOuts::Forward {
+        if handoff_off {
+            qs.push_str("&handoff=0");
+        }
+        if recovery_off {
+            qs.push_str("&recovery=0");
+        }
     }
     // Per-repo brief opt-in: forwarded on every request for simplicity (the
     // capture path ignores it); only the `/handoff` GET at session start, or
@@ -1084,8 +1187,11 @@ pub async fn get_handoff(
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "ai-memory hook warning: handoff fetch failed ({e}); \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: handoff fetch failed ({e}); \
                  a pending handoff (if any) was NOT injected"
+                ))
             );
             return None;
         }
@@ -1097,9 +1203,12 @@ pub async fn get_handoff(
         // is the server's reason and goes to stderr, never into context.
         let reason = resp.text().await.unwrap_or_default();
         eprintln!(
-            "ai-memory hook warning: not authorized for this project's memory ({}); \
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: not authorized for this project's memory ({}); \
              nothing was injected",
-            reason.trim()
+                super::show::terminal_text(reason.trim())
+            ))
         );
         return None;
     }
@@ -1149,6 +1258,12 @@ mod tests {
     fn marker_requests_briefing(cwd: &str) -> bool {
         let home = tempfile::TempDir::new().unwrap();
         marker_requests_briefing_with_home(cwd, Some(home.path()), BriefingKey::SessionStart)
+    }
+
+    /// Shadows [`super::marker_requests_inbox_notice`] with the same empty home.
+    fn marker_requests_inbox_notice(cwd: &str) -> bool {
+        let home = tempfile::TempDir::new().unwrap();
+        marker_requests_inbox_notice_with_home(cwd, Some(home.path()))
     }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
@@ -2069,6 +2184,138 @@ drop_subagent_captures = "true"
         assert!(!outer.contains("handoff"), "{outer}");
     }
 
+    /// `[recovery]` has its own delivery flag and is a settings boundary. Its
+    /// same-named key never disables handoffs, and every non-falsy value keeps
+    /// the request byte-identical to a marker without the key.
+    #[test]
+    fn marker_query_suffix_forwards_recovery_independently_only_when_falsy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        let marker = inner.join(".ai-memory.toml");
+        let unchanged = format!(
+            "&cwd={}&profile_contribute=1&profile_consume=1",
+            url_encode(inner.to_str().unwrap())
+        );
+
+        for off in ["false", "\"no\"", "0", "\"OFF\""] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {off}\n"),
+            )
+            .unwrap();
+            let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+            assert_eq!(qs, format!("{unchanged}&recovery=0"), "{off}");
+            assert!(
+                !qs.contains("workspace=outer"),
+                "a [recovery] marker is a boundary: {qs}"
+            );
+        }
+        for on in ["true", "\"yes\"", "banana"] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {on}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                marker_query_suffix(inner.to_str().unwrap(), None),
+                unchanged,
+                "{on}"
+            );
+        }
+
+        std::fs::write(
+            &marker,
+            "[handoff]\ndeliver_on_session_start = false\n[recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let both = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(both.contains("&handoff=0&recovery=0"), "{both}");
+
+        // Compatibility: legacy section-blind handoff parsing is unchanged
+        // outside the new [recovery] table.
+        std::fs::write(&marker, "deliver_on_session_start = false\n").unwrap();
+        let legacy = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert_eq!(legacy, format!("{unchanged}&handoff=0"));
+
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!outer.contains("recovery"), "{outer}");
+    }
+
+    /// The inbox notice query (#1942) appends its own `handoff=0` and
+    /// `recovery=0`, so it must not also forward the marker's delivery
+    /// opt-outs: `GET /handoff` deserializes its query into `HandoffQuery`,
+    /// which rejects a repeated key, and the notice would never appear for a
+    /// repository that turned handoff or recovery delivery off. Every shape is
+    /// parsed with the server's own extractor; the control proves that
+    /// extractor rejects the old composition.
+    #[test]
+    fn inbox_notice_query_parses_as_a_handoff_query_under_every_delivery_opt_out() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/handoff?agent=claude-code&session_id=s{qs}")
+                .parse()
+                .unwrap();
+            Query::<HandoffQuery>::try_from_uri(&uri).map(|Query(query)| query)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let selection = || {
+            super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            )
+            .unwrap()
+        };
+        let handoff_off = "[handoff]\ndeliver_on_session_start = false\n";
+        let recovery_off = "[recovery]\ndeliver_on_session_start = false\n";
+        let cases = [
+            ("no marker", None),
+            ("no opt-out", Some("workspace = \"w\"\n".to_owned())),
+            ("handoff off", Some(handoff_off.to_owned())),
+            ("recovery off", Some(recovery_off.to_owned())),
+            ("both off", Some(format!("{handoff_off}{recovery_off}"))),
+            (
+                "legacy handoff off",
+                Some("deliver_on_session_start = false\n".to_owned()),
+            ),
+        ];
+        for (name, body) in cases {
+            match &body {
+                Some(body) => std::fs::write(&marker, body).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&marker);
+                }
+            }
+            let qs = inbox_notice_query_suffix_from_selection(cwd, None, selection());
+            let query = parse(&qs).unwrap_or_else(|e| panic!("{name}: {qs} rejected: {e}"));
+            assert_eq!(query.inbox_only.as_deref(), Some("1"), "{name}");
+            assert_eq!(query.handoff.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.recovery.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.profile_digest.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.cwd.as_deref(), Some(cwd), "{name}");
+            assert!(query.briefing.is_none(), "{name}: {qs}");
+
+            // Control: the routing suffix that forwards the opt-outs, followed
+            // by the fixed flags, is what both callers used to send.
+            let forwarded = marker_query_suffix_impl_from_selection(cwd, None, None, selection());
+            let old = format!("{forwarded}{INBOX_NOTICE_FLAGS}");
+            let opted_out = forwarded.contains("&handoff=0") || forwarded.contains("&recovery=0");
+            assert_eq!(parse(&old).is_err(), opted_out, "{name}: {old}");
+        }
+    }
+
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so
     /// the server keeps that project's subagent captures (opt-in only).
     #[test]
@@ -2229,6 +2476,58 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         assert!(marker_requests_briefing(cwd));
+    }
+
+    #[test]
+    fn marker_requests_inbox_notice_only_for_truthy_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let cwd = tmp.path().to_str().unwrap();
+
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninject_on_session_start = true\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = false\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = true\n").unwrap();
+        assert!(marker_requests_inbox_notice(cwd));
+    }
+
+    #[test]
+    fn inbox_notice_gate_reads_the_nearest_settings_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let nested = home.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            home.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n",
+        )
+        .unwrap();
+        let cwd = nested.to_str().unwrap();
+        assert!(marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"/secret\"]\n",
+        )
+        .unwrap();
+        assert!(
+            marker_requests_inbox_notice_with_home(cwd, Some(home.path())),
+            "a capture-only nested marker is transparent, so the outer opt-in stays active"
+        );
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = false\n",
+        )
+        .unwrap();
+        assert!(!marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
     }
 
     /// The Kimi once-per-session gate reads the marker the query it gates

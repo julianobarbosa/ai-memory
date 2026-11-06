@@ -43,6 +43,7 @@ struct PurgeProjectRequest {
 /// confirmed run or `"Would purge"` for a preview — everything else about
 /// the line is identical, so a script matching one also matches the other.
 fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> String {
+    let label = super::show::terminal_text(label);
     let pages = report["pages_deleted"].as_u64().unwrap_or(0);
     let sessions = report["sessions_deleted"].as_u64().unwrap_or(0);
     let observations = report["observations_deleted"].as_u64().unwrap_or(0);
@@ -169,6 +170,7 @@ fn derived_target_warning(
 /// preview surfaced), the server is unreachable, or the server returns a
 /// non-2xx response.
 pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
@@ -207,7 +209,10 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             ),
             id.clone(),
         ),
-        (None, None) => bail!("one of --project or --project-id is required"),
+        (None, None) => bail!(
+            "{}",
+            i18n.text("cli-move-project-one-of-project-or-project-id-is-required")
+        ),
     };
 
     if !args.confirm {
@@ -226,10 +231,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             println!("{line}");
         }
         bail!(
-            "purge-project is destructive and irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  {}",
-            confirm_command(&workspace, &target_flag, &args),
-        );
+            "{}", i18n.format("cli-purge-project-purge-project-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", confirm_command(&workspace, &target_flag, &args).to_string())]));
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -264,30 +266,25 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         && !ids.is_empty()
     {
         println!(
-            "The following workstream segment directories are now orphaned under \
-             <data_dir>/raw/workstreams/ and can be removed:"
-        );
+            "{}", i18n.text("cli-purge-project-the-following-workstream-segment-directories-are-now-orphaned-under-data-dir"));
         for id in ids.iter().filter_map(serde_json::Value::as_str) {
-            println!("  - {id}");
+            println!("  - {}", super::show::terminal_text(id));
         }
     }
     if let Some(failed) = report["files_failed"].as_array()
         && !failed.is_empty()
     {
         println!(
-            "Warning: {} wiki file(s) could not be removed from disk (DB rows are gone).",
-            failed.len()
-        );
+            "{}", i18n.format("cli-purge-project-warning-wiki-file-s-could-not-be-removed-from-disk-db-rows-are-gone", &[("value0", format!("{}", failed.len()))]));
     }
     if report["compacted"].as_bool().unwrap_or(false) {
-        println!("Database compacted: freed bytes reclaimed.");
+        println!(
+            "{}",
+            i18n.text("cli-purge-project-database-compacted-freed-bytes-reclaimed")
+        );
     } else {
         println!(
-            "Note: this was a logical delete. The project is unreachable through \
-             the API and search, but its bytes remain in the database file until \
-             it is rewritten. Re-run with --compact to reclaim them (slow), and \
-             see docs/lifecycle-ops.md for what that does and does not guarantee."
-        );
+            "{}", i18n.text("cli-purge-project-note-this-was-a-logical-delete-the-project-is-unreachable-through-the-api-an"));
     }
     Ok(())
 }

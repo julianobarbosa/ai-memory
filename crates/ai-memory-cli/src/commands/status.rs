@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::hook_spool::{SpoolHealth, spool_dir, spool_health};
+use super::show::terminal_text;
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -194,29 +195,47 @@ fn last_write_line(unix_ms: Option<u64>) -> String {
     spool_age_line(Some(now_ms.saturating_sub(ms)))
 }
 
-fn report_offline_spool(spool: &SpoolHealth, json: bool) {
+fn report_offline_spool(i18n: &ai_memory_core::i18n::Localizer, spool: &SpoolHealth, json: bool) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
-            eprintln!("local spool (server unreachable): {rendered}");
+            eprintln!(
+                "{}",
+                i18n.format(
+                    "cli-status-local-spool-server-unreachable-rendered",
+                    &[("value0", rendered.to_string())]
+                )
+            );
         }
         return;
     }
-    eprintln!("local spool (server unreachable):");
-    eprintln!("  pending:    {}", spool.pending);
-    eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
-    eprintln!("  retries:    {}", spool.retries_total);
+    eprintln!("{}", i18n.text("cli-status-local-spool-server-unreachable"));
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-pending",
+            &[("value0", format!("{}", spool.pending))]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-oldest",
+            &[("value0", spool_age_line(spool.oldest_age_ms).to_string())]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-retries",
+            &[("value0", format!("{}", spool.retries_total))]
+        )
+    );
     if spool.at_capacity() {
         eprintln!(
-            "  The spool is full ({} events): newly captured events are dropped until \
-             space is available. Bring the server back to stop the loss.",
-            spool.capacity
-        );
+            "{}", i18n.format("cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av", &[("value0", format!("{}", spool.capacity))]));
     } else if spool.pending > 0 {
         eprintln!(
-            "  {} event(s) are queued locally and will be delivered once the \
-             server is reachable again.",
-            spool.pending
-        );
+            "{}", i18n.format("cli-status-event-s-are-queued-locally-and-will-be-delivered-once-the-server-is-reachabl", &[("value0", format!("{}", spool.pending))]));
     }
 }
 
@@ -270,6 +289,7 @@ fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool)
 /// The missing logon binary while the server is down, on stderr like the
 /// spool block, so `--json` consumers' stdout stays a single object.
 fn report_offline_logon_binary(
+    i18n: &ai_memory_core::i18n::Localizer,
     problem: Option<&super::user_service::MissingLogonBinary>,
     json: bool,
 ) {
@@ -278,7 +298,13 @@ fn report_offline_logon_binary(
     };
     if json {
         if let Ok(rendered) = serde_json::to_string(problem) {
-            eprintln!("windows logon (server unreachable): {rendered}");
+            eprintln!(
+                "{}",
+                i18n.format(
+                    "cli-status-windows-logon-server-unreachable-rendered",
+                    &[("value0", rendered.to_string())]
+                )
+            );
         }
         return;
     }
@@ -301,6 +327,7 @@ fn resolve_capture_mode(data_dir: &std::path::Path) -> &'static str {
 /// Returns an error if the server is unreachable, returns non-2xx, or
 /// the response can't be parsed.
 pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let capture_mode = resolve_capture_mode(&config.data_dir);
 
@@ -320,9 +347,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
-            report_offline_spool(&spool, args.json);
+            report_offline_spool(i18n, &spool, args.json);
             report_offline_recovery_hint(config, &spool, args.json);
-            report_offline_logon_binary(windows_logon.as_ref(), args.json);
+            report_offline_logon_binary(i18n, windows_logon.as_ref(), args.json);
             return Err(err);
         }
     };
@@ -350,7 +377,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         );
     } else {
         presentation::render(
-            &crate::terminal::Terminal::stdout(&config.runtime_env),
+            &crate::terminal::Terminal::stdout(&config.runtime_env, &config.i18n),
             presentation::View {
                 report: &report,
                 ep: &ep,
@@ -372,7 +399,11 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
 /// completed call, and its most notable state (an open circuit takes
 /// priority over a stale last-error status).
 fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String {
-    let mut line = format!("{}/{}", candidate.provider, candidate.model);
+    let mut line = format!(
+        "{}/{}",
+        terminal_text(&candidate.provider),
+        terminal_text(&candidate.model)
+    );
     if candidate.last_selected {
         line.push_str(" (last selected)");
     }
@@ -381,7 +412,7 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
     } else if let Some(status) = candidate.last_error_status {
         line.push_str(&format!(" — last error: status {status}"));
     } else if let Some(class) = &candidate.last_error_class {
-        line.push_str(&format!(" — last error: {class}"));
+        line.push_str(&format!(" — last error: {}", terminal_text(class)));
     }
     line
 }
@@ -414,8 +445,12 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the server differ in major version, the only difference the semver policy
 /// treats as breaking. A version that does not start with a number never
 /// warns.
-fn client_version_lines(server_version: &str, client_version: &str) -> Vec<String> {
-    let mut lines = vec![format!("ai-memory {client_version} (client)")];
+fn client_version_lines(
+    i18n: &ai_memory_core::i18n::Localizer,
+    server_version: &str,
+    client_version: &str,
+) -> Vec<String> {
+    let mut lines = vec![i18n.one("cli-status-client-version", client_version)];
     let major = |version: &str| -> Option<u64> {
         version
             .trim_start_matches('v')
@@ -427,9 +462,10 @@ fn client_version_lines(server_version: &str, client_version: &str) -> Vec<Strin
     if let (Some(server), Some(client)) = (major(server_version), major(client_version))
         && server != client
     {
-        lines.push(format!(
-            "⚠ The client is {client_version} but the server is {server_version}: across a \
-             major version they may not understand each other's requests. Upgrade the older side."
+        lines.push(i18n.two(
+            "cli-status-major-version-mismatch",
+            client_version,
+            server_version,
         ));
     }
     lines
@@ -491,37 +527,49 @@ fn json_report(
     value
 }
 
-fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
+fn provider_health_line(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     match role.status {
-        ProviderHealthStatus::Disabled => "disabled".to_string(),
+        ProviderHealthStatus::Disabled => i18n.text("cli-status-provider-disabled"),
         ProviderHealthStatus::Unknown => {
-            format!("{} unknown (no calls yet)", provider_label(role))
+            i18n.one("cli-status-provider-unknown", provider_label(role))
         }
         ProviderHealthStatus::Ok => {
             let when = role
                 .last_call_at
                 .as_ref()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| "unknown time".to_string());
-            format!("{} ok (last call: {when})", provider_label(role))
+                .unwrap_or_else(|| i18n.text("cli-status-time-unknown"));
+            i18n.two("cli-status-provider-ok", provider_label(role), when)
         }
         ProviderHealthStatus::Error => {
-            let detail = error_detail(role);
-            format!("{} error ({detail})", provider_label(role))
+            let detail = error_detail(i18n, role);
+            i18n.two("cli-status-provider-error", provider_label(role), detail)
         }
     }
 }
 
 fn provider_label(role: &ProviderRoleHealthSnapshot) -> String {
     match (&role.provider, &role.model, role.dim) {
-        (Some(provider), Some(model), Some(dim)) => format!("{provider}/{model} ({dim}d)"),
-        (Some(provider), Some(model), None) => format!("{provider}/{model}"),
-        (Some(provider), None, _) => provider.clone(),
+        (Some(provider), Some(model), Some(dim)) => format!(
+            "{}/{} ({dim}d)",
+            terminal_text(provider),
+            terminal_text(model)
+        ),
+        (Some(provider), Some(model), None) => {
+            format!("{}/{}", terminal_text(provider), terminal_text(model))
+        }
+        (Some(provider), None, _) => terminal_text(provider),
         _ => "provider".to_string(),
     }
 }
 
-fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
+fn error_detail(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     let mut parts = Vec::new();
     if let Some(status) = role.last_error_status {
         parts.push(format!("status {status}"));
@@ -529,10 +577,10 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
     if let Some(message) = &role.last_error_message
         && !message.is_empty()
     {
-        parts.push(message.clone());
+        parts.push(terminal_text(message));
     }
     if let Some(when) = &role.last_error_at {
-        parts.push(format!("last error: {when}"));
+        parts.push(i18n.one("cli-status-last-error", when));
     }
     if parts.is_empty() {
         "last call failed".to_string()
@@ -723,25 +771,63 @@ mod tests {
 
     #[test]
     fn client_version_line_warns_only_across_a_major_version() {
-        let same = client_version_lines("3.1.1", "3.1.1");
+        let same = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "3.1.1",
+            "3.1.1",
+        );
         assert_eq!(same, ["ai-memory 3.1.1 (client)"]);
         // A minor or patch difference is shown, not warned about.
-        assert_eq!(client_version_lines("3.2.0", "3.1.1").len(), 1);
-        assert_eq!(client_version_lines("v3.0.0", "3.1.1").len(), 1);
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "3.2.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "v3.0.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
 
-        let across = client_version_lines("2.6.0", "3.1.1");
+        let across = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "2.6.0",
+            "3.1.1",
+        );
         assert_eq!(across.len(), 2, "{across:?}");
         assert!(
             across[1].contains("client is 3.1.1 but the server is 2.6.0"),
             "{across:?}"
         );
-        assert_eq!(client_version_lines("4.0.0", "3.1.1").len(), 2);
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "4.0.0",
+                "3.1.1"
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn client_version_line_never_warns_on_an_unparseable_version() {
-        assert_eq!(client_version_lines("dev", "3.1.1").len(), 1);
-        assert_eq!(client_version_lines("", "3.1.1").len(), 1);
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "dev", "3.1.1").len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "", "3.1.1").len(),
+            1
+        );
     }
 
     #[test]
@@ -821,10 +907,18 @@ mod tests {
         );
 
         // Both render paths must tolerate an empty spool.
-        report_offline_spool(&SpoolHealth::default(), false);
-        report_offline_spool(&SpoolHealth::default(), true);
-        report_offline_spool(&spool, false);
-        report_offline_spool(&spool, true);
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            true,
+        );
+        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, false);
+        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, true);
     }
 
     /// A pre-#629 server's `/admin/status` response has no
@@ -856,7 +950,10 @@ mod tests {
     #[test]
     fn provider_health_line_renders_unknown_and_disabled() {
         assert_eq!(
-            provider_health_line(&ProviderRoleHealthSnapshot::default()),
+            provider_health_line(
+                &ai_memory_core::i18n::Localizer::default(),
+                &ProviderRoleHealthSnapshot::default()
+            ),
             "disabled"
         );
 
@@ -867,7 +964,7 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
         assert_eq!(
-            provider_health_line(&role),
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role),
             "openai/gpt-5.5 unknown (no calls yet)"
         );
     }
@@ -885,9 +982,18 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
 
-        assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
-        assert!(provider_health_line(&role).contains("status 401"));
-        assert!(provider_health_line(&role).contains("bad token"));
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("anthropic-oauth/claude-sonnet-4-6 error")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("status 401")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("bad token")
+        );
     }
 
     #[test]

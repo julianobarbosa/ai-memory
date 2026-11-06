@@ -183,6 +183,8 @@ AI_MEMORY_LLM_PROVIDER=openai-compat
 AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
 AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
 AI_MEMORY_LLM_COMPAT_STRICT=true
+# Set only when the endpoint defaults an omitted field to SSE:
+AI_MEMORY_LLM_COMPAT_STREAM=false
 ```
 
 Then verify:
@@ -200,6 +202,13 @@ strip, which occasionally drops a field. Setting it to `true` at the
 env-file level is safer for consolidation reliability. Turn it off
 (`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
 explicitly rejects the schema-constrained shape.
+
+`AI_MEMORY_LLM_COMPAT_STREAM` controls the `stream` field on
+`openai-compat` Chat Completions requests. Leave it unset to omit the field,
+preserving the existing request shape. Set it to `false` when an endpoint
+defaults an omitted field to Server-Sent Events. Setting it to `true` is
+rejected before any request because this transport expects one JSON response
+and does not decode SSE. Use `false` or leave the setting unset.
 
 The `docker/.env.production.example` file in the repo ships with an OpenRouter
 setup pre-filled, with `moonshotai/kimi-k2.6` as the sample model (see the
@@ -481,6 +490,11 @@ Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
 counters are process-local and reset on restart; the server constructs the
 configured provider wrapper once at startup and has no runtime provider reload.
+`providers.llm_workloads_started_ms` gives the Unix time in milliseconds when
+the counters started (null when no LLM provider is configured). A window is the
+difference between two snapshots with the same `llm_workloads_started_ms`. A
+restart, including one for a configuration change, starts a new value, so it
+closes a segment, and a window spanning restarts adds its segments.
 
 `estimated_input_tokens` and `estimated_output_tokens` use a deliberately
 coarse four-characters-per-token estimate so structured and plain calls remain
@@ -493,10 +507,10 @@ estimate is nonzero.
 The telemetry stores no prompt, completion, scope, project, or caller-supplied
 label. A fallback chain is measured as one provider-interface invocation, not
 as one call per internal candidate attempt; an outer caller retry is another
-invocation. Workload labels do not select a
-provider or model: all operations still use the configured global provider and
-fallback chain. Per-workload routing remains measure-first and has no public
-configuration surface.
+invocation. The workload label itself never selects a provider or model. A
+task uses its own provider and fallback chain only when the config declares an
+`[llm.<task>]` profile for it (see `config.default.toml`); every other task
+uses the global provider and its fallback chain.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,

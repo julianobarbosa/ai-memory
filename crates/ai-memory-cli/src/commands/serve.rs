@@ -17,7 +17,8 @@ use ai_memory_hooks::{
     WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{
-    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderHealth,
+    build_embedder, local_capacity,
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
@@ -48,6 +49,7 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use super::eval_embedding_cache::{EvalEmbeddingCache, eval_embedding_cache_dir};
 use crate::cli::{ServeArgs, TransportKind};
 use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
 use ai_memory_mcp::auth::{AuthState, require_bearer};
@@ -775,7 +777,7 @@ fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
-    admin_llm: Option<Arc<dyn LlmProvider>>,
+    llm_providers: LlmProviders,
 }
 
 fn maintenance_start_delay(
@@ -1472,9 +1474,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         configure_consolidator(config, server, &store, &wiki, ws, proj, &provider_health)?;
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
-    let admin_llm = consolidator_setup.admin_llm;
-    let llm_configured = admin_llm.is_some();
-    let profile_llm = admin_llm.clone();
+    let llm_providers = consolidator_setup.llm_providers;
+    let llm_configured = llm_providers.is_configured();
+    let profile_llm = llm_providers.get(LlmWorkload::Profile).cloned();
     // Share the tool router's last-activity clock with the B3 dream scheduler so
     // it can tell an idle box from a busy one and cancel a run on the operator's
     // return.
@@ -1486,7 +1488,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         store.writer.clone(),
         wiki.clone(),
         embedder.clone(),
-        admin_llm.clone(),
+        llm_providers.clone(),
         config.decay,
         config.sessions,
         config.dream,
@@ -1606,8 +1608,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // are pure request-response and project resolution rides the
             // in-process `ActiveProject` pointer, not the transport
             // session — so session mode buys us nothing. `--http-stateful`
-            // restores rmcp's session+SSE behaviour for clients that want
-            // it.
+            // restores rmcp's session+SSE behaviour for legacy clients
+            // that want it. rmcp 3 renamed the switch to
+            // `legacy_session_mode` and scoped it: under the 2026-07-28
+            // revision (SEP-2567) sessions no longer exist, so requests
+            // negotiating that version are always served statelessly and
+            // the flag only governs `initialize`-era versions.
             info!(
                 stateful = args.http_stateful,
                 "MCP Streamable HTTP transport mode"
@@ -1618,7 +1624,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 StreamableHttpServerConfig::default()
                     .with_cancellation_token(cancel.child_token())
                     .with_allowed_hosts(config.allowed_hosts.clone())
-                    .with_stateful_mode(args.http_stateful)
+                    .with_legacy_session_mode(args.http_stateful)
                     .with_json_response(!args.http_stateful),
             );
             // Shared per-cwd project cache: the hook router owns it; the admin
@@ -1688,6 +1694,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 profile: config.profile.clone(),
                 ingest_drop_list: (*config.ingest.drop_list).clone(),
                 record_tool_names: config.ingest.record_tool_names,
+                index_file_paths: config.ingest.index_file_paths,
                 // Benchmark-only escape (docs/benchmarks/README.md), read once
                 // here so the hooks crate keeps making no environment reads.
                 skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
@@ -1710,7 +1717,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),
-                    llm: admin_llm,
+                    llm_providers,
                     auto_improve_require_approval: config.auto_improve.require_approval,
                     auto_improve_review_config: auto_improve_review_config_from_settings(
                         &config.auto_improve,
@@ -1724,7 +1731,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     db_path: store.db_path().to_path_buf(),
                     bind: bind.clone(),
                     home_dir: config.home_dir.clone(),
-                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    bootstrap_gate: ai_memory_mcp::BootstrapGate::new(
+                        config.bootstrap_max_concurrent,
+                    ),
                     token_pepper: config
                         .auth
                         .token_pepper
@@ -2187,7 +2196,7 @@ async fn start_maintenance_scheduler(
     writer: WriterHandle,
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
-    llm: Option<Arc<dyn LlmProvider>>,
+    llm_providers: LlmProviders,
     decay: crate::config::DecaySettings,
     sessions: crate::config::SessionsSettings,
     dream: crate::config::DreamSettings,
@@ -2336,7 +2345,7 @@ async fn start_maintenance_scheduler(
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
-        let llm = llm.clone();
+        let llm = llm_providers.get(LlmWorkload::Lint).cloned();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(lint_interval_secs);
             run_persisted_maintenance_job(
@@ -2458,9 +2467,15 @@ async fn start_maintenance_scheduler(
     }
 
     let scheduler = auto_improve.scheduler.clone();
+    // `max_sessions_per_tick = 0` is the documented off switch for the whole
+    // scheduler, experience pass included; a task provider must not revive it.
     if !scheduler.enabled || scheduler.interval_secs == 0 || scheduler.max_sessions_per_tick == 0 {
         info!("auto-improve scheduler disabled; manual auto-improve remains available");
-    } else if let Some(llm) = llm.clone() {
+    } else if llm_providers.get(LlmWorkload::AutoImprove).is_some()
+        || (scheduler.experience_every_sessions > 0
+            && llm_providers.get(LlmWorkload::Experience).is_some())
+    {
+        let providers = llm_providers.clone();
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
@@ -2503,7 +2518,7 @@ async fn start_maintenance_scheduler(
                     &reader,
                     &writer,
                     &wiki,
-                    &llm,
+                    &providers,
                     &scheduler_settings,
                 )
                 .await
@@ -2533,7 +2548,10 @@ async fn start_maintenance_scheduler(
     // contends with live work: it runs only after `idle_window_secs` of quiet and
     // cancels the moment activity resumes (invariant #5, cancellable + bounded).
     if dream.enabled {
-        match (llm.clone(), dedup_embedding.clone()) {
+        match (
+            llm_providers.get(LlmWorkload::Dream).cloned(),
+            dedup_embedding.clone(),
+        ) {
             (Some(llm), Some(embedding)) => {
                 let reader = reader.clone();
                 let wiki = wiki.clone();
@@ -3143,6 +3161,17 @@ async fn configure_embedder(
     } else {
         embedder
     };
+    // Outermost, so a cached document vector skips the capacity queue too.
+    let embedder: Arc<dyn Embedder> = match eval_embedding_cache_dir() {
+        Some(root) => {
+            info!(
+                root = %root.display(),
+                "benchmark document-embedding cache enabled (eval harness only)"
+            );
+            Arc::new(EvalEmbeddingCache::new(embedder, &root))
+        }
+        None => embedder,
+    };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 
@@ -3169,75 +3198,51 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
-    // Validate the reranker setting before the provider early-return, so
-    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
-    // looking enabled while eligible queries keep their normal ranking.
     let want_reranker = config.reranker_choice()?;
-    // Build the consolidator (if LLM configured) once, then share the
-    // Arc between the MCP server (for `memory_consolidate` + lint),
-    // the hook router (for PreCompact checkpointing), and the admin
-    // router (for `POST /admin/bootstrap`).
-    let Some(cfg) = config.llm_provider_config()? else {
+    let providers = config
+        .llm_providers()
+        .context("building LLM provider chains from config")?;
+    let retry_hint = providers
+        .default
+        .as_ref()
+        .map(|llm| llm_retry_hint(llm.name(), llm.model()));
+    let providers = provider_health.wrap_llm_providers(providers, retry_hint);
+    server = server.with_llm_providers(providers.clone());
+
+    let consolidator = providers.get(LlmWorkload::Consolidation).map(|llm| {
         info!(
-            "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
-             falls back to rule-based checkpoint, lint runs rule-based only"
+            provider = llm.name(),
+            model = llm.model(),
+            max_input_tokens = config.consolidation.max_input_tokens,
+            max_output_tokens = config.consolidation.max_output_tokens,
+            verbatim_residue = config.consolidation.verbatim_residue,
+            "memory_consolidate + PreCompact LLM checkpointing enabled",
         );
-        if want_reranker {
-            anyhow::bail!(
-                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
-                 judges candidates with the configured LLM provider. Set a provider or \
-                 unset AI_MEMORY_RERANKER."
-            );
-        }
-        return Ok(ConsolidatorSetup {
-            server,
-            consolidator: None,
-            admin_llm: None,
-        });
-    };
-    let provider_name = cfg.provider.name().to_string();
-    let model = cfg.model.clone();
-    let retry_hint = llm_retry_hint(&provider_name, &model);
-    // Routes through the same construction `llm_provider_config` just
-    // confirmed is `Some`: wraps `[primary, fallbacks...]` in a
-    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, else returns
-    // the plain provider unchanged (existing single-provider behavior).
-    let llm = config
-        .llm_provider_chain()
-        .context("building LLM provider chain from config")?
-        .context("LLM provider configured but chain construction returned none")?;
-    let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
-    info!(
-        provider = llm.name(),
-        model = llm.model(),
-        max_input_tokens = config.consolidation.max_input_tokens,
-        max_output_tokens = config.consolidation.max_output_tokens,
-        verbatim_residue = config.consolidation.verbatim_residue,
-        "memory_consolidate + PreCompact LLM checkpointing enabled",
-    );
-    let consolidator = Arc::new(
-        Consolidator::new(
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki.clone(),
-            llm.clone(),
-            workspace_id,
-            project_id,
+        Arc::new(
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                llm.clone(),
+                workspace_id,
+                project_id,
+            )
+            .with_per_user_slots(config.slots.per_user)
+            .with_verbatim_residue(config.consolidation.verbatim_residue)
+            .with_prompt_limits(
+                config.consolidation.max_input_tokens,
+                config.consolidation.max_output_tokens,
+                config.consolidation.input_token_safety_margin,
+            ),
         )
-        .with_per_user_slots(config.slots.per_user)
-        .with_verbatim_residue(config.consolidation.verbatim_residue)
-        .with_prompt_limits(
-            config.consolidation.max_input_tokens,
-            config.consolidation.max_output_tokens,
-            config.consolidation.input_token_safety_margin,
-        ),
-    );
-    server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
-    // Optional post-RRF reranking rides on the same provider, so it is
-    // only reachable once an LLM is configured at all. Off unless the
-    // operator asked for it: it puts an LLM call on the memory_query
-    // hot path.
+    });
+    if let Some(consolidator) = &consolidator {
+        server = server.with_consolidator(wiki.clone(), consolidator.clone());
+    }
     if want_reranker {
+        let llm = providers.get(LlmWorkload::Rerank).context(
+            "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
+        )?;
         info!(
             provider = llm.name(),
             model = llm.model(),
@@ -3251,8 +3256,8 @@ fn configure_consolidator(
     }
     Ok(ConsolidatorSetup {
         server,
-        consolidator: Some(consolidator),
-        admin_llm: Some(llm),
+        consolidator,
+        llm_providers: providers,
     })
 }
 
@@ -4606,7 +4611,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
@@ -4630,6 +4635,57 @@ mod tests {
                     .unwrap(),
                 None
             );
+        }
+    }
+
+    /// An experience-only task provider starts the scheduler, but never past
+    /// the documented `max_sessions_per_tick = 0` off switch or with the
+    /// experience cadence off.
+    #[tokio::test]
+    async fn experience_only_provider_starts_scheduler_within_its_switches() {
+        for (max_sessions_per_tick, experience_every_sessions, expected) in
+            [(1, 1, 1), (0, 1, 0), (1, 0, 0)]
+        {
+            let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+            let mut auto_improve = AutoImproveSettings::default();
+            auto_improve.scheduler.enabled = true;
+            auto_improve.scheduler.interval_secs = 60;
+            auto_improve.scheduler.max_sessions_per_tick = max_sessions_per_tick;
+            auto_improve.scheduler.experience_every_sessions = experience_every_sessions;
+            let mut providers = LlmProviders::default();
+            providers
+                .overrides
+                .insert(LlmWorkload::Experience, Arc::new(PanicLlm));
+            let tasks = start_maintenance_scheduler(
+                MaintenanceSettings {
+                    enabled: false,
+                    ..MaintenanceSettings::default()
+                },
+                auto_improve,
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                providers,
+                crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(
+                tasks.len(),
+                expected,
+                "max_sessions_per_tick={max_sessions_per_tick} \
+                 experience_every_sessions={experience_every_sessions}"
+            );
+            for task in tasks {
+                task.abort();
+            }
         }
     }
 
@@ -4659,7 +4715,7 @@ mod tests {
                 store.writer.clone(),
                 wiki,
                 None,
-                None,
+                LlmProviders::default(),
                 crate::config::DecaySettings::default(),
                 crate::config::SessionsSettings::default(),
                 crate::config::DreamSettings::default(),
@@ -4699,7 +4755,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
@@ -4724,7 +4780,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -4754,7 +4810,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -4808,6 +4864,7 @@ mod tests {
                     body: "prompt two hours ago".into(),
                     importance: 5,
                     occurred_at: Some(last_activity),
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4827,7 +4884,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -5281,6 +5338,7 @@ mod tests {
                     title: "work".into(),
                     body: "the session that outlived the daemon".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5384,6 +5442,7 @@ mod tests {
                     title: "work".into(),
                     body: "activity the seed would otherwise reach for".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5448,6 +5507,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5555,6 +5615,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "open session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5660,6 +5721,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "owned session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5760,6 +5822,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5900,6 +5963,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6104,6 +6168,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))

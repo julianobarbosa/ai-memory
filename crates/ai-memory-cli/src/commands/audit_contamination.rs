@@ -7,6 +7,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::AuditContaminationArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -58,6 +59,7 @@ struct Finding {
 /// Returns an error if the server is unreachable, returns non-2xx, or the
 /// response can't be parsed.
 pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let query = scope_query(&args)?;
     let report: Report = get_json(&ep, "/admin/audit-contamination", &query).await?;
@@ -69,45 +71,21 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
 
     if report.findings.is_empty() {
         println!(
-            "No structural contamination found (no session mis-bucketed by cwd, no project \
-             name collisions)."
-        );
+            "{}", i18n.text("cli-audit-contamination-no-structural-contamination-found-no-session-mis-bucketed-by-cwd-no-project"));
         return Ok(());
     }
     println!(
-        "Contamination audit: {} session(s) mis-bucketed, {} project(s) with a colliding name.",
-        report.summary.sessions_misbucketed, report.summary.project_name_collisions
-    );
+        "{}", i18n.format("cli-audit-contamination-contamination-audit-session-s-mis-bucketed-project-s-with-a-colliding-name", &[("value0", format!("{}", report.summary.sessions_misbucketed)), ("value1", format!("{}", report.summary.project_name_collisions))]));
     for f in &report.findings {
         let expected = f.expected_project.as_deref().unwrap_or("?");
         match f.check.as_str() {
             "session_wrong_bucket" => println!(
-                "  [{}] session {} landed in {}/{} but its cwd ({}) resolves to project {}",
-                f.confidence,
-                f.entity_id,
-                f.landed_workspace,
-                f.landed_project,
-                f.cwd.as_deref().unwrap_or("?"),
-                expected,
-            ),
+                "{}", i18n.format("cli-audit-contamination-session-landed-in-but-its-cwd-resolves-to-project", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(&f.entity_id)), ("value2", terminal_text(&f.landed_workspace)), ("value3", terminal_text(&f.landed_project)), ("value4", terminal_text(f.cwd.as_deref().unwrap_or("?"))), ("value5", terminal_text(expected))])),
             "project_name_collision" => println!(
-                "  [{}] project {} ({}/{}): {} page(s), {} session(s), last activity {}; \
-                 collides by {} with {}. Add a `.ai-memory.toml` marker or run `merge-project`.",
-                f.confidence,
-                f.entity_id,
-                f.landed_workspace,
-                f.landed_project,
-                f.pages.unwrap_or(0),
-                f.sessions.unwrap_or(0),
-                f.last_activity_us
-                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
-                f.collision_kind.as_deref().unwrap_or("spelling"),
-                f.peer_projects.as_deref().unwrap_or("?"),
-            ),
+                "{}", i18n.format("cli-audit-contamination-project-page-s-session-s-last-activity-collides-by-with-add-a-ai-memory-toml", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(&f.entity_id)), ("value2", terminal_text(&f.landed_workspace)), ("value3", terminal_text(&f.landed_project)), ("value4", format!("{}", f.pages.unwrap_or(0))), ("value5", format!("{}", f.sessions.unwrap_or(0))), ("value6", f.last_activity_us
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()).to_string()), ("value7", terminal_text(f.collision_kind.as_deref().unwrap_or("spelling"))), ("value8", terminal_text(f.peer_projects.as_deref().unwrap_or("?")))])),
             other => println!(
-                "  [{}] {} {} in {}/{}",
-                f.confidence, other, f.entity_id, f.landed_workspace, f.landed_project
-            ),
+                "{}", i18n.format("cli-audit-contamination-in", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(other)), ("value2", terminal_text(&f.entity_id)), ("value3", terminal_text(&f.landed_workspace)), ("value4", terminal_text(&f.landed_project))])),
         }
     }
     Ok(())

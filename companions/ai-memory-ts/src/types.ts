@@ -44,9 +44,36 @@ export interface ScopedArgs {
   scope?: Scope;
 }
 
+/** An existing project selected by name or by its stable id. */
+export type ExistingProjectTarget =
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Existing project name. */
+      project: string;
+      /** Not allowed together with `project`. */
+      projectId?: never;
+    }
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Stable id of an existing project in the workspace. */
+      projectId: string;
+      /** Not allowed together with `projectId`. */
+      project?: never;
+    };
+
 // ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
+
+/** A repository file a page describes, and the commit it was checked against. */
+export interface PageSourceFile {
+  /** Repository-relative path with `/` separators. */
+  path: string;
+  /** Commit id, 7-64 hex characters; the server stores it lowercased. */
+  commit: string;
+}
 
 /**
  * Page metadata a write sets. A write replaces the whole page: metadata the
@@ -72,6 +99,12 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /**
+   * Up to 16 repository files the page describes. The server stores them and
+   * never reads the files; compare each with your checkout and record `stale`
+   * feedback when one changed.
+   */
+  sourceFiles?: PageSourceFile[];
 }
 
 /** Arguments of {@link PagesNamespace.write}. */
@@ -97,6 +130,76 @@ export interface WritePageResult {
   /** Canonical wiki path written. */
   readonly path: string;
   /** Git checkpoint of the write, when the server reported one. */
+  readonly checkpoint: string | null;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** Arguments of {@link PagesNamespace.resolveWriteTarget}. */
+export interface ResolveWriteTargetArgs {
+  /** Exact existing destination; this operation never creates a scope. */
+  target: ExistingProjectTarget;
+}
+
+/** Canonical existing destination returned by a write-access preflight. */
+export interface ResolvedWriteTarget {
+  /** Canonical workspace name. */
+  readonly workspace: string;
+  /** Canonical project name. */
+  readonly project: string;
+  /** Stable project id. */
+  readonly projectId: string;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** One complete, conditional page version in an atomic batch. */
+export type BatchWritePage = PageMetadata & {
+  /** Relative wiki path. */
+  path: string;
+  /** Complete Markdown body for this version. */
+  body: string;
+} &
+  (
+    | {
+        /** Require this latest page version. */
+        expectedPageId: string;
+        /** Not allowed together with `expectedPageId`. */
+        createOnly?: never;
+      }
+    | {
+        /** Require the path to be absent. */
+        createOnly: true;
+        /** Not allowed together with `createOnly`. */
+        expectedPageId?: never;
+      }
+  );
+
+/** Arguments of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchArgs {
+  /** Exact existing destination; batch writes never create a scope. */
+  target: ExistingProjectTarget;
+  /** One to 100 complete page versions, committed atomically. */
+  pages: readonly BatchWritePage[];
+}
+
+/** One page written by {@link PagesNamespace.writeBatch}. */
+export interface BatchWritePageResult {
+  /** Zero-based request position. */
+  readonly index: number;
+  /** Canonical wiki path written. */
+  readonly path: string;
+  /** New page version id. */
+  readonly pageId: string;
+  /** The server's decoded item JSON. */
+  readonly raw: Raw;
+}
+
+/** Result of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchResult {
+  /** Results in request order. */
+  readonly pages: readonly BatchWritePageResult[];
+  /** One git checkpoint for the whole batch, when reported. */
   readonly checkpoint: string | null;
   /** The server's decoded JSON. */
   readonly raw: Raw;
@@ -562,6 +665,8 @@ export interface SessionActivity {
 export interface BriefingArgs extends ScopedArgs {
   /** How many recent pages to include (default 10, max 100). */
   recentPagesLimit?: number;
+  /** How many recent sessions to include (default 5, max 50). */
+  recentSessionsLimit?: number;
   /** Lead with the project's settled rule and decision pages. */
   settledFirst?: boolean;
 }
@@ -604,9 +709,12 @@ export type ObservationKind =
 /** Arguments of {@link AiMemoryClient.observations}. */
 export interface ObservationsArgs extends ScopedArgs {
   /**
-   * Session id. Omit for the newest other session with captured work in the
-   * project, ended or cut off (the caller's cwd first), or the latest
-   * completed one when nothing worked in the last 30 days.
+   * Session id. The server reads `"current"` as the caller's own session
+   * only when the request carries the caller's hook session id, which this
+   * client does not send, so pass the id itself here. Omit
+   * for the newest other session with captured work in the project, ended or
+   * cut off (the caller's cwd first), or the latest completed one when
+   * nothing worked in the last 30 days.
    */
   sessionId?: string;
   /** Maximum observations (server default 20, clamped to 200). */
@@ -835,6 +943,17 @@ export interface SendMessageArgs {
   to: Scope;
   /** Sending project. Defaults to the client's `scope`. */
   from?: Scope;
+  /**
+   * Restrict claiming to this registered harness in the recipient project
+   * (for example `codex` or `claude-code`); the server refuses a harness with
+   * no session there. Omit for shared project mail.
+   */
+  toAgent?: string;
+  /**
+   * The sending harness (for example `claude-code`), for a client whose
+   * session metadata does not record it. Carried as the message's `fromAgent`.
+   */
+  fromAgent?: string;
   /** Self-contained request for the recipient's agent. */
   body: string;
   /** Optional one-line subject. */

@@ -4,18 +4,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 
 use crate::state::WebState;
 use crate::templates::{
-    DashboardStats, IngestStats, MailSummaryItem, OkfDialog, ProjectCard, ProjectsView, humanize,
+    DashboardStats, IngestStats, MailSummaryItem, OkfDialog, ProjectCard, ProjectsView,
     project_href,
 };
 
 /// Projects the home page's mail summary names before saying "and N more".
 const MAIL_SUMMARY_PROJECTS: usize = 5;
+
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct IndexQuery {
+    #[serde(default)]
+    sort: String,
+    #[serde(default)]
+    state: String,
+}
 
 /// Handler for `GET /`.
 ///
@@ -23,12 +31,21 @@ const MAIL_SUMMARY_PROJECTS: usize = 5;
 /// (#708): the card grid is a list of repository names, and a name is itself
 /// what a team from another organisation must not see.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Query(query): Query<IndexQuery>,
 ) -> Result<Html<String>, StatusCode> {
+    if !matches!(
+        query.sort.as_str(),
+        "" | "sessions" | "events" | "pages" | "open"
+    ) || !matches!(query.state.as_str(), "" | "all" | "open")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let (summaries, counts, registered) = tokio::try_join!(
+    let (mut summaries, counts, registered) = tokio::try_join!(
         state.reader.list_projects_with_stats(viewer_id),
         // One grouped query for every card; the badge shows only where mail waits.
         state.reader.pending_inbox_counts(viewer_id),
@@ -50,7 +67,7 @@ pub(crate) async fn handler(
             .insert(c.project_name, c.pending);
     }
 
-    let show_ingest = super::require_admin(&state, level).await.is_ok();
+    let show_ingest = super::require_admin(&i18n, &state, level).await.is_ok();
     let dashboard = DashboardStats {
         project_count: summaries.len(),
         page_count: summaries.iter().map(|s| s.page_count).sum(),
@@ -60,7 +77,7 @@ pub(crate) async fn handler(
         last_activity_relative: summaries
             .iter()
             .find_map(|s| s.last_activity.as_deref())
-            .map(humanize)
+            .map(|iso| i18n.relative(iso))
             .unwrap_or_default(),
         ingest: state
             .ingest_metrics
@@ -76,11 +93,21 @@ pub(crate) async fn handler(
                 }
             }),
     };
+    match query.sort.as_str() {
+        "sessions" => summaries.sort_by_key(|item| std::cmp::Reverse(item.session_count)),
+        "events" => summaries.sort_by_key(|item| std::cmp::Reverse(item.observation_count)),
+        "pages" => summaries.sort_by_key(|item| std::cmp::Reverse(item.page_count)),
+        "open" => summaries.sort_by_key(|item| std::cmp::Reverse(item.open_session_count)),
+        _ => {}
+    }
     let projects: Vec<ProjectCard> = summaries
         .into_iter()
         .map(|s| {
-            let last_updated_relative =
-                s.last_activity.as_deref().map(humanize).unwrap_or_default();
+            let last_updated_relative = s
+                .last_activity
+                .as_deref()
+                .map(|iso| i18n.relative(iso))
+                .unwrap_or_default();
             let href = project_href(&s.workspace_name, &s.project_name);
             let pending_inbox = pending
                 .get(&s.workspace_name)
@@ -137,8 +164,10 @@ pub(crate) async fn handler(
 
     let okf_dialog = okf_dialog(&state);
     let html = ProjectsView {
+        i18n: i18n.clone(),
         projects,
         dashboard,
+        project_state: query.state,
         okf_dialog,
         mail_total,
         mail_projects,

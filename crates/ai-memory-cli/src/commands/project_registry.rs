@@ -125,9 +125,10 @@ pub(super) fn project_binding_for_server(
     project: &str,
     path: &Path,
 ) -> Result<Option<ManagedProjectScope>> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
-        .context("canonicalizing project binding checkout")?;
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
     let fingerprints = inspect_repository_fingerprints(&canonical)?;
     let registry = match load_registry(&registry_path(config)) {
         Ok(registry) => registry,
@@ -136,8 +137,7 @@ pub(super) fn project_binding_for_server(
             // discovery. Select no ID and leave the file untouched; the server
             // still refuses ambiguous names and an explicit choice is required.
             eprintln!(
-                "ai-memory: could not read the checkout binding ({error:#}); using guarded project-name resolution"
-            );
+                "{}", i18n.format("cli-project-registry-ai-memory-could-not-read-the-checkout-binding-error-using-guarded-project-na", &[("value0", format!("{:#}", error))]));
             return Ok(None);
         }
     };
@@ -165,14 +165,14 @@ pub(super) fn record_project_binding(
     scope: &ManagedProjectScope,
     expected: &ai_memory_workstream::RepositoryFingerprints,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
-        .context("canonicalizing project binding checkout")?;
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
     let fingerprints = inspect_repository_fingerprints(&canonical)?;
     if &fingerprints != expected {
         bail!(
-            "checkout identity changed while selecting the project; refusing to remember a stale selection"
-        );
+            "{}", i18n.text("cli-project-registry-checkout-identity-changed-while-selecting-the-project-refusing-to-remember-a"));
     }
     let server = endpoint.identity();
     update_registry(config, |registry| {
@@ -208,11 +208,18 @@ pub(super) fn record_prepared_checkout(
     project: &str,
     path: &Path,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", path.display()))?;
     if !canonical.is_dir() {
-        bail!("checkout is not a directory: {}", canonical.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-project-registry-checkout-is-not-a-directory",
+                &[("value0", format!("{}", canonical.display()))]
+            )
+        );
     }
     let server = endpoint.identity();
     update_registry(config, |registry| {
@@ -262,6 +269,35 @@ pub(super) fn rekey_scope(
             registry.links.push(source);
         }
         Ok(true)
+    })
+}
+
+/// Point every checkout binding of this server that named `from` at `into`,
+/// under its current name, after the server moved `from`'s repository
+/// identity onto `into` (#1993). Without it a checkout bound to the emptied
+/// project would keep selecting it by id.
+pub(super) fn rebind_project(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    from: ai_memory_core::ProjectId,
+    into: ai_memory_core::ProjectId,
+    into_name: &str,
+) -> Result<()> {
+    let server = endpoint.identity();
+    update_registry(config, |registry| {
+        let mut changed = false;
+        for binding in registry
+            .bindings
+            .iter_mut()
+            .filter(|binding| binding.server == server)
+        {
+            if binding.scope.project_id == from || binding.scope.project_id == into {
+                binding.scope.project_id = into;
+                binding.scope.project = into_name.to_owned();
+                changed = true;
+            }
+        }
+        Ok(changed)
     })
 }
 
@@ -328,6 +364,7 @@ fn update_registry(
     config: &Config,
     mutate: impl FnOnce(&mut ProjectRegistry) -> Result<bool>,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     fs::create_dir_all(&config.data_dir).with_context(|| {
         format!(
             "creating client data directory {}",
@@ -336,19 +373,25 @@ fn update_registry(
     })?;
     let lock = open_private_lock(&lock_path(config))?;
     lock.lock_exclusive()
-        .context("locking client project registry")?;
+        .context(i18n.text("cli-project-registry-locking-client-project-registry"))?;
 
     let path = registry_path(config);
     let mut registry = load_registry(&path)?;
     if mutate(&mut registry)? {
         if registry.links.len() > MAX_LINKS || registry.bindings.len() > MAX_LINKS {
-            bail!("client project registry exceeds {MAX_LINKS} links");
+            bail!(
+                "{}",
+                i18n.format(
+                    "cli-project-registry-client-project-registry-exceeds-max-links-links",
+                    &[("value0", format!("{}", MAX_LINKS))]
+                )
+            );
         }
-        let mut rendered =
-            serde_json::to_vec_pretty(&registry).context("serializing client project registry")?;
+        let mut rendered = serde_json::to_vec_pretty(&registry)
+            .context(i18n.text("cli-project-registry-serializing-client-project-registry"))?;
         rendered.push(b'\n');
         if rendered.len() as u64 > MAX_REGISTRY_BYTES {
-            bail!("client project registry exceeds the byte limit; keeping the previous registry");
+            bail!("{}", i18n.text("cli-project-registry-client-project-registry-exceeds-the-byte-limit-keeping-the-previous-registry"));
         }
         refuse_symlink(&path)?;
         ai_memory_wiki::write_atomic(&path, &rendered)
@@ -466,6 +509,73 @@ mod tests {
 
     fn endpoint(url: &str) -> ServerEndpoint {
         ServerEndpoint::from_pair(Some(url.to_owned()), None)
+    }
+
+    /// After the server moves a split project's identity (#1993), a checkout
+    /// bound to the emptied project selects the session project instead, and
+    /// another server's bindings are left alone.
+    #[test]
+    fn rebind_project_points_bindings_at_the_session_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config = config_at(&tmp.path().join("data"));
+        let server = endpoint("http://memory:49374");
+        let other_server = endpoint("http://other:49374");
+        let emptied = ai_memory_core::ProjectId::new();
+        let sessions = ai_memory_core::ProjectId::new();
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: emptied,
+            workspace: "default".into(),
+            project: "acme-api".into(),
+        };
+        let fingerprints = inspect_repository_fingerprints(&checkout).unwrap();
+        record_project_binding(
+            &config,
+            &server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+        record_project_binding(
+            &config,
+            &other_server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+
+        rebind_project(&config, &server, emptied, sessions, "acme-api").unwrap();
+
+        let bound = project_binding(&config, &server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (bound.project_id, bound.project.as_str()),
+            (sessions, "acme-api")
+        );
+        let untouched = project_binding(&config, &other_server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            untouched.project_id, emptied,
+            "another server keeps its own binding"
+        );
     }
 
     #[test]

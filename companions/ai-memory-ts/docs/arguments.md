@@ -6,6 +6,27 @@ SDK arguments are the server's wire names in camelCase. `workspace` and
 `project` travel inside `scope`; `messages.send` takes `to` and `from` scopes
 for the `to_*` and `from_*` pairs.
 
+## `memory_resolve_write_target`
+
+Methods: `pages.resolveWriteTarget`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+
+## `memory_write_pages_batch`
+
+Methods: `pages.writeBatch`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+| `pages` | `pages` |
+
 ## `memory_write_page`
 
 Methods: `pages.write`, `pages.update`
@@ -25,6 +46,7 @@ Methods: `pages.write`, `pages.update`
 | `abstract` | `abstract` |
 | `relations` | `relations` |
 | `expires_at` | `expiresAt` |
+| `source_files` | `sourceFiles` |
 | `expected_page_id` | `expectedPageId` |
 | `create_only` | `createOnly` |
 
@@ -164,8 +186,10 @@ Methods: `messages.send`
 |---|---|
 | `to_workspace` | `toWorkspace` |
 | `to_project` | `toProject` |
+| `to_agent` | `toAgent` |
 | `from_workspace` | `fromWorkspace` |
 | `from_project` | `fromProject` |
+| `from_agent` | `fromAgent` |
 | `body` | `body` |
 | `subject` | `subject` |
 | `nature` | `nature` |
@@ -212,6 +236,7 @@ Methods: `briefing`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `recent_pages_limit` | `recentPagesLimit` |
+| `recent_sessions_limit` | `recentSessionsLimit` |
 | `settled_first` | `settledFirst` |
 
 ## `memory_explore`

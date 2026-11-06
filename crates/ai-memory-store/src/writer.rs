@@ -440,6 +440,25 @@ pub(crate) enum WriteCmd {
         params: crate::decay::DecayParams,
         reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
     },
+    /// Record one implicit (query → page) association (#1941). The op
+    /// normalizes and hashes the query itself so every writer of a row
+    /// derives the same key.
+    RecordQuerySignal {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        session: Option<String>,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
+    /// Drop one implicit (query → page) association (#1941).
+    ForgetQuerySignal {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     SoftDeleteForDecayIfLatest {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -639,6 +658,14 @@ pub(crate) enum WriteCmd {
     /// Rename a project's `name` column without moving any files (the wiki
     /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
     /// when `new_name` is already used in the same workspace.
+    AdoptProjectIdentity {
+        workspace_id: WorkspaceId,
+        into: ProjectId,
+        from: ProjectId,
+        archive_name: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<ops::AdoptedProjectIdentity>>,
+    },
     RenameProject {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -2353,6 +2380,58 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record one implicit (query → page) association and return the
+    /// association's signal count after the upsert (`0` when the page is no
+    /// longer the current version in that scope). See
+    /// [`ops::record_query_page_signal`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_query_page_signal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        session: Option<String>,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordQuerySignal {
+            workspace_id,
+            project_id,
+            page_id,
+            query_text,
+            session,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Drop one implicit (query → page) association, returning whether a row
+    /// was removed. See [`ops::forget_query_page_signal`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn forget_query_page_signal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ForgetQuerySignal {
+            workspace_id,
+            project_id,
+            page_id,
+            query_text,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Tombstone the expected latest page identified by the forget sweep.
     ///
     /// # Errors
@@ -2867,6 +2946,33 @@ impl WriterHandle {
             workspace_id,
             project_id,
             new_name: new_name.into(),
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Move the repository identity of the empty project `from` onto `into`
+    /// ([`ops::adopt_project_identity`], #1993).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or the
+    /// operation's own refusal.
+    pub async fn adopt_project_identity(
+        &self,
+        workspace_id: WorkspaceId,
+        into: ProjectId,
+        from: ProjectId,
+        archive_name: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<ops::AdoptedProjectIdentity> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AdoptProjectIdentity {
+            workspace_id,
+            into,
+            from,
+            archive_name,
             author_id,
             reply: tx,
         })
@@ -4585,6 +4691,40 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_page_feedback");
             }
+            WriteCmd::RecordQuerySignal {
+                workspace_id,
+                project_id,
+                page_id,
+                query_text,
+                session,
+                reply,
+            } => {
+                let result = ops::record_query_page_signal(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    page_id,
+                    &query_text,
+                    session.as_deref(),
+                );
+                send_or_warn(reply, result, "record_query_page_signal");
+            }
+            WriteCmd::ForgetQuerySignal {
+                workspace_id,
+                project_id,
+                page_id,
+                query_text,
+                reply,
+            } => {
+                let result = ops::forget_query_page_signal(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    page_id,
+                    &query_text,
+                );
+                send_or_warn(reply, result, "forget_query_page_signal");
+            }
             WriteCmd::BumpAccess {
                 page_ids,
                 actor,
@@ -4885,6 +5025,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     commit,
                 );
                 send_or_warn(reply, result, "repair_session_times");
+            }
+            WriteCmd::AdoptProjectIdentity {
+                workspace_id,
+                into,
+                from,
+                archive_name,
+                author_id,
+                reply,
+            } => {
+                let result = ops::adopt_project_identity(
+                    &mut conn,
+                    &workspace_id,
+                    &into,
+                    &from,
+                    archive_name.as_deref(),
+                    author_id,
+                );
+                send_or_warn(reply, result, "adopt_project_identity");
             }
             WriteCmd::RenameProject {
                 workspace_id,

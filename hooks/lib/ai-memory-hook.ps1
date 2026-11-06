@@ -404,6 +404,23 @@ function Get-AiMemoryTomlFlag {
     return $null
 }
 
+function Get-AiMemoryTomlScopedFlag {
+    param([string] $File, [string] $Section, [string] $Key, [switch] $Exclude)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    $inSection = $false
+    foreach ($line in Get-Content $File) {
+        $header = [regex]::Match($line, '^\s*\[\s*([^\]]+?)\s*\]\s*(#.*)?$')
+        if ($header.Success) {
+            $inSection = $header.Groups[1].Value.Trim() -eq $Section
+            continue
+        }
+        if (($Exclude -and $inSection) -or (-not $Exclude -and -not $inSection)) { continue }
+        $m = [regex]::Match($line, "^\s*$Key\s*=\s*`"?([^`"#]*)`"?\s*(#.*)?$")
+        if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    }
+    return $null
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # "0" for a falsy value, "1" for anything else, an absent key included.
 # Parity with `profile_flag_value` in hook_capture.rs.
@@ -591,6 +608,7 @@ function Get-AiMemoryMarkerQuery {
     $profileContribute = $null
     $profileConsume = $null
     $handoffOff = $false
+    $recoveryOff = $false
     $aliases = $null
     $identityQuery = ""
     $homeRouted = $false
@@ -631,8 +649,9 @@ function Get-AiMemoryMarkerQuery {
         # what it stored.
         $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
         $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
-        # `[handoff] deliver_on_session_start = false`: sent only when explicitly falsy.
-        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "deliver_on_session_start")) -eq "0"
+        # The delivery key is independent in [handoff] and [recovery].
+        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start" -Exclude)) -eq "0"
+        $recoveryOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start")) -eq "0"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -667,6 +686,7 @@ function Get-AiMemoryMarkerQuery {
     if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
     if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
     if ($handoffOff) { $qs += "&handoff=0" }
+    if ($recoveryOff) { $qs += "&recovery=0" }
     return $qs
 }
 
@@ -1080,6 +1100,11 @@ function Invoke-AiMemoryHook {
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"
     }
+    # Per-execution opt-out of the automatic handoff (#1951), forwarded only
+    # for an explicit falsy value, as the native hook does.
+    if ($env:AI_MEMORY_AUTO_HANDOFF -and $env:AI_MEMORY_AUTO_HANDOFF.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
+        $QS += "&auto_handoff=0"
+    }
     $SessionQS = ""
     if ($Agent -eq "devin") {
         $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
@@ -1195,6 +1220,16 @@ function Invoke-AiMemoryHook {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
             }
         } catch {
+        }
+        # A compaction's SessionStart (`source: "compact"`) is mid-session:
+        # claim no handoff, recovery snapshot or brief, and print the same
+        # empty reply as "no pending handoff" (parity with the native hook and
+        # `ai_memory_get_start_handoff`; the anchor is native-only).
+        if ($Event -eq "session-start" -and $ParsedPayload -and [string]$ParsedPayload.source -eq "compact") {
+            if ($AntigravityStartOutput -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
+                [Console]::Out.Write("{}")
+            }
+            return
         }
         $Shown = $null
         if ($GrokPostTool) {

@@ -1,14 +1,16 @@
 //! Wire envelope received on `POST /hook`.
 
 use ai_memory_core::{
-    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
+    AgentKind, FilePathOutcome, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
-    ToolFamily, ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+    FileTarget, ToolFamily, ToolObservationMetadata, file_target, tool_observation_metadata,
+    tool_observation_outcome,
 };
+use crate::file_field::{FileClaim, FileSkip};
 
 /// Durable excerpt ceiling for user prompts. Prompts retain more working
 /// context than tool/notification summaries while remaining bounded.
@@ -23,6 +25,10 @@ pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
 /// Durable excerpt ceiling for tool I/O summaries and short excerpts
 /// (tool results, extension bodies, Stop assistant excerpts).
 pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+
+/// The extension label backfilled non-user events (assistant/tool) are recorded
+/// under, mirroring the companion importer's replay-through-`/hook` mechanism.
+pub const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// Durable body ceiling the ingest funnel applies to an event's excerpt
 /// **after** the sanitizer has scrubbed the full text.
@@ -98,6 +104,12 @@ pub struct HookQuery {
     /// Invocation-scoped `ai-memory run` lease. Absent for every direct
     /// harness launch, preserving legacy capture and handoff behavior.
     pub managed_run: Option<String>,
+    /// Invocation-scoped opt-out of the automatic handoff, forwarded by the
+    /// host hook from `AI_MEMORY_AUTO_HANDOFF` (#1951). An explicit falsy
+    /// value keeps this session's end or turn checkpoint from leaving a
+    /// baton; absent or anything else keeps `[handoff]
+    /// create_on_session_end` in charge.
+    pub auto_handoff: Option<String>,
     /// Client-side opt-in for assistant/Stop capture, baked onto the native
     /// `stop` hook command by `install-hooks --capture-assistant`. A truthy
     /// value tells the server the client deliberately attached a sanitized
@@ -185,6 +197,9 @@ pub struct HookEnvelope {
     pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Whether this execution opted out of the automatic handoff (the
+    /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
+    pub auto_handoff_off: bool,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
@@ -214,6 +229,14 @@ pub struct HookEnvelope {
     /// The metadata-only rebuilds clear it.
     #[serde(skip)]
     pub(crate) recorded_tool: Option<crate::capture_policy::RecordedToolName>,
+    /// Why this file-tool PostToolUse did or did not get a `file_path`
+    /// (`[ingest] index_file_paths`, #1843); counted once the delivery is
+    /// stored.
+    #[serde(skip)]
+    pub(crate) file_path_outcome: Option<ai_memory_core::FilePathOutcome>,
+    /// The path to store, set only with [`FilePathOutcome::Indexed`].
+    #[serde(skip)]
+    pub(crate) file_path: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
 }
@@ -239,6 +262,7 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
                 &self.capture_assistant_requested,
@@ -676,6 +700,7 @@ impl HookEnvelope {
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
@@ -770,6 +795,7 @@ impl HookEnvelope {
             recall_default_global_requested,
             all_owners_requested,
             managed_run,
+            auto_handoff_off,
             capture_assistant_requested,
             ingest_key,
             extension,
@@ -778,8 +804,55 @@ impl HookEnvelope {
             body_excerpt,
             occurred_at,
             recorded_tool,
+            file_path_outcome: None,
+            file_path: None,
             raw,
         }
+    }
+
+    /// Decide whether this event stores a `file_path` and why, when
+    /// `[ingest] index_file_paths` is on (#1843). Only a live PostToolUse of a
+    /// file tool is classified; capture inspection has already set an
+    /// invalid-claim or metadata-only outcome. The path check is the one
+    /// `Sanitized::new` repeats on insert, so the two cannot disagree.
+    pub(crate) fn classify_file_path(
+        &mut self,
+        enabled: bool,
+        claim: FileClaim,
+        sanitizer: &Sanitizer,
+    ) {
+        if !enabled
+            || self.event != HookEvent::PostToolUse
+            || self.extension.as_deref() == Some(BACKFILL_EXTENSION)
+        {
+            self.file_path_outcome = None;
+            return;
+        }
+        if self.file_path_outcome.is_some() {
+            return;
+        }
+        let Some(target) = file_target(self.agent, &self.raw) else {
+            return;
+        };
+        self.file_path_outcome = Some(match (target, claim) {
+            (FileTarget::NoFile, _) => FilePathOutcome::NoFile,
+            (FileTarget::Many, _) => FilePathOutcome::MultiFile,
+            (FileTarget::One(_), FileClaim::Absent) => FilePathOutcome::FieldAbsent,
+            (FileTarget::One(_), FileClaim::UnknownVersion) => FilePathOutcome::UnknownVersion,
+            (FileTarget::One(_), FileClaim::Skipped(skip)) => match skip {
+                Some(FileSkip::OutsideCheckout) => FilePathOutcome::SkippedOutsideCheckout,
+                Some(FileSkip::NoCheckout) => FilePathOutcome::SkippedNoCheckout,
+                Some(FileSkip::Refused) => FilePathOutcome::SkippedRefused,
+                None => FilePathOutcome::SkippedOther,
+            },
+            (FileTarget::One(_), FileClaim::Path(path)) if sanitizer.admits_file_path(&path) => {
+                self.file_path = Some(path);
+                FilePathOutcome::Indexed
+            }
+            (FileTarget::One(_), FileClaim::Path(_) | FileClaim::Malformed) => {
+                FilePathOutcome::ServerRejected
+            }
+        });
     }
 
     /// Name a closed-tool call (`[ingest] record_tool_names`): the title

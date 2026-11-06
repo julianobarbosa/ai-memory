@@ -67,3 +67,4 @@ _bmad/render/
 
 evals/datasets/
 evals/models/
+evals/.cache/

@@ -2,7 +2,7 @@
 
 use crate::templates::{
     SessionRow, TokenUsagePanel, TokenUsageRow, agent_label, duration_between, fmt_tokens,
-    humanize, project_href, session_href, short_id,
+    project_href, session_href, short_id,
 };
 use ai_memory_core::AgentKind;
 use ai_memory_store::{AgentUsage, SessionSummary, TokenUsageReport};
@@ -55,7 +55,12 @@ pub(crate) fn agent_card(row: AgentUsage, workspace: &str, project: &str) -> Age
     }
 }
 
-pub(crate) fn session_row(s: SessionSummary, workspace: &str, project: &str) -> SessionRow {
+pub(crate) fn session_row(
+    i18n: &ai_memory_core::i18n::Localizer,
+    s: SessionSummary,
+    workspace: &str,
+    project: &str,
+) -> SessionRow {
     let id = s.session_id.to_string();
     SessionRow {
         agent_label: agent_label(AgentKind::from_wire(&s.agent_kind)),
@@ -75,7 +80,7 @@ pub(crate) fn session_row(s: SessionSummary, workspace: &str, project: &str) -> 
         agent_kind: s.agent_kind,
         short_id: short_id(&id),
         observation_count: s.observation_count,
-        started_relative: humanize(&s.started_at),
+        started_relative: i18n.relative(&s.started_at),
         open: s.ended_at.is_none(),
     }
 }
@@ -104,6 +109,10 @@ pub(crate) struct UsageQuery {
     pub calls_turn: String,
     #[serde(default)]
     pub calls_tool: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub sort: String,
 }
 
 // Flattened query values arrive as strings even for numeric fields.
@@ -202,6 +211,20 @@ impl UsageQuery {
         })
     }
 
+    pub fn session_view(&self) -> Result<(bool, bool), axum::http::StatusCode> {
+        let open_only = match self.state.as_str() {
+            "" | "all" => false,
+            "open" => true,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        let sort_events = match self.sort.as_str() {
+            "" | "recent" => false,
+            "events" => true,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        Ok((open_only, sort_events))
+    }
+
     fn page_href(&self, base: &str, offset: usize) -> String {
         format!(
             "{base}&calls_q={}&calls_sort={}&calls_signal={}&calls_model={}&calls_agent={}&calls_session={}&calls_from={}&calls_until={}&calls_turn={}&calls_tool={}&calls_offset={offset}#token-usage",
@@ -220,6 +243,7 @@ impl UsageQuery {
 }
 
 pub(crate) fn usage_panel(
+    i18n: &ai_memory_core::i18n::Localizer,
     report: TokenUsageReport,
     workspace: &str,
     project: &str,
@@ -360,7 +384,7 @@ pub(crate) fn usage_panel(
                         fmt_tokens(c.cache_write)
                     ),
                     total: fmt_tokens(total),
-                    when: humanize(&recorded_at),
+                    when: i18n.relative(&recorded_at),
                     signal: signal.into(),
                 }
             })
