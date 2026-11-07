@@ -47,6 +47,27 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Approving an auto-improvement proposal that conflicts with a newer version of
+  its page no longer notifies non-blocking observer webhooks. The approval rolls
+  the file back and records nothing, but the observers were still sent the
+  proposal's content as if it had been written, so a mirror could copy a page
+  that never landed. Observers are now notified only when the approval writes
+  the page, as `docs/admission-webhooks.md` already described. (#2068)
+- Deleting a page no longer races a concurrent write to the same path. A plain
+  delete (`memory_delete_page`, `ai-memory delete-page`, lint cleanup) took only
+  the shared wiki lock, not the per-page lock that writes, restores and
+  reindexes hold from the file rename to the index update. A delete landing in
+  between could remove the file of a version the write had just recorded, or
+  tombstone the page while the new file stayed on disk and came back on the next
+  reindex. A delete now waits for that page's lock; other pages are not held up.
+  (#2067)
+- `install-hooks --agent cursor` now writes a `~/.cursor/hooks.json` Cursor can
+  load. Cursor strips `//` (and `/* */`) comments before parsing, with a regex
+  that ignores JSON string boundaries, so the `//` in the `https://`/`http://`
+  server URL truncated the line, parsing failed, and Cursor silently dropped the
+  whole file — no Cursor session was captured. Forward slashes are now escaped as
+  `\/`, which is valid JSON that survives the comment strip and decodes
+  unchanged (#2069).
 - Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
 - Corrected the 2.6.6 note that frontmatter reads exactly as before the
   switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
@@ -138,6 +159,19 @@ version in [`docs/changelog/`](docs/changelog/):
   a deterministic occurrence suffix that agrees between a full backfill and an
   incremental cursor replay, while every unique record keeps its
   rewrite-stable id (#2053).
+- `merge_project` now preserves all recovery and session attributes on migrated
+  `ingest_keys` rows (`session_id`, `agent_kind`, `observation_kind`,
+  `event_identity`, and `recovery_retained`). Previously, only the original
+  four columns from schema V33 were copied, clearing those five fields to `NULL`
+  or `0` on the target project, causing premature TTL deletion of recovery keys
+  and false `StoreError::SessionCollision` errors on replay (#2061).
+- The Windows installer (`install.ps1`) no longer deletes an existing
+  destination. It refuses an existing directory, file or link before
+  downloading, copies the release into a new sibling staging directory and
+  publishes it only while the destination is still absent; a failed copy or
+  publication leaves the destination untouched and names the staging
+  directory to inspect (#2060).
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
