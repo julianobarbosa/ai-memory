@@ -38,8 +38,9 @@ use crate::commands::render_shared::{
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, shell_quote, ts_auth_headers_fn,
-    ts_capture_policy_v1, ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -783,6 +784,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     } else {
         renderable_token.as_deref()
     };
+    // The inline bearer masked for any path that PRINTS the rendered block to
+    // the terminal instead of writing it to a config file: every agent's
+    // preview (no `--apply`), and Hermes/Pool on `--apply` too — they have no
+    // file to write and print the ready-to-paste block, so a token embedded as
+    // the #552 store-failure fallback would otherwise land in the scrollback, a
+    // CI log or an agent transcript (GHSA-6pmr-q79m-87vp items 1 and 2).
+    let printed_auth_owned = auth.map(mask_secret);
+    let printed_auth = printed_auth_owned.as_deref();
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
     // passed via `--auth-token` (typically a native key from
@@ -1009,7 +1018,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             // block a preview does.
             AgentChoice::Hermes => render_hermes(
                 &server_url,
-                auth,
+                printed_auth,
                 &config.data_dir,
                 args.project_strategy.and_then(ProjectStrategyArg::baked),
                 hermes_plugin_dir(&config.runtime_env).as_deref(),
@@ -1072,7 +1081,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     &config.i18n,
                     &hooks_dir,
                     &server_url,
-                    auth,
+                    printed_auth,
                     &config.data_dir,
                     &args,
                 )
@@ -1156,6 +1165,10 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
     // persist (#661) — resolved read-only so a bare preview never writes.
     let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
+    // Every arm below renders to stdout, so the inline bearer is masked for the
+    // whole preview (GHSA-6pmr-q79m-87vp item 1); `--apply` returned above and
+    // renders the real token into the agent's config file.
+    let auth = printed_auth;
     match args.agent {
         AgentChoice::OpenCode => {
             render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
@@ -8951,6 +8964,15 @@ fn write_private_dsh_config(path: &Path, content: &[u8]) -> Result<()> {
 /// and `setup-agent`.
 pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     let config_path = command_dir.join("hooks.json");
+    // The bridge is a Node plugin that reads this path with
+    // `fs.readFileSync`, which cannot resolve a Windows `\\?\` verbatim
+    // prefix and fails ENOENT (it treats the path as relative, #2032).
+    // `command_dir` descends from the canonical data dir, which carries that
+    // prefix on Windows, so strip it the way `service_host` does for command
+    // lines. A plain `C:\...` drive path reads fine in Node.
+    let config_path =
+        super::path_util::strip_windows_verbatim_prefix(&config_path.to_string_lossy())
+            .into_owned();
     let mut out = String::new();
     out.push_str("# DeepSeek Harness (DSH) - merge the entry below into the DSH\n");
     out.push_str("# profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n");
@@ -8964,7 +8986,7 @@ pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     out.push_str("      config:\n");
     out.push_str(&format!(
         "        configPath: {}\n",
-        yaml_single_quote(&config_path.to_string_lossy())
+        yaml_single_quote(&config_path)
     ));
     out
 }
@@ -11042,6 +11064,26 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(
             out.contains(&format!("configPath: '{expected}'")),
             "expected quoted configPath in: {out}"
+        );
+    }
+
+    #[test]
+    fn dsh_bridge_patch_fragment_strips_windows_verbatim_prefix() {
+        // `command_dir` descends from the canonical data dir, which carries a
+        // `\\?\` verbatim prefix on Windows. The Node bridge reads configPath
+        // with `fs.readFileSync`, which fails ENOENT on that prefix (#2032),
+        // so the emitted path must be a plain drive path. The strip is
+        // lexical, so this bites on any host.
+        let out = dsh_bridge_patch_fragment(Path::new(
+            r"\\?\C:\Users\me\AppData\Local\ai-memory\hooks\dsh",
+        ));
+        assert!(
+            !out.contains(r"\\?\"),
+            "verbatim prefix must not reach configPath: {out}"
+        );
+        assert!(
+            out.contains(r"configPath: 'C:\Users\me\AppData\Local\ai-memory\hooks\dsh"),
+            "expected a plain drive path in: {out}"
         );
     }
 
