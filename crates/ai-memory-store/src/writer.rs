@@ -289,7 +289,7 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
         occurred_at: Option<i64>,
-        reply: oneshot::Sender<StoreResult<HandoffId>>,
+        reply: oneshot::Sender<StoreResult<Option<HandoffId>>>,
     },
     EndAdmittedLifecycleOnlySession {
         admitted: AdmittedSession,
@@ -342,6 +342,10 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<usize>>,
     },
     InsertHandoff {
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    InsertManualHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
@@ -1667,8 +1671,10 @@ impl WriterHandle {
 
     /// Close every session, in every scope, open with no activity since
     /// before `cutoff_us` (safety net). No usage, no
-    /// consolidation — see [`ops::close_abandoned_sessions`] for why.
-    /// Returns the number of sessions closed.
+    /// consolidation — see [`ops::close_abandoned_sessions`] for why. Each
+    /// closed session also gets a parked auto-improvement claim so the
+    /// sweep never queues an LLM review. Returns the number of sessions
+    /// closed.
     ///
     /// # Errors
     /// Propagates store failures.
@@ -1773,7 +1779,9 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Guarded hook end plus automatic handoff.
+    /// Guarded hook end plus automatic handoff; `None` when the session still
+    /// has an open explicit handoff of its own, which the end keeps instead.
+    /// See `ops::end_admitted_session_with_handoff`.
     ///
     /// `occurred_at` is the SessionEnd event's own original time (microseconds),
     /// when known; `None` falls back to "now" at the store boundary.
@@ -1783,7 +1791,7 @@ impl WriterHandle {
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
         occurred_at: Option<i64>,
-    ) -> StoreResult<HandoffId> {
+    ) -> StoreResult<Option<HandoffId>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSessionWithHandoff {
             admitted,
@@ -1976,8 +1984,21 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Insert an explicit `memory_handoff_begin` handoff in `open` state. See
+    /// `ops::insert_manual_handoff`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_manual_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertManualHandoff { handoff, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Publish a live session's turn-checkpoint baton; `None` when the session
-    /// already ended or is gone. See `ops::checkpoint_session_handoff`.
+    /// already ended or is gone, or still has an open explicit handoff of its
+    /// own. See `ops::checkpoint_session_handoff`.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
@@ -4396,7 +4417,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "sweep_hollow_projects");
             }
             WriteCmd::CloseAbandonedSessions { cutoff_us, reply } => {
-                let result = ops::close_abandoned_sessions(&conn, cutoff_us);
+                let result = ops::close_abandoned_sessions(&mut conn, cutoff_us);
                 send_or_warn(reply, result, "close_abandoned_sessions");
             }
             WriteCmd::InsertObservation { obs, reply } => {
@@ -4551,6 +4572,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
+            }
+            WriteCmd::InsertManualHandoff { handoff, reply } => {
+                let result = ops::insert_manual_handoff(&mut conn, &handoff);
+                send_or_warn(reply, result, "insert_manual_handoff");
             }
             WriteCmd::CheckpointSessionHandoff { handoff, reply } => {
                 let result = ops::checkpoint_session_handoff(&mut conn, &handoff);

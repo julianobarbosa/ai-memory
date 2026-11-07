@@ -467,6 +467,30 @@ handoff is fetched, and a one-line warning goes to the hook's stderr. It never
 falls back to the install default, because that would deliver one team's
 capture to another team's server.
 
+The commands that work on the checkout you run them in follow the same route,
+so they reach the server your hooks capture to: `run`, `resume`, `continue`,
+`show`, `workstreams`, `workstream-search`, `rename-workstream`, `doctor`,
+`search`, `recent`, `read-page`, `write-page`, `delete-page`,
+`restore-page`, `handoffs`, `message`, `pending-writes`, `profile`, `lint`,
+`forget-sweep`, `curator`, `auto-improve`, `auto-improve-report`, `embed`,
+`bootstrap`, `backfill`, `repair-backfill-timestamps`, `repair-split`,
+`finalize-session`, `rename-project`, `move-project`, `move-session`,
+`purge-project` and `purge-session`. They use the profile's
+URL and stored token, never the bearer from your config, and they fail
+closed with the same reason the hook reports when the profile does not
+resolve. They match the profile's roots against the directory as your
+shell names it (`PWD`, when it is the same directory as the process's working
+directory), the way a harness reports it to the hooks, so a checkout reached
+through a symlink, or macOS's `/var` (really `/private/var`), routes the same
+for both. `AI_MEMORY_SERVER_URL` in the environment still wins for one
+invocation, and `AI_MEMORY_IGNORE_MARKER=1` skips the marker as it does for
+scope. Install-wide commands (`status`, `list-projects`, `backup`, `user`,
+`api-key`, `project access`, `setup` and the other admin commands) keep using
+the configured server. `run --jail` refuses a profile-routed checkout,
+because the jailed run cannot read the profile's token; set
+`AI_MEMORY_SERVER_URL` and a least-privilege `AI_MEMORY_AUTH_TOKEN` for that
+launch instead.
+
 Routing is inherited down the tree, unlike the other keys. The nearest marker
 that declares `server` decides, so a nested marker that only sets `workspace`,
 or only `[capture]`, keeps its ancestor's profile. A nested marker can select
@@ -529,12 +553,12 @@ shared marker.
   rejected one with the install token, or re-send one addressed to a dead
   loopback port to the server in `config.toml`. Upgrade every install that
   shares a data dir.
-- **MCP and `ai-memory run`.** Profiles route hook capture only. The MCP
-  server entry and `ai-memory run` (its managed-run ledger and heartbeats)
-  still talk to the server they were configured with, so in a routed
-  repository they reach the install default. Point that repository's MCP
-  client at its own server with a per-repository `.mcp.json`, and avoid
-  `ai-memory run` there until it learns profiles.
+- **MCP.** Profiles route hook capture and the checkout commands listed
+  above, `ai-memory run` and its managed-run ledger included. The MCP server
+  entry, including `ai-memory mcp-bridge`, still talks to the server it was
+  configured with, so in a routed repository it reaches the install default.
+  Point that repository's MCP client at its own server with a per-repository
+  `.mcp.json`.
 
 Profiles use static tokens only. OIDC `auth.json` stays with the install
 default and is never presented to a profile's server.

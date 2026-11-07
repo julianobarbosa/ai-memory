@@ -1398,6 +1398,164 @@ async fn handoff_accept_rejects_foreign_or_missing_receiver_session() {
     }
 }
 
+/// Grok reuses its session id after a restart, so a receiver the
+/// abandoned-session sweep just closed is still a live handoff candidate —
+/// the reopen is what un-parks the claim it parked. Every *refused* accept
+/// (sibling project, rival workspace, wrong agent kind) must leave the
+/// baton open and the receiver's sweep traces intact: the marker parked,
+/// `ended_at` still set. Only the accepted one clears them.
+#[tokio::test]
+async fn refused_foreign_receiver_keeps_its_sweep_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let sibling_proj = store
+        .writer
+        .get_or_create_project(ws, "sibling-app".to_string(), None)
+        .await
+        .unwrap();
+    let rival_ws = store
+        .writer
+        .get_or_create_workspace("rival".to_string())
+        .await
+        .unwrap();
+    // Same project name as the real one, in another workspace: a lookup by
+    // name alone would conflate the two.
+    let rival_proj = store
+        .writer
+        .get_or_create_project(rival_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+
+    // Every receiver is a real session the abandoned-session sweep just
+    // closed: a cutoff an hour in the future closes all four.
+    let sibling_grok = open_session(&store, ws, sibling_proj, AgentKind::Grok).await;
+    let rival_grok = open_session(&store, rival_ws, rival_proj, AgentKind::Grok).await;
+    let own_codex = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let own_grok = open_session(&store, ws, proj, AgentKind::Grok).await;
+    let now = jiff::Timestamp::now().as_microsecond();
+    let hour = 3_600 * 1_000_000;
+    assert_eq!(
+        store
+            .writer
+            .close_abandoned_sessions(now + hour)
+            .await
+            .unwrap(),
+        4,
+        "the sweep must close every open session"
+    );
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::Grok,
+            to_agent: None,
+            from_session_id: None,
+            summary: "pick this up".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    /// The sweep's traces on a receiver session: whether its claim still
+    /// carries the sweep's marker, and whether its `ended_at` is still set.
+    fn traces(conn: &rusqlite::Connection, session: SessionId) -> (bool, Option<i64>) {
+        conn.query_row(
+            "SELECT EXISTS( \
+                     SELECT 1 FROM auto_improve_scheduler_claims \
+                     WHERE session_id = ?1 AND last_error = ?2 \
+                 ), \
+                 (SELECT ended_at FROM sessions WHERE id = ?1) \
+             FROM sessions WHERE id = ?1",
+            rusqlite::params![
+                session.as_bytes(),
+                ai_memory_store::ABANDONED_SWEEP_CLAIM_ERROR
+            ],
+            |row| Ok((row.get::<_, bool>(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    let handoff_state = || -> HandoffState {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT state FROM handoffs WHERE id = ?1",
+            rusqlite::params![id.as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap()
+    };
+    assert_eq!(handoff_state(), HandoffState::Open, "fixture starts open");
+
+    // Every claim names the handoff's own scope and `Grok`; only the
+    // receiver session varies.
+    let claim = |session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Grok,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    for (label, receiver) in [
+        ("a Grok session of a sibling project", sibling_grok),
+        ("a Grok session of another workspace", rival_grok),
+        ("a session of a different agent kind", own_codex),
+    ] {
+        let err = store
+            .writer
+            .accept_handoff(claim(receiver))
+            .await
+            .expect_err(label);
+        assert!(
+            matches!(&err, StoreError::InvalidState(_)),
+            "{label} must be refused as InvalidState, got {err:?}"
+        );
+        assert_eq!(
+            handoff_state(),
+            HandoffState::Open,
+            "{label} must leave the handoff open"
+        );
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (marker, ended_at) = traces(&conn, receiver);
+        assert!(
+            marker,
+            "{label}: a refused accept must keep the sweep's marker"
+        );
+        assert!(
+            ended_at.is_some(),
+            "{label}: a refused accept must keep the sweep's ended_at"
+        );
+    }
+
+    // Legitimate control: the Grok session in the handoff's own scope is
+    // accepted — the generation the sweep closed is over, so the reopen
+    // clears the marker and `ended_at`.
+    assert!(
+        store.writer.accept_handoff(claim(own_grok)).await.unwrap(),
+        "a Grok restart in the handoff's own scope claims the handoff"
+    );
+    assert_eq!(handoff_state(), HandoffState::Accepted);
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let (marker, ended_at) = traces(&conn, own_grok);
+    assert!(!marker, "the accepted reopen must clear the sweep's marker");
+    assert!(
+        ended_at.is_none(),
+        "the accepted reopen must clear the sweep's ended_at"
+    );
+}
+
 /// Ownership still applies to batons even though pages are shared: the two
 /// halves of the model must not collapse into each other.
 #[tokio::test]
@@ -5815,4 +5973,225 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
     // recorded, are not splits.
     assert_eq!(holder("mine-new").await, None);
     assert_eq!(holder("never-seen").await, None);
+}
+
+/// #2023: a hook event that names a session under another agent is refused
+/// with the bound agent, so the client can tell what went wrong — but only
+/// once the owner check has admitted the caller. Another operator naming the
+/// same session id under any agent still gets the opaque collision, which
+/// says nothing about whose session it is or which harness holds it.
+#[tokio::test]
+async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let session = |id: SessionId, agent_kind: AgentKind, owner: Option<&str>| NewSession {
+        occurred_at: None,
+        id,
+        workspace_id: ws,
+        project_id: proj,
+        agent_kind,
+        cwd: Some("/repo".into()),
+        actor_user: owner.map(str::to_owned),
+    };
+    let event = |id: SessionId| {
+        Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "body".into(),
+                importance: 3,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let admit = |new: NewSession, filter: OwnerFilter| {
+        let id = new.id;
+        store
+            .writer
+            .admit_hook_session_event(new, event(id), filter, None, None)
+    };
+
+    let owned = SessionId::new();
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Another operator, under the bound agent and under another one: opaque.
+    for agent in [AgentKind::ClaudeCode, AgentKind::Dsh] {
+        let refused = admit(
+            session(owned, agent, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(StoreError::SessionCollision)),
+            "a foreign owner must not learn the bound agent ({agent:?}): {refused:?}"
+        );
+    }
+    // The owner under another agent learns which agent holds the session.
+    let mismatch = admit(
+        session(owned, AgentKind::Dsh, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ),
+        "{mismatch:?}"
+    );
+
+    // A shared (unowned) session is everyone's, so any caller may learn it.
+    let shared = SessionId::new();
+    admit(
+        session(shared, AgentKind::ClaudeCode, None),
+        OwnerFilter::Unattributed,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        admit(
+            session(shared, AgentKind::Dsh, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await,
+        Err(StoreError::SessionAgentMismatch {
+            bound: AgentKind::ClaudeCode
+        })
+    ));
+
+    // Control: the owner under the bound agent is stored; no refusal stored
+    // anything.
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+    let stored = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [owned.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "only the owner's two same-agent events land");
+}
+
+/// #2014: an explicit handoff that records its source session is not held back
+/// while that session is still at work, as an automatic baton is: the agent
+/// wrote it on purpose for the next session. It is still claimed exactly once.
+#[tokio::test]
+async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let source = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: source,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "still working".into(),
+                importance: 5,
+                occurred_at: None,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    let baton = |summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: Some(source),
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        cwd: Some("/repo".into()),
+        summary: summary.into(),
+        open_questions: Vec::new(),
+        next_steps: Vec::new(),
+        files_touched: Vec::new(),
+        owner_user: None,
+    };
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let startup = || {
+        store
+            .reader
+            .startup_handoff(ws, proj, Some("/repo".into()), OwnerFilter::Any, cutoff)
+    };
+
+    // Control: the busy session's automatic baton is not offered.
+    store
+        .writer
+        .checkpoint_session_handoff(baton("checkpoint"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(startup().await.unwrap().is_none());
+
+    let explicit = store
+        .writer
+        .insert_manual_handoff(baton("explicit"))
+        .await
+        .unwrap();
+    let offered = startup().await.unwrap().expect("the explicit handoff");
+    assert_eq!(offered.scope.id, explicit);
+
+    let claim = |receiver| HandoffAcceptance {
+        handoff_id: explicit,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Codex,
+        accepting_session: Some(receiver),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: Some("/repo".into()),
+    };
+    let first = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let delivered = store
+        .writer
+        .accept_startup_context(Some(claim(first)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(
+        delivered.handoff_accepted,
+        "a busy source keeps no explicit baton"
+    );
+    let second = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let again = store
+        .writer
+        .accept_startup_context(Some(claim(second)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(!again.handoff_accepted, "claimed exactly once");
 }

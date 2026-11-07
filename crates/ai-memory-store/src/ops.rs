@@ -2727,7 +2727,10 @@ pub fn end_session(
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
-    end_session_row(conn, session_id, summary_page_id, None)
+    let tx = conn.transaction()?;
+    end_session_row(&tx, session_id, summary_page_id, None)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Atomically end a lifecycle-only session and return its startup handoff to
@@ -2813,6 +2816,25 @@ fn end_lifecycle_only_session_in_tx(
     })
 }
 
+/// Delete the sweep-parked auto-improvement claim for one session, if the
+/// sweep parked it.
+///
+/// The delete is filtered on the sweep's marker error, so a claim parked by
+/// a genuine review failure (or any other claim state) is left intact. Runs
+/// in the caller's transaction; both un-park sites — the real end and the
+/// handoff reopen — must keep the session row and the claim consistent.
+fn clear_abandoned_sweep_claim(conn: &Connection, session_id: &SessionId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM auto_improve_scheduler_claims \
+         WHERE session_id = ?1 AND last_error = ?2",
+        params![
+            session_id.as_bytes(),
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        ],
+    )?;
+    Ok(())
+}
+
 fn end_session_row(
     conn: &Connection,
     session_id: &SessionId,
@@ -2830,6 +2852,10 @@ fn end_session_row(
          WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
     )?;
+    // A real end un-parks the claim the abandoned-session sweep left behind,
+    // so a session that is resumed and then truly finished returns to the
+    // auto-improvement queue. Only the sweep's marker is deleted.
+    clear_abandoned_sweep_claim(conn, session_id)?;
     Ok(())
 }
 
@@ -2852,10 +2878,43 @@ fn end_session_row(
 /// One batched `UPDATE`, no per-scope iteration (invariant #2). Returns the
 /// number of sessions closed.
 ///
+/// In the same transaction the sweep parks an auto-improvement claim for
+/// every session it closes (exhausted `attempts`, `last_error` marked with
+/// [`crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR`]): closing a session
+/// is what makes it a candidate for the auto-improvement scheduler, and a
+/// blind sweep must not queue an LLM review for a session it only guessed
+/// was over. An existing claim — in flight, retryable or parked by a
+/// genuine failure — is left untouched (`ON CONFLICT(session_id) DO
+/// NOTHING`). A real `SessionEnd` with new observations un-parks the claim
+/// in [`end_session_row`]; manual auto-improve stays available either way.
+///
 /// # Errors
 /// Propagates any SQL error.
-pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResult<u64> {
-    let changed = conn.execute(
+pub fn close_abandoned_sessions(conn: &mut Connection, cutoff_us: i64) -> StoreResult<u64> {
+    let tx = conn.transaction()?;
+    // The claims are inserted BEFORE the UPDATE, with the exact same
+    // selection predicate: once the UPDATE has run the sessions no longer
+    // match (`ended_at IS NULL` is gone), so they would no longer be
+    // identifiable.
+    let now = Timestamp::now().as_microsecond();
+    tx.execute(
+        "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+         SELECT s.workspace_id, s.project_id, s.id, ?2, ?3, ?4, ?2 \
+         FROM sessions s \
+         WHERE s.ended_at IS NULL \
+           AND COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = s.id), \
+                 s.started_at) < ?1 \
+         ON CONFLICT(session_id) DO NOTHING",
+        params![
+            cutoff_us,
+            now,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR,
+        ],
+    )?;
+    let changed = tx.execute(
         "UPDATE sessions \
          SET ended_at = COALESCE( \
                  (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.id), \
@@ -2869,6 +2928,7 @@ pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResul
                  started_at) < ?1",
         params![cutoff_us],
     )?;
+    tx.commit()?;
     Ok(u64::try_from(changed).unwrap_or(0))
 }
 
@@ -3445,14 +3505,20 @@ pub fn admit_hook_session_event(
         Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
-            // there is a genuine UUID collision and is terminal.
+            // there is a genuine UUID collision and is terminal. The owner is
+            // checked first and stays opaque: only a caller the owner check
+            // admitted learns which agent holds the session (#2023).
             if owner
                 .as_deref()
                 .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
-                || agent != session.agent_kind.as_str()
                 || !owner_filter.admits(owner.as_deref())
             {
                 return Err(StoreError::SessionCollision);
+            }
+            if agent != session.agent_kind.as_str() {
+                return Err(StoreError::SessionAgentMismatch {
+                    bound: AgentKind::from_wire(&agent),
+                });
             }
             // Scope is NOT identity. Under the default `follow-cwd` routing a
             // mid-session `cd` into another project legitimately resolves this
@@ -3700,13 +3766,17 @@ pub fn end_admitted_lifecycle_only_session(
 }
 
 /// Guarded hook end plus automatic handoff in one transaction.
+///
+/// Returns `None` when the session still has an open explicit handoff of its
+/// own ([`session_has_open_manual_handoff`]): the session ends, and no
+/// template baton is left to linger next to the one the agent wrote (#2012).
 pub fn end_admitted_session_with_handoff(
     conn: &mut Connection,
     admitted: &AdmittedSession,
     page: Option<&PageId>,
     handoff: &NewHandoff,
     occurred_at: Option<i64>,
-) -> StoreResult<HandoffId> {
+) -> StoreResult<Option<HandoffId>> {
     if handoff.from_session_id != Some(admitted.session_id)
         || handoff.workspace_id != admitted.workspace_id
         || handoff.project_id != admitted.project_id
@@ -3717,9 +3787,38 @@ pub fn end_admitted_session_with_handoff(
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
     end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = if session_has_open_manual_handoff(&tx, handoff)? {
+        None
+    } else {
+        Some(insert_handoff_row(&tx, handoff, false)?)
+    };
     tx.commit()?;
     Ok(id)
+}
+
+/// Whether the automatic baton's source session already left an explicit
+/// `memory_handoff_begin` handoff that nobody has claimed yet.
+///
+/// The explicit one is what the agent wrote on purpose while wrapping up, and
+/// it wins delivery over any automatic baton, so a template baton written
+/// beside it would only be offered later as a stale pending handoff. Once the
+/// explicit one is claimed or cancelled, later automatic batons of the session
+/// carry work newer than it and are written again.
+fn session_has_open_manual_handoff(tx: &Transaction<'_>, h: &NewHandoff) -> StoreResult<bool> {
+    let Some(session_id) = h.from_session_id.as_ref() else {
+        return Ok(false);
+    };
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM handoffs \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 1 AND state = 'open')",
+        params![
+            session_id.as_bytes(),
+            h.workspace_id.as_bytes(),
+            h.project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 /// An idle auto-end candidate as selected by the server-side tick
@@ -5148,7 +5247,46 @@ pub fn prune_consolidated_observations(
 /// Insert a new handoff in state=open.
 pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
     let tx = conn.transaction()?;
-    let id = insert_handoff_row(&tx, h)?;
+    let id = insert_handoff_row(&tx, h, false)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Insert an explicit (`memory_handoff_begin`) handoff in state=open.
+///
+/// It stays manual whatever `from_session_id` it carries: project-wide for cwd
+/// matching, preferred over automatic batons, and never refreshed or swept by
+/// them. When it names its source session, that session's own open automatic
+/// batons (a turn checkpoint's, say) are retired in the same transaction: the
+/// explicit wrap-up supersedes them, and they would otherwise surface later as
+/// stale pending handoffs (#2012). The caller must have checked that the
+/// session is the caller's own, in this scope.
+pub fn insert_manual_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
+    let tx = conn.transaction()?;
+    let id = insert_handoff_row(&tx, h, true)?;
+    if let Some(session_id) = h.from_session_id.as_ref() {
+        let expired = tx.execute(
+            "UPDATE handoffs SET state = 'expired' \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 0 AND state = 'open'",
+            params![
+                session_id.as_bytes(),
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes()
+            ],
+        )?;
+        if expired > 0 {
+            audit(
+                &tx,
+                "expire_superseded_handoffs",
+                Some(h.workspace_id.as_bytes()),
+                Some(h.project_id.as_bytes()),
+                None,
+                None,
+                Timestamp::now().as_microsecond(),
+            )?;
+        }
+    }
     tx.commit()?;
     Ok(id)
 }
@@ -5162,7 +5300,9 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
 /// scope and owner, the same contract as [`end_session_with_handoff`]; a
 /// checkpoint that lost the race with the session's end, or with a purge,
 /// returns `None` and touches nothing, so it can neither retire the end's
-/// baton nor resurrect a claimed one.
+/// baton nor resurrect a claimed one. A session that still has an open
+/// explicit handoff of its own also gets `None`: the checkpoint keeps that
+/// wrap-up instead of writing a template baton beside it (#2012).
 pub fn checkpoint_session_handoff(
     conn: &mut Connection,
     handoff: &NewHandoff,
@@ -5192,11 +5332,14 @@ pub fn checkpoint_session_handoff(
             "checkpoint handoff scope or owner does not match its session".into(),
         ));
     }
+    if session_has_open_manual_handoff(&tx, handoff)? {
+        return Ok(None);
+    }
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM handoffs \
              WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
-               AND owner_user IS ?4 AND state = 'open' \
+               AND owner_user IS ?4 AND state = 'open' AND manual = 0 \
              ORDER BY created_at DESC LIMIT 1",
             params![
                 session_id.as_bytes(),
@@ -5213,7 +5356,7 @@ pub fn checkpoint_session_handoff(
             refresh_handoff_row(&tx, &id, handoff)?;
             id
         }
-        None => insert_handoff_row(&tx, handoff)?,
+        None => insert_handoff_row(&tx, handoff, false)?,
     };
     tx.commit()?;
     Ok(Some(id))
@@ -5260,7 +5403,7 @@ pub fn end_session_with_handoff(
         ));
     }
     end_session_row(&tx, session_id, summary_page_id, None)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = insert_handoff_row(&tx, handoff, false)?;
     tx.commit()?;
     Ok(id)
 }
@@ -5343,7 +5486,7 @@ fn expire_same_cwd_auto_handoffs(
     let expired = conn.execute(
         "UPDATE handoffs SET state = 'expired' \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
            AND owner_user IS ?4 AND id IS NOT ?5 \
            AND (from_session_id IS ?6 OR NOT EXISTS ( \
@@ -5403,7 +5546,11 @@ fn refresh_handoff_row(conn: &Transaction<'_>, id: &HandoffId, h: &NewHandoff) -
     Ok(())
 }
 
-fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
+fn insert_handoff_row(
+    conn: &Transaction<'_>,
+    h: &NewHandoff,
+    manual: bool,
+) -> StoreResult<HandoffId> {
     validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
@@ -5417,7 +5564,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
-    if from_session.is_some() {
+    if from_session.is_some() && !manual {
         expire_same_cwd_auto_handoffs(conn, h, cwd.as_deref(), None, now)?;
     }
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
@@ -5426,8 +5573,8 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
-          open_questions, next_steps, files_touched, state, created_at, owner_user) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13)",
+          open_questions, next_steps, files_touched, state, created_at, owner_user, manual) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13, ?14)",
         params![
             id.as_bytes(),
             h.workspace_id.as_bytes(),
@@ -5444,6 +5591,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             // NULL owner = shared with the whole project: what a caller with no
             // actor writes, and what every pre-V39 row already looks like.
             h.owner_user.as_deref(),
+            manual,
         ],
     )?;
     audit(
@@ -5581,8 +5729,8 @@ pub(crate) fn accept_handoff_in_transaction(
     }
     let metadata = tx
         .query_row(
-            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user, \
-                    EXISTS (SELECT 1 FROM sessions s \
+            "SELECT from_session_id IS NOT NULL AND manual = 0, cwd, created_at, owner_user, \
+                    manual = 0 AND EXISTS (SELECT 1 FROM sessions s \
                             WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
                               AND EXISTS (SELECT 1 FROM observations o \
                                           WHERE o.session_id = s.id AND o.created_at > ?4)) \
@@ -5658,6 +5806,14 @@ pub(crate) fn accept_handoff_in_transaction(
     };
     // Only a real state transition ('open' -> 'accepted') is audited.
     if changed > 0 {
+        // The receiver took a baton, so the generation the sweep closed is
+        // over and its new work must be reviewable when it ends, including
+        // through the idle-end, which never reaches `end_session_row`. This
+        // waits for the transition because a refused accept also commits: a
+        // session that lost the race resumed nothing and stays parked.
+        if let Some(accepting_session) = accepting_session {
+            clear_abandoned_sweep_claim(tx, accepting_session)?;
+        }
         audit(
             tx,
             "accept_handoff",
@@ -5744,7 +5900,7 @@ fn expire_superseded_auto_handoffs(
     let mut stmt = tx.prepare(
         "SELECT id, cwd, created_at FROM handoffs \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND owner_user IS ?3 \
            AND NOT EXISTS (SELECT 1 FROM sessions s \
                            WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
@@ -6451,6 +6607,18 @@ pub fn reorg_sessions(
             ],
         )?;
         sessions_moved += rows;
+        // A claim is keyed to the session's project: left behind, it would
+        // cascade away with that project once it is empty, and a session the
+        // abandoned-session sweep parked would become reviewable again.
+        tx.execute(
+            "UPDATE auto_improve_scheduler_claims SET project_id = ?1 \
+             WHERE session_id = ?2 AND workspace_id = ?3",
+            params![
+                new_project_id.as_bytes(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes()
+            ],
+        )?;
         // Update observations whose session_id matches, keeping project_id
         // in sync with the session row we just moved.
         let obs_rows = tx.execute(
@@ -11696,6 +11864,251 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(summary, "/turn/2 baton");
+    }
+
+    fn session_baton(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        from: Option<SessionId>,
+        cwd: &str,
+        summary: &str,
+    ) -> NewHandoff {
+        NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: from,
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: Some(cwd.into()),
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: Some("user:alice".into()),
+        }
+    }
+
+    fn handoff_state(conn: &Connection, id: &HandoffId) -> String {
+        conn.query_row(
+            "SELECT state FROM handoffs WHERE id = ?1",
+            params![id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn open_handoff_summaries(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT summary FROM handoffs WHERE state = 'open' ORDER BY summary")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    // #2012: a session that wrapped up with `memory_handoff_begin` ends
+    // without a template baton beside it, and its turn checkpoints write none
+    // while that explicit handoff is open. A session with no explicit handoff
+    // still gets its baton, and once the explicit one is claimed the session's
+    // later checkpoints publish again.
+    #[test]
+    fn an_open_explicit_handoff_replaces_the_sessions_template_baton() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let owner = OwnerFilter::User("user:alice".into());
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admitted_session(
+                admit_hook_session_event(
+                    conn,
+                    session,
+                    &hook_observation(session),
+                    &owner,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let wrapped = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let wrapped_guard = admit(&mut conn, &wrapped);
+        let plain = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let plain_guard = admit(&mut conn, &plain);
+
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(wrapped.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "checkpoint"),
+            )
+            .unwrap(),
+            None,
+            "a turn checkpoint keeps the open explicit handoff instead",
+        );
+        assert_eq!(
+            end_admitted_session_with_handoff(
+                &mut conn,
+                &wrapped_guard,
+                None,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "template"),
+                None,
+            )
+            .unwrap(),
+            None,
+            "the session ends without a template baton",
+        );
+        let ended: bool = conn
+            .query_row(
+                "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+                params![wrapped.id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended, "the end itself still lands");
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let plain_baton = end_admitted_session_with_handoff(
+            &mut conn,
+            &plain_guard,
+            None,
+            &session_baton(ws, proj, Some(plain.id), "/other", "plain template"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            plain_baton.is_some(),
+            "another session's explicit handoff does not suppress this one's baton",
+        );
+        assert_eq!(
+            open_handoff_summaries(&conn),
+            vec!["explicit".to_owned(), "plain template".to_owned()],
+        );
+
+        let live = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &live).unwrap();
+        let live_explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(live.id), "/live", "live explicit"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE handoffs SET state = 'accepted' WHERE id = ?1",
+            params![live_explicit.as_bytes()],
+        )
+        .unwrap();
+        assert!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(live.id), "/live", "later turn"),
+            )
+            .unwrap()
+            .is_some(),
+            "work after a claimed explicit handoff gets a baton again",
+        );
+    }
+
+    // #2012: writing an explicit handoff retires its own session's open
+    // automatic batons, and nothing else: another open session's baton, the
+    // session's baton in another project and a claimed one all stay as they were.
+    #[test]
+    fn an_explicit_handoff_retires_only_its_own_sessions_automatic_batons() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let sibling = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &sibling).unwrap();
+
+        let own = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "own checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let siblings = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(sibling.id), "/repo", "sibling checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let elsewhere = insert_handoff(
+            &mut conn,
+            &session_baton(ws, other_proj, Some(session.id), "/repo", "elsewhere"),
+        )
+        .unwrap();
+
+        insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "explicit"),
+        )
+        .unwrap();
+
+        assert_eq!(handoff_state(&conn, &own), "expired");
+        assert_eq!(handoff_state(&conn, &siblings), "open");
+        assert_eq!(handoff_state(&conn, &elsewhere), "open");
+
+        // Without a source session an explicit handoff retires nothing.
+        insert_manual_handoff(&mut conn, &session_baton(ws, proj, None, "/repo", "bare")).unwrap();
+        assert_eq!(handoff_state(&conn, &siblings), "open");
+    }
+
+    // #2014: an explicit handoff that records its session stays manual. A
+    // later automatic baton from the same cwd and the sweep after claiming one
+    // both leave it open, which they would do to an automatic baton.
+    #[test]
+    fn an_explicit_handoff_with_a_session_is_never_swept_as_automatic() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let source = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &source).unwrap();
+        end_session(&mut conn, &source.id, None).unwrap();
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        let control = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "automatic"),
+        )
+        .unwrap();
+
+        let later = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &later).unwrap();
+        end_session(&mut conn, &later.id, None).unwrap();
+        let newest = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(later.id), "/repo", "newest"),
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_state(&conn, &control),
+            "expired",
+            "control: the same-cwd sweep retires an automatic baton",
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let receiver = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &receiver).unwrap();
+        assert!(
+            accept_handoff(
+                &mut conn,
+                &HandoffAcceptance {
+                    handoff_id: newest,
+                    workspace_id: ws,
+                    project_id: proj,
+                    accepting_agent: AgentKind::Codex,
+                    accepting_session: Some(receiver.id),
+                    accepting_user: Some("user:alice".into()),
+                    owner_filter: OwnerFilter::User("user:alice".into()),
+                    receiving_cwd: Some("/repo".into()),
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
     }
 
     fn embed_failure_rows(conn: &Connection) -> i64 {
@@ -19780,7 +20193,9 @@ pub(crate) mod tests {
                 None,
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
 
         let observations: u64 = conn
@@ -19999,7 +20414,9 @@ pub(crate) mod tests {
         let end = session_end_observation(&drifted);
         assert!(matches!(
             admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::OpenCode
+            })
         ));
     }
 
@@ -20088,7 +20505,9 @@ pub(crate) mod tests {
                 Some("agent-key"),
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
         let counts: (u64, u64) = conn
             .query_row(
@@ -20546,7 +20965,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let cutoff_us = now - one_day_us;
-        let closed = close_abandoned_sessions(&conn, cutoff_us).unwrap();
+        let closed = close_abandoned_sessions(&mut conn, cutoff_us).unwrap();
         assert_eq!(closed, 1, "only the stale open session must close");
 
         let (ended_at, summary_page_id): (Option<i64>, Option<Vec<u8>>) = conn
@@ -20584,6 +21003,583 @@ pub(crate) mod tests {
         assert_eq!(
             already_ended_at_after, already_ended_at_before,
             "an already-ended session's ended_at must be left exactly as it was"
+        );
+    }
+
+    /// Whether the sweep parked the session's claim (the sweep's marker
+    /// error, not a review failure).
+    fn sweep_parked(conn: &Connection, session: &NewSession) -> bool {
+        conn.query_row(
+            "SELECT EXISTS( \
+                     SELECT 1 FROM auto_improve_scheduler_claims \
+                     WHERE session_id = ?1 AND last_error = ?2 \
+                 )",
+            params![
+                session.id.as_bytes(),
+                crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    /// Another receiver can take the baton after startup selected it. The
+    /// late accept returns `false` and its transaction still commits, so the
+    /// marker has to survive: nothing was delivered, and removing it would
+    /// let a later idle-end queue the swept generation for review.
+    #[test]
+    fn refused_handoff_accept_keeps_the_sweep_marker() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "already taken".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        assert!(accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap());
+
+        let mut late = handoff_acceptance(id, ws, proj);
+        late.accepting_agent = AgentKind::Grok;
+        late.accepting_session = Some(session.id);
+        assert!(!accept_handoff(&mut conn, &late).unwrap());
+
+        assert!(
+            sweep_parked(&conn, &session),
+            "a refused accept must keep the sweep's marker"
+        );
+    }
+
+    /// A claim row the way an operator or the scheduler would read it: the
+    /// project it is keyed to, what it last failed with, and how many times
+    /// it was tried.
+    fn claim_row(conn: &Connection, session: SessionId) -> (ProjectId, String, u32) {
+        let (bytes, last_error, attempts): (Vec<u8>, Option<String>, u32) = conn
+            .query_row(
+                "SELECT project_id, last_error, attempts FROM auto_improve_scheduler_claims \
+                 WHERE session_id = ?1",
+                params![session.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the claim row must exist");
+        (
+            ProjectId::from_slice(&bytes).expect("the claim's project id must be a valid id"),
+            last_error.expect("the claim carries its last error"),
+            attempts,
+        )
+    }
+
+    /// A claim is keyed to the session's project. If reorg moved the session
+    /// but left the claim behind, a later hollow-project sweep would delete
+    /// the now-empty source project and the claim would cascade away with it
+    /// — a session the abandoned-session sweep parked would become
+    /// reviewable again. The sweep's parked claim and a genuine failure's
+    /// claim must both move with the session, keeping `attempts` and
+    /// `last_error` intact. A plan that names another workspace must move
+    /// nothing, claim included.
+    #[test]
+    fn reorg_moves_a_parked_claim_with_its_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let dest = get_or_create_project(&mut conn, &ws, "reorg-dest", None).unwrap();
+
+        // One session the abandoned-session sweep just parked.
+        let swept = SessionId::new();
+        let mut swept_session = hook_session(swept, ws, proj, None);
+        swept_session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &swept_session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        let (swept_project, swept_error, swept_attempts) = claim_row(&conn, swept);
+        assert_eq!(
+            swept_project, proj,
+            "the claim starts on the session's project"
+        );
+        assert_eq!(
+            swept_error,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        );
+        assert_eq!(
+            swept_attempts,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS
+        );
+
+        // One session whose claim carries a genuine review failure — the
+        // sweep's un-park must never touch it, so reorg has to keep it.
+        let failed = SessionId::new();
+        begin_session(&mut conn, &hook_session(failed, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                failed.as_bytes(),
+                now,
+                2u32,
+                "auto-improve failed: class=provider status=500"
+            ],
+        )
+        .unwrap();
+
+        // The control session: a plan that names another workspace must not
+        // move it, nor the claim keyed to it.
+        let foreign = SessionId::new();
+        begin_session(&mut conn, &hook_session(foreign, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                foreign.as_bytes(),
+                now,
+                1u32,
+                "auto-improve failed: class=provider status=429"
+            ],
+        )
+        .unwrap();
+
+        let summary = reorg_sessions(&mut conn, &ws, &[(swept, dest), (failed, dest)]).unwrap();
+        assert_eq!(summary.sessions_moved, 2);
+
+        let (project, error, attempts) = claim_row(&conn, swept);
+        assert_eq!(project, dest, "the parked claim must follow the session");
+        assert_eq!(
+            error, swept_error,
+            "the sweep's marker must survive the move"
+        );
+        assert_eq!(
+            attempts, swept_attempts,
+            "the parked attempts must survive the move"
+        );
+
+        let (project, error, attempts) = claim_row(&conn, failed);
+        assert_eq!(
+            project, dest,
+            "a genuine failure's claim must follow the session"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=500");
+        assert_eq!(attempts, 2, "the failure's attempts must survive the move");
+
+        // Adversarial control: a plan naming another workspace must leave
+        // the foreign session and its claim where they were.
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_dest = get_or_create_project(&mut conn, &other_ws, "reorg-dest", None).unwrap();
+        let summary = reorg_sessions(&mut conn, &other_ws, &[(foreign, other_dest)]).unwrap();
+        assert_eq!(
+            summary.sessions_moved, 0,
+            "a plan naming another workspace must not move the session"
+        );
+        let (project, error, attempts) = claim_row(&conn, foreign);
+        assert_eq!(
+            project, proj,
+            "the claim must stay with the session's real project"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=429");
+        assert_eq!(attempts, 1);
+    }
+
+    /// A Grok session the sweep closed is reopened by a handoff accept, gains
+    /// new work, and is then ended by a substantive idle-end — a path that
+    /// never goes through `end_session_row`, so only the reopen's delete of
+    /// the sweep's marker keeps the new generation claimable for scheduled
+    /// review. The claim must be accepted and the marker must be gone.
+    #[test]
+    fn grok_reopened_by_handoff_after_sweep_is_claimable_after_idle_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        // The watermark sits behind the new end, so the claim is past it.
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        let mut obs = hook_observation(&session);
+        obs.occurred_at = session.occurred_at;
+        insert_observation(&mut conn, &obs).unwrap();
+
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(
+            sweep_parked(&conn, &session),
+            "the sweep must park the claim"
+        );
+
+        // The real reopen path: accept a handoff into the ended Grok session.
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(
+            accept_handoff(&mut conn, &acceptance).unwrap(),
+            "a Grok restart must accept the handoff into the ended session"
+        );
+        assert!(
+            !sweep_parked(&conn, &session),
+            "the reopen must clear the sweep's marker"
+        );
+
+        // New work, then a substantive idle-end (the path that never goes
+        // through `end_session_row`).
+        for i in 0..3 {
+            let mut o = hook_observation(&session);
+            o.occurred_at = Some(now - 3_600_000 + i * 60_000);
+            insert_observation(&mut conn, &o).unwrap();
+        }
+        let page_id = upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                &format!("sessions/{}.md", session.id),
+                "new resumed work",
+            ),
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let results = idle_end_sessions(
+            &mut conn,
+            &[IdleEndCandidate {
+                session_id: session.id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Grok,
+                action: IdleEndAction::Substantive {
+                    expected_page_id: page_id,
+                    observation_count: count,
+                    now_us: now,
+                    last_activity_us: now - hour,
+                },
+            }],
+            true,
+        )
+        .unwrap();
+        assert_eq!(results, vec![IdleEndResult::EndedSubstantive]);
+
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the resumed generation must be claimable for scheduled review"
+        );
+        assert!(!sweep_parked(&conn, &session));
+    }
+
+    /// Control for the reopen un-park: the same sequence with no sweep at all
+    /// also accepts the scheduler claim.
+    #[test]
+    fn grok_reopened_by_handoff_without_sweep_is_claimable_after_idle_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        begin_session(&mut conn, &session).unwrap();
+        insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+        end_session(&mut conn, &session.id, None).unwrap();
+        assert!(
+            !sweep_parked(&conn, &session),
+            "no sweep ran; no marker may exist"
+        );
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+
+        for i in 0..3 {
+            let mut o = hook_observation(&session);
+            o.occurred_at = Some(now - 3_600_000 + i * 60_000);
+            insert_observation(&mut conn, &o).unwrap();
+        }
+        let page_id = upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                &format!("sessions/{}.md", session.id),
+                "new resumed work",
+            ),
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let results = idle_end_sessions(
+            &mut conn,
+            &[IdleEndCandidate {
+                session_id: session.id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Grok,
+                action: IdleEndAction::Substantive {
+                    expected_page_id: page_id,
+                    observation_count: count,
+                    now_us: now,
+                    last_activity_us: now - hour,
+                },
+            }],
+            true,
+        )
+        .unwrap();
+        assert_eq!(results, vec![IdleEndResult::EndedSubstantive]);
+
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the control generation must be claimable too"
+        );
+    }
+
+    /// The reopen must not over-delete: a claim parked by a genuine review
+    /// failure survives the handoff reopen with its `last_error` and its
+    /// attempt count intact.
+    #[test]
+    fn grok_reopened_by_handoff_keeps_a_real_failure_claim() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        begin_session(&mut conn, &session).unwrap();
+        insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+        end_session(&mut conn, &session.id, None).unwrap();
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap()
+        );
+        let error = "auto-improve failed: class=provider status=500";
+        let attempts =
+            crate::auto_improve::record_claim_failure(&conn, ws, proj, session.id, error).unwrap();
+        assert_eq!(attempts, 1);
+        let before: (String, i64) = conn
+            .query_row(
+                "SELECT last_error, attempts FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+
+        let after: (String, i64) = conn
+            .query_row(
+                "SELECT last_error, attempts FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "a real-failure claim must survive the reopen"
+        );
+    }
+
+    /// A second sweep over a reopened session parks it again: the claim was
+    /// deleted by the reopen, so the sweep's `ON CONFLICT … DO NOTHING` has
+    /// nothing to preserve and the marker comes back — with the session out
+    /// of the scheduler's reach again.
+    #[test]
+    fn grok_reopened_by_handoff_is_reparked_by_a_second_sweep() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        let mut obs = hook_observation(&session);
+        obs.occurred_at = session.occurred_at;
+        insert_observation(&mut conn, &obs).unwrap();
+
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(sweep_parked(&conn, &session));
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+        assert!(
+            !sweep_parked(&conn, &session),
+            "the reopen must clear the marker"
+        );
+
+        // No new work: the session is stale again and the second sweep closes
+        // and re-parks it.
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(
+            sweep_parked(&conn, &session),
+            "the second sweep must park the reopened session again"
+        );
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the re-parked session must stay out of the scheduler queue"
         );
     }
 }
