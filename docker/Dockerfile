@@ -18,6 +18,12 @@ ARG AI_MEMORY_FEATURES=""
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# Install the pinned toolchain (and its rustfmt/clippy components, which the
+# slim base image lacks) in its own layer, keyed only on rust-toolchain.toml.
+# Left to the cargo build step below, rustup re-downloads the whole toolchain
+# on every source change, and a slow or flaky link times that download out.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustup show active-toolchain
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE ./
 COPY crates ./crates
 # `evals/` is a workspace member (off-tree A/B harness, not shipped
