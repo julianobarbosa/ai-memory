@@ -50,6 +50,8 @@ Split by durability:
 | `logs/` | No. | Tracing output; nothing durable. |
 | `models/` | No. | Local embedder weights, sha256-pinned, redownloaded on first boot per [`local-embeddings.md`](local-embeddings.md). |
 | `.serve.lock` | No. | Server pidfile. |
+| `auth-tokens/`, `auth-token`, `auth-header` | **No — never.** | Plaintext bearer tokens and the hook `Authorization` header (mode `0600`). They grant full access to the server; a mirror push would leak them. The shipped `.gitignore` and `ai-memory-snapshot.sh` exclude them. |
+| `hook-spool/` | No. | Pre-delivery hook spool: transient, drained after delivery, and may hold un-sanitized payload text. Durable memory lives in `wiki/` and `raw/`. |
 | `config.toml` and env files under `~/.config/ai-memory/` | Yes, minus secrets. | Provider config is useful for reproducing an install; API-key env files (`*.env`), OAuth tokens (`auth.json`), and private CA bundles must never land in a mirror. |
 
 If you also need the SQLite index for near-instant recovery (rather than
@@ -181,14 +183,17 @@ cadence):
    bundles are not.
 3. `git add -A && git commit -m "auto: snapshot $(date +%F)"` if anything
    changed; skip if there is no delta.
-4. `git push origin main` with a timeout so a hung network does not block the
-   next run.
+4. `git push origin main` with a timeout. Each run attempts the push so a
+   previously unpushed commit can reach the mirror even if nothing changed.
 5. Run `ai-memory backup --to
    $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` so SQLite is copied through its
    online backup API rather than racing the live WAL. Models are not included;
    redownload them after recovery.
 6. Rotate old tarballs and old script logs on a retention window (30 days by
    default).
+
+A failed mirror push still allows the online backup and rotation to run.
+The script returns a nonzero status so the scheduler can report the failure.
 
 See the example directory's [README](examples/backup/README.md) for the
 install-and-enable steps and non-systemd equivalents (macOS launchd, Windows

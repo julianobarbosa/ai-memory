@@ -4345,7 +4345,7 @@ impl AiMemoryServer {
             ai_memory_consolidate::LintOptions {
                 dry_run: args.dry_run.unwrap_or(false),
                 use_llm: !args.no_llm.unwrap_or(false),
-                decay_lambda: self.decay_params.lambda,
+                decay: self.decay_params,
                 // Drive the zero-LLM contradiction detector (A5) off the
                 // configured embedder's triple; `None` when no embedder is
                 // configured makes that pass a clean no-op.
@@ -6746,10 +6746,11 @@ impl AiMemoryServer {
 
         let author_id = crate::actor::author_id_from_parts(&parts);
         match expected {
-            None => wiki
-                .delete_page(ws, proj, &path, admission_ctx, author_id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => {
+                wiki.delete_page(ws, proj, &path, admission_ctx, author_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            }
             Some(expected) => {
                 // The authority: re-checked under the exclusive mutation lock
                 // and in the delete transaction.
@@ -6771,6 +6772,7 @@ impl AiMemoryServer {
 
         ok_json(&serde_json::json!({
             "path": path.to_string(),
+            // The MCP acknowledgement includes paths that were already absent.
             "deleted": true,
             "pre_checkpoint": pre_checkpoint,
             "checkpoint": checkpoint,
@@ -7106,7 +7108,9 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
-        let receiving_cwd = args.cwd;
+        // Blank means omitted, as for `handoff_id`: an empty path has no
+        // directory inside it, so it would hide every automatic handoff.
+        let receiving_cwd = args.cwd.filter(|cwd| !cwd.trim().is_empty());
         let requested_id = args
             .handoff_id
             .as_deref()
@@ -7407,6 +7411,14 @@ impl AiMemoryServer {
             "Pass from_workspace and from_project to name the sending project.",
         )
         .await?;
+        // Both recipient fields are required: a blank one would fall through
+        // to the caller's current project and deliver to the sender's inbox.
+        if args.to_workspace.trim().is_empty() || args.to_project.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "to_workspace and to_project are required: name the recipient project",
+                None,
+            ));
+        }
         // Recipient MUST already exist: resolved without creating it, so a typo
         // fails closed with a scope error naming the target instead of dropping
         // a message into a phantom inbox nobody reads. And it needs `write`:
@@ -12472,6 +12484,39 @@ mod tests {
             result.is_err(),
             "sending to a non-existent recipient project must fail closed, not create it"
         );
+    }
+
+    /// Both recipient fields are required. A blank one used to fall through
+    /// to the caller's current project, so the message landed in the
+    /// sender's own inbox instead of being refused.
+    #[tokio::test]
+    async fn message_send_with_a_blank_recipient_is_invalid_params() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        for (to_workspace, to_project) in [("", "  "), ("", "scratch"), ("default", "")] {
+            let err = server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: to_workspace.into(),
+                        to_project: to_project.into(),
+                        to_agent: None,
+                        body: "hello?".into(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: None,
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{to_workspace:?}/{to_project:?}: {err:?}"
+            );
+        }
     }
 
     /// The design's open question 3 (#708): delivering into a restricted
@@ -25487,6 +25532,67 @@ mod tests {
         assert!(again_text.contains("\"handoff\": null"));
         // Taken by this server's own MCP call, not by a SessionStart hook.
         assert!(again_text.contains("\"status\": \"none_pending\""));
+    }
+
+    /// A blank `cwd` is an omitted one, as for `handoff_id`: clients that
+    /// fill every optional field send `""`, and no stored directory lies
+    /// within an empty path, so it used to hide every automatic handoff.
+    #[tokio::test]
+    async fn memory_handoff_accept_reads_a_blank_cwd_as_omitted() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/tmp/aim".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(session_id),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: Some("/tmp/aim".into()),
+                summary: "automatic baton".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let accept = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("  ".into()),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                    handoff_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = accept
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(text.contains("automatic baton"), "{text}");
+        assert!(text.contains("\"status\": \"claimed\""), "{text}");
     }
 
     /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/

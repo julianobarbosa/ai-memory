@@ -4,8 +4,8 @@
 # Daily snapshot of an ai-memory single-user install:
 #   1. rsync the mutable data dir into a git-tracked mirror checkout,
 #      excluding derived state and secrets (see .gitignore in this dir).
-#   2. commit + push the mirror to a remote git repository when anything
-#      changed.
+#   2. commit changes and push the mirror, including any earlier commits
+#      whose push failed.
 #   3. ask the running server for a consistent online backup (wiki + SQLite +
 #      data-dir config.toml) and write it to a second location.
 #
@@ -59,6 +59,10 @@ rsync_excludes=(
     --exclude=db/             # SQLite index, derived from wiki via `ai-memory reindex`
     --exclude=logs/           # rotated tracing output
     --exclude=.serve.lock     # server pidfile
+    --exclude=auth-tokens/    # per-profile bearer tokens, incl. the root token (plaintext, 0600) — NEVER mirror
+    --exclude=auth-token      # hook bearer token (plaintext, 0600)
+    --exclude=auth-header     # hook Authorization header value (plaintext, 0600)
+    --exclude=hook-spool/     # pre-delivery hook spool (transient; may hold un-sanitized payloads)
 )
 for glob in $SECRET_EXCLUDES; do
     rsync_excludes+=(--exclude="$glob")
@@ -78,11 +82,15 @@ cd "$REPO_DIR"
 git add -A
 
 if git diff --cached --quiet; then
-    echo "no changes since last snapshot; skipping commit + push"
+    echo "no changes since last snapshot; skipping commit"
 else
     git commit -m "auto: snapshot $stamp" | tail -3
-    echo "--- push ---"
-    timeout 180 git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 | tail -10
+fi
+echo "--- push ---"
+push_status=0
+timeout 180 git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 | tail -10 || push_status=$?
+if (( push_status != 0 )); then
+    echo "mirror push failed (status $push_status); continuing with the online snapshot" >&2
 fi
 
 echo "--- online data snapshot to second location ---"
@@ -98,4 +106,8 @@ echo "--- rotate logs (retention: ${LOG_RETENTION_DAYS}d) ---"
 find "$LOG_DIR" -maxdepth 1 -name 'ai-memory-snapshot_*.log' -type f \
     -mtime "+${LOG_RETENTION_DAYS}" -delete -print
 
+if (( push_status != 0 )); then
+    echo "=== $(date -Iseconds) online snapshot done; mirror push failed ===" >&2
+    exit "$push_status"
+fi
 echo "=== $(date -Iseconds) ai-memory snapshot done ==="
