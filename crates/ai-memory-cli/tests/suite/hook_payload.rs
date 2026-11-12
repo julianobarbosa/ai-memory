@@ -175,6 +175,63 @@ fn native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure
 }
 
 #[test]
+fn oversized_native_tool_result_keeps_usage_for_the_next_event() {
+    for agent in ["claude-code", "codex"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        let row = if agent == "claude-code" {
+            serde_json::json!({"type":"assistant","message":{
+                "id":"response-1","usage":{"input_tokens":100,"output_tokens":20}
+            }})
+        } else {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":20}
+            }}})
+        };
+        std::fs::write(&transcript, format!("{row}\n")).unwrap();
+        let payload = serde_json::json!({
+            "session_id": "oversized-tool-result", "cwd": tmp.path(),
+            "transcript_path": transcript, "tool_name": "Bash",
+            "tool_input": {"command": "echo test"}, "tool_response": "test",
+        });
+        let mut large = payload.clone();
+        // JSON string escaping makes the spool envelope exceed its cap even
+        // though the hook's stdin is well under the 10 MiB limit.
+        large["tool_response"] = "\"".repeat(3 * 1024 * 1024).into();
+        let large = serde_json::to_vec(&large).unwrap();
+        assert!(large.len() < 10 * 1024 * 1024);
+        let endpoint = ai_memory_test_support::dead_http_endpoint();
+        let dropped = run_hook_at(tmp.path(), agent, "post-tool-use", &large, false, &endpoint);
+        assert!(dropped.status.success());
+        assert!(
+            String::from_utf8_lossy(&dropped.stderr).contains("dropping one UNDELIVERED event")
+        );
+        let spool = tmp.path().join("hook-spool");
+        assert!(!spool.exists() || spool_entries(tmp.path()).is_empty());
+
+        let next = run_hook_at(
+            tmp.path(),
+            agent,
+            "post-tool-use",
+            &serde_json::to_vec(&payload).unwrap(),
+            false,
+            &endpoint,
+        );
+        assert!(
+            next.status.success(),
+            "{}",
+            String::from_utf8_lossy(&next.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_str(&spooled_body(tmp.path())).unwrap();
+        assert_eq!(
+            body["_ai_memory_usage_calls"].as_array().map(Vec::len),
+            Some(1),
+            "{agent} must still deliver the unspooled response usage"
+        );
+    }
+}
+
+#[test]
 fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
     for agent in ["claude-code", "codex"] {
         for event in [
@@ -350,6 +407,68 @@ fn stop_hook_strips_last_assistant_message_from_spool_and_stderr() {
     // Unrelated fields survive so the Stop event is still ingested.
     assert!(
         body.contains("stop-strip"),
+        "session_id was dropped: {body}"
+    );
+}
+
+#[test]
+fn gemini_prompt_is_spooled_without_referenced_file_contents() {
+    // Gemini CLI's BeforeAgent `prompt` carries the contents of every
+    // `@`-referenced file after the user's words. The native hook cuts them
+    // before it spools, so they reach neither the disk nor the wire.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-at","cwd":"/tmp/project","hook_event_name":"BeforeAgent","prompt":"explain @.env\n--- Content from referenced files ---\nContent from @.env:\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---"}"#;
+
+    let output = run_hook_full_agent(
+        tmp.path(),
+        "gemini-cli",
+        "user-prompt-submit",
+        payload,
+        false,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("SENTINEL_FILE_CONTENT"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = spooled_body(tmp.path());
+    assert!(
+        !body.contains("SENTINEL_FILE_CONTENT"),
+        "spooled body still carries the referenced file: {body}"
+    );
+    let spooled: serde_json::Value = serde_json::from_str(&body).expect("spooled body is JSON");
+    assert_eq!(spooled["prompt"], "explain @.env");
+    assert_eq!(spooled["session_id"], "gemini-at");
+}
+
+#[test]
+fn gemini_after_agent_is_spooled_without_the_reply_or_its_at_files() {
+    // AfterAgent repeats the expanded prompt and adds the model's reply as
+    // `prompt_response`. Neither the reply nor the referenced file reaches
+    // the spool while assistant capture is off.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-stop","cwd":"/tmp/project","hook_event_name":"AfterAgent","prompt":"explain @.env\n--- Content from referenced files ---\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---","prompt_response":"SENTINEL_ASSISTANT_MESSAGE","stop_hook_active":false}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "gemini-cli", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+
+    let body = spooled_body(tmp.path());
+    for leaked in [
+        "SENTINEL_ASSISTANT_MESSAGE",
+        "prompt_response",
+        "SENTINEL_FILE_CONTENT",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "spooled body still carries {leaked}: {body}"
+        );
+    }
+    assert!(
+        body.contains("gemini-stop"),
         "session_id was dropped: {body}"
     );
 }

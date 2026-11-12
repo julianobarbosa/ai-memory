@@ -13,6 +13,51 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run claude --resume <name>` now links the session Claude resumed
+  and imports its transcript. The session name was recorded as the native
+  session id, so the transcript was never found: the run exited 0 with the
+  conversation missing from the workstream ledger, the server refused that
+  session's hook events, and the next run in the workstream started a fresh
+  session. A transcript path passed to `--resume` was recorded the same way;
+  its session id is now linked correctly, though a transcript outside
+  `~/.claude/projects` is still not imported. A `--resume <uuid>` is
+  unchanged. (#2200)
+- Fixed `drop_subagent_captures` dropping the rest of a Codex, Qwen Code, Kimi
+  Code or CodeBuddy main session after its first subagent event. These
+  harnesses report a subagent under the parent's `session_id`, so, as for
+  Claude Code, only the subagent's own events are dropped now, and the main
+  session keeps its prompts, tool calls, Stop, SessionEnd, summary and
+  handoff. A Cline event counts as a subagent's only when it carries a
+  `parent_agent_id`, so an opted-in Cline project no longer stores nothing.
+  (#2195)
+- Fixed Gemini CLI sessions never storing a user prompt or a turn end.
+  `install-hooks --agent gemini-cli` now wires Gemini's `BeforeAgent` to the
+  prompt hook and `AfterAgent` to the stop hook. Gemini appends the contents
+  of every `@`-referenced file to the prompt it hands both hooks; they are cut
+  in the native hook before it spools and on the server, and the model's
+  reply (`prompt_response`) is stripped like other assistant messages. The
+  shell and PowerShell script hooks, which cannot cut them, drop a prompt
+  carrying file contents and a turn end carrying the reply. Re-run
+  `ai-memory install-hooks --agent gemini-cli --apply` on an existing
+  install. (#2196)
+- The profile pass no longer drops a whole classification batch to the
+  zero-LLM detector when the model's answer is cut at the output budget. A
+  truncated batch is now halved and the halves classified again, within the
+  pass's cap on classification calls, so verbose models and long sentences
+  still get LLM verdicts. A single sentence that still truncates falls back as
+  before. (#2199)
+- The OpenAI-compatible providers now treat `finish_reason = "max_tokens"` as
+  truncation, the Anthropic stop reason that some gateways in front of Claude
+  pass through unchanged. A structured answer cut there now reports a
+  truncated response instead of a misleading parse or schema error. (#2199)
+- A managed session start that cannot be bound to a single eligible run — two
+  live managed runs in the same checkout with a stale shared-daemon run id
+  matching neither — no longer falls through to the legacy project-wide handoff
+  path and accepts an unrelated task's handoff. Such a start is now refused with
+  a `403` the native hook reports on stderr, leaving every handoff open for an
+  explicit `memory_handoff_accept`; a plain session start, a stale id that
+  matches no run, and a safely bound managed start are all unaffected. Follow-up
+  to #987. (#2194)
 - `ai-memory checkpoints` and `ai-memory commit` now use the wiki of the server
   the checkout routes to, matching their paired command `restore-page`. From a
   checkout whose `.ai-memory.toml` selects a server profile, `checkpoints`
@@ -21,6 +66,16 @@ version in [`docs/changelog/`](docs/changelog/):
   `restore-page` targets. An explicit `AI_MEMORY_SERVER_URL` still uses the
   install-default wiki, and a marker that selects an unresolvable profile now
   fails closed rather than acting on another server's wiki. (#2186)
+- Fixed a profile-routed checkout failing closed on Windows when its server
+  profile's root was registered as a verbatim path (`\\?\C:\...`, the spelling
+  `fs::canonicalize` and some harnesses produce). The root was read as a UNC
+  path and matched no checkout, so `checkpoints` and `commit` refused rather
+  than reaching the profile server. Verbatim and plain spellings of a path now
+  compare equal. (#2186)
+- Fixed page deletion moving a directory out of the wiki. Child pages stay
+  accessible even when the directory replaced an indexed page. (#2190)
+- Kept usage calls from an oversized native tool result available for the next
+  hook by preserving the transcript cursor on a spool size refusal. (#2179)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying
@@ -65,6 +120,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the container wrapper reporting success after a native host-client
   extraction or install failure. The wrapper keeps the previous cached
   archive and retries on the next host command that checks for updates. (#2174)
+- Fixed Windows hook workers inheriting the hook executor's output pipes.
+  Background uploads and startup backfills now inherit only their own standard
+  streams, so waiting for hook output no longer waits for a worker's HTTP
+  request. (#2193)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends

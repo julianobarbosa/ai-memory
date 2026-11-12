@@ -1706,17 +1706,6 @@ fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
     env.agent == AgentKind::Cursor && env.session_id.as_deref() == Some(CURSOR_DRAFT_SESSION_ID)
 }
 
-/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
-/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
-/// session on `SubagentStart` and on any marker-bearing event; keeps it through
-/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
-/// `stop` / `session_end`) of a session already known to be a subagent. No-op
-/// (returns `false`) unless this event's project opted in via the per-event
-/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-///
-/// Claude Code is the exception to seeding: its subagent events carry the
-/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
-/// the main session's own tail. Its marked events still drop one by one.
 /// Whether the event belongs to a harness's own background work rather than
 /// the person: today, Codex's memory-writing agent (#1674).
 ///
@@ -1740,6 +1729,17 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
         .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
 }
 
+/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
+/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
+/// session on `SubagentStart` and on any marker-bearing event; keeps it through
+/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
+/// `stop` / `session_end`) of a session already known to be a subagent. No-op
+/// (returns `false`) unless this event's project opted in via the per-event
+/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+///
+/// A harness that reports a subagent under its parent's `session_id` is the
+/// exception to seeding ([`subagent_event_seeds_session`]): seeding would drop
+/// the main session's own tail, so its marked events drop one by one.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -1776,10 +1776,10 @@ async fn should_drop_subagent(
     let marked = matches!(
         env.event,
         HookEvent::SubagentStart | HookEvent::SubagentStop
-    ) || body_is_subagent(&env.raw);
+    ) || body_is_subagent(env.agent, &env.raw);
 
     if marked {
-        if env.agent != AgentKind::ClaudeCode {
+        if subagent_event_seeds_session(env.agent) {
             state.subagent_sessions.lock().await.insert(key);
         }
         return true;
@@ -1790,6 +1790,47 @@ async fn should_drop_subagent(
         state.subagent_sessions.lock().await.remove(&key);
     }
     tracked
+}
+
+/// Whether a marked event from `agent` seeds the subagent-session set, so the
+/// rest of its session drops with it ([`should_drop_subagent`]). That is right
+/// for a harness that runs a subagent in a session of its own (Grok, DSH, the
+/// OMP extension, OpenCode) and wrong for the harnesses below. Their marked
+/// events still drop one by one, and the session they share keeps the rest:
+///
+/// - Claude Code reports a Task subagent under the parent's `session_id` and
+///   tells it apart only by `agent_id`.
+/// - Codex sends a spawned agent's hooks with the root thread's `session_id`,
+///   "the identity shared by the root thread and all descendant threads"
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/session/session.rs#L701-L704>),
+///   and adds the child thread's `agent_id`
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/hook_runtime.rs#L1083-L1102>).
+/// - Qwen Code stamps a subagent's hooks with the invoking session's
+///   `session_id` and adds the subagent's `agent_id`
+///   (<https://github.com/QwenLM/qwen-code/blob/f42fe0f3251172c1174d00382ece522eafb3c6c2/packages/core/src/hooks/hookEventHandler.ts#L1232-L1252>).
+/// - Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+///   session's `sessionId`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/5af9942e9fb789b6a1530830575b3768499932e9/packages/agent-core-v2/src/features/externalHooks/session/sessionExternalHooksService.ts#L156-L183>).
+/// - CodeBuddy Code reports a subagent session's hooks under its parent's id
+///   and adds the subagent's `agent_id` (`resolveHookSessionId` returns
+///   `meta.parentSessionId`, `buildAgentTrigger` sets `agent_id`;
+///   `@tencent-ai/codebuddy-code` 2.183.0, `dist/codebuddy.js`).
+/// - Cline marks every event of a subagent with its `parent_agent_id`
+///   ([`body_is_subagent`]), so there is no unmarked tail for the set to
+///   catch, and it builds a delegated agent with its parent runtime's
+///   `sessionId`
+///   (<https://github.com/cline/cline/blob/071e1b25b48f9ef5dff7fc32085e6a16f02bf02e/sdk/packages/core/src/extensions/tools/team/delegated-agent.ts#L120-L146>),
+///   so tracking it could only reach the root agent's events.
+fn subagent_event_seeds_session(agent: AgentKind) -> bool {
+    !matches!(
+        agent,
+        AgentKind::ClaudeCode
+            | AgentKind::Codex
+            | AgentKind::QwenCode
+            | AgentKind::KimiCode
+            | AgentKind::CodeBuddy
+            | AgentKind::Cline
+    )
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
@@ -1940,7 +1981,12 @@ async fn handle_handoff(
         Ok(None) => (StatusCode::OK, String::new()),
         // A refusal is the one failure that must not look like "no handoff":
         // it is a 403 carrying the reason, which the hook client reports on
-        // stderr and never injects as context (#708).
+        // stderr and never injects as context (#708). An ambiguous or
+        // boundary-mismatched managed startup takes the same channel so it
+        // cannot consume an unrelated task's handoff (#2194).
+        Err(e) if e.downcast_ref::<ManagedStartupRefused>().is_some() => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
         Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
             Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
             _ => {
@@ -1999,7 +2045,17 @@ async fn fetch_and_accept_handoff_at(
     // authorize the request's repository before interpreting the run id: a
     // shared Codex daemon may carry a terminal id from another checkout, and
     // recovery must select only inside the current, authorized boundary.
-    let managed = fetch_managed_context(state, &query, agent, ws, proj, actor.as_ref()).await?;
+    let managed =
+        match fetch_managed_context(state, &query, agent, ws, proj, actor.as_ref()).await? {
+            // A managed startup we cannot bind to a single eligible run must not
+            // fall through to the legacy project-wide handoff/recovery path and
+            // consume an unrelated task's baton. Refuse the whole start before any
+            // read, claim or pointer publish; the handoff stays open for an
+            // explicit `memory_handoff_accept` (#2194).
+            ManagedStartup::Unresolved => return Err(ManagedStartupRefused.into()),
+            ManagedStartup::Resolved(context) => Some(context),
+            ManagedStartup::Absent => None,
+        };
     // Session-start handoff delivery is a foreground action. Publish it so
     // static MCP callers resolve to the directory that is opening now. The
     // query carries no recall preference; the main capture path publishes
@@ -2917,12 +2973,52 @@ struct PendingManagedContext {
     markdown: Option<String>,
 }
 
+/// Outcome of resolving a managed SessionStart's run for `/handoff`.
+enum ManagedStartup {
+    /// No managed run id, or a benign non-binding condition (bad id, no live
+    /// run for this scope, already delivered, agent mismatch). The caller
+    /// proceeds with the legacy pending-handoff path exactly as a plain
+    /// session start would.
+    Absent,
+    /// A managed run bound safely; deliver its ledger. The legacy handoff stays
+    /// additive alongside it, unchanged.
+    Resolved(PendingManagedContext),
+    /// A managed startup whose run could not be bound to a single eligible run
+    /// safely: more than one candidate (`Ambiguous`), or a boundary mismatch
+    /// (`Refused`). The whole start is refused so it cannot fall through and
+    /// consume another task's project-wide handoff or deliver its recovery
+    /// packet (#2194).
+    Unresolved,
+}
+
+/// A managed SessionStart whose run could not be bound to a single eligible
+/// run. Surfaced as a `403` so the native hook reports it on stderr and never
+/// injects or consumes unrelated context, the same channel a forbidden scope
+/// resolution uses (#2194).
+#[derive(Debug)]
+struct ManagedStartupRefused;
+
+impl std::fmt::Display for ManagedStartupRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "managed session start could not be bound to a single eligible run; \
+             refusing to deliver or consume another task's context. Re-run \
+             without a stale run id, or accept a handoff explicitly.",
+        )
+    }
+}
+
+impl std::error::Error for ManagedStartupRefused {}
+
 /// Render the managed-run ledger for this SessionStart, if there is one.
 ///
-/// Returns `None` — never an early exit for the caller — when the run is
-/// unusable (bad id, no active run, agent mismatch) or its context was
-/// already delivered. The pending handoff still has to reach the agent in
-/// every one of those cases.
+/// Returns [`ManagedStartup::Absent`] — never an early exit for the caller —
+/// when the run is unusable (bad id, no active run, agent mismatch) or its
+/// context was already delivered: the pending handoff still has to reach the
+/// agent in every one of those cases. Returns [`ManagedStartup::Unresolved`]
+/// only when a run id was supplied but could not be bound to a single eligible
+/// run safely, which the caller turns into a refusal rather than letting the
+/// start consume an unrelated handoff (#2194).
 async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
@@ -2930,13 +3026,13 @@ async fn fetch_managed_context(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     actor: Option<&IdentityKey>,
-) -> anyhow::Result<Option<PendingManagedContext>> {
+) -> anyhow::Result<ManagedStartup> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
         warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let Some(native_session_id) = query
         .session_id
@@ -2944,7 +3040,7 @@ async fn fetch_managed_context(
         .filter(|value| !value.trim().is_empty())
     else {
         warn!(managed_run = %run_id, "managed SessionStart has no native session id");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let native_identity = match ai_memory_core::NativeSessionIdentity::parse(
         native_session_id,
@@ -2953,7 +3049,7 @@ async fn fetch_managed_context(
         Ok(id) => id,
         Err(_) => {
             warn!(managed_run = %run_id, "managed SessionStart native identity is UNKNOWN; binding refused");
-            return Ok(None);
+            return Ok(ManagedStartup::Absent);
         }
     };
     let Some(cwd) = query
@@ -2962,7 +3058,7 @@ async fn fetch_managed_context(
         .filter(|value| !value.trim().is_empty())
     else {
         warn!(managed_run = %run_id, "managed SessionStart has no checkout cwd");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let owner_user = crate::workstream::managed_run_owner_stamp(
         &state.reader,
@@ -2993,17 +3089,24 @@ async fn fetch_managed_context(
             );
             adopted
         }
+        // Both mean the run could not be bound to a single eligible run: more
+        // than one candidate, or a boundary the supplied id disagreed with.
+        // Refuse the whole start so it cannot fall through to the legacy
+        // project-wide handoff and consume another task's baton (#2194).
         ai_memory_store::ManagedRunSessionLink::Ambiguous => {
             warn!(managed_run = %run_id, "managed SessionStart recovery is ambiguous");
-            return Ok(None);
-        }
-        ai_memory_store::ManagedRunSessionLink::NoMatch => {
-            warn!(managed_run = %run_id, "managed SessionStart has no live scoped run");
-            return Ok(None);
+            return Ok(ManagedStartup::Unresolved);
         }
         ai_memory_store::ManagedRunSessionLink::Refused => {
             warn!(managed_run = %run_id, "managed SessionStart run boundary mismatch");
-            return Ok(None);
+            return Ok(ManagedStartup::Unresolved);
+        }
+        // No run matched this scope at all, so there is nothing to bind and no
+        // ambiguity: a stale env id on an otherwise plain session start. The
+        // legacy pending handoff still has to reach the agent.
+        ai_memory_store::ManagedRunSessionLink::NoMatch => {
+            warn!(managed_run = %run_id, "managed SessionStart has no live scoped run");
+            return Ok(ManagedStartup::Absent);
         }
     };
     let Some(context) = state
@@ -3012,7 +3115,7 @@ async fn fetch_managed_context(
         .await?
     else {
         warn!(managed_run = %selected_run_id, "managed SessionStart has no active run");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     if context.agent != agent {
         warn!(
@@ -3021,10 +3124,10 @@ async fn fetch_managed_context(
             actual = %agent.as_str(),
             "managed SessionStart agent mismatch"
         );
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     }
     if context.context_delivered {
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     }
     let rendered = render_managed_context(
         &context.events,
@@ -3033,7 +3136,7 @@ async fn fetch_managed_context(
         context.sync_after,
         context.previous_native_session.as_ref(),
     );
-    Ok(Some(PendingManagedContext {
+    Ok(ManagedStartup::Resolved(PendingManagedContext {
         run_id: selected_run_id,
         markdown: rendered,
     }))
@@ -5545,7 +5648,7 @@ async fn process_authorized(
             _ => false,
         }
         && !managed
-        && !body_is_subagent(&env.raw);
+        && !body_is_subagent(env.agent, &env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
         // Token-usage visibility (docs: session usage tracking): the native
         // hook spliced an optional `_ai_memory_usage` object into the
@@ -5716,7 +5819,7 @@ async fn process_authorized(
         let child_session = matches!(
             env.agent,
             AgentKind::OpenCode | AgentKind::Omp | AgentKind::Grok
-        ) && body_is_subagent(&env.raw);
+        ) && body_is_subagent(env.agent, &env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
@@ -12794,6 +12897,251 @@ pub(crate) mod tests {
         );
     }
 
+    /// One batch of a parent session with a subagent's events in the middle,
+    /// under `drop_subagent_captures`: only the subagent's events may drop. The
+    /// parent keeps its prompt, tool call, Stop and SessionEnd, its summary
+    /// page and its baton.
+    async fn assert_subagent_drop_keeps_the_parent(
+        agent: &str,
+        session: SessionId,
+        parent: serde_json::Value,
+        subagent: serde_json::Value,
+        subagent_events: &[&str],
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let item = |event: &str, body: &serde_json::Value| HookBatchItem {
+            url: format!("http://h/hook?event={event}&agent={agent}&drop_subagent=1"),
+            body: body.clone(),
+        };
+        let mut items = vec![
+            item("session-start", &parent),
+            item("user-prompt-submit", &parent),
+        ];
+        items.extend(subagent_events.iter().map(|event| item(event, &subagent)));
+        for event in ["post-tool-use", "stop", "session-end"] {
+            items.push(item(event, &parent));
+        }
+        let total = items.len();
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "{agent}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], total,
+            "{agent}: stored and dropped events are acked"
+        );
+
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            metrics.dropped_by_policy,
+            subagent_events.len() as u64,
+            "{agent}: only the subagent's events drop"
+        );
+        assert_eq!(
+            metrics.accepted, 5,
+            "{agent}: the parent's events, tail included"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "{agent}"
+        );
+        assert_eq!(
+            session_pages(&state).await.len(),
+            1,
+            "{agent}: the parent session keeps its summary"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "{agent}: the parent session keeps its baton"
+        );
+    }
+
+    /// Codex sends a spawned agent's hooks with the root thread's `session_id`
+    /// and the child's `agent_id`. The child's events drop, but they must not
+    /// mark the shared session as a subagent's and take the root tail with it.
+    #[tokio::test]
+    async fn codex_subagent_events_drop_without_dropping_the_root_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codex",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-root",
+                "prompt": "Fix the parser",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-child",
+                "agent_id": "019a0000-0000-7000-8000-0000000000c1",
+                "agent_type": "worker",
+                "prompt": "child: do work",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": "child output",
+            }),
+            &[
+                "user-prompt-submit",
+                "pre-tool-use",
+                "post-tool-use",
+                "stop",
+            ],
+        )
+        .await;
+    }
+
+    /// Qwen Code stamps a subagent's hooks, `SubagentStart` and `SubagentStop`
+    /// included, with the invoking session's `session_id` and the subagent's
+    /// `agent_id`. The main session keeps its tail.
+    #[tokio::test]
+    async fn qwen_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "qwen-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Refactor the cache",
+                "tool_name": "run_shell_command",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": {"llmContent": "ok"},
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "subagent-explorer-1",
+                "agent_type": "Explorer",
+                "tool_name": "grep_search",
+                "tool_input": {"pattern": "cache"},
+                "tool_response": {"llmContent": "subagent output"},
+            }),
+            &[
+                "subagent-start",
+                "pre-tool-use",
+                "post-tool-use",
+                "subagent-stop",
+            ],
+        )
+        .await;
+    }
+
+    /// Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+    /// session's `sessionId` and no subagent id of their own. They drop; the
+    /// main session keeps its tail.
+    #[tokio::test]
+    async fn kimi_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "kimi-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Add the retry",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+                "tool_call_id": "call_1",
+                "tool_output": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_name": "coder",
+                "prompt": "Write the retry helper",
+                "session_title": "Add the retry",
+            }),
+            &["subagent-start", "subagent-stop"],
+        )
+        .await;
+    }
+
+    /// CodeBuddy Code reports a subagent's tool calls under the parent's
+    /// `session_id` with the subagent's `agent_id`. They drop; the main
+    /// session keeps its tail.
+    #[tokio::test]
+    async fn codebuddy_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codebuddy",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Bump the dependency",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm install"},
+                "tool_use_id": "call_main",
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "store-subagent-1",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "package.json"},
+                "tool_use_id": "call_sub",
+                "tool_response": "subagent output",
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
+    }
+
+    /// Cline puts the firing agent's `agent_id` on every event, the root
+    /// agent's included, so only a `parent_agent_id` marks a subagent. The root
+    /// agent's events are stored and a subagent under the same task drops
+    /// without taking the root tail with it.
+    #[tokio::test]
+    async fn cline_subagent_events_drop_without_dropping_the_root_agent() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "cline",
+            session,
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_root_1",
+                "parent_agent_id": null,
+                "tool_result": {
+                    "id": "toolu_root",
+                    "name": "run_commands",
+                    "input": {"commands": ["cargo test"]},
+                    "output": "ok"
+                },
+            }),
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_sub_1",
+                "parent_agent_id": "agent_root_1",
+                "tool_result": {
+                    "id": "toolu_sub",
+                    "name": "read_files",
+                    "input": {"paths": ["README.md"]},
+                    "output": "subagent output"
+                },
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
@@ -19707,6 +20055,107 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none(),
             "create_on_session_end = false must not create an automatic handoff"
+        );
+    }
+
+    /// #2194: a managed SessionStart whose run cannot be bound to a single
+    /// eligible run — two live, undelivered Codex runs in the same checkout and
+    /// a stale daemon run id matching neither — must refuse the whole start, not
+    /// fall through to the legacy project-wide handoff and consume another
+    /// task's baton. The foreign handoff stays open; a later plain session start
+    /// still claims it, proving the baton was consumable and that plain delivery
+    /// is unchanged (control).
+    #[tokio::test]
+    async fn ambiguous_managed_start_refuses_and_never_consumes_a_foreign_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        // A third task's project-wide baton, open in the same checkout.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "FOREIGN-HANDOFF-734".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        // Two live, undelivered, never-linked Codex runs in the same checkout.
+        // A stale daemon run id binds to neither, so recovery is ambiguous.
+        for fp in ["pink", "blue"] {
+            state
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    repo_fingerprint: format!("ambiguous-repo-{fp}"),
+                    worktree_fingerprint: format!("ambiguous-worktree-{fp}"),
+                    cwd: "/tmp/scratch".into(),
+                    agent: AgentKind::Codex,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: WorkstreamSelection::Current,
+                    lease_owner: format!("test:{fp}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let ambiguous = HandoffQuery {
+            managed_run: Some(ManagedRunId::new().to_string()),
+            agent: Some("codex".into()),
+            session_id: Some("blue-native".into()),
+            ..session_start_query("/tmp/scratch")
+        };
+        let refused = fetch_and_accept_handoff_at(
+            &state,
+            ambiguous,
+            None,
+            Vec::new(),
+            None,
+            Timestamp::now(),
+        )
+        .await
+        .expect_err("an ambiguous managed start must refuse, not deliver foreign context");
+        assert!(
+            refused.downcast_ref::<ManagedStartupRefused>().is_some(),
+            "the refusal must be the typed managed-startup refusal (a 403), got: {refused:?}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "the ambiguous managed start must leave the foreign handoff open"
+        );
+
+        // Control: the baton was genuinely consumable, and a plain session start
+        // (no managed run) still claims it — the refusal is specific to the
+        // unresolvable managed startup, not a blanket suppression.
+        let plain = HandoffQuery {
+            session_id: Some("plain-native".into()),
+            ..session_start_query("/tmp/scratch")
+        };
+        let delivered =
+            fetch_and_accept_handoff_at(&state, plain, None, Vec::new(), None, Timestamp::now())
+                .await
+                .expect("a plain session start resolves normally");
+        assert!(
+            delivered
+                .as_deref()
+                .is_some_and(|md| md.contains("FOREIGN-HANDOFF-734")),
+            "a plain start still receives the project handoff: {delivered:?}"
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "the plain start consumed the handoff, proving it was consumable all along"
         );
     }
 
@@ -28302,18 +28751,21 @@ pub(crate) mod tests {
                     ..Default::default()
                 };
                 assert!(
-                    fetch_managed_context(
-                        &state,
-                        &query,
-                        AgentKind::ClaudeCode,
-                        state.workspace_id,
-                        state.project_id,
-                        None
-                    )
-                    .await
-                    .unwrap()
-                    .is_none(),
-                    "dirty original must not bind SessionStart"
+                    matches!(
+                        fetch_managed_context(
+                            &state,
+                            &query,
+                            AgentKind::ClaudeCode,
+                            state.workspace_id,
+                            state.project_id,
+                            None
+                        )
+                        .await
+                        .unwrap(),
+                        ManagedStartup::Absent
+                    ),
+                    "an UNKNOWN native identity must not bind SessionStart, and must \
+                     keep the legacy capture path rather than refuse the start"
                 );
             } else {
                 let mut env = session_envelope("user-prompt", "private-vendor", &cwd);
