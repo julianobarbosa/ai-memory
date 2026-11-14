@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "fluent-bundle",
  "fluent-syntax",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -291,14 +291,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "socket2",
 ]
 
 [[package]]
 name = "ai-memory-web"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.4.5"
+version = "3.4.6"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -3065,16 +3065,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.14"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

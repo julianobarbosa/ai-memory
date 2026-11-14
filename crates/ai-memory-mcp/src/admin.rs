@@ -1095,11 +1095,10 @@ async fn build_okf_bundle_file(
             let path = entry.path();
             let ft = entry.file_type()?;
             if ft.is_dir() {
-                // `_pending/` is the auto-improve staging area — proposal
-                // sidecars, not concept files; a strict OKF reader has no
-                // business seeing them (post-audit finding: an unresolved
-                // pending proposal blocked every export).
-                if entry.file_name() == "_pending" {
+                // Only the project's root `_pending/` is proposal staging;
+                // nested names contain ordinary pages, as in the watcher
+                // and migration walks.
+                if dir == bundle_dir && entry.file_name() == "_pending" {
                     continue;
                 }
                 if dir == bundle_dir {
@@ -1109,7 +1108,30 @@ async fn build_okf_bundle_file(
             } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name == "index.md" || name == "log.md" {
-                    continue; // regenerated / not adopted
+                    // The bundle's own `index.md` is generated below and `log.md`
+                    // is the raw event ledger (git is the log), so neither is
+                    // adopted. But a page with real frontmatter can legitimately
+                    // occupy one of these names at any depth (#1557), and OKF v0.2
+                    // §3.1 reserves both throughout the hierarchy — it cannot ship
+                    // under that name. Refuse with the path instead of silently
+                    // dropping the concept (#2233); a frontmatter-less ledger file
+                    // is still skipped.
+                    let raw = std::fs::read_to_string(&path)?;
+                    let is_concept = ai_memory_wiki::parse(&raw)
+                        .map(|m| ai_memory_core::okf::is_conformant(&m.frontmatter))
+                        .unwrap_or(false);
+                    if is_concept {
+                        anyhow::bail!(
+                            "page {} occupies the OKF-reserved filename `{name}` \
+                             (OKF v0.2 §3.1 reserves `index.md` and `log.md` at every \
+                             level); rename it before exporting",
+                            path.strip_prefix(&bundle_dir)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        );
+                    }
+                    continue; // generated index.md / unadopted log ledger
                 }
                 // A rotated event ledger is the same raw hook capture as the
                 // `log.md` above, only past a month boundary — it carries no
@@ -1129,7 +1151,10 @@ async fn build_okf_bundle_file(
                     anyhow::bail!(
                         "page {} is not OKF-conformant; run the server once to migrate \
                          before exporting",
-                        path.strip_prefix(&bundle_dir).unwrap_or(&path).display()
+                        path.strip_prefix(&bundle_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
                     );
                 }
                 files.push((path, raw));
@@ -6534,6 +6559,16 @@ async fn handle_rename_project(
         return (status, Json(serde_json::json!({ "error": e.to_string() })));
     }
 
+    // The hook router caches `(workspace_id, project_id)` keyed partly on the
+    // declared `project` name, and a declared name routes by name — never by
+    // repository identity. So a marker that pins `project = "<from>"` keeps
+    // hitting the cached slot after this rename and keeps writing into the
+    // renamed project, while a cold server re-resolves the same marker through
+    // `get_or_create_project` and mints a fresh project under the old name.
+    // Evicting here makes both paths agree, the same way `rename-workspace`
+    // already does for a declared `workspace`.
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
+
     // Step 4: count is_latest pages that now belong to the renamed project.
     // COUNT(*) always produces a row, so no optional() needed. We pass the
     // 16-byte project id as a plain &[u8] slice to avoid importing rusqlite
@@ -6663,6 +6698,12 @@ async fn handle_adopt_project_identity(
             return (status, Json(serde_json::json!({ "error": e.to_string() })));
         }
     };
+    // The hook router's project cache keys entries on the repository identity,
+    // so a slot resolved before the move still answers with `from` — the next
+    // hook would write the checkout's work into the project that just gave the
+    // identity away. `into` keeps its project id across the move, so entries
+    // already pointing there stay correct (as for `rename-project`).
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(from)).await;
     let mut manifest_warning = None;
     for project_id in [into, from] {
         if let Err(error) = state.wiki.refresh_renamed_scope(ws_id, project_id).await {
@@ -11842,6 +11883,14 @@ mod tests {
     async fn export_okf_tolerates_manifests_and_skips_pending() {
         let (tmp, router) = read_page_test_router();
         post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "notes/_pending/manual.md",
+            "ordinary nested concept",
+        )
+        .await;
         let ws_dir = std::fs::read_dir(tmp.path().join("wiki"))
             .unwrap()
             .flatten()
@@ -11892,8 +11941,87 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "_meta.md"), "{names:?}");
         assert!(
+            names.iter().any(|n| n == "notes/_pending/manual.md"),
+            "nested _pending directories contain ordinary concept pages: {names:?}"
+        );
+        assert!(
             !names.iter().any(|n| n.starts_with("_pending")),
             "pending sidecars must not ship: {names:?}"
+        );
+    }
+
+    /// A concept page may sit at a nested `index.md` (#1557), but OKF v0.2
+    /// §3.1 reserves `index.md` and `log.md` at every level. The export used
+    /// to skip such a page by basename and return 200, silently dropping
+    /// native content. It now refuses with the path so the operator can
+    /// rename it; a frontmatter-less ledger at the same name is still skipped,
+    /// and a project without the collision still exports (#2233).
+    #[tokio::test]
+    async fn export_okf_refuses_a_concept_at_a_reserved_filename() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/kept.md", "ordinary").await;
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "notes/index.md",
+            "nested index concept",
+        )
+        .await;
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("notes/index.md") && message.contains("OKF-reserved"),
+            "{message}"
+        );
+
+        // Control: a frontmatter-less file at the same reserved name is raw
+        // capture, not a concept, and is skipped — the export succeeds.
+        std::fs::remove_file(scratch_project_dir(tmp.path()).join("notes/index.md")).unwrap();
+        std::fs::write(
+            scratch_project_dir(tmp.path()).join("notes/log.md"),
+            "## [2026-08-01T00:00:00Z] note | no frontmatter here\n",
+        )
+        .unwrap();
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let names: Vec<String> = tar::Archive::new(dec)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "notes/kept.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("log.md")),
+            "the frontmatter-less reserved-name file is skipped: {names:?}"
         );
     }
 
@@ -12305,6 +12433,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The refusal names the nested path with forward slashes on every
+        // platform; a `Path::display()` here renders `notes\legacy.md` on
+        // Windows (#2233 twin site).
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("notes/legacy.md") && message.contains("not OKF-conformant"),
+            "{message}"
+        );
     }
 
     fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {

@@ -150,8 +150,9 @@ ai-memory's canonical events when possible:
 ### Hermes Agent
 
 ai-memory ships a first-party Hermes integration: lifecycle hooks and an MCP
-entry, both printed for you to merge into `~/.hermes/config.yaml`
-(`$HERMES_HOME/config.yaml`), which ai-memory never writes.
+entry, both printed for you to merge into the Hermes home's `config.yaml`
+(`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+elsewhere), which ai-memory never writes.
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -179,8 +180,8 @@ install's own, which matters because Hermes passes MCP servers a filtered
 environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
 model passes `workspace` and `project` on project-scoped calls. `--apply` is
 refused. Hermes does not read MCP server instructions, so the routing rules
-reach the model only through the skills in `~/.hermes/skills` and the handoff
-in the next primary-session turn.
+reach the model only through the skills in the Hermes home's `skills/` and the
+handoff in the next primary-session turn.
 
 The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
@@ -1465,9 +1466,11 @@ fill both in:
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
-  hook environment to pin an externally managed run id instead. Because the
-  slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it: the newest `SessionStart` wins and earlier
+  hook environment to pin an externally managed run id instead. The native
+  hook uses that pin without changing the fallback slot, and a pinned
+  `SessionEnd` leaves the slot intact. Because the slot is per host+agent,
+  two unpinned Devin sessions running *concurrently* on the same machine
+  share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.

@@ -13,6 +13,102 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `export-okf` no longer silently drops a concept page that occupies an
+  OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
+  hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
+  throughout the hierarchy, so the export now refuses with the page's path
+  and asks you to rename it, instead of returning a `200` bundle that is
+  missing the page. A frontmatter-less file at a reserved name (the raw event
+  ledger) is still skipped. (#2233)
+- `memory_patch_page` `replace_section` now keeps the blank line after a
+  section's heading and before the next heading, instead of collapsing
+  `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
+  section's own heading is refused (`section_content_repeats_heading`) rather
+  than written, which used to leave two identical headings that no later edit
+  could target. (#2239)
+- The document importer now preserves DOCX nonbreaking hyphens encoded as
+  `w:noBreakHyphen` elements. It previously dropped them and joined the
+  surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
+- `status --json` now preserves the server's write-queue depth and wiki-format
+  diagnostics. Both fields were read from the server and shown in the human
+  report but silently dropped from JSON, hiding a backed-up writer from
+  monitors. Older servers that omit the fields keep the same JSON shape. (#2235)
+- The document importer now excludes DOCX moved-source revisions
+  (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
+  previously extracted both copies of a tracked move, duplicating text that
+  appears only once in the accepted document. (#2236)
+- Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
+  without a native session id. Explicitly pinned executions now keep their own
+  capture identity instead of sharing the fallback session. A pinned Devin
+  session end leaves the unrelated fallback slot intact. (#2237)
+- OKF exports now include ordinary concept pages beneath nested `_pending`
+  directories such as `notes/_pending/manual.md`. The exclusion for the
+  project's proposal staging directory matched that name at every depth and
+  silently omitted these pages. Project-root proposal sidecars stay excluded. (#2238)
+- Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
+  resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
+  to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
+- A cross-project message whose body is within the published 8 000-character
+  budget is no longer silently truncated at the store boundary. The store
+  field cap reused the 16 KiB handoff budget, so a body of mostly multibyte
+  characters was cut mid-text even though the MCP and web callers had accepted
+  it; messages now have their own 32 KiB cap, which holds 8 000 characters at
+  UTF-8's four-byte worst case. (#2241)
+
+## [3.4.6] - 2026-11-13
+
+### Fixed
+
+- The dashboard's envelope icon (sidebar Inbox link, inbox rows and empty
+  state, and the Open inbox / Message agent buttons) now renders at the
+  size and baseline of the surrounding text on macOS. #2003 left `✉`
+  (U+2709) to the platform, expecting Apple Color Emoji, but CoreText
+  resolves it to Menlo, whose glyph sits small and low. The templates now
+  draw it as an inline SVG that inherits the text colour, and the three
+  translated button labels no longer carry the glyph. (#2230)
+- `backup --to` and `export-okf --to` now decode the downloaded archive to its
+  end before replacing the destination, so a complete `200` whose gzip body has
+  a corrupt CRC or a missing trailer is refused and the existing archive is
+  kept, instead of being overwritten with bytes `restore` then rejects. The
+  earlier check read only the gzip signature. (#2206)
+- `install-mcp` on Windows no longer writes the `\\?\` verbatim prefix into
+  a bridge entry's `--data-dir`. Hermes rewrote it into `C:\?\C:\...` and the
+  bridge failed to start; the entry now carries the plain drive path, as
+  `setup` and the generated hooks do. (#2203)
+- The `/health` page no longer reports a database it could not measure as an
+  empty one. When the storage pragma reads failed, the database row rendered
+  `0 bytes, 0 reclaimable` — indistinguishable from a real measurement of an
+  empty store — and the reclaim advice was suppressed as if there were
+  nothing to compact. The figures now read `unknown` and a check reports that
+  they could not be read. A failed read still never takes the page down.
+  (#2215)
+- Fixed the web inbox refusing to load when a project name was also another
+  project's legacy key. The default mailbox now opens through the project id.
+  A request that names the clashing project keeps the page and shows a warning
+  pointing to `merge-project`, where it used to return a bare 400. (#2224)
+- Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
+  reported as unrelated JSON errors. They now report truncation before parsing,
+  allowing profile classification to split the batch and recover its verdicts. (#2218)
+- The root-only `/pending` triage page now sends `Cache-Control: no-store`,
+  like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
+  cached copy could list a proposal an operator had already approved or
+  rejected as still pending, with its no-longer-actionable review id and CLI
+  commands, until the page was force-reloaded. (#2225)
+- `adopt-project-identity` now drops the hook router's cached resolution for
+  the project that gave the identity away, so the checkout's hooks reach the
+  project that took it. That cache keys entries on the repository identity, and
+  the move left the pre-adoption entry in place: until the server restarted or
+  the entry aged out, new sessions, prompts and observations kept landing in
+  the project the command had just emptied and archived. (#2216)
+- `POST /admin/rename-project` now invalidates the hook router's scope cache
+  for the renamed project, as `rename-workspace` already did for a renamed
+  workspace. A repository whose `.ai-memory.toml` declares `project = "<old
+  name>"` routes by that name, so after a rename its warm cache slot kept
+  sending captures into the renamed project while a freshly started server
+  re-resolved the same marker and created an empty project under the old name
+  — which of the two a capture landed in depended on whether the cache
+  happened to be warm. Other projects' cached slots are left untouched.
+  (#2221)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
@@ -50,6 +146,9 @@ version in [`docs/changelog/`](docs/changelog/):
   truncation, the Anthropic stop reason that some gateways in front of Claude
   pass through unchanged. A structured answer cut there now reports a
   truncated response instead of a misleading parse or schema error. (#2199)
+- Fixed OpenCode Responses structured replies stopped at `max_output_tokens`
+  being accepted or reported as JSON or empty-content errors. They now report
+  truncation so profile classification can split the batch and recover. (#2219)
 - A managed session start that cannot be bound to a single eligible run — two
   live managed runs in the same checkout with a stale shared-daemon run id
   matching neither — no longer falls through to the legacy project-wide handoff
@@ -91,6 +190,8 @@ version in [`docs/changelog/`](docs/changelog/):
   reports a shorter wait. (#2187)
 - Fixed conditional page reads from configured cross-origin frontends by
   exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- The TypeScript SDK's `api.page` reads stored paths with literal percent
+  escapes such as `notes/%2e/example.md`. (#2217)
 - `backup` and `export-okf` now preserve the previous archive when a server
   returns a successful response without a gzip signature, such as an HTML login
   page or an empty response (#2138).
@@ -115,6 +216,8 @@ version in [`docs/changelog/`](docs/changelog/):
   already-absent page with `deleted: true`. (#2181)
 - Fixed native install and reinstall with a trailing slash in
   `AI_MEMORY_LIB_DIR`. (#2171)
+- Preserved the installed Claude Code native hook URL and stored credentials
+  during `ai-memory upgrade` when no server URL is configured. (#2210)
 - Fixed conditional page reads returning a full response for a matching weak
   ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
 - Fixed the container wrapper reporting success after a native host-client
@@ -124,6 +227,17 @@ version in [`docs/changelog/`](docs/changelog/):
   Background uploads and startup backfills now inherit only their own standard
   streams, so waiting for hook output no longer waits for a worker's HTTP
   request. (#2193)
+- `ai-memory doctor` now finds a Windows Hermes install, and
+  `install-skills --scope global --agent hermes` writes where Hermes reads
+  skills. Hermes' Windows setup keeps its home at `%LOCALAPPDATA%\hermes` and
+  exports `HERMES_HOME` only into its own process tree, while ai-memory looked
+  at `~/.hermes` alone. `doctor` therefore printed no Hermes profile even with
+  a configured `config.yaml` (its JSON `hermes` array stayed empty), and the
+  global skills went to a directory Hermes never reads. One resolver now
+  follows Hermes (`$HERMES_HOME`, else the platform default with
+  `$HERMES_DATA_DIR_SUFFIX` appended) for the doctor scan, the community
+  plugin check, a named profile's marker routing and the skill root, and the
+  `install-hooks` and `setup-agent` guidance names the platform path. (#2211)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -203,6 +317,13 @@ version in [`docs/changelog/`](docs/changelog/):
   before anything live is replaced. It used to skip that check, report success,
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
+- Fixed `restore` replacing live data and installing a backup's malformed
+  `config.toml`, which prevented the restored server from starting. (#2209)
+
+- Fixed `retrieval-compare` treating unmeasured cutoffs as zero, which could
+  invent accuracy gains or losses and first-hit ranking moves between runs
+  with different `--ks`. Incompatible or incomplete hit/recall grids are now
+  refused before a comparison is printed. (#2220)
 
 ### Security
 
@@ -5070,7 +5191,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
 [3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
