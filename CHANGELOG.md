@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.7] - 2026-11-15
+
 ### Fixed
 
 - A `move-project` true move now re-resolves project-only cross-project links
@@ -57,6 +59,23 @@ version in [`docs/changelog/`](docs/changelog/):
   read before that check and keeps the agent's page when it lands in between;
   a rule-based summary or checkpoint landing in between is still replaced, as
   before. (#2275)
+- A Claude Code subagent's compaction is no longer treated as the session's.
+  Since Claude Code 2.1.323 a subagent's `PreCompact` and post-compaction
+  `SessionStart` carry its `agent_id` under the parent's session id, and
+  ai-memory injected the session's post-compaction anchor into the subagent
+  (the parent's prompts as the source of truth for its task), rewrote
+  `sessions/<id>.md` as a checkpoint, and let the recap start at the
+  subagent's compaction. A compaction that names an `agent_id` now gets no
+  anchor and no checkpoint and is stored as a `subagent pre-compact` event;
+  the session's own compaction is unchanged. (#2301)
+- Zero-LLM session pages now get the duplicate-title collision backstop the
+  LLM consolidation and `memory_write_page` paths already apply (#926): when a
+  rule-based `sessions/<id>.md` write (SessionEnd, the compaction checkpoint,
+  or the idle-end tick) takes a title that already names another of the
+  project's latest pages, it suffixes the session short id. A resume habit that
+  opens every session with the same phrase ("where were we?") no longer gives
+  every page one title and trips ai-memory's own `duplicate_title` curator
+  finding. (#2300)
 - Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
   (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
   behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
@@ -195,6 +214,14 @@ version in [`docs/changelog/`](docs/changelog/):
   Values the line keeps, and `--query-arg` values, also pass through the
   built-in sanitizer, so a password inside a URL or a provider key under an
   unrelated name is redacted too. (#2274)
+- `memory_handoff_accept` no longer claims the latest eligible handoff when
+  `handoff_id` is explicitly empty or whitespace-only, and `memory_write_page`
+  and `memory_delete_page` no longer drop a blank `expected_page_id` and write
+  or delete unconditionally. A blank id in either place is now refused with
+  invalid params and changes nothing, as message ids already are (#2244).
+  Leaving the argument out keeps the latest-handoff and unconditional
+  defaults, and a valid id with surrounding whitespace still selects its
+  row. (#2298)
 
 ### Security
 
@@ -208,8 +235,11 @@ version in [`docs/changelog/`](docs/changelog/):
   pointing the app at a new server, the old token stayed in the keychain
   while the binding had already moved to the new server, so it was sent there
   and re-adopted on the next launch. A failed save now clears both the stored
-  token and its binding, and the failure is surfaced in Settings.
-  (GHSA-xj78-fp6w-8r74)
+  token and its binding, and the failure is surfaced in Settings. A rarer
+  double fault, where that follow-up clear also fails and leaves the old token
+  in the keychain, is now recorded so the next launch keeps it unbound (and
+  unsent) instead of re-adopting it to the current server.
+  (GHSA-xj78-fp6w-8r74, #2289)
 
 ## [3.4.6] - 2026-11-13
 
@@ -5347,7 +5377,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.7...HEAD
+[3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
