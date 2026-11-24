@@ -1,0 +1,15 @@
+{
+  "mcp": {
+    "servers": {
+      "obsidian": {
+        "type": "local",
+        "command": [
+          "obsidian-mcp",
+          "serve",
+          "--vault",
+          "barbosa-0=/mnt/c/Fiscal/.obsidian/vaults/.obsidian-barbosa-0"
+        ]
+      }
+    }
+  }
+}

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use super::e2e_support::{ServerGuard, free_port, hermetic};
+use super::e2e_support::{ServerGuard, hermetic, start_serve};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 const DEFAULT_SERVER: &str = "https://default.example";
@@ -283,47 +283,25 @@ struct RealServer {
 impl RealServer {
     async fn start(token: &'static str) -> Self {
         let data = tempfile::tempdir().unwrap();
-        let port = free_port();
-        let base = format!("http://127.0.0.1:{port}");
-        let guard = ServerGuard(
-            hermetic(BIN)
-                .args([
-                    "serve",
-                    "--transport",
-                    "http",
-                    "--bind",
-                    &format!("127.0.0.1:{port}"),
-                    "--no-watcher",
-                ])
-                .env("AI_MEMORY_DATA_DIR", data.path())
-                .env("AI_MEMORY_HOME", data.path())
-                .env("AI_MEMORY_AUTH_TOKEN", token)
-                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
-                .env("RUST_LOG", "off")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn serve"),
-        );
+        let log = data.path().join("serve.log");
         let client = reqwest::Client::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if client
-                .get(format!("{base}/mcp"))
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "server on {base} never became reachable"
-            );
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
+        let (guard, base) = start_serve(&client, &log, |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data.path())
+            .env("AI_MEMORY_HOME", data.path())
+            .env("AI_MEMORY_AUTH_TOKEN", token)
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd
+        })
+        .await;
         Self {
             _guard: guard,
             _data: data,
