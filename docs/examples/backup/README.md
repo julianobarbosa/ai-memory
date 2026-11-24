@@ -8,10 +8,11 @@ excludes. Models remain redownloadable and are not backed up.
 See [`docs/backup.md`](../../backup.md) for the walkthrough. The pieces in this
 directory are:
 
-- `ai-memory-snapshot.sh`: the rsync + git push + tarball loop, configurable
-  through six environment variables (`REPO_DIR`, `DATA_SRC`, `CFG_SRC`,
-  `TARBALL_DIR`, `LOG_DIR`, `SECRET_EXCLUDES`) with sensible defaults for a
-  single-user Linux/WSL/macOS install.
+- `ai-memory-snapshot.sh`: the rsync + git push + online tarball + optional
+  encrypted OneDrive loop. It is configurable through environment variables
+  including `REPO_DIR`, `DATA_SRC`, `CFG_SRC`, `TARBALL_DIR`, `ONEDRIVE_DIR`,
+  `LOG_DIR`, and `SECRET_EXCLUDES` with sensible defaults for a single-user
+  Linux/WSL/macOS install.
 - `ai-memory-backup.service`: a `systemd --user` oneshot that runs the
   script. `%h` expands to the user's home directory.
 - `ai-memory-backup.timer`: a daily user timer with a small randomised delay
@@ -57,6 +58,43 @@ systemctl --user start ai-memory-backup.service
 journalctl --user -u ai-memory-backup.service --since '5 minutes ago'
 ```
 
+## Encrypted OneDrive copy
+
+OneDrive support targets a directory that is already mounted or synchronized by
+an official OneDrive client. Configure both the destination and a passphrase;
+no passphrase is embedded in the script, archive name, or logs.
+
+```bash
+# Create an owner-only passphrase file. Store a recovery copy in 1Password.
+install -d -m700 "$HOME/.config/ai-memory-backup"
+umask 077
+printf '%s\n' 'GENERATE-A-HIGH-ENTROPY-PASSPHRASE' \
+    > "$HOME/.config/ai-memory-backup/passphrase"
+
+# Put this destination-specific setting in the scheduler environment.
+export ONEDRIVE_DIR="$HOME/OneDrive/Backups/ai-memory"
+export AI_MEMORY_BACKUP_PASSPHRASE_FILE="$HOME/.config/ai-memory-backup/passphrase"
+```
+
+The script keeps the plaintext online snapshot in `TARBALL_DIR`, encrypts it
+with GnuPG AES-256, stages it as a temporary file, then atomically renames the
+finished `.gpg` archive into `ONEDRIVE_DIR`. A configured OneDrive failure makes
+the scheduled run fail, but the local snapshot remains available. Leaving
+`ONEDRIVE_DIR` unset preserves the original local + private-git behavior.
+
+To decrypt for recovery, stop ai-memory first and never decrypt into a synced
+folder:
+
+```bash
+gpg --batch --yes --pinentry-mode loopback \
+    --passphrase-file "$HOME/.config/ai-memory-backup/passphrase" \
+    --output /secure/local/ai-memory-restore.tar.gz \
+    --decrypt "$HOME/OneDrive/Backups/ai-memory/ai-memory-YYYY-MM-DD.tar.gz.gpg"
+```
+
+Then follow the documented `ai-memory restore --from` procedure against an
+isolated or stopped data directory.
+
 ## Non-systemd equivalents
 
 The script is a plain bash program; anything that runs a shell command on a
@@ -82,5 +120,8 @@ repo's `.gitignore` catches anything the rsync exclude missed. The separate
 online snapshot may include `<data_dir>/config.toml`, including secrets stored
 inline there, and always contains private memory data. The git mirror can also
 include inline secrets from the copied config directory because filename globs
-cannot redact TOML values. Inspect or encrypt both outputs and protect them as
-secret-bearing artifacts.
+cannot redact TOML values. Inspect the local and git outputs and protect them as
+secret-bearing artifacts. The OneDrive copy is encrypted, but its confidentiality
+still depends on keeping and recovering the passphrase; do not place the
+passphrase file, decrypted archive, or recovery instructions containing the
+actual secret in OneDrive or git.

@@ -85,3 +85,62 @@ CFG_SRC="$fixture/absent-override" bash "$root/docs/examples/backup/ai-memory-sn
 test "$override_status" -ne 0
 test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 4
 test -f "$REPO_DIR/config/current.toml"
+
+# OneDrive receives only encrypted bytes and the archive round-trips with the
+# passphrase file. Keep the local plaintext archive after the remote copy.
+ONEDRIVE_DIR="$fixture/onedrive" bash -c 'mkdir -p "$ONEDRIVE_DIR"'
+printf 'a-test-only-passphrase-with-enough-entropy\n' > "$fixture/passphrase"
+chmod 600 "$fixture/passphrase"
+ONEDRIVE_DIR="$fixture/onedrive" \
+AI_MEMORY_BACKUP_PASSPHRASE_FILE="$fixture/passphrase" \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh"
+stamp="$(date +%Y-%m-%d)"
+encrypted="$fixture/onedrive/ai-memory-$stamp.tar.gz.gpg"
+test -f "$encrypted"
+test ! -f "$fixture/onedrive/ai-memory-$stamp.tar.gz"
+case "$(file -b "$encrypted")" in
+    *OpenPGP*|*PGP*|*data*) ;;
+    *) echo "encrypted output has unexpected type" >&2; exit 1 ;;
+esac
+gpg --batch --yes --pinentry-mode loopback \
+    --passphrase-file "$fixture/passphrase" \
+    --output "$fixture/decrypted.tar.gz" --decrypt "$encrypted"
+cmp "$TARBALL_DIR/ai-memory-$stamp.tar.gz" "$fixture/decrypted.tar.gz"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 5
+
+# Unsafe passphrase permissions and a missing secret both fail closed while the
+# local online backup remains present. Neither run may leave a remote archive.
+unsafe="$fixture/unsafe-passphrase"
+printf 'unsafe\n' > "$unsafe"
+chmod 644 "$unsafe"
+rm -f "$encrypted"
+unsafe_status=0
+ONEDRIVE_DIR="$fixture/onedrive" \
+AI_MEMORY_BACKUP_PASSPHRASE_FILE="$unsafe" \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || unsafe_status=$?
+test "$unsafe_status" -ne 0
+test ! -e "$encrypted"
+test -f "$TARBALL_DIR/ai-memory-$stamp.tar.gz"
+
+missing_status=0
+ONEDRIVE_DIR="$fixture/onedrive" \
+env -u AI_MEMORY_BACKUP_PASSPHRASE_FILE -u AI_MEMORY_BACKUP_PASSPHRASE \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || missing_status=$?
+test "$missing_status" -ne 0
+test ! -e "$encrypted"
+test -f "$TARBALL_DIR/ai-memory-$stamp.tar.gz"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 7
+
+# Retention is independently configurable for the encrypted and local outputs.
+old_plain="$TARBALL_DIR/ai-memory-2000-01-01.tar.gz"
+old_encrypted="$fixture/onedrive/ai-memory-2000-01-01.tar.gz.gpg"
+printf 'old\n' > "$old_plain"
+printf 'old\n' > "$old_encrypted"
+touch -d '90 days ago' "$old_plain" "$old_encrypted"
+TARBALL_RETENTION_DAYS=1 ONEDRIVE_RETENTION_DAYS=2 \
+ONEDRIVE_DIR="$fixture/onedrive" \
+AI_MEMORY_BACKUP_PASSPHRASE_FILE="$fixture/passphrase" \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh"
+test ! -e "$old_plain"
+test ! -e "$old_encrypted"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 8

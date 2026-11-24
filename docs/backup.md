@@ -164,7 +164,8 @@ A worked example lives at
 [`docs/examples/backup/`](examples/backup/README.md) and consists of:
 
 - `ai-memory-snapshot.sh`: an idempotent rsync + `git commit && git push` +
-  online `ai-memory backup` script driven by environment variables.
+  online `ai-memory backup` script, with optional GPG-encrypted staging to a
+  locally mounted OneDrive sync directory, driven by environment variables.
 - `ai-memory-backup.service`: a `systemd --user` oneshot unit that runs it.
 - `ai-memory-backup.timer`: a daily user timer with a randomised delay and
   `Persistent=true` so a missed run after a reboot still fires.
@@ -192,8 +193,11 @@ cadence):
    $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` so SQLite is copied through its
    online backup API rather than racing the live WAL. Models are not included;
    redownload them after recovery.
-6. Rotate old tarballs and old script logs on a retention window (30 days by
-   default).
+6. When `ONEDRIVE_DIR` is configured, GPG-encrypt that local tarball with a
+   passphrase from an owner-only file or scheduler-provided secret, stage it in
+   OneDrive atomically, and never copy the plaintext archive there.
+7. Rotate old plaintext tarballs, encrypted OneDrive archives, and script logs
+   on independently configurable retention windows (30 days by default).
 
 A failed mirror push still allows the online backup and rotation to run.
 The script returns a nonzero status so the scheduler can report the failure.

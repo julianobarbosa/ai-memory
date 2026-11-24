@@ -26,11 +26,15 @@ if [[ -z "${CFG_SRC:-}" ]]; then
     CFG_SRC="$HOME/.config/ai-memory"              # may hold provider env files
     cfg_src_is_default=true
 fi
-: "${TARBALL_DIR:=$HOME/backups/ai-memory}"       # second-location tarball drop (external disk, network share, ...)
+: "${TARBALL_DIR:=$HOME/backups/ai-memory}"       # local plaintext tarball drop
 : "${LOG_DIR:=$HOME/logs/ai-memory-snapshot}"     # rotated per run
-: "${TARBALL_RETENTION_DAYS:=30}"                 # how long to keep tarballs
+: "${TARBALL_RETENTION_DAYS:=30}"                 # how long to keep local plaintext tarballs
+: "${ONEDRIVE_RETENTION_DAYS:=30}"                # how long to keep encrypted OneDrive archives
 : "${LOG_RETENTION_DAYS:=30}"                     # how long to keep run logs
 : "${SECRET_EXCLUDES:=*.env auth.json .secrets *.pem *.key *.crt}"  # glob patterns for files never to sync
+: "${ONEDRIVE_DIR:=}"                            # configured local OneDrive sync/mount directory
+: "${AI_MEMORY_BACKUP_PASSPHRASE_FILE:=}"        # owner-only file; preferred over an environment passphrase
+: "${AI_MEMORY_BACKUP_PASSPHRASE:=}"             # scheduler-injected alternative to the file
 
 set -euo pipefail
 
@@ -44,6 +48,11 @@ echo "data_src=$DATA_SRC"
 echo "cfg_src=$CFG_SRC"
 echo "repo_dir=$REPO_DIR"
 echo "tarball_dir=$TARBALL_DIR"
+if [[ -n "$ONEDRIVE_DIR" ]]; then
+    echo "onedrive_dir=$ONEDRIVE_DIR"
+else
+    echo "onedrive_dir=(disabled)"
+fi
 
 if [ ! -d "$DATA_SRC" ]; then
     echo "ERROR: $DATA_SRC does not exist. Aborting." >&2
@@ -103,12 +112,76 @@ if (( push_status != 0 )); then
     echo "mirror push failed (status $push_status); continuing with the online snapshot" >&2
 fi
 
-echo "--- online data snapshot to second location ---"
+echo "--- online data snapshot to local location ---"
 tarball="$TARBALL_DIR/ai-memory-$stamp.tar.gz"
 ai-memory --data-dir "$DATA_SRC" backup --to "$tarball"
-echo "tarball: $(ls -lh "$tarball" | awk '{print $5, $9}')"
+echo "tarball: $(wc -c < "$tarball") bytes $tarball"
 
-echo "--- rotate tarballs (retention: ${TARBALL_RETENTION_DAYS}d) ---"
+onedrive_status=0
+if [[ -n "$ONEDRIVE_DIR" ]]; then
+    echo "--- encrypt and stage for OneDrive ---"
+    if [[ ! -d "$ONEDRIVE_DIR" ]]; then
+        echo "ERROR: ONEDRIVE_DIR does not exist: $ONEDRIVE_DIR" >&2
+        onedrive_status=1
+    elif ! command -v gpg >/dev/null 2>&1; then
+        echo "ERROR: gpg is required when ONEDRIVE_DIR is configured" >&2
+        onedrive_status=1
+    elif [[ -n "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" ]]; then
+        if [[ ! -f "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" ]]; then
+            echo "ERROR: passphrase file does not exist: $AI_MEMORY_BACKUP_PASSPHRASE_FILE" >&2
+            onedrive_status=1
+        else
+            passphrase_mode=$(stat -c '%a' "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" 2>/dev/null || stat -f '%Lp' "$AI_MEMORY_BACKUP_PASSPHRASE_FILE")
+            passphrase_permissions=$((8#$passphrase_mode))
+            if (( (passphrase_permissions & 077) != 0 )); then
+                echo "ERROR: passphrase file must not be group/world accessible" >&2
+                onedrive_status=1
+            elif [[ ! -s "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" ]]; then
+                echo "ERROR: passphrase file is empty" >&2
+                onedrive_status=1
+            fi
+        fi
+    elif [[ -z "$AI_MEMORY_BACKUP_PASSPHRASE" ]]; then
+        echo "ERROR: configure AI_MEMORY_BACKUP_PASSPHRASE_FILE or AI_MEMORY_BACKUP_PASSPHRASE" >&2
+        onedrive_status=1
+    fi
+
+    if (( onedrive_status == 0 )); then
+        encrypted="$ONEDRIVE_DIR/ai-memory-$stamp.tar.gz.gpg"
+        encrypted_tmp="$encrypted.tmp.$$"
+        rm -f "$encrypted_tmp"
+        if [[ -n "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" ]]; then
+            if ! gpg --batch --yes --pinentry-mode loopback \
+                --passphrase-file "$AI_MEMORY_BACKUP_PASSPHRASE_FILE" \
+                --symmetric --cipher-algo AES256 --output "$encrypted_tmp" "$tarball"; then
+                echo "ERROR: archive encryption failed" >&2
+                onedrive_status=1
+            fi
+        else
+            if ! printf '%s' "$AI_MEMORY_BACKUP_PASSPHRASE" | gpg --batch --yes \
+                --pinentry-mode loopback --passphrase-fd 0 \
+                --symmetric --cipher-algo AES256 --output "$encrypted_tmp" "$tarball"; then
+                echo "ERROR: archive encryption failed" >&2
+                onedrive_status=1
+            fi
+        fi
+        if (( onedrive_status == 0 )); then
+            mv -f "$encrypted_tmp" "$encrypted"
+            chmod 600 "$encrypted"
+            echo "encrypted archive: $(wc -c < "$encrypted") bytes $encrypted"
+        else
+            rm -f "$encrypted_tmp"
+        fi
+    fi
+fi
+
+if [[ -n "$ONEDRIVE_DIR" && -d "$ONEDRIVE_DIR" ]]; then
+    echo "--- rotate encrypted OneDrive archives (retention: ${ONEDRIVE_RETENTION_DAYS}d) ---"
+    find "$ONEDRIVE_DIR" -maxdepth 1 -name 'ai-memory-*.tar.gz.gpg' -type f \
+        -mtime "+${ONEDRIVE_RETENTION_DAYS}" -delete -print
+fi
+
+echo "--- rotate local tarballs (retention: ${TARBALL_RETENTION_DAYS}d) ---"
 find "$TARBALL_DIR" -maxdepth 1 -name 'ai-memory-*.tar.gz' -type f \
     -mtime "+${TARBALL_RETENTION_DAYS}" -delete -print
 
@@ -116,8 +189,10 @@ echo "--- rotate logs (retention: ${LOG_RETENTION_DAYS}d) ---"
 find "$LOG_DIR" -maxdepth 1 -name 'ai-memory-snapshot_*.log' -type f \
     -mtime "+${LOG_RETENTION_DAYS}" -delete -print
 
-if (( push_status != 0 )); then
-    echo "=== $(date -Iseconds) online snapshot done; mirror push failed ===" >&2
-    exit "$push_status"
+if (( push_status != 0 || onedrive_status != 0 )); then
+    echo "=== $(date -Iseconds) online snapshot done; one or more remote destinations failed ===" >&2
+    (( push_status != 0 )) && echo "mirror_push_status=$push_status" >&2
+    (( onedrive_status != 0 )) && echo "onedrive_status=$onedrive_status" >&2
+    exit 1
 fi
 echo "=== $(date -Iseconds) ai-memory snapshot done ==="
