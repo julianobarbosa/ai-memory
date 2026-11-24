@@ -203,7 +203,7 @@ runs, in order, the commands a native install otherwise needs one by one:
    `CODEX_HOME` and similar relocations). The plan numbers each agent and
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
-   Gemini CLI, Droid and the other agents with no store to look for are
+   Droid and the other agents with no store to look for are
    wired by naming them. OpenCode 1 and 2 share one session store, so a
    detected or named `opencode` runs `opencode --version` once and wires the
    plugin and MCP entry for the major it reports, as `install-mcp --client
@@ -2668,6 +2668,30 @@ same. Preview output and every later `--apply` (including the refresh that
 `ai-memory upgrade` runs) read the same setting, so regenerating keeps your
 choice. Set it back to `direct`, or remove it, to return to the default.
 
+#### Pi selective direct/deferred tools (`pi_direct_tools`)
+
+To keep a small set of ai-memory tools directly declared to the model while
+deferring the remaining schemas behind Pi's `tool_search`, set
+`pi_direct_tools` in `config.toml` (or `AI_MEMORY_PI_DIRECT_TOOLS` as a JSON
+array) and regenerate the extension:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Listed tools register with `exposure: "direct"`, all other ai-memory tools
+register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
+attached once so the model knows to use `tool_search` for deferred memory
+tools, and `session_start` activates `tool_search` when Pi exposes
+`getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
+mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+return to the default extension output.
+
 ### Bind mounts vs docker cp
 
 The `setup-agent` subcommand does the extract + render in one shot
@@ -3178,7 +3202,7 @@ ai-memory works in three intensity tiers:
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Cursor subscription** | Same LLM features using the logged-in Cursor Agent CLI. Read-only `--mode ask`; does not pass `--yolo` | `AI_MEMORY_LLM_PROVIDER=cursor` + `agent` on `PATH` (or `AI_MEMORY_CURSOR_AGENT`) | Uses your Cursor subscription |
 | **+ Google Cloud credits** | Same LLM features with Gemini through Vertex AI, billed to a Google Cloud project so Cloud credits pay for it | `AI_MEMORY_LLM_PROVIDER=vertex` + `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`) + `GOOGLE_CLOUD_PROJECT` | Billed to your Google Cloud project |
-| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
+| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider, or `AI_MEMORY_RERANKER=decisions-choice` + `OPENAI_API_KEY` + `llm_model` (direct OpenAI Decisions) | One provider call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
@@ -4217,6 +4241,34 @@ contain inline credentials, or cannot be safely re-rendered as native hooks,
 upgrade refreshes the staged scripts and keeps the existing settings. To
 update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
 with the original connection options.
+
+### Hook files after an update
+
+`ai-memory upgrade` rewrites the hook scripts and generated integrations it
+staged when a release changes them; it is the only update path that does. Every
+other way of updating leaves the installed files at their old version:
+
+- package-managed installs (Homebrew, AUR, Scoop, Nix, `/usr`), which `upgrade`
+  refuses and hands to the package manager;
+- a binary copied into place by hand, which never touches the hooks tree;
+- project-scoped hook installs, which live in each checkout instead of the
+  data-dir hooks tree.
+
+After any of those, run the installer for every agent whose hooks you use:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# project-scoped install, in each checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+This matters when a project's `.ai-memory.toml` sets `[handoff]
+deliver_on_session_start = true` or `[recovery] deliver_on_session_start =
+true` to override a server-wide `false`, as described in
+[marker-file.md](marker-file.md): the current clients forward the declared
+value (`handoff=1` / `recovery=1`), while an old hook file sends only the `0`
+opt-out and the project override has no effect. A marker set to `false` keeps
+working without the refresh, because old files already send `0`.
 
 ### Server container you run yourself, native client on the host
 

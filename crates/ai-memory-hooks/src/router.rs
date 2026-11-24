@@ -789,6 +789,17 @@ pub struct HookState {
     /// handoff; it renders a non-consuming notice instead and leaves the
     /// claim to an explicit `memory_handoff_accept` (design: #959).
     pub claim_handoff_on_session_start: bool,
+    /// `[handoff].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `handoff` flag
+    /// reads no baton, posts no continuity notice, and claims nothing; the
+    /// handoff stays open for `memory_handoff_accept`. A request's explicit
+    /// `handoff=1` still overrides it.
+    pub deliver_handoff_on_session_start: bool,
+    /// `[recovery].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `recovery` flag
+    /// skips the unfinished-session recovery snapshot and its backfill marker.
+    /// A request's explicit `recovery=1` still overrides it.
+    pub deliver_recovery_on_session_start: bool,
     /// `[handoff].create_on_session_end` (default `true` — unchanged
     /// behavior). When `false`, `SessionEnd` writes the summary page and
     /// consolidates as usual, but skips automatic handoff creation (#1043).
@@ -2067,16 +2078,20 @@ pub struct HandoffQuery {
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
-    /// The marker's `[handoff] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value keeps this
-    /// project's handoff and continuity notice out of its session starts: the
-    /// handoff stays open and unclaimed, and the rest of the on-start context
-    /// is delivered as usual. Absent or anything else delivers as before.
+    /// The marker's `[handoff] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value keeps this project's handoff and continuity notice out of its
+    /// session starts: the handoff stays open and unclaimed, and the rest of
+    /// the on-start context is delivered as usual. An explicit truthy value
+    /// delivers even when the server's `[handoff] deliver_on_session_start`
+    /// is `false`; absent or unrecognized follows that server default.
     pub handoff: Option<String>,
-    /// The marker's `[recovery] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value suppresses only the
-    /// unfinished-session recovery snapshot and its backfill marker. Absent or
-    /// anything else delivers recovery as before.
+    /// The marker's `[recovery] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value suppresses only the unfinished-session recovery snapshot and its
+    /// backfill marker; an explicit truthy value delivers even when the
+    /// server's `[recovery] deliver_on_session_start` is `false`, and absent
+    /// or unrecognized follows that server default.
     pub recovery: Option<String>,
     /// Per-request claim suppression, sent falsy (`claim=0`) by an execution
     /// that must not consume the pending baton — an external-capture run
@@ -2185,6 +2200,16 @@ async fn fetch_and_accept_handoff(
     .await
 }
 
+fn delivery_flag_enabled(value: Option<&str>, default: bool) -> bool {
+    if crate::payload::query_flag_falsy(value) {
+        false
+    } else if crate::payload::query_flag_truthy(value) {
+        true
+    } else {
+        default
+    }
+}
+
 async fn fetch_and_accept_handoff_at(
     state: &HookState,
     query: HandoffQuery,
@@ -2255,7 +2280,10 @@ async fn fetch_and_accept_handoff_at(
     // `[handoff] deliver_on_session_start = false` never reads the baton, so
     // there is nothing to claim, announce or render; it stays open for a
     // project that has not opted out (or for `memory_handoff_accept`).
-    let deliver_handoff = !crate::payload::query_flag_falsy(query.handoff.as_deref());
+    let deliver_handoff = delivery_flag_enabled(
+        query.handoff.as_deref(),
+        state.deliver_handoff_on_session_start,
+    );
     let handoff = if deliver_handoff {
         state
             .reader
@@ -2278,7 +2306,10 @@ async fn fetch_and_accept_handoff_at(
     // The source row stays open because it may belong to a legitimate parallel
     // agent; the packet says so explicitly and is never claimed/consumed.
     // `[recovery] deliver_on_session_start = false` skips only this packet.
-    let interrupted_md = if crate::payload::query_flag_falsy(query.recovery.as_deref()) {
+    let interrupted_md = if !delivery_flag_enabled(
+        query.recovery.as_deref(),
+        state.deliver_recovery_on_session_start,
+    ) {
         None
     } else {
         render_interrupted_session_context(state, ws, proj, owner_filter.clone(), accepting_session)
@@ -5669,6 +5700,7 @@ async fn process_authorized(
                 .clone()
                 .unwrap_or_else(|| kind.as_str().to_string())
         };
+        let trust_class = ai_memory_core::TrustClass::from_observation_kind(kind);
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5681,6 +5713,7 @@ async fn process_authorized(
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
             file_path: env.file_path.clone(),
+            trust_class: Some(trust_class),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -6219,6 +6252,7 @@ async fn process_authorized(
                         // predate owner recording.
                         actor: session_actor.clone(),
                         evidence: Vec::new(),
+                        trust_class: new_page.trust_class,
                     })
                     .await?
             }
@@ -6696,7 +6730,7 @@ fn derive_open_questions(facts: &HandoffFacts, last_prompt: &Option<String>) -> 
     // Heuristic 1: last prompt is a question → it is the open question.
     if let Some(p) = last_prompt_obs {
         let body = p.body.trim();
-        if body.ends_with('?') || body.ends_with('？') {
+        if body.ends_with('?') || body.ends_with('？') || body.ends_with('؟') {
             return vec![format!("Unresolved question: {}", cap_handoff_text(body))];
         }
     }
@@ -6789,6 +6823,17 @@ fn is_acknowledgment(text: &str) -> bool {
         "明白",
         "了解",
         "可以的",
+        // Arabic acknowledgments.
+        "تمام",
+        "شكرا",
+        "شكراً",
+        "حسنا",
+        "حسناً",
+        "ممتاز",
+        "واضح",
+        "مفهوم",
+        "تم",
+        "طيب",
     ];
     if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
         return true;
@@ -6806,7 +6851,7 @@ fn is_acknowledgment(text: &str) -> bool {
         // Any whitespace separates phrases: a multi-line "ok\nthanks" is
         // the same acknowledgment as "ok thanks".
         rest = rest.trim_start_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！')
+            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！' | '،' | '؛')
         });
         if rest.is_empty() {
             return true;
@@ -6815,11 +6860,10 @@ fn is_acknowledgment(text: &str) -> bool {
             .iter()
             .filter(|phrase| {
                 rest.strip_prefix(**phrase).is_some_and(|after| {
-                    !phrase.is_ascii()
-                        || !after
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphanumeric())
+                    phrase
+                        .chars()
+                        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                        || !after.chars().next().is_some_and(char::is_alphanumeric)
                 })
             })
             .max_by_key(|phrase| phrase.len());
@@ -6932,6 +6976,7 @@ async fn write_checkpoint_page(
             author_id: None,
             actor,
             evidence: Vec::new(),
+            trust_class: new_page.trust_class,
         })
         .await?;
     if checkpoint.track_page_write && previous_page_id != Some(page_id) {
@@ -7355,6 +7400,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -9617,6 +9663,8 @@ pub(crate) mod tests {
             capture_assistant_enabled: false,
             assistant_excerpt_max_bytes: crate::assistant_capture::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: true,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -9965,6 +10013,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -11895,6 +11944,7 @@ pub(crate) mod tests {
                     body: "hello".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -17866,6 +17916,7 @@ pub(crate) mod tests {
                                 body: String::new(),
                                 importance: 1,
                                 file_path: None,
+                                trust_class: None,
                             },
                             &state.sanitizer
                         ),
@@ -18473,6 +18524,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -19034,6 +19086,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -21048,6 +21101,96 @@ pub(crate) mod tests {
         assert!(project_b.contains(BACKFILL_MARKER_PREFIX));
         assert!(project_b.contains("RECOVERY-SOURCE-B"));
         assert!(!project_b.contains("RECOVERY-SOURCE-A"));
+    }
+
+    /// A server with `[recovery] deliver_on_session_start = false` skips the
+    /// snapshot for a start that names no `recovery` flag (or an unrecognized
+    /// value) while the brief, profile digest and inbox notice still arrive; a
+    /// project marker's explicit `recovery=1` opts back in.
+    #[tokio::test]
+    async fn server_recovery_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.deliver_recovery_on_session_start = false;
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some("/tmp/project-a".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "56565656-5656-5656-5656-565656565656",
+                    "cwd": "/tmp/project-a",
+                    "prompt": "RECOVERY-DEFAULT-OFF-SOURCE",
+                    "occurred_at": "2020-01-01T00:00:00Z"
+                }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_rules/recovery-default.md",
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        seed_global_profile(&state).await;
+        seed_inbox(&state, 1).await;
+
+        let query = |recovery: Option<&str>| HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some("/tmp/project-a".into()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            briefing: Some("true".into()),
+            recovery: recovery.map(str::to_string),
+            ..Default::default()
+        };
+        for absent in [None, Some("banana")] {
+            let body = fetch_and_accept_handoff(&state, query(absent), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("the other startup context must survive the server default");
+            for unwanted in [
+                "unfinished-session recovery snapshot",
+                BACKFILL_MARKER_PREFIX,
+                "RECOVERY-DEFAULT-OFF-SOURCE",
+            ] {
+                assert!(!body.contains(unwanted), "{absent:?}: {unwanted}: {body}");
+            }
+            for retained in [
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                "Use pnpm, not npm.",
+                "1 cross-project message waiting",
+            ] {
+                assert!(
+                    body.contains(retained),
+                    "{absent:?}: missing {retained}: {body}"
+                );
+            }
+        }
+
+        let body = fetch_and_accept_handoff(&state, query(Some("1")), None, Vec::new(), None)
+            .await
+            .unwrap()
+            .expect("the other startup context must survive the server default");
+        assert!(
+            body.contains("unfinished-session recovery snapshot"),
+            "{body}"
+        );
+        assert!(body.contains("RECOVERY-DEFAULT-OFF-SOURCE"), "{body}");
     }
 
     #[tokio::test]
@@ -23305,6 +23448,56 @@ pub(crate) mod tests {
         assert!(!open_handoff_exists(&state).await);
     }
 
+    /// A server with `[handoff] deliver_on_session_start = false` delivers no
+    /// baton or continuity notice for a start that sends no `handoff` flag (or
+    /// an unrecognized value) and leaves the handoff open; a project marker's
+    /// explicit `handoff=1` delivers and claims it.
+    #[tokio::test]
+    async fn server_handoff_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state_with_admission(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        state.deliver_handoff_on_session_start = false;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        for absent in [None, Some("banana")] {
+            let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", absent).await;
+            assert!(
+                !body.contains("HANDOFF-MARKER") && !body.to_lowercase().contains("handoff"),
+                "{absent:?}: a server default off must deliver no handoff or notice: {body}",
+            );
+            assert!(
+                open_handoff_exists(&state).await,
+                "{absent:?}: the server default must leave the baton open",
+            );
+        }
+
+        let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
+        assert!(!open_handoff_exists(&state).await);
+    }
+
     /// #2148: an external-capture run sends `claim=0` so its SessionStart
     /// announces the pending baton as an offer and leaves it open — even though
     /// the server claims by default — instead of consuming the user's handoff.
@@ -23951,6 +24144,7 @@ pub(crate) mod tests {
                     body: "finish".into(),
                     importance: 7,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -23994,6 +24188,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -24849,6 +25044,7 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -29617,6 +29813,7 @@ pub(crate) mod tests {
             body: body.into(),
             importance: 5,
             created_at: jiff::Timestamp::now(),
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 
@@ -30366,6 +30563,24 @@ pub(crate) mod tests {
         let last = None;
         let q = derive_open_questions(&obs, &last);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn open_questions_arabic_question_mark_and_ack_detected() {
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "q",
+            "هل يمكننا ترحيل قاعدة البيانات؟",
+        )];
+        let last = Some("هل يمكننا ترحيل قاعدة البيانات؟".to_string());
+        let qs = derive_open_questions(&obs, &last);
+        assert_eq!(
+            qs,
+            vec!["Unresolved question: هل يمكننا ترحيل قاعدة البيانات؟"]
+        );
+        assert!(is_acknowledgment("تم، شكراً!"));
+        assert!(is_acknowledgment("تمام"));
+        assert!(!is_acknowledgment("تمكين المصادقة الثنائية"));
     }
 
     #[test]
@@ -31446,6 +31661,7 @@ pub(crate) mod tests {
                         body: habit.into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

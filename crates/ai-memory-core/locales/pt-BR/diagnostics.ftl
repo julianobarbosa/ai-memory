@@ -87,6 +87,8 @@ diag-generating-random-token = gerando token aleatório: { $e }
 diag-level = { $value0 }  { $value1 }  NÍVEL
 diag-listing-s-grants = listando as permissões de { $user }
 diag-listing-grants-on = listando as permissões em { $value0 }/{ $value1 }
+diag-granting-on = concedendo permissão a { $value0 } em { $value1 }
+diag-revoking-on = revogando as permissões de { $value0 } em { $value1 }
 diag-open-handoffs-for-oldest-first = Handoffs abertos em { $workspace }/{ $project } (mais antigos primeiro):
 diag-from = { "  " }{ $value0 }  de { $value1 } -> { $value2 }
 diag-id = { "    " }id: { $value0 }
@@ -1001,6 +1003,7 @@ diag-building-profile = criando provedor alternativo LLM { $item }
 diag-profile-api-key-unsupported = provedor não configurado: api_key_env não é compatível com o provedor { $provider }
 diag-building-llm-provider-chains = criando cadeias de provedores LLM a partir da configuração
 diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requer AI_MEMORY_LLM_PROVIDER ou um provedor llm.rerank
+diag-reranker-decisions-choice-requires-key-and-model = AI_MEMORY_RERANKER=decisions-choice requer OPENAI_API_KEY e llm_model
 diag-jail-encoding-choices = codificando as escolhas do jail
 diag-jail-checklist-header = 🔒 ai-jail: o que o agente pode acessar
 diag-jail-checklist-enter-keeps = (Enter mantém as marcas)
@@ -1052,3 +1055,6 @@ diag-true-yolo-is-now-yolo = ai-memory: --true-yolo agora é o mesmo que --yolo;
 diag-claude-true-yolo-deprecated = ai-memory: claude_true_yolo está obsoleto e é ignorado: --yolo no Claude agora sempre força bypassPermissions; remova-o do config.toml
 diag-serializing-redacted-config = serializando configuração redigida para { $value0 }
 diag-verifying-redacted-config = verificando configuração redigida para { $value0 }
+diag-pi-direct-tools-codemode-conflict = pi_direct_tools e pi_tool_exposure = "codemode" são mutuamente exclusivos; remova pi_direct_tools ou defina pi_tool_exposure = "direct"
+diag-pi-direct-tools-too-many = pi_direct_tools pode listar no máximo { $max } ferramentas (recebido { $count })
+diag-pi-direct-tools-invalid-entry = a entrada `{ $tool }` em pi_direct_tools é inválida; nomes de ferramentas não podem ser vazios, devem ter no máximo { $max } caracteres e usar apenas letras ASCII, dígitos, `_` ou `-`

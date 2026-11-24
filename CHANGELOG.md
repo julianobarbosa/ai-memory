@@ -11,6 +11,139 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-11-23
+
+### Added
+
+- `ai-memory user grant --all-projects` gave a user `read` or `write` on every
+  project of a workspace, including projects created later, instead of one
+  grant per project; `user revoke --all-projects` takes it away. The grant is
+  stored in a new `workspace_grants` table (V115, additive), combines with a
+  project grant to the higher level, never reaches another workspace or private
+  `_profile.<user_id>` scopes, and does not allow writing the workspace's
+  shared `_profile` scope. `POST
+  /admin/users/{username}/grant|revoke` accept `"all_projects": true` in place
+  of `"project"`, and the grant listings return workspace grants in a separate
+  `workspace_grants` array. See `docs/users.md#per-project-access`. (#2444)
+
+- `pi_direct_tools` (`AI_MEMORY_PI_DIRECT_TOOLS`) lets the generated Pi
+  extension keep a chosen list of ai-memory MCP tools `direct` while
+  registering the rest with `exposure: "deferred"`, attaching a single
+  `promptGuidelines` discovery hint and activating Pi's `tool_search` in
+  `session_start` (`[]` defers all tools; unset leaves the generated
+  extension byte-identical; mutually exclusive with
+  `pi_tool_exposure = "codemode"`). (#2428)
+
+- `ai-memory run` accepts `gemini` (alias `gemini-cli`) and manages Google
+  Gemini CLI as a workstream harness: a fresh session gets a generated
+  `--session-id`, a returning one is resumed with `--resume <id>`, explicit user
+  selectors (`--resume`, `-r`, `--session-id`, `--session-file`) win, utility
+  subcommands (`mcp`, `extensions`, `skills`, `hooks`, `gemma`) and listing /
+  deletion / help / version flags pass through, `-p`/`--prompt` blocks
+  first-use adoption, and `--yolo` maps to Gemini CLI's `--yolo` without
+  duplicating `-y`, `--yolo`, or `--approval-mode`. Visible messages and
+  completed tool calls/results are imported read-only from
+  `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl` with
+  exact-checkout `projectHash` isolation and symlink refusal (hidden `thoughts`,
+  system prompts, binary payloads, and provider metadata are excluded), and the
+  existing `SessionStart` hook delivers workstream context. The first managed
+  launch auto-wires Gemini CLI's hooks and MCP (honoring `GEMINI_CLI_HOME`),
+  `ai-jail` maps it to `--harness gemini` with `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY`, and `doctor` scans its local store. Verified against Gemini
+  CLI 0.64.0 / 0.66.0. (#2435)
+
+- Arabic FTS5 search normalization and hook heuristics: the auxiliary
+  CJK/Arabic FTS index strips tashkeel/tatweel/BiDi marks, folds Arabic letter
+  variants (Alef, Alef Maksura, Teh Marbuta, Hamza carriers), and normalizes
+  Eastern/Extended Arabic-Indic digits (`٠-٩`, `۰-۹`) to ASCII across
+  punctuation-separated words, while hook handoff heuristics recognize the
+  Arabic question mark (`؟`) and common Arabic acknowledgments. Pages and
+  observations stored before the upgrade get the Arabic terms on the first
+  start, through migration V114. (#2426, #2439)
+
+- Local in-process embeddings (`embedding_provider = "local"`) now offer a
+  checksum-pinned multilingual model for non-English wikis:
+  `intfloat/multilingual-e5-small` (also accepted via the shorthand alias
+  `multilingual-e5-small`, 384-dim, ~470 MB, stored under
+  `<data_dir>/models/multilingual-e5-small/`). `all-MiniLM-L6-v2` remains the
+  default. `LocalEmbedder` automatically prepends E5's asymmetric `"query: "`
+  and `"passage: "` prefixes ahead of truncation, reports the canonical model
+  id so switching local models triggers the existing mismatch guard
+  (`ai-memory embed --force`), and rejects unknown local model names loudly at
+  config load. (#2369)
+
+- Memory-poisoning origin trust class (`trust_class`, migration V113) and
+  `_rules/` emission gating: observations receive an immutable trust class at
+  hook ingress (`user-prompt` -> `operator_authored`, `post-tool-use` ->
+  `tool_result`, assistant/lifecycle -> `model_generated`), compiled pages
+  derive their least-trusted class from `page_sources` (and fold on
+  byte-identical accumulation), a `merge-project` path collision takes the less
+  trusted class of the two pages it combines (#2398), citationless rewrites such as
+  `memory_patch_page` inherit the superseded version's `trust_class` so a patch
+  cannot launder `tool_result` into `operator_authored`, zero-LLM rule-based
+  `sessions/<id>.md` pages derive their class from the session's observations
+  without synthetic `page_evidence` rows, consolidation and auto-improve refuse
+  `_rules/` emission when all supporting sources are `tool_result` (downgrading
+  consolidation output to `gotchas/` and rejecting auto-improve rule proposals;
+  operator corroboration in a `user-prompt` lifts the gate), and `memory_query`
+  surfaces `trust_class` on hits without changing RRF ranking. A rebuild with
+  `ai-memory reindex` cannot recover a class from the markdown, so it stores
+  each rebuilt page as `model_generated` rather than `operator_authored`.
+  (#2164, #2392)
+
+- `memory_patch_page` accepts `scope: "global"`, like `memory_read_page` and
+  `memory_write_page`, so a page read from the global scope can be patched with
+  the `page_id` that read returned. Before, the patch looked in the current
+  project and failed with `latest is no page`, which read as a concurrent
+  delete. A patch whose path has no page in the resolved project still fails as
+  `precondition_failed`, and its message now says to pass `scope: "global"` for
+  a global page. The TypeScript SDK exposes it as
+  `pages.patch({ global: true })`. (#2362, #2363)
+
+- `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) reads the `openai-compat`
+  API key from a file instead of `LLM_API_KEY`, for gateways whose bearer token
+  rotates while the server runs. The key is read on first use and cached; after
+  a `401` the file is read once more, and the request is retried once only when
+  the file now holds a different key, so a stale token never loops. ai-memory
+  never writes the file. `[llm.<task>]` profiles that inherit the global key
+  inherit the file too, and an ambient `LLM_API_KEY` is ignored by the chat
+  provider when the file is set. (#2365)
+
+- Added the native OpenAI Decisions Choice reranker, selected with `reranker = "decisions-choice"` or `AI_MEMORY_RERANKER=decisions-choice`.
+  It requires `OPENAI_API_KEY` and an explicit `llm_model`, without a generative provider.
+  It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
+  Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
+
+- Reported write-time truncation to the sender of `memory_message_send` and
+  `memory_handoff_begin`. When a size cap cut any text, the response adds
+  `truncated: true` and a `truncated_fields` map with `original_chars` and
+  `stored_chars` per cut field, plus `original_items` and `stored_items` for
+  handoff lists; a call that fits returns the same keys as before. Both tool
+  descriptions and their field descriptions now state the exact limits, and
+  the TypeScript SDK exposes the report as `truncated` / `truncatedFields`.
+  (#2411)
+
+- Added server-wide `[handoff] deliver_on_session_start` and `[recovery]
+  deliver_on_session_start` settings, which turn off the session-start handoff
+  block and the unfinished-session recovery snapshot for every project from one
+  `config.toml`. A project's `.ai-memory.toml` still overrides the server
+  default in either direction: all four hook clients now forward a declared
+  value (`handoff=1` / `recovery=1` as well as `0`) instead of only the
+  opt-out, and an absent key follows the server default. Existing `0` opt-outs
+  keep working; old hook files need
+  `ai-memory install-hooks --agent <agent> --apply` to send the opt-in (see
+  `docs/install.md#hook-files-after-an-update`). (#1621, #1865)
+
+### Fixed
+
+- The retrieval-history page now refuses browser caching like every other
+  `/web` page, closing the one route missed by the every-page header change.
+  (#2442)
+
+- `memory_query(answer=true)` now tells the answer model that page snippets are
+  untrusted data rather than instructions, matching every other memory-bearing
+  LLM prompt. (#2443)
+
 ## [3.5.2] - 2026-11-23
 
 ### Fixed
@@ -6195,7 +6328,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.0...HEAD
+[3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
 [3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0

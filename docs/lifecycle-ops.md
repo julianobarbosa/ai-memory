@@ -564,7 +564,9 @@ the source has an open session or an unexpired active managed-run lease. A
 same-path collision produces a new version whose body is the target body, a
 `<!-- ai-memory:merged-from workspace/source -->` marker, and the source body.
 The target frontmatter wins; `expires_at`/`stale_after` survive only when both
-sides were expiring. The new page keeps the earlier creation time and receives
+sides were expiring. Its trust class (#2164) is the less trusted of the two
+sides', so text compiled from a tool result keeps that class in the combined
+page. The new page keeps the earlier creation time and receives
 `stale` feedback naming the source, so `memory_lint` continues to report it
 until a person or agent reconciles the combined prose. Every prior target and
 source version remains under the target path and is available to history and
@@ -1495,6 +1497,9 @@ What is not rebuilt:
 
 - Sessions, observations, handoffs, users/tokens, audit rows, access counters,
   and embeddings. Those are DB-only state; keep a backup if you need them.
+- Page trust classes (`trust_class`, #2164). The markdown does not carry them,
+  so every rebuilt page is `model_generated`, the class of a row whose origin
+  was never recorded, rather than `operator_authored`.
 
 Every scope directory carries the `_meta.md` manifest `reindex` reads its
 workspace/project name from. Identity-backed project manifests also carry

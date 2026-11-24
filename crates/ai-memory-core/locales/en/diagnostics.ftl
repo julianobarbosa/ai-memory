@@ -12,6 +12,7 @@ diag-building-profile = building LLM fallback provider { $item }
 diag-profile-api-key-unsupported = provider not configured: api_key_env is not supported by provider { $provider }
 diag-building-llm-provider-chains = building LLM provider chains from config
 diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider
+diag-reranker-decisions-choice-requires-key-and-model = AI_MEMORY_RERANKER=decisions-choice requires OPENAI_API_KEY and llm_model
 diag-aborted-no-input = aborted (no input)
 diag-aborted = aborted
 diag-reading = reading { $value0 }
@@ -98,6 +99,8 @@ diag-generating-random-token = generating random token: { $e }
 diag-level = { $value0 }  { $value1 }  LEVEL
 diag-listing-s-grants = listing { $user }'s grants
 diag-listing-grants-on = listing grants on { $value0 }/{ $value1 }
+diag-granting-on = granting { $value0 } on { $value1 }
+diag-revoking-on = revoking { $value0 } on { $value1 }
 diag-open-handoffs-for-oldest-first = Open handoffs for { $workspace }/{ $project } (oldest first):
 diag-from = { "  " }{ $value0 }  from { $value1 } -> { $value2 }
 diag-id = { "    " }id: { $value0 }
@@ -1043,3 +1046,6 @@ diag-true-yolo-is-now-yolo = ai-memory: --true-yolo is now the same as --yolo; u
 diag-claude-true-yolo-deprecated = ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml
 diag-serializing-redacted-config = serializing redacted config for { $value0 }
 diag-verifying-redacted-config = verifying redacted config for { $value0 }
+diag-pi-direct-tools-codemode-conflict = pi_direct_tools and pi_tool_exposure = "codemode" are mutually exclusive; remove pi_direct_tools or set pi_tool_exposure = "direct"
+diag-pi-direct-tools-too-many = pi_direct_tools may list at most { $max } tools (got { $count })
+diag-pi-direct-tools-invalid-entry = pi_direct_tools entry `{ $tool }` is invalid; tool names must be non-empty, at most { $max } characters, and use only ASCII letters, digits, `_`, or `-`
