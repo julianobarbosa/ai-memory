@@ -35,11 +35,11 @@ The existing backup example remains simple and local-first while gaining:
 
 - [x] ISC-3: Encryption reads its passphrase from `AI_MEMORY_BACKUP_PASSPHRASE_FILE` or `AI_MEMORY_BACKUP_PASSPHRASE`, never command-line arguments or logs. Evidence: script uses `--passphrase-file` or a stdin file descriptor; secret values are never echoed or interpolated into process arguments.
 
-- [x] ISC-4: The script refuses unsafe passphrase files, missing encryption tooling, and missing OneDrive destinations without producing a remote plaintext copy. Evidence: unsafe-mode and missing-secret negative tests pass; the configured destination check precedes encryption.
+- [x] ISC-4: The script refuses unsafe passphrase files, missing encryption tooling, missing OneDrive destinations, and path overlap with synced or mirrored trees. Evidence: negative tests pass for unsafe permissions, missing secrets, and source/destination overlap; no remote plaintext or mirrored secret is produced.
 
 - [x] ISC-5: Existing local and private-git behavior still works when OneDrive is not configured. Evidence: first four integration phases pass with `ONEDRIVE_DIR` unset, including failed-push retry behavior.
 
-- [x] ISC-6: Encrypted-copy retention and local retention are independently configurable. Evidence: dated fixture archives are pruned by their respective `TARBALL_RETENTION_DAYS` and `ONEDRIVE_RETENTION_DAYS` values.
+- [x] ISC-6: Encrypted-copy retention and local retention are independently configurable. Evidence: plaintext and encrypted fixtures at different ages prove only the archive past its own threshold is pruned.
 
 - [x] ISC-7: README and systemd example document OneDrive setup, secret storage, restore, and the fact that passphrase is required for decryption. Evidence: example README and service include the destination, owner-only passphrase file, 1Password recovery note, decryption command, and retention settings.
 
@@ -80,4 +80,5 @@ The existing backup example remains simple and local-first while gaining:
 - `bash tests/backup_snapshot.sh` passed.
 - `cargo test -p ai-memory-cli repo_layout -- --nocapture` passed (5/5 selected tests).
 - `git diff --check` passed.
-- Acceptance: real local workflow exercised through fake git remote and fake OneDrive sync directory; encrypted archive decrypted byte-for-byte to the local online snapshot (2026-11-24).
+- Acceptance: real local workflow exercised through fake git remote and fake OneDrive sync directory; encrypted archive decrypted byte-for-byte to the local online snapshot; overlap, unsafe-secret, missing-secret, inherited-config, and independent-retention cases passed (2026-11-24).
+- Review mitigation: addressed Sourcery comments 1–13 and CodeRabbit's inherited-environment, private-staging, and systemd findings.

@@ -68,19 +68,38 @@ no passphrase is embedded in the script, archive name, or logs.
 # Create an owner-only passphrase file. Store a recovery copy in 1Password.
 install -d -m700 "$HOME/.config/ai-memory-backup"
 umask 077
-printf '%s\n' 'GENERATE-A-HIGH-ENTROPY-PASSPHRASE' \
-    > "$HOME/.config/ai-memory-backup/passphrase"
+openssl rand -base64 48 > "$HOME/.config/ai-memory-backup/passphrase"
+chmod 600 "$HOME/.config/ai-memory-backup/passphrase"
+# Store a recovery copy in 1Password. Do not put this file in OneDrive or git.
 
-# Put this destination-specific setting in the scheduler environment.
+# These exports apply only when you run ai-memory-snapshot.sh directly.
 export ONEDRIVE_DIR="$HOME/OneDrive/Backups/ai-memory"
 export AI_MEMORY_BACKUP_PASSPHRASE_FILE="$HOME/.config/ai-memory-backup/passphrase"
 ```
 
+For the supplied systemd timer, use a persistent user-service drop-in; shell
+exports are not inherited by a running user manager:
+
+```ini
+# ~/.config/systemd/user/ai-memory-backup.service.d/onedrive.conf
+[Service]
+Environment=ONEDRIVE_DIR=%h/OneDrive/Backups/ai-memory
+Environment=AI_MEMORY_BACKUP_PASSPHRASE_FILE=%h/.config/ai-memory-backup/passphrase
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user start ai-memory-backup.service
+journalctl --user -u ai-memory-backup.service --since '5 minutes ago'
+```
+
 The script keeps the plaintext online snapshot in `TARBALL_DIR`, encrypts it
-with GnuPG AES-256, stages it as a temporary file, then atomically renames the
-finished `.gpg` archive into `ONEDRIVE_DIR`. A configured OneDrive failure makes
-the scheduled run fail, but the local snapshot remains available. Leaving
-`ONEDRIVE_DIR` unset preserves the original local + private-git behavior.
+with GnuPG AES-256 in a private staging directory, then atomically renames the
+finished `.gpg` archive into `ONEDRIVE_DIR`. It refuses paths where the plaintext
+tarball or passphrase file would sync to OneDrive or be mirrored to git. A
+configured OneDrive failure makes the scheduled run fail, but the local snapshot
+remains available. Leaving `ONEDRIVE_DIR` unset preserves the original local +
+private-git behavior.
 
 To decrypt for recovery, stop ai-memory first and never decrypt into a synced
 folder:

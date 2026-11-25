@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- The backup example can publish a GPG AES-256 encrypted online snapshot to a
+  locally synced OneDrive directory using `ONEDRIVE_DIR` and an owner-only
+  passphrase file or scheduler-injected secret. It keeps the local snapshot
+  first, rejects plaintext/secret path overlaps with synced and mirrored trees,
+  serializes overlapping runs, publishes through private atomic staging, and
+  applies separate local/encrypted retention windows. See `docs/backup.md` and
+  `docs/examples/backup/README.md`.
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

@@ -8,6 +8,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export REPO_DIR="$fixture/mirror" DATA_SRC="$fixture/source" CFG_SRC="$fixture/config"
 export LOG_DIR="$fixture/logs" TARBALL_DIR="$fixture/backups"
 export PATH="$fixture/bin:$PATH" SNAPSHOT_CALLS="$fixture/calls"
+unset ONEDRIVE_DIR AI_MEMORY_BACKUP_PASSPHRASE_FILE AI_MEMORY_BACKUP_PASSPHRASE
 
 mkdir -p "$fixture/bin" "$DATA_SRC/wiki" "$CFG_SRC"
 git init -q --bare "$fixture/remote"
@@ -83,7 +84,7 @@ cmp "$default_config_home/.config/ai-memory/current.toml" "$REPO_DIR/config/curr
 override_status=0
 CFG_SRC="$fixture/absent-override" bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || override_status=$?
 test "$override_status" -ne 0
-test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 4
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 5
 test -f "$REPO_DIR/config/current.toml"
 
 # OneDrive receives only encrypted bytes and the archive round-trips with the
@@ -94,10 +95,11 @@ chmod 600 "$fixture/passphrase"
 ONEDRIVE_DIR="$fixture/onedrive" \
 AI_MEMORY_BACKUP_PASSPHRASE_FILE="$fixture/passphrase" \
 bash "$root/docs/examples/backup/ai-memory-snapshot.sh"
-stamp="$(date +%Y-%m-%d)"
-encrypted="$fixture/onedrive/ai-memory-$stamp.tar.gz.gpg"
+encrypted_list=("$fixture/onedrive"/ai-memory-*.tar.gz.gpg)
+test "${#encrypted_list[@]}" -eq 1
+encrypted="${encrypted_list[0]}"
 test -f "$encrypted"
-test ! -f "$fixture/onedrive/ai-memory-$stamp.tar.gz"
+test -z "$(find "$fixture/onedrive" -maxdepth 1 -name '*.tar.gz' -print -quit)"
 case "$(file -b "$encrypted")" in
     *OpenPGP*|*PGP*|*data*) ;;
     *) echo "encrypted output has unexpected type" >&2; exit 1 ;;
@@ -105,8 +107,11 @@ esac
 gpg --batch --yes --pinentry-mode loopback \
     --passphrase-file "$fixture/passphrase" \
     --output "$fixture/decrypted.tar.gz" --decrypt "$encrypted"
-cmp "$TARBALL_DIR/ai-memory-$stamp.tar.gz" "$fixture/decrypted.tar.gz"
-test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 5
+plain_list=("$TARBALL_DIR"/ai-memory-*.tar.gz)
+test "${#plain_list[@]}" -ge 1
+newest_plain=$(find "$TARBALL_DIR" -maxdepth 1 -name 'ai-memory-*.tar.gz' -type f -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+cmp "$newest_plain" "$fixture/decrypted.tar.gz"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 6
 
 # Unsafe passphrase permissions and a missing secret both fail closed while the
 # local online backup remains present. Neither run may leave a remote archive.
@@ -120,7 +125,7 @@ AI_MEMORY_BACKUP_PASSPHRASE_FILE="$unsafe" \
 bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || unsafe_status=$?
 test "$unsafe_status" -ne 0
 test ! -e "$encrypted"
-test -f "$TARBALL_DIR/ai-memory-$stamp.tar.gz"
+test -f "$newest_plain"
 
 missing_status=0
 ONEDRIVE_DIR="$fixture/onedrive" \
@@ -128,19 +133,41 @@ env -u AI_MEMORY_BACKUP_PASSPHRASE_FILE -u AI_MEMORY_BACKUP_PASSPHRASE \
 bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || missing_status=$?
 test "$missing_status" -ne 0
 test ! -e "$encrypted"
-test -f "$TARBALL_DIR/ai-memory-$stamp.tar.gz"
-test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 7
+test -f "$newest_plain"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 6
 
-# Retention is independently configurable for the encrypted and local outputs.
+# Reject overlap with OneDrive and mirrored source trees before a backup is made.
+overlap_status=0
+ONEDRIVE_DIR="$fixture/onedrive" \
+TARBALL_DIR="$fixture/onedrive/plain" \
+AI_MEMORY_BACKUP_PASSPHRASE_FILE="$fixture/passphrase" \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || overlap_status=$?
+test "$overlap_status" -ne 0
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 6
+
+printf 'mirrored secret\n' > "$CFG_SRC/backup-secret"
+chmod 600 "$CFG_SRC/backup-secret"
+leak_status=0
+ONEDRIVE_DIR="$fixture/onedrive" \
+AI_MEMORY_BACKUP_PASSPHRASE_FILE="$CFG_SRC/backup-secret" \
+bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || leak_status=$?
+test "$leak_status" -ne 0
+test ! -e "$REPO_DIR/config/backup-secret"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 6
+rm -f "$CFG_SRC/backup-secret"
+
+# Retention is independently configurable: the plain fixture is past its
+# threshold while the encrypted fixture is between the two thresholds.
 old_plain="$TARBALL_DIR/ai-memory-2000-01-01.tar.gz"
-old_encrypted="$fixture/onedrive/ai-memory-2000-01-01.tar.gz.gpg"
+between_encrypted="$fixture/onedrive/ai-memory-2000-01-02.tar.gz.gpg"
 printf 'old\n' > "$old_plain"
-printf 'old\n' > "$old_encrypted"
-touch -d '90 days ago' "$old_plain" "$old_encrypted"
-TARBALL_RETENTION_DAYS=1 ONEDRIVE_RETENTION_DAYS=2 \
+printf 'old encrypted\n' > "$between_encrypted"
+touch -d '10 days ago' "$old_plain"
+touch -d '5 days ago' "$between_encrypted"
+TARBALL_RETENTION_DAYS=7 ONEDRIVE_RETENTION_DAYS=14 \
 ONEDRIVE_DIR="$fixture/onedrive" \
 AI_MEMORY_BACKUP_PASSPHRASE_FILE="$fixture/passphrase" \
 bash "$root/docs/examples/backup/ai-memory-snapshot.sh"
 test ! -e "$old_plain"
-test ! -e "$old_encrypted"
-test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 8
+test -e "$between_encrypted"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 7
