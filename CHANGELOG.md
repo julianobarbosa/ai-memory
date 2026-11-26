@@ -11,6 +11,151 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- The backup example can publish a GPG AES-256 encrypted online snapshot to a
+  locally synced OneDrive directory using `ONEDRIVE_DIR` and an owner-only
+  passphrase file or scheduler-injected secret. It keeps the local snapshot
+  first, rejects plaintext/secret path overlaps with synced and mirrored trees,
+  serializes overlapping runs, publishes through private atomic staging, and
+  applies separate local/encrypted retention windows. See `docs/backup.md` and
+  `docs/examples/backup/README.md`.
+
+## [3.6.2] - 2026-11-25
+
+### Security
+
+- Bypassed the `cap + 64 KiB` pre-scrub prefix window in hook `durable_body`
+  whenever `[sanitize].extra_patterns` is configured, so custom regexes that
+  depend on context past the overlap window (such as multi-line delimited
+  blocks or end-anchored `$` patterns) still redact secrets inside stored hook
+  bodies before truncation. Built-in-only deployments keep the bounded
+  `cap + 64 KiB` scrub window for multi-MiB tool responses.
+  (GHSA-qxwf-7hw8-qw28)
+
+### Fixed
+
+- Fixed `backup-agents` and `restore-agents` to honor `GROK_HOME` for Grok's
+  global `config.toml` and skills and `KIRO_HOME` for Kiro CLI's
+  `settings/mcp.json` and agent configs, the homes `install-mcp`,
+  `install-skills` and `install-hooks` write to. A backup no longer archives
+  the default `~/.grok` or `~/.kiro` in their place, and a restore writes the
+  entries back under the destination's home. (#2467)
+- Fixed `backup-agents` to archive OpenCode global skills from
+  `~/.config/opencode/skills`, which `restore-agents` already restored to the
+  OpenCode config root. (#2469)
+- Fixed `backup-agents` to archive Gemini CLI project skills from the
+  repository's `.gemini/skills`, which `restore-agents` already wrote back.
+  (#2472)
+- Fixed `backup-agents` to archive Gemini CLI plugins from `~/.gemini/plugins`,
+  the second plugin root the asset matrix lists beside Antigravity's. (#2477)
+- Kept spooled hook events queued instead of charging a retry when a request
+  deadline shorter than the 2 s connect budget expires while still connecting.
+  (#2465)
+- A Cursor `stop` whose `status` is `aborted` is stored as an interrupted
+  turn end, and one whose status is `error` as a failed turn end, as Claude
+  Code's `StopFailure` and Codex's `Interrupt` already are. Cursor has no
+  separate events for them, so both were stored like a turn that completed
+  (#2481).
+- Claude Code tool observations store each built-in tool's output text
+  instead of the escaped JSON of its result object: Bash and PowerShell
+  output, a Read's file text, the patch of an Edit or an overwriting Write, a
+  NotebookEdit's cell source, and Grep and Glob matches one per line.
+  Full-text search now finds words on every line of a Bash or Read result, an
+  Edit no longer stores the whole original file in place of its patch, and an
+  image or PDF read no longer stores base64 (#2480).
+- `[capture] ignore_paths` now holds for files a Claude Code shell command
+  changed without naming them. Claude Code 2.1.269 and later lists those files
+  and their diffs in `tool_response.bashEditDiff`, so a `make gen` that
+  rewrote an ignored file stored the file's old and new lines. A call that
+  changed an ignored file is now dropped, in its own checkout or another one,
+  and under an active policy a list that does not fit the documented shape
+  keeps only metadata (#2479).
+- OpenCode 2 plugin now persists lightweight per-session ownership markers on
+  disk so `session.deleted` still emits `session-end` (preserving subagent
+  `agent_id`, location ownership, and `session.moved` rebinding) after the
+  location plugin reloads, while ignoring uncaptured sessions and preventing
+  duplicate `session-end` deliveries. (#2485)
+
+## [3.6.1] - 2026-11-24
+
+### Fixed
+
+- Recorded project access-mode changes in `audit_log` with the workspace,
+  project, operator and previous/new modes. The change and audit row commit
+  together, so an audit failure leaves access unchanged; repeated modes do
+  not add audit rows. (#2446)
+
+- Hook titles skipped leading blank lines, so pasted prompts no longer fell
+  back to `user-prompt`. Claude Code `<agent-message>` subagent hand-backs
+  stayed in session history but no longer became page titles, listed prompts,
+  or harvested user preferences (#2450).
+
+- `ai-memory serve` starts again when `embedding_model` names a model the
+  local embedder cannot run, such as `text-embedding-3-small` left behind
+  after the `embedding_provider` line was removed. 3.6.0 refused to start with
+  "unknown local embedding model"; with no provider set, the default local
+  embedder now keeps its default model, as releases before 3.6.0 did, and logs
+  a warning naming the ignored setting. An explicit `embedding_provider =
+  "local"` still refuses an unknown model. (#2454)
+
+- `ai-memory upgrade` no longer moves the hooks of Codex, Copilot CLI,
+  Cursor, Gemini CLI, Kimi Code and the other native-hook agents to the local
+  server. Installed with `install-hooks --server-url <remote> --auth-token
+  <token>` and refreshed with no `server_url` configured, their commands were
+  re-rendered with `http://127.0.0.1:49374`, and after `ai-memory init` the
+  local root bearer replaced the stored hook token. The refresh now keeps the
+  endpoint every installed hook shares and the hook credential stored for it,
+  as it already did for Claude Code, in each command form the installer
+  writes, including the PowerShell form those agents get on Windows. A
+  configured `server_url` or `AI_MEMORY_SERVER_URL` still wins. (#2455)
+
+- Fixed `backup-agents` and `restore-agents` to honor `GEMINI_CLI_HOME`
+  for Gemini CLI's global settings and skills. (#2459)
+
+- Fixed duplicate-title lint to compare the indexed titles shown in the page
+  list, including titles derived from a Markdown heading or filename. (#2447)
+
+- Stabilized duplicate-title ordering in lint reports to avoid redundant
+  report revisions and keep the briefing's warning-page list consistent. (#2461)
+
+- Kept Gemini CLI utility commands such as `--debug mcp list` in passthrough
+  mode so `ai-memory run gemini` leaves their arguments intact. (#2435)
+
+- XLSX import kept a cell under its header when an earlier blank cell was
+  omitted from the worksheet, for a gap of up to 32 columns. A wider jump
+  still uses one separator, so a sparse sheet is not expanded into the empty
+  rectangle. (#2458)
+
+- A repeated delivery of an ordinary hook whose ingest key had already
+  completed is acknowledged before its body is scrubbed again. A
+  multi-megabyte tool result no longer has to be reprocessed on every spool
+  retry. Recovery keys and `SessionEnd` still take the full path: a recovery
+  mismatch stays a collision, and an ended session can still repair its wiki
+  commit. (#2452)
+
+- Hook spool drain and large `PostToolUse` sanitization: `post_batch` and
+  `post_hook` now classify post-connect request/response timeouts
+  (`err.is_timeout() && !err.is_connect()`, backed by a 2 s `connect_timeout`
+  on `build_client`) as `Failed` instead of `Unreachable` so a slow or poison
+  head entry charges `attempts` and drops at `MAX_ATTEMPTS` instead of stalling
+  subsequent spooled events forever, while connection-refused, DNS, and connect
+  timeout outages stay `Unreachable` with zero attempt charge; server-side
+  `durable_body` now scrubs a UTF-8-safe `cap + 64 KiB` overlap window before
+  truncating to the per-event cap so multi-MiB `tool_response` payloads finish
+  in milliseconds while preserving `#1114` straddling-secret and PEM private-key
+  redaction. (#2452)
+
+### Security
+
+- Enforce the reserved-scope write gate (`default/_global` and
+  `<workspace>/_profile`) and private-profile isolation (`_profile.<user_id>`)
+  for non-root trusted-proxy callers (`AuthLevel::User` without a database
+  `AuthorizedViewer`) across MCP tools, `/messages/*`, and hook/workstream
+  routes (`GHSA-v4vw-rf7v-cxgf`). Non-root proxied users can still read shared
+  scopes and write ordinary projects, while root-matched proxy identities and
+  the static root bearer retain full access.
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
@@ -6328,7 +6473,9 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.2...HEAD
+[3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
+[3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1

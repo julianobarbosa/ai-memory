@@ -14,6 +14,11 @@ ExecStart=%h/.local/bin/ai-memory-snapshot.sh
 # Environment=DATA_SRC=%h/.local/share/ai-memory
 # Environment=CFG_SRC=%h/.config/ai-memory
 # Environment=TARBALL_DIR=%h/backups/ai-memory
+# Configure OneDrive in a persistent drop-in, not with interactive exports:
+#   ~/.config/systemd/user/ai-memory-backup.service.d/onedrive.conf
+# Environment=ONEDRIVE_DIR=%h/OneDrive/Backups/ai-memory
+# Environment=AI_MEMORY_BACKUP_PASSPHRASE_FILE=%h/.config/ai-memory-backup/passphrase
+# Environment=ONEDRIVE_RETENTION_DAYS=30
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
